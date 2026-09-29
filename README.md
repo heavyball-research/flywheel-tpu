@@ -537,3 +537,17 @@ eval/ruler/run_ruler_sweep.sh --seqlens 524288 --cp-size 2 --enable-sp \
 
 Start Ray without `USE_FLYWHEEL_TPU_*` or `RPA_V3_*` set: the driver's kernel
 switches reach the Ray workers only where a node does not already set them.
+
+## Citation
+
+If you use FlyWheel in your research, please cite:
+
+```bibtex
+@misc{bao2026flywheel,
+  title        = {FlyWheel: Attention Kernels for TPU},
+  author       = {Zishuo Bao and Zeshen Zhang and Yucheng Lu},
+  year         = {2026},
+  howpublished = {\url{https://github.com/heavyball-research/flywheel-tpu}},
+  note         = {Version 0.1.0}
+}
+```
