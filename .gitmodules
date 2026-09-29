@@ -1,0 +1,7 @@
+[submodule "third_party/tpu-inference"]
+	path = third_party/tpu-inference
+	url = https://github.com/vllm-project/tpu-inference.git
+	ignore = dirty
+[submodule "third_party/tokamax"]
+	path = third_party/tokamax
+	url = https://github.com/openxla/tokamax.git

@@ -1,0 +1,17 @@
+.claude/
+.ruff_cache/
+docs/
+__pycache__/
+*.pyc
+.venv/
+profiles/
+results/
+.pytest_cache/
+*.egg-info/
+dist/
+.superpowers/
+profile/
+paper/
+.DS_Store
+roofline/
+tools/
