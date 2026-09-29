@@ -20,22 +20,22 @@ linear attention.
 
 ## Install
 
-With [uv](https://github.com/astral-sh/uv), from the repo root. Local
-development (CPU, Pallas interpret mode):
-
 ```bash
-uv sync
+pip install flywheel-tpu            # CPU, Pallas interpret mode
+pip install "flywheel-tpu[tpu]"     # TPU VM, adds jax[tpu]>=0.11.0
 ```
 
-On a TPU VM:
+From source, with [uv](https://github.com/astral-sh/uv) (needed for the
+benchmarks and end-to-end evaluation below):
 
 ```bash
-uv sync --extra tpu
+git clone https://github.com/heavyball-research/flywheel-tpu.git && cd flywheel-tpu
+uv sync --extra tpu     # plain `uv sync` off TPU
 source .venv/bin/activate
 ```
 
-`tpu` adds `jax[tpu]==0.11.0` with `libtpu==0.0.44`, the stack tpu-inference
-runs. The benchmarks below run in this venv.
+The benchmarks below run in this venv. The numbers in this README were measured
+with `jax[tpu]==0.11.0` and `libtpu==0.0.44`, the stack tpu-inference runs.
 
 ## How to use flywheel
 

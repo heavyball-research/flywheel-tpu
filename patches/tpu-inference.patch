@@ -7288,10 +7288,10 @@ index 7fdc9ed7c..cc8d3b7fd 100644
          # With nothing cached the current phase already IS the answer.
 diff --git a/tpu_inference/layers/common/flywheel_pcp_attention.py b/tpu_inference/layers/common/flywheel_pcp_attention.py
 new file mode 100644
-index 000000000..87749dd44
+index 000000000..c41c23333
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_pcp_attention.py
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,331 @@
 +# Copyright 2025 Google LLC
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -7604,6 +7604,14 @@ index 000000000..87749dd44
 +        cache_local = write_kv_cache(owned_k, owned_v, cache_local,
 +                                     local_write_slices[0],
 +                                     local_write_counts[0])
++        # Note (david): tie the cache write to this layer's output. Nothing in
++        # the step reads the updated cache, so XLA otherwise sinks every
++        # layer's take + write to the end of the step and keeps each layer's
++        # gathered full-length K/V alive until then: 0.5 GiB per attention
++        # layer and chip at 512k tokens with PCP=2, 7.4 GiB over
++        # Qwen3.8-27B's 16 layers, which left the 524288-token prefill program
++        # 33 MB short of HBM on v6e.
++        cache_local, output = lax.optimization_barrier((cache_local, output))
 +        return cache_local, output.astype(q_local.dtype)
 +
 +    return jax.shard_map(
