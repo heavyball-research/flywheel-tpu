@@ -50,12 +50,20 @@ def load(directory):
 
 
 def device_pids(trace):
+    """The TensorCore processes.
+
+    On v7x XLA offloads data formatting to the SparseCores, which adds
+    '/device:TPU:0 SparseCore N' processes with their own jit_block events and
+    one copy of each op per TEC thread. That work overlaps the TensorCore
+    timeline, where the wait for it already shows as a
+    sparse-core-data-format-call op, so those processes are left out.
+    """
     keep = set()
     for event in trace.get("traceEvents", []):
         if event.get("ph") == "M" and event.get("name") == "process_name":
             name = event.get("args", {}).get("name", "")
             if (re.search(r"TPU|Device|/device:", name, re.I)
-                    and "Host" not in name):
+                    and "Host" not in name and "SparseCore" not in name):
                 keep.add(event["pid"])
     return keep
 
@@ -66,7 +74,8 @@ def segment_of(event):
         return "attn_kernel"
     tf_op = (event.get("args") or {}).get("tf_op", "")
     primitive = tf_op.rstrip(":").rsplit("/", 1)[-1] if tf_op else ""
-    if any(primitive.startswith(m) for m in MOVERS) or name.startswith("copy"):
+    if (any(primitive.startswith(m) for m in MOVERS)
+            or name.startswith(("copy", "sparse-core-data-format-call"))):
         return "layout"
     if "/qkv_proj/" in tf_op:
         return "qkv_proj"

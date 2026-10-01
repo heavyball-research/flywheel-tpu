@@ -351,6 +351,8 @@ over [RPA v3](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inf
 
 ![Attention kernel throughput](assert/softmax_attn_benchmark.png)
 
+The same benchmark on v7x is in [README_v7x.md](README_v7x.md).
+
 Every number in the figure comes from
 [`benchmarks/softmax_attention/`](benchmarks/softmax_attention/). Each cell
 times a whole attention block under one `jax.jit`, from hidden states
@@ -389,8 +391,11 @@ tpu-inference's [RPA v3](https://github.com/vllm-project/tpu-inference/tree/4420
 at `4420cae` and Tokamax's [Splash Attention](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/tpu/splash_attention)
 at `84e5f36`. Their block configs come from `rpa_tuned_v6e.json` and
 `splash_tuned_v6e.json` next to the script, searched earlier per
-(heads, heads_k, head_dim, mask, T) at B = 1 on v6e; the tuners are not in
-this repo. The tables cover every cell of the figure. A cell outside them
+(heads, heads_k, head_dim, mask, T) at B = 1 on v6e, with tuners that are not
+in this repo. On a v7x chip the script reads `rpa_tuned_v7x.json` and
+`splash_tuned_v7x.json` instead, searched with
+[`tune_blocks.py`](benchmarks/softmax_attention/tune_blocks.py). The tables
+cover every cell of the figure. A cell outside them
 runs RPA's `get_default_block_sizes` or Tokamax's heuristic config instead,
 and its JSONL record says so in `block_source` / `config_source`. flywheel
 runs its own block-size lookup inside `flywheel_tpu`.

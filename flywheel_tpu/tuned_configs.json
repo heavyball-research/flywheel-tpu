@@ -1950,5 +1950,167 @@
       1024,
       2
     ]
+  },
+  "TPU v7": {
+    "fwd|hm|bfloat16|h32|b-|s1024|d256|c1|m-|l0": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      4,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s1024|d256|c1|m-|l0|k4": [
+      1024,
+      1024,
+      512,
+      512,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s131072|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      512,
+      4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s131072|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s16384|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s16384|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s32768|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      256,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s32768|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      256,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s65536|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s65536|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      512,
+      4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d256|c1|m-|l0": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d256|c1|m-|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ]
   }
 }
