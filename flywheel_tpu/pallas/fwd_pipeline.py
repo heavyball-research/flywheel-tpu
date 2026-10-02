@@ -18,11 +18,20 @@ from .block_sizes import (
   NUM_SUBLANES,
   VMEM_LIMIT_BYTES,
   BlockSizes,
+  PagedKVInfo,
   QKVLayout,
   TokenMajorInfo,
   from_head_minor,
+  round_up,
 )
-from .copy_utils import advance, drain, fold_row, hbm_window
+from .copy_utils import (
+  advance,
+  drain,
+  fold_row,
+  hbm_head_slice,
+  hbm_window,
+  load_kv_fragment,
+)
 from .loop_schedule import FwdSchedule
 from .mask import apply_packed_bounds_mask
 from .rotary import ROTARY_DIM_MULTIPLE, rotate_tile
@@ -93,14 +102,19 @@ def fwd_body(
     rotary_k_heads: int = 1,
     rotary_groups: int = 1,
     rotary_k: bool = True,
+    paged: PagedKVInfo | None = None,
 ) -> None:
   """Run the fragment pipeline over every block the schedule yields.
 
   refs are forward_common's rotary operands, outputs and scratch, in its
   allocation order. The logits run in log2 units: Q reaches the QK matmul
-  pre-multiplied by log2(e).
+  pre-multiplied by log2(e). paged (per-seq only) reads K/V out of a paged
+  cache: k_hbm / v_hbm are the cache operands (the same ref when merged), a
+  kv block stages whole token rows page by page, and the packed padding rows
+  past schedule.packed_q_end are written as out = 0 (lse = -inf).
   """
   is_per_seq = schedule.q_token is not None
+  is_paged = paged is not None
 
   remaining_refs = list(refs)
   if rotary_dim:
@@ -110,8 +124,14 @@ def fwd_body(
     rotary_q_hbm = rotary_k_hbm = None
   o_hbm = remaining_refs.pop(0)
   lse_hbm = remaining_refs.pop(0) if return_lse else None
-  q_buf, k_buf, v_buf = (
-      remaining_refs.pop(0), remaining_refs.pop(0), remaining_refs.pop(0))
+  if is_paged and paged.is_merged:
+    # Note (david): a merged cache's token row holds its K heads, then its V
+    # heads, so one staging buffer serves both parts.
+    q_buf, k_buf = remaining_refs.pop(0), remaining_refs.pop(0)
+    v_buf = k_buf
+  else:
+    q_buf, k_buf, v_buf = (
+        remaining_refs.pop(0), remaining_refs.pop(0), remaining_refs.pop(0))
   bounds_buf = remaining_refs.pop(0) if is_per_seq else None
   if rotary_dim:
     rotary_q_buf = remaining_refs.pop(0)
@@ -280,7 +300,106 @@ def fwd_body(
                    token_major=token_major, fold=head_fold),
         sems.at[SEM_OUT, slot])
 
-  def _block_step(group, si, kv, lo, hi, ctx, next_row_entry, carry):
+  if is_paged:
+    pages_per_block = bkv // paged.page_size
+    if paged.is_merged:
+      paged_load_parts = ((k_hbm, k_buf, SEM_K),)
+      v_head_offset = paged.num_kv_heads
+    else:
+      paged_load_parts = ((k_hbm, k_buf, SEM_K), (v_hbm, v_buf, SEM_V))
+      v_head_offset = 0
+
+  def _paged_buffer_tile(buffers, slot, token_start, num_tokens):
+    tokens = pl.ds(token_start, num_tokens)
+    if paged.is_cache_head_major:
+      return buffers.at[slot, :, tokens, :]
+    elif paged.is_bitcast_load:
+      return buffers.at[slot].reshape(
+          bkv, paged.staged_kv_heads, buffers.shape[-1]).at[tokens, :, :]
+    else:
+      return buffers.at[slot, tokens, :, :]
+
+  def _paged_page_tokens(kv_end, kv):
+    # Note (david): each page DMA is clipped to the 8-aligned tokens the
+    # sequence owns in that page, so a block table entry past the sequence's
+    # pages is never dereferenced, and kv_end <= pages_per_seq * page_size
+    # keeps every dereferenced entry inside the sequence's own table row.
+    load_size = jnp.clip(
+        (kv_end + NUM_SUBLANES - 1) // NUM_SUBLANES * NUM_SUBLANES - kv * bkv,
+        0, bkv)
+    return [
+        pl.multiple_of(
+            jnp.clip(load_size - page * paged.page_size, 0, paged.page_size),
+            NUM_SUBLANES)
+        for page in range(pages_per_block)
+    ]
+
+  def _start_paged_kv(seq_idx, kv_end, kv, slot):
+    for page, num_tokens in enumerate(_paged_page_tokens(kv_end, kv)):
+      @pl.when(num_tokens > 0)
+      def _start_page(page=page, num_tokens=num_tokens):
+        physical_page = schedule.kv_page(seq_idx, kv, page)
+        if paged.is_cache_head_major:
+          page_index = (physical_page, slice(None), pl.ds(0, num_tokens),
+                        slice(None))
+        else:
+          page_index = (physical_page, pl.ds(0, num_tokens), slice(None),
+                        slice(None))
+        for cache_hbm, buffers, sem_index in paged_load_parts:
+          pltpu.make_async_copy(
+              cache_hbm.at[page_index],
+              _paged_buffer_tile(
+                  buffers, slot, page * paged.page_size, num_tokens),
+              sems.at[sem_index, slot]).start()
+
+  def _wait_paged_kv(kv_end, kv, slot):
+    # Note (david): every page of a block signals the part's one semaphore,
+    # and a DMA wait only needs the destination size, so each page is waited
+    # with its own staged window as both ends.
+    for page, num_tokens in enumerate(_paged_page_tokens(kv_end, kv)):
+      @pl.when(num_tokens > 0)
+      def _wait_page(page=page, num_tokens=num_tokens):
+        for _, buffers, sem_index in paged_load_parts:
+          staged = _paged_buffer_tile(
+              buffers, slot, page * paged.page_size, num_tokens)
+          pltpu.make_async_copy(staged, staged, sems.at[sem_index, slot]).wait()
+
+    # Note (david): staged rows [valid_rows, bkv) hold cache slots past
+    # seqused_k (uninitialized, possibly NaN) or stale VMEM. Their keys are
+    # masked, but a zero probability times a NaN value is still NaN in the pv
+    # matmul, so a partial block zeroes its value rows (whole token rows when
+    # merged) once, right after its load lands.
+    valid_rows = jnp.maximum(kv_end - kv * bkv, 0)
+
+    @pl.when(valid_rows < bkv)
+    def _zero_value_tail():
+      token_row = jnp.arange(NUM_SUBLANES, dtype=jnp.int32)
+      if paged.is_cache_head_major:
+        token_rows = token_row[None, :, None]
+      elif paged.is_bitcast_load:
+        token_rows = token_row[:, None, None, None]
+      else:
+        token_rows = token_row[:, None, None]
+
+      def _zero_tile(tile, carry):
+        tile_start = pl.multiple_of(tile * NUM_SUBLANES, NUM_SUBLANES)
+        tile_tokens = pl.ds(tile_start, NUM_SUBLANES)
+        if paged.is_cache_head_major:
+          tile_index = (slot, slice(None), tile_tokens, slice(None))
+        else:
+          tile_index = (slot, tile_tokens) + (slice(None),) * (
+              len(v_buf.shape) - 2)
+        staged_tile = v_buf[tile_index]
+        v_buf[tile_index] = jnp.where(
+            tile_start + token_rows < valid_rows, staged_tile,
+            jnp.zeros_like(staged_tile))
+        return carry
+
+      lax.fori_loop(
+          valid_rows // NUM_SUBLANES, bkv // NUM_SUBLANES, _zero_tile, None)
+
+  def _block_step(group, si, kv, lo, hi, ctx, next_row_entry, next_row_paged,
+                  carry):
     (q_loaded, q_inflight, q_slot, kv_loaded, kv_inflight, kv_slot,
      prev_out_tok, num_out_copies) = carry
 
@@ -307,10 +426,16 @@ def fwd_body(
           * heads_outer_batch + base_head % heads_outer_batch
       )
     row_key = group * num_rows + si
-    # Note (david): stream keys must be unique per DMA content, which on the
-    # per-seq schedule only the token offset is, not the kv block index.
-    kv_axis_len = schedule.num_kv_blocks * bkv
-    kv_key = kv_head * kv_axis_len + kv_tok
+    if is_paged:
+      # Note (david): a paged block stages whole token rows of one sequence,
+      # every kv head included, so its content is (sequence, kv block) for any
+      # head group, and consecutive groups reuse a staged block.
+      kv_key = ctx.seq_idx * schedule.num_kv_blocks + kv
+    else:
+      # Note (david): stream keys must be unique per DMA content, which on the
+      # per-seq schedule only the token offset is, not the kv block index.
+      kv_axis_len = schedule.num_kv_blocks * bkv
+      kv_key = kv_head * kv_axis_len + kv_tok
     is_first = kv == lo
     is_last = kv == hi
     is_partial, needs_bounds = schedule.block_flags(si, kv, ctx)
@@ -325,7 +450,14 @@ def fwd_body(
     lookahead_kv_head = jnp.where(is_last, next_row_kv_head, kv_head)
     lookahead_kv_tok = jnp.where(is_last, next_row_kv_tok, next_block_kv_tok)
     lookahead_row_key = jnp.where(is_last, next_row_key, row_key)
-    lookahead_kv_key = lookahead_kv_head * kv_axis_len + lookahead_kv_tok
+    if is_paged:
+      next_row_kv, next_row_seq, next_row_kv_end = next_row_paged
+      lookahead_kv = jnp.where(is_last, next_row_kv, kv + 1)
+      lookahead_seq = jnp.where(is_last, next_row_seq, ctx.seq_idx)
+      lookahead_kv_end = jnp.where(is_last, next_row_kv_end, ctx.kv_end)
+      lookahead_kv_key = lookahead_seq * schedule.num_kv_blocks + lookahead_kv
+    else:
+      lookahead_kv_key = lookahead_kv_head * kv_axis_len + lookahead_kv_tok
 
     q_loaded, q_inflight, q_slot = advance(
         row_key,
@@ -335,14 +467,25 @@ def fwd_body(
         _wait_q_row,
         q_loaded, q_inflight, q_slot, num_stages,
     )
-    kv_loaded, kv_inflight, kv_slot = advance(
-        kv_key,
-        lookahead_kv_key,
-        lambda slot: _start_kv(kv_head, kv_tok, slot),
-        lambda slot: _start_kv(lookahead_kv_head, lookahead_kv_tok, slot),
-        _wait_kv,
-        kv_loaded, kv_inflight, kv_slot, num_stages,
-    )
+    if is_paged:
+      kv_loaded, kv_inflight, kv_slot = advance(
+          kv_key,
+          lookahead_kv_key,
+          lambda slot: _start_paged_kv(ctx.seq_idx, ctx.kv_end, kv, slot),
+          lambda slot: _start_paged_kv(
+              lookahead_seq, lookahead_kv_end, lookahead_kv, slot),
+          lambda slot: _wait_paged_kv(ctx.kv_end, kv, slot),
+          kv_loaded, kv_inflight, kv_slot, num_stages,
+      )
+    else:
+      kv_loaded, kv_inflight, kv_slot = advance(
+          kv_key,
+          lookahead_kv_key,
+          lambda slot: _start_kv(kv_head, kv_tok, slot),
+          lambda slot: _start_kv(lookahead_kv_head, lookahead_kv_tok, slot),
+          _wait_kv,
+          kv_loaded, kv_inflight, kv_slot, num_stages,
+      )
 
     # Note (david): o_stage is one output ring shared by the whole fold group,
     # so wait out the slot's previous DMA before any head writes into it.
@@ -364,19 +507,44 @@ def fwd_body(
       new_parity = parity_smem[g]
       return new_parity, 1 - new_parity
 
+    def _paged_fragment(g, kv_compute_index, kv_part):
+      # Note (david): a paged fold is kv_heads_per_group kv heads times their
+      # consecutive q heads, so q head g reads kv head g // q_heads_per_kv_head
+      # of the group, out of a staging that holds the whole token row. This is
+      # the one place q and kv fold indices differ.
+      staged_head = kv_head + g // q_heads_per_kv_head
+      if kv_part == 0:
+        buffers = k_buf
+      else:
+        buffers = v_buf
+        staged_head = staged_head + v_head_offset
+      return load_kv_fragment(
+          buffers, kv_slot, staged_head, kv_compute_index, kv_part,
+          block_kv_compute=bkv_compute,
+          kv_heads_per_fragment=1,
+          is_kv_pair_tile=False,
+          is_cache_head_major=paged.is_cache_head_major,
+          is_bitcast_load=paged.is_bitcast_load,
+      )
+
     def _qk(g, kv_compute_index, q_compute_index):
       q_ref, q_half = _fold_lane(q_buf.at[q_slot], g, bq, lane_width_qk)
-      k_ref, k_half = _fold_lane(k_buf.at[kv_slot], g, bkv, lane_width_qk)
-      slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
       slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
-      if is_head_dim_minor:
-        q = _take_half(q_ref[slice_q, :], q_half, lane_width_qk)
-        k = _take_half(k_ref[slice_k, :], k_half, lane_width_qk)
+      if is_paged:
+        q = q_ref[slice_q, :]
+        k = _paged_fragment(g, kv_compute_index, 0)
         dim_numbers = NT_DIM_NUMBERS
       else:
-        q = q_ref[:, slice_q].T
-        k = k_ref[:, slice_k]
-        dim_numbers = NN_DIM_NUMBERS
+        k_ref, k_half = _fold_lane(k_buf.at[kv_slot], g, bkv, lane_width_qk)
+        slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
+        if is_head_dim_minor:
+          q = _take_half(q_ref[slice_q, :], q_half, lane_width_qk)
+          k = _take_half(k_ref[slice_k, :], k_half, lane_width_qk)
+          dim_numbers = NT_DIM_NUMBERS
+        else:
+          q = q_ref[:, slice_q].T
+          k = k_ref[:, slice_k]
+          dim_numbers = NN_DIM_NUMBERS
       raw_logits = lax.dot_general(
           q, k, dim_numbers, preferred_element_type=jnp.float32)
       assert raw_logits.shape == (bq_compute, bkv_compute)
@@ -507,9 +675,16 @@ def fwd_body(
       new_parity, old_parity = _head_parities(g)
       rescale_scratch_g = rescale_scratch.at[head_rows]
 
-      v_ref, v_half = _fold_lane(v_buf.at[kv_slot], g, bkv, lane_width_v)
+      if is_paged:
+        v_ref = v_half = None
+      else:
+        v_ref, v_half = _fold_lane(v_buf.at[kv_slot], g, bkv, lane_width_v)
       slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-      if is_head_dim_minor:
+      if is_paged:
+        o_curr = lax.dot_general(
+            probs, _paged_fragment(g, kv_compute_index, 1), NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32)
+      elif is_head_dim_minor:
         o_curr = lax.dot_general(
             probs, _take_half(v_ref[slice_k, :], v_half, lane_width_v),
             NN_DIM_NUMBERS, preferred_element_type=jnp.float32)
@@ -755,8 +930,15 @@ def fwd_body(
       # outbound DMA reads it), and both windows are 8-aligned, so the copy is
       # tile-to-tile and never reads past the source stage.
       num_blend_rows = schedule.blend_start(ctx) - q_tok
+      should_blend = jnp.logical_and(is_last, num_blend_rows > 0)
+      if is_paged:
+        # Note (david): a paged cu_seqlens_q may start past 0, and the rows
+        # below cu_q[0] its first block reaches are the caller's to restore.
+        # That block has no predecessor in its head group (the previous
+        # output belongs to another group), so it skips the blend.
+        should_blend = jnp.logical_and(should_blend, si > 0)
 
-      @pl.when(jnp.logical_and(is_last, num_blend_rows > 0))
+      @pl.when(should_blend)
       def _blend_head_rows():
         prev_slot = (num_out_copies - 1) % num_stages
         src_row_offset = q_tok - prev_out_tok
@@ -785,6 +967,29 @@ def fwd_body(
         lax.fori_loop(
             0, (num_blend_rows + NUM_SUBLANES - 1) // NUM_SUBLANES,
             _blend_tile, None)
+
+    if is_paged:
+      packed_q_end = schedule.packed_q_end
+
+      # Note (david): rows at or past cu_seqlens_q[-1] belong to no sequence
+      # and read out = 0 (lse = -inf). A window reaching them zeroes them in
+      # its stage, which covers the partial tile at the packed end; the fill
+      # after the loop covers the whole tiles past it.
+      @pl.when(jnp.logical_and(is_last, q_tok + bq > packed_q_end))
+      def _zero_packed_padding():
+        o_slot = o_stage.at[out_slot]
+        staged_out = o_slot[...]
+        out_rows = q_tok + lax.broadcasted_iota(
+            jnp.int32, staged_out.shape, staged_out.ndim - 2)
+        o_slot[...] = jnp.where(
+            out_rows < packed_q_end, staged_out, jnp.zeros_like(staged_out))
+        if return_lse:
+          lse_slot = lse_stage.at[out_slot]
+          staged_lse = lse_slot[...]
+          lse_rows = q_tok + lax.broadcasted_iota(
+              jnp.int32, staged_lse.shape, 0)
+          lse_slot[...] = jnp.where(
+              lse_rows < packed_q_end, staged_lse, -jnp.inf)
 
     @pl.when(is_last)
     def _start_out():
@@ -857,10 +1062,15 @@ def fwd_body(
         next_kv_tok,
         next_g * num_rows + next_si,
     )
+    if is_paged:
+      next_row_paged = (next_kv, next_ctx.seq_idx, next_ctx.kv_end)
+    else:
+      next_row_paged = None
     return lax.fori_loop(
         lo, hi + 1,
         lambda kv, block_carry: _block_step(
-            g, si, kv, lo, hi, ctx, next_row_entry, block_carry),
+            g, si, kv, lo, hi, ctx, next_row_entry, next_row_paged,
+            block_carry),
         carry,
     )
 
@@ -877,6 +1087,57 @@ def fwd_body(
   )
 
   drain(num_out_copies, num_stages, lambda slot: _o_copy(0, 0, slot).wait())
+
+  if is_paged:
+    # Note (david): the paged schedule has no pad-tail sequence, so once every
+    # output DMA has landed the packed padding rows are written from a cleared
+    # stage. The last block already zeroed its window's padding rows, so the
+    # fill starts at the next 8-row tile, or at the tile holding packed_q_end
+    # when no block ran (that tile's rows below it are the caller's).
+    packed_q_end = schedule.packed_q_end
+    padded_total_q = o_hbm.shape[-2]
+    fill_start = jnp.where(
+        num_rows > 0,
+        (packed_q_end + NUM_SUBLANES - 1) // NUM_SUBLANES * NUM_SUBLANES,
+        packed_q_end // NUM_SUBLANES * NUM_SUBLANES)
+    num_fills = pl.cdiv(jnp.maximum(padded_total_q - fill_start, 0), bq)
+
+    @pl.when(num_fills > 0)
+    def _clear_fill_stage():
+      o_stage[0] = jnp.zeros(o_stage.shape[1:], o_stage.dtype)
+      if return_lse:
+        lse_stage[0] = jnp.full(lse_stage.shape[1:], -jnp.inf, jnp.float32)
+
+    def _fill_rows(fill_index, carry):
+      row_start = pl.multiple_of(fill_start + fill_index * bq, NUM_SUBLANES)
+      num_fill_rows = pl.multiple_of(
+          jnp.minimum(padded_total_q - row_start, bq), NUM_SUBLANES)
+      fill_rows = pl.ds(0, num_fill_rows)
+      if head_fold == 1:
+        o_fill = o_stage.at[0, fill_rows, :]
+      else:
+        o_fill = o_stage.at[0, :, fill_rows, :]
+      for group in range(num_head_groups):
+        fill_copies = [(
+            o_fill,
+            hbm_head_slice(o_hbm, group * head_fold, row_start, num_fill_rows,
+                           QKVLayout.HEAD_DIM_MINOR, head_fold),
+            SEM_OUT,
+        )]
+        if return_lse:
+          fill_copies.append((
+              lse_stage.at[0, fill_rows, :],
+              lse_hbm.at[group, pl.ds(row_start, num_fill_rows), :],
+              SEM_LSE,
+          ))
+        for fill_src, fill_dst, sem_index in fill_copies:
+          fill_copy = pltpu.make_async_copy(
+              fill_src, fill_dst, sems.at[sem_index, 0])
+          fill_copy.start()
+          fill_copy.wait()
+      return carry
+
+    lax.fori_loop(0, num_fills, _fill_rows, None)
 
 
 def forward_common(
@@ -897,6 +1158,7 @@ def forward_common(
     is_per_seq: bool = False,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = True,
+    paged: PagedKVInfo | None = None,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Validate q/k/v, allocate scratch and run a fwd_body kernel.
@@ -906,6 +1168,10 @@ def forward_common(
   rotary is the (2, batch, tokens, head_dim / 2) Q and K coefficient pair
   (K None when K arrives rotated). Returns o shaped like q (head_dim_v wide),
   or (o, lse) with a (num_q_heads, q_seq_len) float32 natural-log lse.
+
+  paged (per-seq, head-major q only) makes k / v the paged cache operands:
+  k the merged cache and v None, or the K and V caches of a pair, each laid
+  out as paged describes. The kernel then takes (q, k[, v], *rotary).
   """
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   bkv_compute = block_sizes.block_kv_compute
@@ -920,13 +1186,39 @@ def forward_common(
         f"{bq_compute=} must be a multiple of {NUM_SUBLANES}."
     )
 
-  if k.shape[:-1] != v.shape[:-1]:
+  if paged is None and k.shape[:-1] != v.shape[:-1]:
     raise ValueError(
         f"'key' {k.shape} and 'value' {v.shape} must have the same leading"
         " dimensions."
     )
 
-  if token_major is not None:
+  if paged is not None:
+    if (token_major is not None or not is_per_seq or transposed_pv
+        or qkv_layout != QKVLayout.HEAD_DIM_MINOR):
+      raise ValueError(
+          "a paged KV cache runs only the per-seq schedule over head-major q"
+          " with a HEAD_DIM_MINOR qkv_layout and transposed_pv=False."
+      )
+    num_q_heads, q_seq_len, head_dim_qk = q.shape
+    head_dim_v = head_dim_qk
+    if paged.is_cache_head_major:
+      cache_row_shape = (1, paged.page_size, head_dim_qk)
+    else:
+      cache_row_shape = (paged.page_size, paged.staged_kv_heads, head_dim_qk)
+    caches = (k,) if paged.is_merged else (k, v)
+    if (paged.is_merged != (v is None) or any(
+        cache.ndim != 4 or cache.shape[1:] != cache_row_shape
+        or cache.shape[0] != k.shape[0] for cache in caches)):
+      raise ValueError(
+          f"paged cache operands must be (num_pages, *{cache_row_shape}) (v"
+          f" None iff merged={paged.is_merged}); got {k.shape=},"
+          f" v={None if v is None else v.shape}."
+      )
+    # Note (david): seqused_k bounds every sequence's kv blocks, so the kv
+    # axis only needs its block count; the padded capacity stands in for its
+    # length.
+    kv_seq_len = -(-(paged.pages_per_seq * paged.page_size) // bkv) * bkv
+  elif token_major is not None:
     batch = token_major.batch
     q_heads_per_row = token_major.num_q_heads
     kv_heads_per_row = token_major.num_kv_heads
@@ -1041,9 +1333,14 @@ def forward_common(
       raise ValueError("rotary batch must match token-major batch or be shared.")
     rotary_q_heads = num_q_heads // rotary_batch
     rotary_k_heads = num_kv_heads // rotary_batch
+    if paged is not None and rotary_k:
+      raise ValueError(
+          "a paged cache holds K already rotated; pass no K coefficients.")
     # Note (david): a dense head-major fold may span batch rows, and only then
-    # does each folded head need its own coefficient plane.
-    if rotary_q_heads % head_fold or rotary_k_heads % head_fold:
+    # does each folded head need its own coefficient plane. A paged fold mixes
+    # q and kv heads, and only its q heads are rotated.
+    if rotary_q_heads % head_fold or (
+        paged is None and rotary_k_heads % head_fold):
       rotary_groups = head_fold
     else:
       rotary_groups = 1
@@ -1058,7 +1355,7 @@ def forward_common(
       token_major=token_major, rotary_dim=rotary_dim,
       rotary_interleaved=rotary_interleaved, rotary_batch=rotary_batch,
       rotary_q_heads=rotary_q_heads, rotary_k_heads=rotary_k_heads,
-      rotary_groups=rotary_groups, rotary_k=rotary_k, **body,
+      rotary_groups=rotary_groups, rotary_k=rotary_k, paged=paged, **body,
   )
 
   folded_bq = head_fold * bq
@@ -1081,9 +1378,25 @@ def forward_common(
       return (num_stages, head_fold, *from_head_minor((rows, head_dim), layout))
 
   q_buf = vmem(_staged_shape(bq, head_dim_qk, qkv_layout), q.dtype)
-  k_buf = vmem(_staged_shape(bkv, head_dim_qk, qkv_layout), k.dtype)
-  v_buf = vmem(_staged_shape(bkv, head_dim_v, qkv_layout), v.dtype)
-  scratch_shapes = [q_buf, k_buf, v_buf]
+  if paged is None:
+    k_buf = vmem(_staged_shape(bkv, head_dim_qk, qkv_layout), k.dtype)
+    v_buf = vmem(_staged_shape(bkv, head_dim_v, qkv_layout), v.dtype)
+    scratch_shapes = [q_buf, k_buf, v_buf]
+  else:
+    # Note (david): a paged block stages whole token rows in the decode
+    # kernel's staging layouts: (1, tokens, head_dim) for a one-head pair, u32
+    # head pairs under the bitcast load, plain token rows otherwise. A merged
+    # cache stages K and V heads together in one buffer.
+    if paged.is_cache_head_major:
+      kv_staging_shape = (num_stages, 1, bkv, head_dim_qk)
+    elif paged.is_bitcast_load:
+      kv_staging_shape = (
+          num_stages, bkv, paged.staged_kv_heads // 2, 2, head_dim_qk)
+    else:
+      kv_staging_shape = (num_stages, bkv, paged.staged_kv_heads, head_dim_qk)
+    num_kv_staging = 1 if paged.is_merged else 2
+    scratch_shapes = [q_buf] + [
+        vmem(kv_staging_shape, k.dtype) for _ in range(num_kv_staging)]
   if is_per_seq:
     # Note (david): the per-seq kernel synthesizes its bounds rows (the q lower
     # bound, plus the span under a left window) once per block in-kernel, so
@@ -1108,8 +1421,15 @@ def forward_common(
   sems = pltpu.SemaphoreType.DMA((NUM_SEMS + num_rotary_streams, num_stages))
   scratch_shapes += [o_stage, row_max_scratch, row_sum_scratch, o_scratch,
                      rescale_scratch, guard_smem, parity_smem, sems]
+  # Note (david): a per-seq lse row holds one lane per folded head. A paged
+  # fold (kv_heads_per_group kv heads times all their q heads) can pass 128
+  # heads, so its row widens to whole lane tiles.
+  if paged is None:
+    lse_lanes = NUM_LANES
+  else:
+    lse_lanes = round_up(head_fold, NUM_LANES)
   if return_lse and is_per_seq:
-    scratch_shapes.append(vmem((num_stages, bq, NUM_LANES), jnp.float32))
+    scratch_shapes.append(vmem((num_stages, bq, lse_lanes), jnp.float32))
   elif return_lse:
     scratch_shapes.append(vmem((head_fold, bq), jnp.float32))
 
@@ -1118,7 +1438,10 @@ def forward_common(
         operand.swapaxes(-1, -2) for operand in (q, k, v, *rotary_operands))
   else:
     q_in, k_in, v_in, *rotary_in = (q, k, v, *rotary_operands)
-  kernel_inputs = [q_in, k_in, v_in, *rotary_in]
+  if paged is not None and paged.is_merged:
+    kernel_inputs = [q_in, k_in, *rotary_in]
+  else:
+    kernel_inputs = [q_in, k_in, v_in, *rotary_in]
   smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
   any_spec = pl.BlockSpec(memory_space=pl.ANY)
   in_specs = (
@@ -1130,11 +1453,12 @@ def forward_common(
   else:
     o_shape = (
         *q.shape[:-2], q_seq_len, token_major.num_q_heads * head_dim_v)
-  # Note (david): per-seq LSE gives every head group an explicit 128-lane minor
-  # axis, so fwd_body DMAs a complete tile at offset zero and groups never
-  # alias in the physical layout; only the first head_fold lanes are returned.
+  # Note (david): per-seq LSE gives every head group an explicit minor axis of
+  # whole 128-lane tiles, so fwd_body DMAs complete tiles at offset zero and
+  # groups never alias in the physical layout; only the first head_fold lanes
+  # are returned.
   lse_shape = (
-      (num_q_heads // head_fold, q_seq_len, NUM_LANES)
+      (num_q_heads // head_fold, q_seq_len, lse_lanes)
       if is_per_seq else (num_q_heads, q_seq_len)
   )
   if return_lse:

@@ -12,6 +12,9 @@ import jax
 import jax.numpy as jnp
 
 from .pallas.block_sizes import (
+  FWD_BLOCKS,
+  FWD_KV_COMPUTE_BLOCKS,
+  FWD_Q_COMPUTE_BLOCKS,
   LOG2E,
   NUM_LANES,
   PAIRED_HEAD_DIM,
@@ -27,14 +30,10 @@ from .pallas.flash_bwd import flash_attn_bwd
 from .pallas.flash_fwd import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
 from .pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
 from .pallas.flash_fwd_kvcache_varlen import flash_attn_kvcache_varlen
+from .pallas.flash_fwd_varlen_paged import flash_attn_varlen_paged
 from .pallas.rotary import prepare_rotary
 from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
 
-# Note (david): descending, since pick_tile takes the first candidate that
-# divides the axis.
-FWD_BLOCKS = (2048, 1024, 512, 256, 128)
-FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
-FWD_Q_COMPUTE_BLOCKS = (256, 128)
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # decode kernel descriptor-bound.
 PAGE_SIZE_MULTIPLE = 128
@@ -821,12 +820,159 @@ def _flash_attn_func_pcp_causal_offset(
     return out
 
 
+def paged_varlen_attn(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array | None,
+    cu_seqlens_q: jax.Array,
+    cu_seqlens_k: jax.Array | None,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    *,
+    softmax_scale: float | None,
+    causal: bool,
+    window_size: tuple[int, int],
+    softcap: float,
+    return_softmax_lse: bool,
+    interpret: bool,
+    head_dim: int | None,
+    token_major: bool,
+    blocks_override: tuple[int, int, int, int] | None,
+    rotary_cos: jax.Array | None,
+    rotary_sin: jax.Array | None,
+    rotary_interleaved: bool,
+    rotary_k: bool,
+    block_table: jax.Array,
+    seqused_k: jax.Array | None,
+    num_active: jax.Array | int | None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+  """flash_attn_varlen_func's paged KV cache branch (block_table given)."""
+  if token_major:
+    raise NotImplementedError(
+        "a paged KV cache takes head-major q (nheads, total_q, headdim);"
+        " token_major=True is not supported."
+    )
+  if head_dim is not None:
+    raise ValueError(
+        "head_dim is only meaningful for token-major inputs; a paged call"
+        " takes head-major q."
+    )
+  if window_size != (-1, -1):
+    raise NotImplementedError(
+        "window_size is not supported with a paged KV cache.")
+  if softcap != 0.0:
+    raise NotImplementedError("softcap is not supported with a paged KV cache.")
+  if cu_seqlens_k is not None:
+    raise ValueError(
+        "with block_table, pass cu_seqlens_k=None: seqused_k gives each"
+        " sequence's kv length."
+    )
+  if seqused_k is None:
+    raise ValueError(
+        "block_table needs seqused_k, the (batch,) kv length of each sequence"
+        " (its new tokens included)."
+    )
+  if rotary_cos is not None and rotary_k:
+    raise NotImplementedError(
+        "a paged KV cache holds K already rotated; pass rotary_k=False to"
+        " rotate Q only."
+    )
+  for arg_name, seqlen_bound in (("max_seqlen_q", max_seqlen_q),
+                                 ("max_seqlen_k", max_seqlen_k)):
+    if isinstance(seqlen_bound, jax.core.Tracer):
+      raise ValueError(
+          f"{arg_name} must be a concrete int (it picks the kernel's block"
+          " sizes); pass a static bucket bound, not a traced value."
+      )
+    if int(seqlen_bound) <= 0:
+      raise ValueError(f"{arg_name} must be positive; got {seqlen_bound}.")
+  if q.ndim != 3:
+    raise ValueError(
+        f"with block_table, q must be (nheads, total_q, headdim); got"
+        f" {q.shape=}."
+    )
+
+  cu_seqlens_q = jnp.asarray(cu_seqlens_q)
+  seqused_k = jnp.asarray(seqused_k)
+  if (cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape[0] < 2
+      or not jnp.issubdtype(cu_seqlens_q.dtype, jnp.integer)):
+    raise ValueError(
+        "cu_seqlens_q must be a 1-D integer array of batch + 1 boundaries;"
+        f" got {cu_seqlens_q.shape} {cu_seqlens_q.dtype}."
+    )
+  batch = cu_seqlens_q.shape[0] - 1
+  cu_seqlens_q = cu_seqlens_q.astype(jnp.int32)
+  if num_active is None:
+    rotary_seqused_k = seqused_k
+  else:
+    num_active = jnp.asarray(num_active)
+    if (num_active.size != 1
+        or not jnp.issubdtype(num_active.dtype, jnp.integer)):
+      raise ValueError(
+          "num_active must be one integer; got"
+          f" {num_active.shape} {num_active.dtype}."
+      )
+    num_active = num_active.reshape(())
+    # Note (david): a concrete num_active of any type (int, NumPy or jax
+    # scalar) is range-checked here. A traced one is the caller's contract,
+    # like the other traced metadata: the cu_seqlens_q lookup below would
+    # clamp a value past batch and wrap a negative one.
+    if (not isinstance(num_active, jax.core.Tracer)
+        and not 0 <= int(num_active) <= batch):
+      raise ValueError(
+          f"num_active must be in [0, {batch}]; got {int(num_active)}.")
+    active = num_active.astype(jnp.int32)
+    # Note (david): pinning every boundary past num_active to
+    # cu_seqlens_q[num_active] turns the inactive sequences into empty ones,
+    # which own no q block, so the kernel never reads their seqused_k or
+    # block_table entries and their rows become packed padding.
+    cu_seqlens_q = jnp.where(
+        jnp.arange(batch + 1, dtype=jnp.int32) <= active, cu_seqlens_q,
+        cu_seqlens_q[active])
+    rotary_seqused_k = jnp.where(
+        jnp.arange(batch, dtype=jnp.int32) < active, seqused_k, 0)
+
+  total_q, head_dim_qk = q.shape[1], q.shape[2]
+  rotary = prepare_rotary(
+      rotary_cos, rotary_sin, head_dim=head_dim_qk, dtype=q.dtype,
+      rotate_k=rotary_k, seqlen_q=total_q, seqlen_k=int(max_seqlen_k),
+      interleaved=rotary_interleaved, cu_q=cu_seqlens_q,
+      seqused_k=None if rotary_cos is None else rotary_seqused_k,
+      max_seqlen_k=max_seqlen_k)
+  if blocks_override is None:
+    paged_block_sizes = None
+  else:
+    block_q, block_kv, block_q_compute, block_kv_compute = blocks_override
+    paged_block_sizes = BlockSizes(
+        block_q=block_q,
+        block_kv=block_kv,
+        block_kv_compute=block_kv_compute,
+        block_q_compute=block_q_compute,
+    )
+  softmax_scale = (
+      1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
+  )
+  kernel = functools.partial(
+      flash_attn_varlen_paged,
+      max_seqlen_q=int(max_seqlen_q),
+      max_seqlen_k=int(max_seqlen_k),
+      causal=bool(causal),
+      q_scale=float(fused_q_scale(softmax_scale, 0.0)),
+      return_lse=bool(return_softmax_lse),
+      interpret=bool(interpret),
+      block_sizes=paged_block_sizes,
+  )
+  return forward_only_attn(
+      kernel, "flash_attn_varlen_func", q, k, v,
+      (cu_seqlens_q, seqused_k, block_table), rotary, rotary_interleaved)
+
+
 def flash_attn_varlen_func(
     q: jax.Array,
     k: jax.Array,
-    v: jax.Array,
+    v: jax.Array | None,
     cu_seqlens_q: jax.Array,
-    cu_seqlens_k: jax.Array,
+    cu_seqlens_k: jax.Array | None,
     max_seqlen_q: int,
     max_seqlen_k: int,
     dropout_p: float = 0.0,
@@ -847,6 +993,9 @@ def flash_attn_varlen_func(
     rotary_sin: jax.Array | None = None,
     rotary_interleaved: bool = True,
     rotary_k: bool = True,
+    block_table: jax.Array | None = None,
+    seqused_k: jax.Array | None = None,
+    num_active: jax.Array | int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn.flash_attn_varlen_func on TPU for packed sequences.
 
@@ -875,6 +1024,23 @@ def flash_attn_varlen_func(
   block_kv_compute) pins the forward tiles instead of the tuned or analytic
   ones. block_q and block_kv must be multiples of 128, and each packed total
   then pads to a multiple of its own block.
+
+  Paged KV cache (block_table given; read-only, as in FlashAttention): k is
+  one merged bf16 (num_pages, page_size, 2 * nheads_k, headdim) cache whose
+  token rows hold the K heads, then the V heads, with v None, or k and v are
+  a (num_pages, page_size, nheads_k, headdim) pair; headdim and page_size are
+  multiples of 128. block_table: (batch, max_pages_per_seq) int, never read
+  past a sequence's own pages. cu_seqlens_k must be None and seqused_k
+  ((batch,) int) is each sequence's kv length, its new tokens included,
+  which the cache must already hold; max_seqlen_k bounds it. q / out stay
+  head-major; token_major, window_size, softcap and rotary_k=True raise, and
+  RoPE rotates Q only, at positions seqused_k - len_q + t. cu_seqlens_q[0]
+  may exceed 0: the rows below it are the caller's and come back
+  unspecified (the first q block may overwrite them). num_active (int
+  or int32 scalar, possibly traced) keeps only the first num_active
+  sequences; rows past the last kept one return out = 0 and lse = -inf. A
+  concrete num_active outside [0, batch] raises; a traced one must lie in
+  that range, which is not checked on device.
   """
   window_size = check_common_kwargs(
       window_size, dropout_p=dropout_p, softcap=softcap,
@@ -897,6 +1063,22 @@ def flash_attn_varlen_func(
           "block_q and block_kv must be multiples of 128 (the kernel's"
           f" native tile); got {blocks_override!r}."
       )
+  if block_table is not None:
+    return paged_varlen_attn(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+        softmax_scale=softmax_scale, causal=causal, window_size=window_size,
+        softcap=softcap, return_softmax_lse=return_softmax_lse,
+        interpret=interpret, head_dim=head_dim, token_major=token_major,
+        blocks_override=blocks_override, rotary_cos=rotary_cos,
+        rotary_sin=rotary_sin, rotary_interleaved=rotary_interleaved,
+        rotary_k=rotary_k, block_table=block_table, seqused_k=seqused_k,
+        num_active=num_active,
+    )
+  if seqused_k is not None or num_active is not None:
+    raise ValueError(
+        "seqused_k and num_active describe a paged KV cache and need"
+        " block_table; packed K/V takes cu_seqlens_k."
+    )
 
   expected_rank = 2 if token_major else 3
   nheads, nheads_k, head_dim_qk, head_dim_v = parse_qkv(

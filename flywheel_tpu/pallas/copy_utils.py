@@ -6,8 +6,12 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo
+
+MIN_BLOCK_KV = 128
+BF16_BITS = 16
 
 
 def advance(
@@ -184,3 +188,70 @@ def fold_row(
     return ref.at[:, pl.ds(fold_idx * lane_width, lane_width)]
   else:
     return ref.at[fold_idx]
+
+
+def load_kv_fragment(
+    buffers: jax.Array,
+    slot: jax.Array,
+    head_group: int,
+    kv_compute_index: int,
+    kv_part: int,
+    *,
+    block_kv_compute: int,
+    kv_heads_per_fragment: int,
+    is_kv_pair_tile: bool,
+    is_cache_head_major: bool,
+    is_bitcast_load: bool,
+) -> jax.Array:
+  """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 keys (kv_part 0)
+  or values (kv_part 1) of one head group, read from a KV staging slot."""
+  head_dim = buffers.shape[-1]
+  compute_start = pl.multiple_of(
+      kv_compute_index * block_kv_compute, MIN_BLOCK_KV
+  )
+  # Note (david): a K/V pair tile stages K as head 0 and V as head 1, so its
+  # u32 words hold K in lane 0 and V in lane 1.
+  staged_head = kv_part if is_kv_pair_tile else head_group
+  if is_cache_head_major:
+    return buffers[
+        slot,
+        pl.ds(staged_head, 1),
+        pl.ds(compute_start, block_kv_compute),
+        :,
+    ].reshape(block_kv_compute, head_dim)
+  elif not is_bitcast_load:
+    return buffers[
+        slot,
+        pl.ds(compute_start, block_kv_compute),
+        pl.ds(staged_head, 1),
+        :,
+    ].reshape(block_kv_compute, head_dim)
+  else:
+    _, block_kv, head_pairs_per_token, _, _ = buffers.shape
+    words_ref = buffers.bitcast(jnp.uint32).at[slot].reshape(
+        block_kv * head_pairs_per_token, head_dim
+    )
+    if is_kv_pair_tile:
+      word_start = compute_start
+      lane = kv_part
+    else:
+      pair_index = (
+          head_group if kv_heads_per_fragment == 2 else head_group // 2
+      )
+      word_start = compute_start * head_pairs_per_token + pair_index
+      lane = head_group % 2
+    word_rows = pl.ds(word_start, block_kv_compute, head_pairs_per_token)
+    if head_dim <= NUM_LANES:
+      words = words_ref[word_rows]
+    else:
+      folded_words_ref = words_ref.reshape(
+          block_kv * head_pairs_per_token, head_dim // NUM_LANES, NUM_LANES
+      )
+      words = folded_words_ref[word_rows, :, :].reshape(
+          block_kv_compute, head_dim
+      )
+    if kv_heads_per_fragment == 2:
+      return pltpu.bitcast(words, jnp.bfloat16)
+    else:
+      lane_bits = words >> jnp.uint32(lane * BF16_BITS)
+      return pltpu.bitcast(lane_bits.astype(jnp.uint16), jnp.bfloat16)

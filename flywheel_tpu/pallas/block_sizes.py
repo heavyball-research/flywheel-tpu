@@ -26,6 +26,11 @@ MIN_NUM_STAGES = 2
 # for stages >= 2).
 STAGES = (2, 3, 4)
 DEFAULT_BLOCK_Q_COMPUTE = 256
+# Note (david): descending, since pick_tile takes the first candidate that
+# divides the axis.
+FWD_BLOCKS = (2048, 1024, 512, 256, 128)
+FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
+FWD_Q_COMPUTE_BLOCKS = (256, 128)
 
 # Note (david): exp(x) == exp2(x * log2(e)). Folding log2(e) into the score
 # scale and the loaded lse lets the softmax use exp2, dropping the per-element
@@ -107,6 +112,32 @@ class TokenMajorInfo:
   num_kv_heads: int
   head_dim_qk: int
   head_dim_v: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PagedKVInfo:
+  """Static addressing facts for a paged KV cache; None means packed K/V.
+
+  The cache holds (num_pages, page_size, heads, head_dim) token rows, either
+  merged (one operand whose token row is the num_kv_heads K heads, then the V
+  heads) or a K/V pair of operands. is_cache_head_major marks a one-head pair
+  passed as the same bytes viewed (num_pages, 1, page_size, head_dim). A kv
+  block stages whole token rows, so each head group of kv_heads_per_group
+  KV heads (and their q heads) reads its heads out of the same staging.
+  is_bitcast_load packs two bf16 heads into one u32 word (TPU builds only).
+  """
+  num_kv_heads: int
+  kv_heads_per_group: int
+  page_size: int
+  pages_per_seq: int
+  is_merged: bool
+  is_cache_head_major: bool
+  is_bitcast_load: bool
+
+  @property
+  def staged_kv_heads(self) -> int:
+    """Heads per staged token row of one load part."""
+    return 2 * self.num_kv_heads if self.is_merged else self.num_kv_heads
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

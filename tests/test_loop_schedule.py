@@ -18,6 +18,7 @@ from flywheel_tpu.pallas.loop_schedule import (
     dense_fwd_params,
     make_dense_bwd_schedule,
     make_dense_fwd_schedule,
+    make_paged_fwd_schedule,
     make_per_seq_fwd_schedule,
     per_seq_qblk_prefix,
 )
@@ -320,6 +321,175 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
     out[row.staged_q_start:row.staged_q_start + bq] = stage
     prev_stage, prev_start = stage, row.staged_q_start
   np.testing.assert_array_equal(out, owner)
+
+
+def paged_mask(cu_q, seqused_k, q_len, k_len, left, right):
+  """Rows of sequence r see its own logical kv axis [0, seqused_k[r]) under
+  flash_attn's bottom-right window on (q_len(r), seqused_k[r]); rows outside
+  every sequence see nothing."""
+  q = np.arange(q_len)[:, None]
+  k = np.arange(k_len)[None, :]
+  mask = np.zeros((q_len, k_len), bool)
+  for seq in range(len(cu_q) - 1):
+    offset = seqused_k[seq] - cu_q[seq + 1]
+    own = (cu_q[seq] <= q) & (q < cu_q[seq + 1]) & (k < seqused_k[seq])
+    left_visible = True if left is None else q + offset - left <= k
+    right_visible = True if right is None else k <= q + offset + right
+    mask |= own & left_visible & right_visible
+  return mask
+
+
+# Note (david): entry PAGE_ID_STRIDE * r + p names logical page p of sequence
+# r, so every lookup shows which table row and column it read.
+PAGE_ID_STRIDE = 1000
+
+
+def replay_paged_fwd(cu_q, seqused_k, q_pad, bq, bkv, page_size,
+                     pages_per_seq, window):
+  """Walks one head group of the paged schedule; each visited block is (kv,
+  first kv token, needs_bounds). Returns (sched, rows, table)."""
+  cu_q_array = jnp.asarray(cu_q, jnp.int32)
+  cu_qblk = per_seq_qblk_prefix(cu_q_array, bq)
+  num_rows = int(cu_qblk[-1])
+  table = (PAGE_ID_STRIDE * np.arange(len(seqused_k))[:, None]
+           + np.arange(pages_per_seq)[None])
+  left, right = window
+  sched = make_paged_fwd_schedule(
+      cu_q_array, jnp.asarray(seqused_k, jnp.int32), cu_qblk,
+      jnp.asarray(table.reshape(-1), jnp.int32), num_head_groups=1,
+      q_heads_per_kv_head=1, padded_total_q=q_pad, bq=bq, bkv=bkv,
+      page_size=page_size, pages_per_seq=pages_per_seq, left=left,
+      right=right, num_rows=num_rows)
+  rows = []
+  for si in range(num_rows):
+    lo, hi, ctx = sched.row_interval(jnp.int32(si))
+    seq = int(np.searchsorted(np.asarray(cu_qblk), si, side="right")) - 1
+    assert int(ctx.seq_idx) == seq, si
+    aligned_q_start = cu_q[seq] // 8 * 8 + (si - int(cu_qblk[seq])) * bq
+    blocks = []
+    for kv in range(int(lo), int(hi) + 1):
+      _, needs_bounds = sched.block_flags(jnp.int32(si), jnp.int32(kv), ctx)
+      blocks.append(
+          (kv, int(sched.kv_token(jnp.int32(kv), ctx)), bool(needs_bounds)))
+    rows.append(PerSeqRow(
+        si=si,
+        staged_q_start=int(sched.q_token(ctx)),
+        aligned_q_start=aligned_q_start,
+        owned_rows=(max(int(ctx.q_start), aligned_q_start),
+                    min(int(ctx.q_end), aligned_q_start + bq)),
+        ctx=ctx,
+        blocks=blocks,
+    ))
+  return sched, rows, table
+
+
+PAGED_CASES = [
+    # (cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq)
+    ([0, 512], [512], 512, 128, 128, 128, 4),
+    ([0, 37, 90, 112], [37, 180, 22], 128, 128, 256, 128, 2),
+    ([0, 40, 100], [200, 500], 128, 128, 512, 128, 4),
+    ([0, 0, 90], [0, 400], 128, 128, 256, 256, 2),
+    ([0, 100, 226], [150, 400], 256, 128, 256, 256, 2),
+    # Note (david): the last kv block of every sequence runs past its 14-page
+    # table row, whose missing pages must clamp into the row.
+    ([0, 300, 364, 1000], [590, 233, 1700], 1024, 256, 512, 128, 14),
+    # Note (david): cu_seqlens_q starts past 0 off the 8-row grid, with an
+    # empty request in the middle.
+    ([13, 30, 30, 75], [100, 0, 300], 128, 128, 256, 128, 3),
+    # Note (david): the last block clamps from 288 to 256 at the padded end,
+    # and rows past cu_q[-1] belong to no block.
+    ([0, 128, 128, 165, 380], [128, 0, 37, 300], 384, 128, 128, 128, 3),
+]
+
+# Note (david): the paged path supports full and causal attention only.
+PAGED_WINDOWS = [(None, None), (None, 0)]
+
+
+@pytest.mark.parametrize("window", PAGED_WINDOWS)
+@pytest.mark.parametrize("case", PAGED_CASES)
+def test_paged_fwd_schedule_windows_masks_and_pages(case, window):
+  cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq = case
+  sched, rows, table = replay_paged_fwd(
+      cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq, window)
+  kv_cap = -(-pages_per_seq * page_size // bkv) * bkv
+  mask = paged_mask(cu_q, seqused_k, q_pad, kv_cap, *window)
+  assert int(sched.packed_q_end) == cu_q[-1]
+
+  # Note (david): each sequence's kv axis is its own logical one from token 0,
+  # addressed through its pages.
+  for row in rows:
+    assert row.aligned_q_start % 8 == 0 and row.staged_q_start % 8 == 0, row.si
+    assert int(row.ctx.kv_start) == 0 and int(row.ctx.kv_window_base) == 0
+    for kv, k_tok, _ in row.blocks:
+      assert k_tok == kv * bkv, (row.si, kv, k_tok)
+
+  # Note (david): the owned ranges partition [cu_q[0], cu_q[-1]) in si order;
+  # packed padding past cu_q[-1] gets no block.
+  cursor = cu_q[0]
+  for row in rows:
+    start, end = row.owned_rows
+    assert start == cursor and start < end, (row.si, row.owned_rows)
+    assert row.staged_q_start <= start and end <= row.staged_q_start + bq, (
+        row.si, row.owned_rows)
+    cursor = end
+  assert cursor == cu_q[-1]
+
+  for row in rows:
+    valid_rows = kept_rows(row, bq)
+    needed = set(np.nonzero(mask[valid_rows].any(axis=0))[0])
+    covered = set()
+    for _, k_tok, _ in row.blocks:
+      covered |= set(range(k_tok, k_tok + bkv))
+    assert needed <= covered, (row.si, sorted(needed - covered)[:4])
+    visited = [kv for kv, _, _ in row.blocks]
+    if needed:
+      assert visited[-1] == max(needed) // bkv, (row.si, visited)
+      assert visited[0] == min(needed) // bkv, (row.si, visited)
+    else:
+      assert len(visited) == 1, row.si
+    # Note (david): unflagged blocks run the mask-free pipeline copy, so every
+    # kept (row, column) pair they load must already be valid, past the
+    # sequence's last token included.
+    for kv, k_tok, needs_bounds in row.blocks:
+      assert needs_bounds or mask[np.ix_(valid_rows,
+                                         np.arange(k_tok, k_tok + bkv))].all(), (
+          row.si, kv)
+
+  # Note (david): a kv block reads pages kv * pages_per_block + page of its
+  # own sequence's table row; a lookup past the row's last page may read any
+  # entry of that row (its DMA clips to zero tokens) but never another row.
+  pages_per_block = bkv // page_size
+  for row in rows:
+    seq = int(row.ctx.seq_idx)
+    for kv, _, _ in row.blocks:
+      for page in range(pages_per_block):
+        entry = int(sched.kv_page(row.ctx.seq_idx, jnp.int32(kv), page))
+        logical_page = kv * pages_per_block + page
+        assert entry // PAGE_ID_STRIDE == seq, (row.si, kv, page, entry)
+        if logical_page * page_size < seqused_k[seq]:
+          assert entry == table[seq, logical_page], (row.si, kv, page, entry)
+
+
+@pytest.mark.parametrize("window", PAGED_WINDOWS)
+@pytest.mark.parametrize("case", PAGED_CASES)
+def test_paged_q_bounds_match_kept_rows(case, window):
+  cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq = case
+  sched, rows, _ = replay_paged_fwd(
+      cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq, window)
+  kv_cap = -(-pages_per_seq * page_size // bkv) * bkv
+  mask = paged_mask(cu_q, seqused_k, q_pad, kv_cap, *window)
+  for row in rows:
+    q_ids = kept_rows(row, bq)
+    for kv, k_tok, _ in [block for block in row.blocks if block[2]]:
+      k_abs = jnp.arange(k_tok, k_tok + bkv, dtype=jnp.int32)[None, :]
+      lower, span = sched.q_bounds(row.ctx, jnp.int32(kv), k_abs)
+      assert span is None
+      actual = q_ids[:, None] >= np.asarray(lower)[0][None, :]
+      # Note (david): a paged block owns every column of its window, so the
+      # bounds alone must reproduce the mask, columns past seqused_k included.
+      np.testing.assert_array_equal(
+          actual, mask[np.ix_(q_ids, np.arange(k_tok, k_tok + bkv))],
+          err_msg=str((row.si, kv)))
 
 
 BWD_CASES = [

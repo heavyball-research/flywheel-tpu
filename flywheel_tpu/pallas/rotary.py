@@ -22,6 +22,7 @@ def prepare_rotary(
     cu_k: jax.Array | None = None,
     max_seqlen_k: int | None = None,
     rotate_k: bool = True,
+    seqused_k: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array | None] | None:
   """Gather per-token cos/sin coefficients without materializing rotated Q or K.
 
@@ -32,11 +33,19 @@ def prepare_rotary(
   (2, 1, tokens, head_dim / 2) holding cos then sin; the singleton axis is
   shared by all batch rows or packed heads. k_coefficients is None when
   rotate_k is False (K arrives already rotated). Returns None without tables.
+
+  seqused_k (with cu_q, in place of cu_k) gives each sequence's len_k directly,
+  as a paged KV cache does; its K is already rotated, so rotate_k must be
+  False.
   """
   if type(interleaved) is not bool:
     raise ValueError("rotary_interleaved must be a static bool.")
   if type(rotate_k) is not bool:
     raise ValueError("rotary_k must be a static bool.")
+  if seqused_k is not None and (cu_q is None or cu_k is not None or rotate_k):
+    raise ValueError(
+        "seqused_k replaces cu_k for packed Q over an already rotated K: pass"
+        " it with cu_q, cu_k=None and rotate_k=False.")
   if (cos is None) != (sin is None):
     raise ValueError("rotary_cos and rotary_sin must be provided together.")
   if cos is None and not rotate_k:
@@ -84,7 +93,11 @@ def prepare_rotary(
       q_positions = jnp.arange(seqlen_q) + seqlen_k - seqlen_q
       k_positions = jnp.arange(seqlen_k)
     else:
-      q_lens, k_lens = jnp.diff(cu_q), jnp.diff(cu_k)
+      q_lens = jnp.diff(cu_q)
+      if seqused_k is None:
+        k_lens = jnp.diff(cu_k)
+      else:
+        k_lens = jnp.asarray(seqused_k, q_lens.dtype)
       are_lengths_valid = jnp.all(
           (q_lens >= 0) & (k_lens >= q_lens) & (k_lens <= cos.shape[0]))
 
@@ -101,7 +114,11 @@ def prepare_rotary(
       elif not bool(are_lengths_valid):
         _raise_invalid_lengths()
       q_positions = _packed_positions(cu_q, seqlen_q, k_lens - q_lens)
-      k_positions = _packed_positions(cu_k, seqlen_k, jnp.zeros_like(k_lens))
+      if seqused_k is None:
+        k_positions = _packed_positions(
+            cu_k, seqlen_k, jnp.zeros_like(k_lens))
+      else:
+        k_positions = None
 
     q_coefficients = jnp.stack((cos[q_positions], sin[q_positions]))[:, None]
     if rotate_k:
