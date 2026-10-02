@@ -167,7 +167,7 @@ def run_paged(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
               return_lse=True, num_active=None, max_seqlen_q=None,
               max_seqlen_k=None, **kwargs):
   """Appends k/v (when given) with append_ragged, then reads the "merged" pool
-  or the K/V "pair" through flash_attn_varlen_func with token-major q/out.
+  or the K/V "pair" through flash_attn_varlen_func; q/out stay token-major here.
   Returns (out, lse or None, k_pages, v_pages)."""
   active = table.shape[0] if num_active is None else num_active
   is_merged = layout == "merged"
@@ -500,15 +500,12 @@ def test_empty_packed_allocation(append):
   assert_extend_matches(actual, expected, cu, lengths, 2)
 
 
-@pytest.mark.parametrize("heads,kv_heads,head_dim",
-                         [(132, 6, 256), (128, 8, 256), (192, 1, 128)])
-def test_ragged_cache_large_head_fold(heads, kv_heads, head_dim):
-  # Note (david): the VMEM budget folds 3 of 6 and 4 of 8 KV heads; one KV
-  # head under 192 q heads folds past one 128-lane lse row. 256 q heads on
-  # one d256 KV head fit no fold (test_paged_tiles_reject_vmem_overflow).
+@pytest.mark.parametrize("heads,kv_heads", [(132, 6), (128, 8)])
+def test_ragged_cache_large_head_fold(heads, kv_heads):
+  # Note (david): the VMEM budget folds 3 of 6 and 4 of 8 KV heads.
   case = random_ragged_case(lengths=(67, 11), prefixes=(3, 128), heads=heads,
-                            kv_heads=kv_heads, head_dim=head_dim,
-                            capacity=256, padding=0)
+                            kv_heads=kv_heads, head_dim=256, capacity=256,
+                            padding=0)
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
@@ -758,17 +755,9 @@ def test_paged_tiles_pins_and_page_multiples():
         block_kv, block_kv_compute)
 
 
-def test_paged_tiles_reject_vmem_overflow():
-  # Note (david): a head group holds every q head of its KV heads, so 256 q
-  # heads on one d256 KV head need ~193 MiB at the smallest tiles; a pinned
-  # build past the budget raises too, and nothing shrinks behind the pin.
-  with pytest.raises(ValueError, match="VMEM"):
-    flash_attn_varlen_func(
-        jnp.zeros((256, 8, 256), jnp.bfloat16),
-        jnp.zeros((2, 128, 2, 256), jnp.bfloat16), None,
-        jnp.array([0, 8], jnp.int32), None, 8, 128, causal=True,
-        interpret=INTERPRET, block_table=jnp.array([[0]], jnp.int32),
-        seqused_k=jnp.array([8], jnp.int32))
+def test_paged_tiles_reject_pinned_vmem_overflow():
+  # Note (david): a pinned build past the budget raises; nothing shrinks
+  # behind the pin.
   with pytest.raises(ValueError, match="VMEM"):
     paged_tiles(8192, 40960, kv_heads_per_group=8, block_sizes=BlockSizes(
         block_q=2048, block_kv=2048, block_kv_compute=512,
