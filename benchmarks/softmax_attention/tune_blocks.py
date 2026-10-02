@@ -27,7 +27,9 @@ after the second time.
 benchmark reads: rpa_tuned_<chip>.json and splash_tuned_<chip>.json next to
 this file, and one section of flywheel_tpu/tuned_configs.json. Which tables and
 which section come from the device the searches recorded, not from the machine
---collect runs on, which needs no TPU.
+--collect runs on, which needs no TPU. It refuses to write an RPA or Splash
+table for a device attention_block.py has no table suffix for, or over a table
+that holds cells the directory has no search for, which would drop them.
 """
 
 from __future__ import annotations
@@ -50,7 +52,7 @@ from benchmarks.common.splash import (DEFAULT_SPLASH_SOURCE, HEURISTIC,
 from benchmarks.common.splash import FIELDS as SPLASH_FIELDS
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention.attention_block import (
-    RPA_TABLE, SPLASH_TABLE, TABLE_TAGS, Cell, table_entry, tuned_table)
+    RPA_TABLE, SPLASH_TABLE, Cell, table_entry, tuned_table)
 
 FLYWHEEL_FIELDS = ("q_block", "kv_block", "q_cblock", "kv_cblock", "stages",
                    "head_fold", "qkv_layout", "transposed_pv")
@@ -588,6 +590,21 @@ def dump_table(header, configs, per_mask):
     return "\n".join(lines) + "\n"
 
 
+def table_cells(configs):
+    """The (head, [mask,] seq) path of every entry of a table's configs."""
+    cells = set()
+
+    def walk(node, path):
+        for name, value in node.items():
+            if isinstance(value, dict):
+                walk(value, path + (str(name),))
+            else:
+                cells.add(path + (str(name),))
+
+    walk(configs, ())
+    return cells
+
+
 def collect(directory):
     """Write the tables of the device the searches in directory ran on."""
     from flywheel_tpu import tuned_block_sizes
@@ -605,10 +622,6 @@ def collect(directory):
     if len(devices) != 1:
         raise ValueError(f"expected searches from one device, got {devices}.")
     device = devices.pop()
-    if device not in TABLE_TAGS:
-        raise ValueError(
-            f"no table suffix for device {device!r}; add it to TABLE_TAGS in "
-            f"attention_block.py, which reads the tables by the same map.")
     section_name = tuned_block_sizes.get_device_name(device)
 
     def head_tables(records):
@@ -620,19 +633,39 @@ def collect(directory):
             configs.setdefault(head, {})[cell["seq"]] = record["config"]
         return configs
 
-    written = []
+    # Everything is checked before anything is written. tuned_table raises
+    # for a device attention_block.py reads no tables for.
+    tables = []
     for impl, order_name, extra, per_mask in (
             ("rpa", "block_order", {"rpa_git_sha": RPA_V3_GIT_SHA}, False),
             ("splash", "config_order", {"splash_git_sha": SPLASH_GIT_SHA},
              True)):
         if not by_impl[impl]:
             continue
+        path = tuned_table(impl, device)
+        configs = head_tables(by_impl[impl])
+        if path.exists():
+            # The file is rewritten whole, so it must not hold a cell these
+            # searches do not cover.
+            nested = ({head: {"causal": by_seq}
+                       for head, by_seq in configs.items()}
+                      if per_mask else configs)
+            dropped = (table_cells(json.loads(path.read_text())["configs"])
+                       - table_cells(nested))
+            if dropped:
+                raise ValueError(
+                    f"{path.name} holds {len(dropped)} cells that {directory} "
+                    f"has no search for, e.g. {sorted(dropped)[0]}; writing "
+                    f"it would drop them.")
         header = {"device": device, "dtype": "bfloat16", **extra,
                   order_name: by_impl[impl][0]["fields"]}
-        path = tuned_table(impl, device)
-        path.write_text(dump_table(header, head_tables(by_impl[impl]),
-                                   per_mask))
-        written.append((path, len(by_impl[impl])))
+        tables.append((path, dump_table(header, configs, per_mask),
+                       len(by_impl[impl])))
+
+    written = []
+    for path, text, count in tables:
+        path.write_text(text)
+        written.append((path, count))
 
     if by_impl["flywheel"]:
         path = tuned_block_sizes.TUNED_CONFIGS_PATH

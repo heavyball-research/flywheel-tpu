@@ -30,9 +30,11 @@ kernel-level number (kernel_tflops); the wall clock is the block-level one.
 Block sizes come from each impl's table for the chip the cell runs on: splash
 and RPA from splash_tuned_<chip>.json and rpa_tuned_<chip>.json next to this
 file (v6e or v7x; tune_blocks.py searches them), flywheel from flywheel_tpu's
-own lookup. A cell its table does not hold runs the impl's own default: RPA's
-formula or Tokamax's heuristic. A cell already recorded as ok in --output is
-skipped unless --trace is given.
+own lookup. No chip stands in for another: on one with no tables, splash and
+RPA cells are an error until --splash-table / --rpa-table name a table. A cell
+its table does not hold runs the impl's own default: RPA's formula or Tokamax's
+heuristic. A cell already recorded as ok in --output is skipped unless --trace
+is given.
 """
 
 from __future__ import annotations
@@ -60,9 +62,9 @@ from benchmarks.softmax_attention import segments as segments_lib
 
 RPA_TABLE = pathlib.Path(__file__).with_name("rpa_tuned_v6e.json")
 SPLASH_TABLE = pathlib.Path(__file__).with_name("splash_tuned_v6e.json")
-# device_kind -> the suffix of the tables searched on that chip; any other
-# chip reads the v6e tables.
-TABLE_TAGS = {"TPU7x": "v7x"}
+# Chip, as flywheel_tpu names it, -> the suffix of the tables searched on it.
+# There is no default: a chip missing here has no tables.
+TABLE_TAGS = {"TPU v6e": "v6e", "TPU v7": "v7x"}
 IMPLS = ("flywheel", "splash", "rpa")
 TRACE_CALLS = 3
 
@@ -92,9 +94,17 @@ class Cell:
 
 
 def tuned_table(impl, device_kind):
-    """The path of impl's tuned table for this chip, which may not exist."""
-    tag = TABLE_TAGS.get(device_kind, "v6e")
-    return pathlib.Path(__file__).with_name(f"{impl}_tuned_{tag}.json")
+    """The path of impl's tuned table for the chip JAX calls device_kind."""
+    from flywheel_tpu.tuned_block_sizes import get_device_variant_name
+
+    chip = get_device_variant_name(device_kind)
+    if chip not in TABLE_TAGS:
+        raise ValueError(
+            f"no tuned {impl} table for {device_kind!r} ({chip}): search one "
+            f"with tune_blocks.py and add the chip to TABLE_TAGS, or name a "
+            f"table with --{impl}-table.")
+    return pathlib.Path(__file__).with_name(
+        f"{impl}_tuned_{TABLE_TAGS[chip]}.json")
 
 
 def table_entry(path, cell, per_mask):
@@ -358,10 +368,10 @@ def main(argv=None):
 
     if jax.default_backend() != "tpu":
         raise RuntimeError(f"requires TPU; got {jax.default_backend()!r}.")
-    device_kind = jax.devices()[0].device_kind
-    for impl in ("rpa", "splash"):
-        if getattr(args, f"{impl}_table") is None:
-            setattr(args, f"{impl}_table", tuned_table(impl, device_kind))
+    if (cell.impl in ("rpa", "splash")
+            and getattr(args, f"{cell.impl}_table") is None):
+        setattr(args, f"{cell.impl}_table",
+                tuned_table(cell.impl, jax.devices()[0].device_kind))
 
     record = run(cell, args)
     write_record(args.output, record)
@@ -396,10 +406,10 @@ def parse_args(argv=None):
                              "subdirectory per cell")
     parser.add_argument("--rpa-table", type=pathlib.Path,
                         help="default: rpa_tuned_<chip>.json next to this "
-                             "file; a missing file selects RPA's formula")
+                             "file, for the chip the cell runs on")
     parser.add_argument("--splash-table", type=pathlib.Path,
                         help="default: splash_tuned_<chip>.json next to this "
-                             "file; a missing file selects the heuristic")
+                             "file, for the chip the cell runs on")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,

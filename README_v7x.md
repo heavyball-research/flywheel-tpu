@@ -120,7 +120,9 @@ PYTHONPATH=. uv run --no-sync python benchmarks/softmax_attention/tune_blocks.py
 
 `--collect` takes the device from the search logs, not from the machine it
 runs on, so it needs no TPU and cannot write one chip's configs into another
-chip's tables.
+chip's tables. It writes each table whole, and refuses when the table already
+holds cells the directory has no search for. A chip `attention_block.py` has
+no table suffix for needs an entry in its `TABLE_TAGS` first.
 
 ## Not on v7x yet
 

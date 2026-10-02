@@ -394,8 +394,10 @@ at `84e5f36`. Their block configs come from `rpa_tuned_v6e.json` and
 (heads, heads_k, head_dim, mask, T) at B = 1 on v6e, with tuners that are not
 in this repo. On a v7x chip the script reads `rpa_tuned_v7x.json` and
 `splash_tuned_v7x.json` instead, searched with
-[`tune_blocks.py`](benchmarks/softmax_attention/tune_blocks.py). The tables
-cover every cell of the figure. A cell outside them
+[`tune_blocks.py`](benchmarks/softmax_attention/tune_blocks.py). No chip
+stands in for another: on one with no tables of its own, the two baselines
+are an error until `--rpa-table` and `--splash-table` name a table. The
+tables cover every cell of the figure. A cell outside them
 runs RPA's `get_default_block_sizes` or Tokamax's heuristic config instead,
 and its JSONL record says so in `block_source` / `config_source`. flywheel
 runs its own block-size lookup inside `flywheel_tpu`.
