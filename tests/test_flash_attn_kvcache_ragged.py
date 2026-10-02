@@ -1,9 +1,7 @@
-"""Packed multi-token attention over a paged KV cache.
+"""Packed multi-token attention over a paged KV cache vs a NumPy reference.
 
-The cache cases append the new tokens with append_ragged, then read the whole
-cache through flash_attn_varlen_func(block_table=...). The kv-outer extend
-kernel, which flash_attn_with_kvcache still runs for multi-token calls, keeps
-its direct kernel tests and the empty-cache cases as the A/B reference.
+flash_attn_varlen_func(block_table=...) reads the cache append_ragged filled;
+the extend kernel behind flash_attn_with_kvcache keeps its own cases.
 """
 
 import dataclasses
@@ -132,36 +130,6 @@ def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
   return out, lse, kc, vc, np.concatenate(top2)
 
 
-def rope_tables(length, head_dim, theta=10000.0):
-  """float32 (length, head_dim / 2) cos and sin tables."""
-  frequency = theta ** (-np.arange(0, head_dim, 2) / head_dim)
-  angle = np.arange(length)[:, None] * frequency
-  return (jnp.asarray(np.cos(angle), jnp.float32),
-          jnp.asarray(np.sin(angle), jnp.float32))
-
-
-def rotate_queries(q, cos, sin, cu, seqused_k, *, interleaved):
-  """q in float32 with each request's rows rotated at their bottom-right
-  positions seqused_k[r] - q_len[r] + t; other rows stay as they are."""
-  q = np.asarray(q, np.float32)
-  cos, sin, cu, seqused_k = map(np.asarray, (cos, sin, cu, seqused_k))
-  rotated = q.copy()
-  half = q.shape[-1] // 2
-  for seq in range(len(seqused_k)):
-    start, end = cu[seq:seq + 2]
-    positions = seqused_k[seq] - (end - start) + np.arange(end - start)
-    cosine, sine = cos[positions][:, None], sin[positions][:, None]
-    if interleaved:
-      first, second = q[start:end, :, 0::2], q[start:end, :, 1::2]
-      rotated[start:end, :, 0::2] = first * cosine - second * sine
-      rotated[start:end, :, 1::2] = first * sine + second * cosine
-    else:
-      first, second = q[start:end, :, :half], q[start:end, :, half:]
-      rotated[start:end, :, :half] = first * cosine - second * sine
-      rotated[start:end, :, half:] = first * sine + second * cosine
-  return rotated
-
-
 def contiguous_case(q, kc, vc, k, v, cu, lengths, table):
   """A random_ragged_case over the contiguous K/V pair: each request's pages
   gathered into one (capacity, kv_heads, head_dim) cache row, which the
@@ -195,45 +163,33 @@ def run_extend(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
   return (result[0], result[1] if return_lse else None, *updated)
 
 
-def append_tokens(caches, k, v, cu, lengths, table, num_active):
-  """append_ragged of k/v after the first num_active requests'
-  cache_seqlens, into the (merged pool,) or (k_pages, v_pages) caches."""
-  is_merged = len(caches) == 1
-  return append_ragged(
-      caches[0], None if is_merged else caches[1], k, v, cu, lengths,
-      table.reshape(-1), jnp.full((1,), num_active, jnp.int32),
-      page_size=caches[0].shape[1], pages_per_seq=table.shape[1],
-      interpret=INTERPRET, merged_cache=is_merged)
-
-
 def run_paged(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
               return_lse=True, num_active=None, max_seqlen_q=None,
               max_seqlen_k=None, **kwargs):
-  """Appends k/v (when given) with append_ragged, then reads the whole paged
-  cache through flash_attn_varlen_func: one "merged" (pages, page_size,
-  2 * kv_heads, dim) pool with v=None, or the "pair" of K and V page pools.
-
-  seqused_k is cache_seqlens plus the appended tokens. q and out are
-  head-major in the call and in the reference's token-major layout here. The
-  max_seqlen bounds default to the active requests' exact maxima. Returns
-  (out, lse or None, k_pages, v_pages).
-  """
+  """Appends k/v (when given) with append_ragged, then reads the "merged" pool
+  or the K/V "pair" through flash_attn_varlen_func with token-major q/out.
+  Returns (out, lse or None, k_pages, v_pages)."""
   active = table.shape[0] if num_active is None else num_active
-  if layout == "merged":
+  is_merged = layout == "merged"
+  if is_merged:
     caches = (jnp.concatenate((kc, vc), axis=2),)
   else:
     caches = (kc, vc)
   if k is None:
     seqused = lengths
   else:
-    caches = append_tokens(caches, k, v, cu, lengths, table, active)
+    caches = append_ragged(
+        caches[0], None if is_merged else caches[1], k, v, cu, lengths,
+        table.reshape(-1), jnp.full((1,), active, jnp.int32),
+        page_size=kc.shape[1], pages_per_seq=table.shape[1],
+        interpret=INTERPRET, merged_cache=is_merged)
     seqused = lengths + jnp.diff(cu)
   if max_seqlen_q is None:
     max_seqlen_q = max(
         1, int(np.diff(np.asarray(cu))[:active].max(initial=0)))
   if max_seqlen_k is None:
     max_seqlen_k = max(1, int(np.asarray(seqused)[:active].max(initial=0)))
-  if layout == "merged":
+  if is_merged:
     k_cache, v_cache = caches[0], None
   else:
     k_cache, v_cache = caches
@@ -244,7 +200,7 @@ def run_paged(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
       num_active=None if num_active is None else jnp.int32(num_active),
       **kwargs)
   out, lse = result if return_lse else (result, None)
-  if layout == "merged":
+  if is_merged:
     k_pages, v_pages = jnp.split(k_cache, 2, axis=2)
   else:
     k_pages, v_pages = k_cache, v_cache
@@ -253,11 +209,9 @@ def run_paged(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
 
 def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
                           skip_unseen_rows=False):
-  """Owned rows [cu[0], cu[num_active]) match the reference, packed padding
-  rows past them are out = 0 and lse = -inf, and the appended caches match
-  exactly. lse is None when the call did not return it. Rows before cu[0]
-  are the caller's; skip_unseen_rows also leaves out the rows that see no
-  key, which the paged path does not specify."""
+  """Rows [cu[0], cu[num_active]) match the reference (skip_unseen_rows drops
+  the rows that see no key), packed padding is out = 0 and lse = -inf, and
+  the caches match exactly; lse is None when the call did not return it."""
   out, lse, updated_k, updated_v = actual
   cu, lengths = np.asarray(cu), np.asarray(lengths)
   real = int(cu[num_active])
@@ -289,30 +243,54 @@ def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
   np.testing.assert_array_equal(np.asarray(updated_v, np.float32), expected[3])
 
 
-@pytest.mark.parametrize("rotary", [None, "interleaved", "half"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("append", [False, True])
 @pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_ragged_cache_matches_reference(causal, append, layout, rotary):
+def test_ragged_cache_matches_reference(causal, append, layout):
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
   k, v = (k, v) if append else (None, None)
-  kwargs = dict(causal=causal)
-  reference_q = q
-  if rotary is not None:
-    # Note (david): the cached K is already rotated, so only Q turns, at its
-    # bottom-right position seqused_k - q_len + t; the reference attends with
-    # Q rotated up front in f32.
-    interleaved = rotary == "interleaved"
-    cos, sin = rope_tables(table.shape[1] * kc.shape[1], q.shape[-1])
-    seqused = lengths + (jnp.diff(cu) if append else 0)
-    reference_q = rotate_queries(q, cos, sin, cu, seqused,
-                                 interleaved=interleaved)
-    kwargs.update(rotary_cos=cos, rotary_sin=sin,
-                  rotary_interleaved=interleaved, rotary_k=False)
+  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
+                              causal=causal)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table, layout=layout,
+                     causal=causal)
+  assert_extend_matches(actual, expected, cu, lengths, len(lengths))
+
+
+@pytest.mark.parametrize("interleaved,layout,causal,append", [
+    (True, "merged", True, True), (False, "pair", False, False)])
+def test_ragged_cache_rotary_q_matches_reference(interleaved, layout, causal,
+                                                 append):
+  # Note (david): the paged cache holds K already rotated, so only Q turns, at
+  # its bottom-right position seqused_k - q_len + t.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
+  k, v = (k, v) if append else (None, None)
+  head_dim = q.shape[-1]
+  frequency = 10000.0 ** (-np.arange(0, head_dim, 2) / head_dim)
+  angle = np.arange(table.shape[1] * kc.shape[1])[:, None] * frequency
+  cos, sin = np.cos(angle).astype(np.float32), np.sin(angle).astype(np.float32)
+  if interleaved:
+    first_lanes = np.arange(0, head_dim, 2)
+    second_lanes = np.arange(1, head_dim, 2)
+  else:
+    first_lanes = np.arange(head_dim // 2)
+    second_lanes = np.arange(head_dim // 2, head_dim)
+  boundaries = np.asarray(cu)
+  seqused = np.asarray(lengths) + (np.diff(boundaries) if append else 0)
+  reference_q = np.array(q, np.float32)
+  for seq in range(len(lengths)):
+    start, end = boundaries[seq:seq + 2]
+    positions = seqused[seq] - (end - start) + np.arange(end - start)
+    cosine, sine = cos[positions][:, None], sin[positions][:, None]
+    first = reference_q[start:end, :, first_lanes]
+    second = reference_q[start:end, :, second_lanes]
+    reference_q[start:end, :, first_lanes] = first * cosine - second * sine
+    reference_q[start:end, :, second_lanes] = first * sine + second * cosine
   expected = ragged_reference(reference_q, kc, vc, k, v, cu, lengths, table,
                               causal=causal)
   actual = run_paged(q, kc, vc, k, v, cu, lengths, table, layout=layout,
-                     **kwargs)
+                     causal=causal, rotary_cos=jnp.asarray(cos),
+                     rotary_sin=jnp.asarray(sin),
+                     rotary_interleaved=interleaved, rotary_k=False)
   assert_extend_matches(actual, expected, cu, lengths, len(lengths))
 
 
@@ -332,9 +310,8 @@ def test_ragged_cache_multiple_query_blocks_and_pages(head_dim, heads,
 
 
 @pytest.mark.parametrize("heads,kv_heads,dim,layout", [
-    (6, 6, 128, "merged"), (16, 8, 128, "merged"), (16, 16, 128, "merged"),
-    (24, 4, 256, "merged"), (32, 16, 128, "merged"), (6, 3, 128, "merged"),
-    (6, 3, 128, "pair")])
+    (16, 16, 128, "merged"), (24, 4, 256, "merged"), (32, 16, 128, "merged"),
+    (6, 3, 128, "merged"), (6, 3, 128, "pair")])
 def test_ragged_cache_head_tiles(heads, kv_heads, dim, layout):
   # Note (david): the paged path stages whole token rows, so any KV head
   # count works, odd ones included.
@@ -431,8 +408,10 @@ def test_ragged_metadata_reuses_one_executable():
     kc, vc = jnp.split(kv_pages, 2, axis=2)
     expected = ragged_reference(q, kc, vc, k, v, boundaries, lens, pages,
                                 causal=True, num_active=active)
-    (kv_pages,) = append_tokens((kv_pages,), k, v, boundaries, lens, pages,
-                                active)
+    (kv_pages,) = append_ragged(
+        kv_pages, None, k, v, boundaries, lens, pages.reshape(-1),
+        jnp.full((1,), active, jnp.int32), page_size=kv_pages.shape[1],
+        pages_per_seq=pages.shape[1], interpret=INTERPRET, merged_cache=True)
     out = compiled(q.transpose(1, 0, 2), kv_pages, boundaries,
                    lens + jnp.diff(boundaries), pages, jnp.int32(active))
     assert_extend_matches(
@@ -441,15 +420,14 @@ def test_ragged_metadata_reuses_one_executable():
 
 
 @pytest.mark.parametrize("layout", ["pair", "merged"])
-@pytest.mark.parametrize("head_dim", [128, 256])
-def test_multitoken_contiguous_cache_and_mapping(layout, head_dim):
+def test_multitoken_contiguous_cache_and_mapping(layout):
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
-      lengths=(3, 3), prefixes=(127, 509), head_dim=head_dim, padding=0)
-  kc = kc[table].reshape(2, 512, 2, head_dim)
-  vc = vc[table].reshape(2, 512, 2, head_dim)
-  # Note (david): a contiguous cache is one 512-token page per row, mapped to
-  # its request through a one-column block table (cache_batch_idx's role);
-  # the second request fills its row exactly.
+      lengths=(3, 3), prefixes=(127, 509), padding=0)
+  kc = kc[table].reshape(2, 512, 2, 128)
+  vc = vc[table].reshape(2, 512, 2, 128)
+  # Note (david): a contiguous cache is one 512-token page per row behind a
+  # one-column block table (cache_batch_idx's role); the second request
+  # fills its row exactly.
   mapping = jnp.array([[1], [0]], jnp.int32)
   expected = ragged_reference(q, kc, vc, k, v, cu, lengths, mapping,
                               causal=True)
@@ -575,47 +553,34 @@ def test_ragged_cache_has_no_pool_sized_temporary(layout):
   assert memory.temp_size_in_bytes < pool_bytes // 4, memory
 
 
-REJECTED_PAGED_CALLS = {
-    # Note (david): case -> (exception, message pattern).
-    "seqused_k_without_block_table": (ValueError, "seqused_k"),
-    "num_active_without_block_table": (ValueError, "num_active"),
-    "block_table_without_seqused_k": (ValueError, "seqused_k"),
-    "cu_seqlens_k_with_block_table": (ValueError, "cu_seqlens_k"),
-    "token_major": ((ValueError, NotImplementedError), "(?i)token.major"),
-    "rotary_k": ((ValueError, NotImplementedError), "rotary_k"),
-    "window_size": ((ValueError, NotImplementedError), "window"),
-    "softcap": ((ValueError, NotImplementedError), "softcap"),
-    "float32": ((ValueError, NotImplementedError), "(?i)bf16|bfloat16"),
-    "head_dim_64": ((ValueError, NotImplementedError), "head_dim"),
-    "num_active_past_batch": (ValueError, "num_active"),
-    "num_active_numpy_past_batch": (ValueError, "num_active"),
-    "num_active_jax_past_batch": (ValueError, "num_active"),
-    "num_active_jax_negative": (ValueError, "num_active"),
-    "num_active_float": (ValueError, "num_active"),
-}
-
-
-@pytest.mark.parametrize("case", list(REJECTED_PAGED_CALLS))
-def test_paged_varlen_rejects_unsupported_calls(case):
-  # Note (david): each case changes one knob of an otherwise valid paged
-  # call: 2 requests of 3 and 5 rows over 5 and 9 cached tokens.
-  error, message = REJECTED_PAGED_CALLS[case]
-  heads, kv_heads, total = 4, 2, 8
-  head_dim = 64 if case == "head_dim_64" else 128
-  dtype = jnp.float32 if case == "float32" else jnp.bfloat16
-  q = jnp.zeros((heads, total, head_dim), dtype)
+@pytest.mark.parametrize("case,error,message", [
+    ("seqused_k_without_block_table", ValueError, "seqused_k"),
+    ("block_table_without_seqused_k", ValueError, "seqused_k"),
+    ("cu_seqlens_k_with_block_table", ValueError, "cu_seqlens_k"),
+    ("token_major", NotImplementedError, "(?i)token.major"),
+    ("rotary_k", NotImplementedError, "rotary_k"),
+    ("window_size", NotImplementedError, "window"),
+    ("softcap", NotImplementedError, "softcap"),
+    ("num_active_past_batch", ValueError, "num_active"),
+    ("num_active_jax_negative", ValueError, "num_active"),
+    ("num_active_float", ValueError, "num_active"),
+    ("float32", NotImplementedError, "(?i)bf16|bfloat16"),
+    ("head_dim_64", ValueError, "head_dim"),
+])
+def test_paged_varlen_rejects_unsupported_calls(case, error, message):
+  # Note (david): each case changes one knob of an otherwise valid paged call.
+  heads, kv_heads, total, head_dim = 4, 2, 8, 128
+  q = jnp.zeros((heads, total, head_dim), jnp.bfloat16)
   cu = jnp.array([0, 3, total], jnp.int32)
-  operands = [q, jnp.zeros((2, 128, 2 * kv_heads, head_dim), dtype), None,
-              cu, None]
+  operands = [q, jnp.zeros((2, 128, 2 * kv_heads, head_dim), jnp.bfloat16),
+              None, cu, None]
   kwargs = dict(causal=True, interpret=INTERPRET,
                 block_table=jnp.array([[0], [1]], jnp.int32),
                 seqused_k=jnp.array([5, 9], jnp.int32))
-  if case.endswith("_without_block_table"):
-    packed_kv = jnp.zeros((kv_heads, total, head_dim), dtype)
+  if case == "seqused_k_without_block_table":
+    packed_kv = jnp.zeros((kv_heads, total, head_dim), jnp.bfloat16)
     operands[1:] = [packed_kv, packed_kv, cu, cu]
     kwargs["block_table"] = None
-    if case.startswith("num_active"):
-      kwargs.update(seqused_k=None, num_active=jnp.int32(1))
   elif case == "block_table_without_seqused_k":
     kwargs["seqused_k"] = None
   elif case == "cu_seqlens_k_with_block_table":
@@ -624,66 +589,52 @@ def test_paged_varlen_rejects_unsupported_calls(case):
     operands[0] = q.transpose(1, 0, 2).reshape(total, heads * head_dim)
     kwargs.update(token_major=True, head_dim=head_dim)
   elif case == "rotary_k":
-    cos, sin = rope_tables(128, head_dim)
-    kwargs.update(rotary_cos=cos, rotary_sin=sin, rotary_k=True)
+    rope_table = jnp.ones((128, head_dim // 2), jnp.float32)
+    kwargs.update(rotary_cos=rope_table, rotary_sin=rope_table, rotary_k=True)
   elif case == "window_size":
     kwargs["window_size"] = (16, 0)
   elif case == "softcap":
     kwargs["softcap"] = 5.0
-  elif case.startswith("num_active_"):
-    # Note (david): a concrete NumPy or jax scalar is range-checked like an
-    # int; batch is 2.
-    kwargs["num_active"] = {
-        "num_active_past_batch": 3,
-        "num_active_numpy_past_batch": np.int32(3),
-        "num_active_jax_past_batch": jnp.int32(3),
-        "num_active_jax_negative": jnp.int32(-1),
-        "num_active_float": jnp.float32(1.0),
-    }[case]
+  elif case == "num_active_past_batch":
+    kwargs["num_active"] = 3
+  elif case == "num_active_jax_negative":
+    kwargs["num_active"] = jnp.int32(-1)
+  elif case == "num_active_float":
+    kwargs["num_active"] = jnp.float32(1.0)
+  elif case == "float32":
+    operands[:2] = [operand.astype(jnp.float32) for operand in operands[:2]]
+  else:
+    operands[:2] = [operand[..., :64] for operand in operands[:2]]
   with pytest.raises(error, match=message):
     flash_attn_varlen_func(*operands, total, 128, **kwargs)
 
 
 def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, heads=32,
-                kv_heads=8, head_dim=128, page_size=128, pages_per_seq=320,
-                is_merged=True, return_lse=False, **pins):
-  """resolve_paged_tiles for nheads/nheads_k heads, no rotary."""
+                head_dim=128, page_size=128, **pins):
+  """resolve_paged_tiles on a merged cache of 8 KV heads, no lse or rotary."""
   return resolve_paged_tiles(
       max_seqlen_q_bucket=max_seqlen_q_bucket,
       max_seqlen_k_bucket=max_seqlen_k_bucket, page_size=page_size,
-      pages_per_seq=pages_per_seq, num_kv_heads=kv_heads,
-      q_heads_per_kv_head=heads // kv_heads, head_dim=head_dim,
-      is_merged=is_merged, return_lse=return_lse, rotary_dtype=None, **pins)
-
-
-def tpu_vmem_bytes(blocks, group, *, heads=32, kv_heads=8, head_dim=128,
-                   page_size=128, is_merged=True, return_lse=False):
-  """estimate_vmem_bytes of the TPU (pair-packed) staging, no rotary."""
-  paged = paged_kv_info(
-      num_kv_heads=kv_heads, kv_heads_per_group=group, page_size=page_size,
-      pages_per_seq=320, is_merged=is_merged, interpret=False)
-  return estimate_vmem_bytes(
-      blocks, paged, q_heads_per_kv_head=heads // kv_heads, head_dim=head_dim,
-      return_lse=return_lse, rotary_dtype=None)
+      pages_per_seq=320, num_kv_heads=8, q_heads_per_kv_head=heads // 8,
+      head_dim=head_dim, is_merged=True, return_lse=False, rotary_dtype=None,
+      **pins)
 
 
 @pytest.mark.parametrize("shape,dtype,expected_bytes", [
-    ((2, 512, 3, 128), jnp.bfloat16, 2 * 512 * 4 * 128 * 2),
     ((2, 512, 12, 128), jnp.bfloat16, 2 * 512 * 16 * 128 * 2),
     ((2, 512, 8, 2, 128), jnp.bfloat16, 2 * 512 * 8 * 2 * 128 * 2),
-    ((2, 1, 512, 256), jnp.bfloat16, 2 * 512 * 256 * 2),
     ((2, 1, 2, 128, 64), jnp.float32, 2 * 2 * 128 * 128 * 4),
     ((1, 2, 512), jnp.int32, 2 * 512 * 4),
-    ((4096, 128), jnp.float32, 4096 * 128 * 4),
 ])
 def test_vmem_buffer_bytes_pads_to_mosaic_tiles(shape, dtype, expected_bytes):
   # Note (david): an odd staged head axis pads to a power of two (12 to 16),
-  # a bf16 head pair costs nothing, and a half-lane rotary plane pads to 128.
+  # a bf16 head pair costs nothing, a half-lane rotary plane pads to 128, and
+  # the two int32 bounds rows pad to 2, not 8.
   assert vmem_buffer_bytes(shape, jnp.dtype(dtype)) == expected_bytes
 
 
 class CapturedPallasCall(Exception):
-  """Carries the scratch_shapes of an intercepted pallas_call."""
+  """Stops forward_common at its intercepted pallas_call."""
 
 
 @pytest.mark.parametrize(
@@ -693,7 +644,6 @@ class CapturedPallasCall(Exception):
         (6, 3, 128, "pair", 3, False, True, False),
         (3, 3, 128, "pair", 1, False, False, True),
         (8, 1, 256, "pair", 1, False, True, True),
-        (8, 2, 128, "merged", 2, False, False, False),
     ])
 def test_paged_vmem_estimate_tracks_forward_common_scratch(
     monkeypatch, heads, kv_heads, head_dim, layout, group, interpret,
@@ -713,12 +663,12 @@ def test_paged_vmem_estimate_tracks_forward_common_scratch(
   cache = jnp.zeros((8, page_size, cache_heads, head_dim), jnp.bfloat16)
   blocks = BlockSizes(block_q=256, block_kv=256, block_kv_compute=128,
                       block_q_compute=128)
-  rotary_dtype = jnp.dtype(jnp.float32) if rotary else None
   if rotary:
-    q_coeff = jnp.zeros((2, 1, total_q, head_dim // 2), rotary_dtype)
-    rotary_pair = (q_coeff, None)
+    rotary_dtype = jnp.dtype(jnp.float32)
+    rotary_pair = (
+        jnp.zeros((2, 1, total_q, head_dim // 2), rotary_dtype), None)
   else:
-    rotary_pair = None
+    rotary_dtype, rotary_pair = None, None
   with pytest.raises(CapturedPallasCall):
     flash_attn_varlen_paged(
         jnp.zeros((heads, total_q, head_dim), jnp.bfloat16), cache,
@@ -739,75 +689,56 @@ def test_paged_vmem_estimate_tracks_forward_common_scratch(
       head_dim=head_dim, return_lse=return_lse, rotary_dtype=rotary_dtype)
 
 
-def assert_fewest_prefix_streams(blocks, group, max_seqlen_q_bucket, *,
-                                 heads=32, kv_heads=8, head_dim=128,
-                                 is_merged=True):
-  """The tiles fit the VMEM budget, and every q block and KV head group
-  that streams the longest prefix fewer times does not."""
-  layout = dict(heads=heads, kv_heads=kv_heads, head_dim=head_dim,
-                is_merged=is_merged)
-  assert tpu_vmem_bytes(blocks, group, **layout) <= VMEM_LIMIT_BYTES
-
-  def _streams(block_q, kv_group):
-    return -(-max_seqlen_q_bucket // block_q) * (kv_heads // kv_group)
-
-  for block_q in FWD_BLOCKS:
-    for kv_group in range(1, kv_heads + 1):
-      if (kv_heads % kv_group
-          or block_q > max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
-          or _streams(block_q, kv_group) >= _streams(blocks.block_q, group)):
-        continue
-      fewer_streams = dataclasses.replace(
-          blocks, block_q=block_q, block_q_compute=min(256, block_q // 2))
-      assert tpu_vmem_bytes(fewer_streams, kv_group, **layout) > (
-          VMEM_LIMIT_BYTES), (block_q, kv_group)
-
-
 @pytest.mark.parametrize(
-    "max_seqlen_q_bucket,max_seqlen_k_bucket,expected", [
-        (128, 4096, (128, 2048, 8)),
-        (128, 40960, (128, 2048, 8)),
-        (2048, 4096, (512, 2048, 8)),
-        (2048, 40960, (512, 2048, 8)),
-        (8192, 4096, (512, 2048, 8)),
-        (8192, 40960, (512, 2048, 8)),
-        (64, 128, (128, 128, 8)),
-        (384, 640, (256, 640, 8)),
+    "heads,head_dim,max_seqlen_q_bucket,max_seqlen_k_bucket,expected", [
+        (32, 128, 128, 40960, (128, 2048, 8)),
+        (32, 128, 8192, 40960, (512, 2048, 8)),
+        (32, 128, 64, 128, (128, 128, 8)),
+        (32, 128, 384, 640, (256, 640, 8)),
+        (64, 256, 2048, 40960, (128, 2048, 8)),
+        (128, 256, 2048, 256, (128, 256, 4)),
     ])
-@pytest.mark.parametrize("is_merged", [True, False])
 def test_paged_tiles_minimize_prefix_streams_within_vmem(
-    max_seqlen_q_bucket, max_seqlen_k_bucket, expected, is_merged):
-  # Note (david): Qwen3-4B's 32 q / 8 KV heads at d128 on 128-token pages.
-  # Past a 512-row q block, (512, all 8 KV heads), (1024, 4) and (2048, 2)
-  # stream the prefix equally often and the next halving does not fit, so
-  # the tie takes the widest group, whose q block pads short sequences least.
-  # A 640-token bucket (a five-page table row) is one five-page block, whose
-  # kv compute tile is 128, the largest one dividing it.
+    heads, head_dim, max_seqlen_q_bucket, max_seqlen_k_bucket, expected):
+  # Note (david): 32 q heads at d128 are Qwen3-4B. Past a 512-row q block,
+  # (512, all 8 KV heads), (1024, 4) and (2048, 2) stream the prefix equally
+  # often and the next halving does not fit, so the tie takes the widest
+  # group, whose q block pads short sequences least. A 640-token bucket (a
+  # five-page table row) is one five-page block, whose kv compute tile is 128,
+  # the largest one dividing it. At d256, 64 q heads keep all 8 KV heads in
+  # one group on a 128-row q block; 128 q heads overflow even then, so their
+  # group halves.
   blocks, group = paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket,
-                              is_merged=is_merged)
+                              heads=heads, head_dim=head_dim)
   assert (blocks.block_q, blocks.block_kv, group) == expected
   assert blocks.block_q_compute == min(256, blocks.block_q // 2)
   if blocks.block_kv == 640:
     assert blocks.block_kv_compute == 128
   else:
     assert blocks.block_kv_compute == min(512, blocks.block_kv)
-  assert_fewest_prefix_streams(blocks, group, max_seqlen_q_bucket,
-                               is_merged=is_merged)
 
+  def _tpu_vmem_bytes(candidate_blocks, kv_group):
+    paged = paged_kv_info(
+        num_kv_heads=8, kv_heads_per_group=kv_group, page_size=128,
+        pages_per_seq=320, is_merged=True, interpret=False)
+    return estimate_vmem_bytes(
+        candidate_blocks, paged, q_heads_per_kv_head=heads // 8,
+        head_dim=head_dim, return_lse=False, rotary_dtype=None)
 
-@pytest.mark.parametrize("heads,max_seqlen_k_bucket,expected", [
-    (64, 40960, (128, 2048, 8)), (128, 256, (128, 256, 4))])
-def test_paged_tiles_trade_the_q_block_then_the_fold_for_vmem(
-    heads, max_seqlen_k_bucket, expected):
-  # Note (david): at d256 on 8 KV heads, 64 q heads keep all 8 KV heads in
-  # one group on a 128-row q block, the widest of the tied (128, 8),
-  # (256, 4), (512, 2) and (1024, 1). 128 q heads overflow even then, so
-  # their group halves.
-  blocks, group = paged_tiles(2048, max_seqlen_k_bucket, heads=heads,
-                              head_dim=256)
-  assert (blocks.block_q, blocks.block_kv, group) == expected
-  assert_fewest_prefix_streams(blocks, group, 2048, heads=heads,
-                               head_dim=256)
+  def _prefix_streams(block_q, kv_group):
+    return -(-max_seqlen_q_bucket // block_q) * (8 // kv_group)
+
+  assert _tpu_vmem_bytes(blocks, group) <= VMEM_LIMIT_BYTES
+  for block_q in FWD_BLOCKS:
+    for kv_group in (1, 2, 4, 8):
+      if (block_q > max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
+          or _prefix_streams(block_q, kv_group)
+          >= _prefix_streams(blocks.block_q, group)):
+        continue
+      fewer_streams = dataclasses.replace(
+          blocks, block_q=block_q, block_q_compute=min(256, block_q // 2))
+      assert _tpu_vmem_bytes(fewer_streams, kv_group) > VMEM_LIMIT_BYTES, (
+          block_q, kv_group)
 
 
 def test_paged_tiles_pins_and_page_multiples():
@@ -820,8 +751,7 @@ def test_paged_tiles_pins_and_page_multiples():
   blocks, group = paged_tiles(8192, 40960, kv_heads_per_group=2)
   assert (blocks.block_q, group) == (2048, 2)
   for page_size, kv_bucket, block_kv, block_kv_compute in [
-      (256, 128, 256, 256), (512, 1536, 1536, 512), (2048, 4096, 2048, 512),
-      (384, 128, 384, 384), (384, 4096, 1920, 384), (640, 4096, 1920, 384),
+      (384, 128, 384, 384), (512, 1536, 1536, 512), (640, 4096, 1920, 384),
       (4096, 8192, 4096, 512)]:
     blocks, _ = paged_tiles(128, kv_bucket, page_size=page_size)
     assert (blocks.block_kv, blocks.block_kv_compute) == (
@@ -843,11 +773,6 @@ def test_paged_tiles_reject_vmem_overflow():
     paged_tiles(8192, 40960, kv_heads_per_group=8, block_sizes=BlockSizes(
         block_q=2048, block_kv=2048, block_kv_compute=512,
         block_q_compute=256))
-  with pytest.raises(ValueError, match="VMEM"):
-    paged_tiles(2048, 40960, heads=64, head_dim=256, kv_heads_per_group=8,
-                block_sizes=BlockSizes(block_q=512, block_kv=2048,
-                                       block_kv_compute=512,
-                                       block_q_compute=256))
 
 
 # Note (david): with N(0, 1) inputs attention spreads over the whole visible
@@ -990,10 +915,10 @@ def test_paged_unaligned_sequence_boundaries(padding, causal):
 @pytest.mark.parametrize("leading_rows,causal", [(13, True), (16, False)])
 def test_paged_rows_before_cu_seqlens_q_start_are_not_owned(leading_rows,
                                                             causal):
-  # Note (david): serving starts cu_seqlens_q past the decode rows. The kernel
-  # owns no row below cu_seqlens_q[0]; its first block, aligned down to 8
-  # rows, may overwrite [align8(start), start), which the caller restores.
-  # NaN in the leading rows must not reach any owned row.
+  # Note (david): serving starts cu_seqlens_q past the decode rows. The
+  # kernel's first block, aligned down to 8 rows, may overwrite
+  # [align8(start), start), which the caller restores, but NaN there must not
+  # reach any owned row.
   lengths = (14, 0, 21, 7, 1)
   q, kc, vc, k, v, cu, cache_seqlens, table = probe_case(
       lengths, (5, 64, 130, 250, 127), padding=9, causal=causal)

@@ -118,13 +118,9 @@ class TokenMajorInfo:
 class PagedKVInfo:
   """Static addressing facts for a paged KV cache; None means packed K/V.
 
-  The cache holds (num_pages, page_size, heads, head_dim) token rows, either
-  merged (one operand whose token row is the num_kv_heads K heads, then the V
-  heads) or a K/V pair of operands. is_cache_head_major marks a one-head pair
-  passed as the same bytes viewed (num_pages, 1, page_size, head_dim). A kv
-  block stages whole token rows, so each head group of kv_heads_per_group
-  KV heads (and their q heads) reads its heads out of the same staging.
-  is_bitcast_load packs two bf16 heads into one u32 word (TPU builds only).
+  A merged cache is one operand whose token rows hold the K heads, then the V
+  heads. is_cache_head_major views a one-head K/V pair as (num_pages, 1,
+  page_size, head_dim); is_bitcast_load packs two bf16 heads per u32 word.
   """
   num_kv_heads: int
   kv_heads_per_group: int

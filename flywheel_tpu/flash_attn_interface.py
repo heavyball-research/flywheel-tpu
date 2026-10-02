@@ -913,24 +913,23 @@ def paged_varlen_attn(
           f" {num_active.shape} {num_active.dtype}."
       )
     num_active = num_active.reshape(())
-    # Note (david): a concrete num_active of any type (int, NumPy or jax
-    # scalar) is range-checked here. A traced one is the caller's contract,
-    # like the other traced metadata: the cu_seqlens_q lookup below would
-    # clamp a value past batch and wrap a negative one.
+    # Note (david): a traced num_active is the caller's contract, like the
+    # other traced metadata; out of range, the cu_seqlens_q lookup below
+    # would clamp or wrap it instead of raising.
     if (not isinstance(num_active, jax.core.Tracer)
         and not 0 <= int(num_active) <= batch):
       raise ValueError(
           f"num_active must be in [0, {batch}]; got {int(num_active)}.")
-    active = num_active.astype(jnp.int32)
+    num_active = num_active.astype(jnp.int32)
     # Note (david): pinning every boundary past num_active to
-    # cu_seqlens_q[num_active] turns the inactive sequences into empty ones,
-    # which own no q block, so the kernel never reads their seqused_k or
-    # block_table entries and their rows become packed padding.
+    # cu_seqlens_q[num_active] empties the inactive sequences, so they own no
+    # q block, the kernel never reads their seqused_k or block_table entries,
+    # and their rows become packed padding.
     cu_seqlens_q = jnp.where(
-        jnp.arange(batch + 1, dtype=jnp.int32) <= active, cu_seqlens_q,
-        cu_seqlens_q[active])
+        jnp.arange(batch + 1, dtype=jnp.int32) <= num_active, cu_seqlens_q,
+        cu_seqlens_q[num_active])
     rotary_seqused_k = jnp.where(
-        jnp.arange(batch, dtype=jnp.int32) < active, seqused_k, 0)
+        jnp.arange(batch, dtype=jnp.int32) < num_active, seqused_k, 0)
 
   total_q, head_dim_qk = q.shape[1], q.shape[2]
   rotary = prepare_rotary(
@@ -1074,7 +1073,7 @@ def flash_attn_varlen_func(
         rotary_k=rotary_k, block_table=block_table, seqused_k=seqused_k,
         num_active=num_active,
     )
-  if seqused_k is not None or num_active is not None:
+  elif seqused_k is not None or num_active is not None:
     raise ValueError(
         "seqused_k and num_active describe a paged KV cache and need"
         " block_table; packed K/V takes cu_seqlens_k."

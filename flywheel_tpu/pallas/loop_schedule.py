@@ -21,9 +21,8 @@ class PerSeqIntervals(NamedTuple):
 
   bottom_right_offset is kv_end - q_end, the sequence's causal offset;
   q_window_start is the block's DMA-clamped first q token; kv_window_base is
-  the aligned base of the sequence's kv windows. seq_idx is the block's
-  sequence, set only by the paged schedule, whose kv DMAs look up that
-  sequence's block table row.
+  the aligned base of the sequence's kv windows. seq_idx (paged schedule only)
+  is the block's sequence, whose block table row its kv DMAs read.
   """
   q_start: jax.Array
   q_end: jax.Array
@@ -65,8 +64,8 @@ class FwdSchedule:
       is a heads-outer fold of B sequences (q fold index n * B + b reads kv
       fold index (n // q_heads_per_kv_head) * B + b).
     kv_page, packed_q_end: set only by the paged schedule. kv_page(seq_idx,
-      kv, page) is the physical page holding page `page` of kv block kv of
-      sequence seq_idx; packed_q_end is cu_seqlens_q[-1], where the packed
+      kv, page) is the physical page holding the page-th page of kv block kv
+      of sequence seq_idx; packed_q_end is cu_seqlens_q[-1], where the packed
       padding rows fwd_body zero-fills begin.
   """
   num_head_groups: int
@@ -447,41 +446,28 @@ def make_paged_fwd_schedule(
     bkv: int,
     page_size: int,
     pages_per_seq: int,
-    left: int | None,
-    right: int | None,
+    causal: bool,
     num_rows: jax.Array,
 ) -> FwdSchedule:
   """Per-sequence q blocks attending a paged KV cache.
 
-  The q side is the per-seq schedule's: block i of sequence r starts at
-  align(cu_q[r]) + i * bq and empty sequences own no si (cu_qblk_ref is
-  per_seq_qblk_prefix(cu_q) in SMEM, num_rows its last entry). The kv side of
-  sequence r is its own logical axis [0, seqused_k[r]), so kv_start =
-  kv_window_base = 0, kv_end = seqused_k[r] and the bottom-right offset is
-  kv_end - cu_q[r + 1]. The per-seq block flags, q bounds, token windows and
-  blend start read nothing but that row context, so they are reused as-is.
-
-  There is no pad-tail sequence: rows [cu_q[-1], padded_total_q) get no q
-  block, and fwd_body zero-fills them from packed_q_end. block_table_ref is
-  the flat (batch * pages_per_seq,) table and a kv block spans
-  bkv // page_size pages; kv_page clamps its index into the sequence's own
-  row, so a lookup past the row's last page reads an entry the caller never
-  dereferences (its DMA clips to zero tokens).
+  The q side is make_per_seq_fwd_schedule's. Sequence r's kv axis is its own
+  [0, seqused_k[r]), read through its row of the flat (batch * pages_per_seq,)
+  block_table_ref. Rows past cu_q[-1] get no q block; fwd_body zero-fills them
+  from packed_q_end.
   """
-  if bkv % page_size:
-    raise ValueError(f"{bkv=} must be a multiple of {page_size=}.")
   num_kv_blocks = -(-(pages_per_seq * page_size) // bkv)
   pages_per_block = bkv // page_size
-  # Note (david): the reused per-seq helpers never read cu_k_ref (only
-  # row_interval does, and it is replaced below), so the base schedule is
-  # built without one.
+  # Note (david): only the per-seq row_interval reads cu_k_ref, and it is
+  # replaced below, so the base schedule is built without one.
   per_seq = make_per_seq_fwd_schedule(
       cu_q_ref, None, cu_qblk_ref,
       num_head_groups=num_head_groups,
       q_heads_per_kv_head=q_heads_per_kv_head,
       padded_total_q=padded_total_q,
       padded_total_k=num_kv_blocks * bkv,
-      bq=bq, bkv=bkv, left=left, right=right, num_rows=num_rows,
+      bq=bq, bkv=bkv, left=None, right=0 if causal else None,
+      num_rows=num_rows,
   )
 
   def _row_interval(si):
@@ -492,28 +478,22 @@ def make_paged_fwd_schedule(
     q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
     q_window_start = jnp.minimum(q_block_start, padded_total_q - bq)
     bottom_right_offset = kv_end - q_end
-    if right is None:
-      kv_hi_token = kv_end - 1
-    else:
+    if causal:
       last_valid_q = jnp.minimum(q_block_start + bq, q_end) - 1
-      kv_hi_token = jnp.minimum(
-          kv_end - 1, last_valid_q + bottom_right_offset + right)
+      kv_hi_token = jnp.minimum(kv_end - 1, last_valid_q + bottom_right_offset)
+    else:
+      kv_hi_token = kv_end - 1
     # Note (david): kv_len == 0 still gets one kv block, as on the per-seq
     # schedule; its page DMAs clip to zero tokens.
     hi = jnp.clip(kv_hi_token // bkv, 0, num_kv_blocks - 1)
-    if left is None:
-      lo = jnp.int32(0)
-    else:
-      first_kept_q = jnp.maximum(q_start, q_window_start)
-      kv_lo_token = jnp.maximum(
-          kv_start, first_kept_q + bottom_right_offset - left)
-      lo = jnp.clip(kv_lo_token // bkv, 0, hi)
     ctx = PerSeqIntervals(
         q_start, q_end, kv_start, kv_end, bottom_right_offset,
         q_window_start, kv_start, seq_idx)
-    return lo, hi, ctx
+    return jnp.int32(0), hi, ctx
 
   def _kv_page(seq_idx, kv, page):
+    # Note (david): a lookup past the row's last page clamps into the row; its
+    # DMA clips to zero tokens, so the entry is never dereferenced.
     table_index = jnp.minimum(kv * pages_per_block + page, pages_per_seq - 1)
     return block_table_ref[seq_idx * pages_per_seq + table_index]
 

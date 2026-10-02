@@ -3875,10 +3875,10 @@ index 000000000..dfe014854
 +        assert seen["attention"]["fused_q_rope_theta"] is None
 diff --git a/tests/layers/common/test_flywheel_tpu_extend.py b/tests/layers/common/test_flywheel_tpu_extend.py
 new file mode 100644
-index 000000000..2f974f7ff
+index 000000000..7d1c34ff8
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_extend.py
-@@ -0,0 +1,790 @@
+@@ -0,0 +1,781 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Cached-prefix dispatch and paged extend numerics, mixed batches included."""
 +
@@ -3910,8 +3910,6 @@ index 000000000..2f974f7ff
 +# slack covers accumulation order rather than correctness.
 +BF16_TOLERANCE = 0.035
 +
-+# Note (david): FLYWHEEL_TPU_EXTEND_KERNEL's values, the kernel that attends
-+# the prefill rows of an extend step; every extend numerics case runs on both.
 +EXTEND_KERNELS = ("varlen", "extend")
 +
 +
@@ -4332,9 +4330,6 @@ index 000000000..2f974f7ff
 +                      max_seqlen_q, max_seqlen_k, softmax_scale, causal,
 +                      token_major, block_table, seqused_k, num_active):
 +        assert extend_kernel == "varlen"
-+        # Note (david): the runner's [T, N, D] rows reach the head-major API
-+        # as (N, T, D), and the merged pages are its one k operand, read up
-+        # to seqused_k instead of through cu_seqlens_k.
 +        assert q_heads.shape == (QUERY_HEADS, batch.q.shape[0], HEAD_DIM)
 +        assert k_cache.shape == batch.kv_cache.shape
 +        assert v_cache is None and cu_seqlens_k is None
@@ -4384,10 +4379,6 @@ index 000000000..2f974f7ff
 +                                    -1)[:slots - num_decode, :PAGES_PER_SEQ],
 +        batch.block_table[num_decode:])
 +    if extend_kernel == "varlen":
-+        # Note (david): the runner's table as is, with none of the decode
-+        # kernel's capacity padding, and static bounds that do not follow
-+        # this step's lengths: the token bucket for q and the table's
-+        # capacity, max_model_len rounded up to whole pages, for kv.
 +        assert seen["block_table"].shape == (slots, PAGES_PER_SEQ)
 +        assert seen["max_seqlens"] == (batch.q.shape[0],
 +                                       PAGES_PER_SEQ * PAGE_SIZE)
@@ -6890,10 +6881,10 @@ index 8b102400e..f9c2b0d5b 100644
              self.host_kv_pool = HostKVPool(
                  pool_size=dist_utils.get_max_host_kv_buffer_size(),
 diff --git a/tpu_inference/envs.py b/tpu_inference/envs.py
-index cde16e5a0..4d01e6e8c 100644
+index cde16e5a0..76f8c8309 100644
 --- a/tpu_inference/envs.py
 +++ b/tpu_inference/envs.py
-@@ -44,6 +44,26 @@ if TYPE_CHECKING:
+@@ -44,6 +44,25 @@ if TYPE_CHECKING:
      CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
      USE_BATCHED_RPA_KERNEL: bool = False
      USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
@@ -6901,10 +6892,9 @@ index cde16e5a0..4d01e6e8c 100644
 +    # configuration this backend cannot serve fails at the platform config
 +    # check rather than falling back to RPA v3.
 +    USE_FLYWHEEL_TPU_KERNEL: bool = False
-+    # Note (david): the kernel that attends the prefill rows of an
-+    # USE_FLYWHEEL_TPU_KERNEL extend step: "varlen", the q-outer varlen kernel
-+    # reading the paged cache, or "extend", the kv-outer extend kernel it
-+    # replaces, kept for A/B runs. Any other value raises.
++    # Note (david): the prefill-row kernel of a USE_FLYWHEEL_TPU_KERNEL extend
++    # step. "extend", the kv-outer kernel the q-outer "varlen" one replaced,
++    # stays for A/B runs.
 +    FLYWHEEL_TPU_EXTEND_KERNEL: str = "varlen"
 +    # Note (david): selected independently of USE_FLYWHEEL_TPU_KERNEL, since
 +    # a hybrid model mixes the two attention families. Unsupported inputs fail
@@ -6920,7 +6910,7 @@ index cde16e5a0..4d01e6e8c 100644
      # Optional operator override for the RPA v3 kernel block sizes, one per
      # case. Each is a comma-separated 4-tuple (bq_sz, bkv_sz, bq_csz, bkv_csz).
      # Empty (default) = use the built-in tuned/heuristic sizes.
-@@ -358,6 +378,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
+@@ -358,6 +377,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
      env_bool("USE_BATCHED_RPA_KERNEL"),
      "USE_BATCHED_RPA_SEQ_ON_LANE":
      env_bool("USE_BATCHED_RPA_SEQ_ON_LANE"),
@@ -7724,10 +7714,10 @@ index 000000000..c41c23333
 +                         write_slices, write_counts)
 diff --git a/tpu_inference/layers/common/flywheel_tpu_attention.py b/tpu_inference/layers/common/flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..0475c8a50
+index 000000000..8f49b1b04
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_tpu_attention.py
-@@ -0,0 +1,1129 @@
+@@ -0,0 +1,1118 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Dense FlyWheel TPU attention backend (USE_FLYWHEEL_TPU_KERNEL=1)."""
 +
@@ -8524,10 +8514,9 @@ index 000000000..0475c8a50
 +
 +    A mixed step splits over the same written cache: its leading num_decode
 +    one-token rows go to the decode kernel, the prefill requests to the kernel
-+    FLYWHEEL_TPU_EXTEND_KERNEL names over a request window slid past them:
-+    the q-outer varlen kernel reading the pages ("varlen", the default) or the
-+    kv-outer extend kernel ("extend").
++    FLYWHEEL_TPU_EXTEND_KERNEL names, over a request window slid past them.
 +    """
++    # Note (david): read first, so an invalid value raises before any kernel.
 +    extend_kernel = envs.FLYWHEEL_TPU_EXTEND_KERNEL
 +    cache = write_kv_cache(k, v, kv_cache, kv_write_slices,
 +                           kv_write_num_slices)
@@ -8568,16 +8557,14 @@ index 000000000..0475c8a50
 +                                    (num_decode, ), (batch + 1, ))
 +    kv_lens_window = lax.dynamic_slice(jnp.pad(kv_lens, (0, batch)),
 +                                       (num_decode, ), (batch, ))
++    table_window = lax.dynamic_slice(jnp.pad(table, ((0, batch), (0, 0))),
++                                     (num_decode, 0), (batch, pages_per_seq))
 +    if extend_kernel == "varlen":
-+        # Note (david): the varlen kernel clamps every page index into a
-+        # sequence's own pages, so it takes the runner's table as is, without
-+        # the decode kernel's capacity padding. Its max_seqlen_q/k are static
-+        # block-size bounds and not lengths: the token bucket for q, and for
-+        # kv the table's capacity, max_model_len rounded up to whole pages (a
-+        # multiple of 128), so one executable serves every kv_len of a bucket.
-+        table_window = lax.dynamic_slice(jnp.pad(table, ((0, batch), (0, 0))),
-+                                         (num_decode, 0),
-+                                         (batch, pages_per_seq))
++        # Note (david): max_seqlen_q/k are static block-size bounds, not
++        # lengths (the token bucket and the table's capacity), so one
++        # executable serves every kv_len of a bucket. The kernel clamps page
++        # indices into each sequence's own pages, so its table needs none of
++        # the decode kernel's capacity padding.
 +        output = flash_attn_varlen_func(
 +            q.transpose(1, 0, 2),
 +            cache,
@@ -8593,33 +8580,25 @@ index 000000000..0475c8a50
 +            seqused_k=kv_lens_window,
 +            num_active=num_active - num_decode,
 +        ).transpose(1, 0, 2)
-+    elif extend_kernel == "extend":
++    else:
 +        padded_pages = decode_block_table_pages(pages_per_seq, page_size)
-+        table = jnp.pad(table, ((0, 0), (0, padded_pages - pages_per_seq)))
 +        output, cache = flash_attn_with_kvcache(
 +            q,
 +            cache,
 +            None,
 +            cache_seqlens=kv_lens_window,
-+            block_table=lax.dynamic_slice(jnp.pad(table, ((0, batch), (0, 0))),
-+                                          (num_decode, 0),
-+                                          (batch, padded_pages)),
++            block_table=jnp.pad(table_window,
++                                ((0, 0), (0, padded_pages - pages_per_seq))),
 +            num_active=num_active - num_decode,
 +            cu_seqlens_q=cu_q_window,
 +            softmax_scale=sm_scale,
 +            causal=True)
-+    else:
-+        raise ValueError("FLYWHEEL_TPU_EXTEND_KERNEL must be 'varlen' or "
-+                         f"'extend'; got {extend_kernel!r}.")
 +    # Note (david): neither prefill kernel owns the rows below its first
-+    # request, the first PREFILL one at row num_decode: the extend kernel
-+    # writes from that request's 8-aligned tile and zero-fills from the
-+    # 8-aligned tile past the step's last token, and the varlen kernel's first
-+    # q block may start anywhere below it. A DP rank whose whole batch is
-+    # decode leaves either kernel no request at all. num_decode never exceeds
-+    # rows, so rebuild that leading window: decode rows from the decode
-+    # kernel, scheduled rows from the prefill kernel, zeros for the bucket
-+    # padding.
++    # request (row num_decode): the extend kernel writes from that request's
++    # 8-aligned tile and zero-fills from the 8-aligned tile past the step's
++    # last token, the varlen kernel's first q block may start anywhere below
++    # it, and a decode-only DP rank leaves either kernel no request. num_decode
++    # never exceeds rows, so rebuilding the leading rows covers all of them.
 +    rows = min(align_to(decode_out.shape[0], 8), q.shape[0])
 +    if decode_out.shape[0] < rows:
 +        # Note (david): shape padding only; num_decode cannot reach these rows.

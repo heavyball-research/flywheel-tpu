@@ -34,18 +34,13 @@ def prepare_rotary(
   shared by all batch rows or packed heads. k_coefficients is None when
   rotate_k is False (K arrives already rotated). Returns None without tables.
 
-  seqused_k (with cu_q, in place of cu_k) gives each sequence's len_k directly,
-  as a paged KV cache does; its K is already rotated, so rotate_k must be
-  False.
+  seqused_k replaces cu_k for a paged KV cache, whose K arrives rotated
+  (rotate_k=False).
   """
   if type(interleaved) is not bool:
     raise ValueError("rotary_interleaved must be a static bool.")
   if type(rotate_k) is not bool:
     raise ValueError("rotary_k must be a static bool.")
-  if seqused_k is not None and (cu_q is None or cu_k is not None or rotate_k):
-    raise ValueError(
-        "seqused_k replaces cu_k for packed Q over an already rotated K: pass"
-        " it with cu_q, cu_k=None and rotate_k=False.")
   if (cos is None) != (sin is None):
     raise ValueError("rotary_cos and rotary_sin must be provided together.")
   if cos is None and not rotate_k:
