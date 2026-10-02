@@ -6,7 +6,9 @@
 </p>
 
 ## News
-
+- [2026/10] Added [TPU v7x benchmark results](README_v7x.md) for MHA/GQA 
+  softmax attention. Thanks to [@lk-chen](https://github.com/lk-chen) for 
+  testing and contributing the results!
 - [2026/09] FlyWheel 0.1.0 is released: flash-attn-style softmax attention
   (forward and backward, varlen, KV cache) and fused GDN/KDA linear attention
   kernels for TPU.
