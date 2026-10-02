@@ -115,8 +115,12 @@ in front of the command. Once every cell has a best config, write the tables:
 
 ```bash
 PYTHONPATH=. uv run --no-sync python benchmarks/softmax_attention/tune_blocks.py \
-    --collect results/tune/softmax_attention --device-tag v7x
+    --collect results/tune/softmax_attention
 ```
+
+`--collect` takes the device from the search logs, not from the machine it
+runs on, so it needs no TPU and cannot write one chip's configs into another
+chip's tables.
 
 ## Not on v7x yet
 

@@ -8,7 +8,7 @@
 
     PYTHONPATH=. uv run --no-sync python \\
         benchmarks/softmax_attention/tune_blocks.py \\
-        --collect results/tune/softmax_attention --device-tag v7x
+        --collect results/tune/softmax_attention
 
 The search times the kernel alone, on q, k and v already in the layout it
 takes, with the wall clock of queued calls. It is a coordinate descent: from
@@ -24,8 +24,10 @@ the process down is tried once more, in case something else did, and skipped
 after the second time.
 
 --collect turns a directory of finished searches into the tables the block
-benchmark reads: rpa_tuned_<tag>.json and splash_tuned_<tag>.json next to this
-file, and this device's section of flywheel_tpu/tuned_configs.json.
+benchmark reads: rpa_tuned_<chip>.json and splash_tuned_<chip>.json next to
+this file, and one section of flywheel_tpu/tuned_configs.json. Which tables and
+which section come from the device the searches recorded, not from the machine
+--collect runs on, which needs no TPU.
 """
 
 from __future__ import annotations
@@ -48,9 +50,8 @@ from benchmarks.common.splash import (DEFAULT_SPLASH_SOURCE, HEURISTIC,
 from benchmarks.common.splash import FIELDS as SPLASH_FIELDS
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention.attention_block import (
-    RPA_TABLE, SPLASH_TABLE, Cell, table_entry)
+    RPA_TABLE, SPLASH_TABLE, TABLE_TAGS, Cell, table_entry, tuned_table)
 
-HERE = pathlib.Path(__file__).resolve().parent
 FLYWHEEL_FIELDS = ("q_block", "kv_block", "q_cblock", "kv_cblock", "stages",
                    "head_fold", "qkv_layout", "transposed_pv")
 PRUNE_FACTOR = 1.5
@@ -587,7 +588,8 @@ def dump_table(header, configs, per_mask):
     return "\n".join(lines) + "\n"
 
 
-def collect(directory, tag):
+def collect(directory):
+    """Write the tables of the device the searches in directory ran on."""
     from flywheel_tpu import tuned_block_sizes
 
     best = []
@@ -597,10 +599,17 @@ def collect(directory, tag):
             best.append(log.best)
     by_impl = {impl: [b for b in best if b["cell"]["impl"] == impl]
                for impl in SEARCHERS}
+    # Note: the device comes from the logs, so a directory searched on one
+    # chip cannot land in another chip's tables when it is collected elsewhere.
     devices = {b["device"] for b in best}
     if len(devices) != 1:
         raise ValueError(f"expected searches from one device, got {devices}.")
     device = devices.pop()
+    if device not in TABLE_TAGS:
+        raise ValueError(
+            f"no table suffix for device {device!r}; add it to TABLE_TAGS in "
+            f"attention_block.py, which reads the tables by the same map.")
+    section_name = tuned_block_sizes.get_device_name(device)
 
     def head_tables(records):
         configs = {}
@@ -620,7 +629,7 @@ def collect(directory, tag):
             continue
         header = {"device": device, "dtype": "bfloat16", **extra,
                   order_name: by_impl[impl][0]["fields"]}
-        path = HERE / f"{impl}_tuned_{tag}.json"
+        path = tuned_table(impl, device)
         path.write_text(dump_table(header, head_tables(by_impl[impl]),
                                    per_mask))
         written.append((path, len(by_impl[impl])))
@@ -628,7 +637,7 @@ def collect(directory, tag):
     if by_impl["flywheel"]:
         path = tuned_block_sizes.TUNED_CONFIGS_PATH
         table = json.loads(path.read_text())
-        section = table.setdefault(tuned_block_sizes.get_device_name(), {})
+        section = table.setdefault(section_name, {})
         for record in by_impl["flywheel"]:
             cell = record["cell"]
             key = tuned_block_sizes.tuned_config_key(
@@ -638,13 +647,12 @@ def collect(directory, tag):
                 max_seqlen=None, return_lse=False,
                 num_kv_heads=cell["batch"] * cell["heads_k"])
             section[key] = record["config"]
-        table[tuned_block_sizes.get_device_name()] = dict(sorted(
-            section.items()))
+        table[section_name] = dict(sorted(section.items()))
         path.write_text(json.dumps(table, indent=2) + "\n")
         written.append((path, len(by_impl["flywheel"])))
 
     for path, count in written:
-        print(f"wrote {count} cells to {path}")
+        print(f"wrote {count} cells searched on {device} to {path}")
 
 
 def main(argv=None):
@@ -673,12 +681,10 @@ def main(argv=None):
     parser.add_argument("--collect", type=pathlib.Path,
                         help="write the tables from this directory of "
                              "finished searches instead of searching")
-    parser.add_argument("--device-tag", default="v7x",
-                        help="suffix of the tables --collect writes")
     args = parser.parse_args(argv)
 
     if args.collect is not None:
-        collect(args.collect, args.device_tag)
+        collect(args.collect)
         return 0
     if args.impl is None or args.output is None:
         parser.error("--impl and --output are required to search")

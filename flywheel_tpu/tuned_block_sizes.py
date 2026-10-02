@@ -68,9 +68,13 @@ TUNED_VARLEN_FWD_HEAD_FOLD: dict[
 }
 
 
-def get_device_variant_name() -> str:
-  """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p)."""
-  device_kind = jax.devices()[0].device_kind
+def get_device_variant_name(device_kind: str | None = None) -> str:
+  """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p).
+
+  device_kind defaults to the chip JAX runs on.
+  """
+  if device_kind is None:
+    device_kind = jax.devices()[0].device_kind
   kind_match = re.fullmatch(r"TPU\s*v?(\d+)(?:(e|p)|\s+(lite))?", device_kind)
   if device_kind == "TPU7x":
     return "TPU v7"
@@ -84,9 +88,10 @@ def get_device_variant_name() -> str:
     return f"TPU v{kind_match.group(1)}"
 
 
-def get_device_name() -> str:
+def get_device_name(device_kind: str | None = None) -> str:
   """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX does)."""
-  return re.sub(r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name())
+  return re.sub(
+      r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind))
 
 
 def get_varlen_head_fold(
