@@ -49,7 +49,13 @@ import sys
 import numpy as np
 
 from benchmarks.common.records import recorded, write_record
-from benchmarks.common.rpa import DEFAULT_RPA_SOURCE, load_rpa_v3, vllm_page_size
+from benchmarks.common.rpa import (
+    DEFAULT_RPA_SOURCE,
+    load_rpa_v3,
+    request_distribution,
+    unjitted_kernel,
+    vllm_page_size,
+)
 from benchmarks.common.rpa import FIELDS as RPA_FIELDS
 from benchmarks.common.splash import (
     DEFAULT_SPLASH_SOURCE,
@@ -248,7 +254,7 @@ def build_rpa(cell, w, args):
         jnp.full((cell.batch,), cell.seq, jnp.int32),
         jnp.arange(num_pages, dtype=jnp.int32),
         jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.seq,
-        jnp.asarray(np.array([0, 0, cell.batch], np.int32)),
+        request_distribution(num_decode=0, num_seqs=cell.batch),
     )
 
     blocks = table_entry(args.rpa_table, cell, per_mask=False)
@@ -262,8 +268,7 @@ def build_rpa(cell, w, args):
         source = "formula"
     block_sizes = tuple(int(blocks[name]) for name in RPA_FIELDS)
 
-    kernel = getattr(rpa.ragged_paged_attention, "__wrapped__",
-                     rpa.ragged_paged_attention)
+    kernel = unjitted_kernel(rpa)
     scale = 1.0 / math.sqrt(cell.head_dim)
 
     def block(x, wq, wk, wv, wo, cache):
