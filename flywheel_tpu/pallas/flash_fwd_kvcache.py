@@ -17,8 +17,8 @@ from .block_sizes import (
   NUM_LANES,
   NUM_SUBLANES,
   STAGES,
-  VMEM_LIMIT_BYTES,
   next_pow2,
+  vmem_limit_bytes,
 )
 from .fwd_pipeline import overflow_guard_threshold
 
@@ -878,10 +878,10 @@ def validate_kvcache_config(
   accumulator_bytes = num_query_heads * head_dim * BF16_BYTES
   required_vmem = (
       kv_staging_bytes + q_o_buffer_bytes + row_state_bytes + accumulator_bytes)
-  if required_vmem > VMEM_LIMIT_BYTES:
+  if required_vmem > vmem_limit_bytes():
     raise ValueError(
         f"KV-cache config requires {required_vmem} VMEM bytes, exceeding"
-        f" limit {VMEM_LIMIT_BYTES}."
+        f" limit {vmem_limit_bytes()}."
     )
   return config
 
@@ -1144,7 +1144,7 @@ def flash_attn_kvcache_pallas(
       input_output_aliases=input_output_aliases,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("arbitrary",),
-          vmem_limit_bytes=VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=vmem_limit_bytes(),
           disable_bounds_checks=True,
           disable_semaphore_checks=True,
       ),

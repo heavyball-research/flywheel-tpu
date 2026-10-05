@@ -17,10 +17,11 @@ from jax.experimental.pallas import tpu as pltpu
 from .block_sizes import (
     BF16_BYTES,
     F32_BYTES,
+    MAX_VMEM_LIMIT_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
-    VMEM_LIMIT_BYTES,
     round_up,
+    vmem_limit_bytes,
 )
 from .flash_fwd_kvcache import (
     MIN_BLOCK_KV,
@@ -51,12 +52,26 @@ BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 256, 128)
 # 2.2x). Long chunks favor many rows against small per-head KV fragments,
 # short suffixes few rows against large pair-packed ones. Entries are
 # (rows, block_kv, block_kv_compute, kv_heads_per_fragment), rows descending.
-DEFAULT_TILINGS: tuple[TilingSpec, ...] = (
-    (384, 512, 512, 1),
-    (128, 512, 512, 1),
-    (32, 1024, 1024, 2),
-    (8, 1024, 1024, 2),
-)
+def default_tilings() -> tuple[TilingSpec, ...]:
+  """The tilings resolve_tilings starts from, for the core's VMEM."""
+  if vmem_limit_bytes() >= MAX_VMEM_LIMIT_BYTES:
+    return (
+        (384, 512, 512, 1),
+        (128, 512, 512, 1),
+        (32, 1024, 1024, 2),
+        (8, 1024, 1024, 2),
+    )
+  # On a core with less VMEM than v6e's, every tiling's K/V staging is a block
+  # of every head whatever its rows, so the four above squeeze each other: on
+  # v7x, with 32 heads of 256, a 16K prefill in 1K chunks ran out of VMEM at
+  # 32:4 and took 93.4 ms at 32:32 on one-page blocks. This one tiling takes
+  # 13.0 ms at 32:4 and 56.5 ms at 32:32, where the limit shrinks it to 256-key
+  # blocks. A request's last chunk runs it padded.
+  # TODO: tune across shapes. This is the fastest of a sweep of single tilings
+  # at one point: 32 query heads of 256, 4 and 32 KV heads, a 1K chunk at 8K
+  # context, 128-token pages. Other head dims, KV-head counts, chunk sizes and
+  # short requests are untested.
+  return ((128, 1024, 512, 1),)
 
 
 def extend_kernel(
@@ -826,11 +841,11 @@ def resolve_tilings(
 ) -> tuple[TilingSpec, ...]:
   """Default static tilings for one build.
 
-  Each default is fit to the cache (whole-page blocks dividing the capacity)
-  and capped at the 8-aligned token count; a tiling whose rows no longer fall
-  below the previous one's is dropped. Blocks then shrink, from the last
-  tiling back, and finally the first tiling's rows, until the build fits the
-  scoped VMEM budget.
+  Each of default_tilings() is fit to the cache (whole-page blocks dividing the
+  capacity) and capped at the 8-aligned token count; a tiling whose rows no
+  longer fall below the previous one's is dropped. Blocks then shrink, from the
+  last tiling back, and finally the first tiling's rows, until the build fits
+  the scoped VMEM budget.
   """
   q_rows = round_up(total_rows, NUM_SUBLANES)
 
@@ -845,7 +860,7 @@ def resolve_tilings(
 
   tilings = []
   for rows, block_kv, block_kv_compute, kv_heads_per_fragment in (
-      DEFAULT_TILINGS
+      default_tilings()
   ):
     fitted_block_kv = _fit_block(block_kv)
     fitted_block_kv_compute = next(
@@ -866,7 +881,7 @@ def resolve_tilings(
       tilings, num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
       staged_heads=staged_heads, head_dim=head_dim, return_lse=return_lse,
       lse_width=lse_width,
-  ) > VMEM_LIMIT_BYTES:
+  ) > vmem_limit_bytes():
     shrinkable = [
         index for index, (_, block_kv, _, _) in enumerate(tilings)
         if block_kv > page_size
@@ -1117,7 +1132,7 @@ def flash_attn_kvcache_extend_pallas(
       out_shape=out_shapes,
       compiler_params=pltpu.CompilerParams(
           dimension_semantics=("arbitrary",),
-          vmem_limit_bytes=VMEM_LIMIT_BYTES,
+          vmem_limit_bytes=vmem_limit_bytes(),
           disable_bounds_checks=True,
           disable_semaphore_checks=True,
       ),

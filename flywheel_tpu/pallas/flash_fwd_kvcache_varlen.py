@@ -9,7 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import VMEM_LIMIT_BYTES
+from .block_sizes import vmem_limit_bytes
 from .flash_fwd_kvcache import SUPPORTED_HEAD_DIMS
 from .flash_fwd_kvcache_extend import flash_attn_kvcache_extend_pallas
 
@@ -142,7 +142,8 @@ def append_ragged(
           len(scalar_prefetches) + len(new_tokens) + index: index
           for index in range(len(flat_caches))
       },
-      compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
+      compiler_params=pltpu.CompilerParams(
+          vmem_limit_bytes=vmem_limit_bytes()),
       interpret=pltpu.InterpretParams() if interpret else False,
       name="flash_attn_ragged_cache_append",
   )

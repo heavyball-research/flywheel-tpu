@@ -15,10 +15,10 @@ from .block_sizes import (
   NN_DIM_NUMBERS,
   NT_DIM_NUMBERS,
   NUM_LANES,
-  VMEM_LIMIT_BYTES,
   QKVLayout,
   TokenMajorInfo,
   default_block,
+  vmem_limit_bytes,
 )
 from .copy_utils import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .loop_schedule import BwdSchedule
@@ -535,6 +535,7 @@ def call_bwd(
             kv_seq_len, head_dim_qk, head_dim_v),
         scratch_shapes=scratch_shapes,
         name=kernel_name,
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes()),
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*hbm_operands)
