@@ -2,10 +2,13 @@
 
 import dataclasses
 import enum
+import functools
 import math
 from collections.abc import Sequence
 
+import jax
 import numpy as np
+from jax.experimental.pallas import tpu as pltpu
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
@@ -15,9 +18,24 @@ NUM_SUBLANES = 8
 PAIRED_HEAD_DIM = NUM_LANES // 2
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
-VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 BF16_BYTES = 2
 F32_BYTES = 4
+# Kernels on v6e's 128 MiB cores are built against 100 MiB of VMEM; a core with
+# less is built against all of it (64 MiB on v7x).
+MAX_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+@functools.cache
+def vmem_limit_bytes() -> int:
+  """The scoped VMEM limit kernels are planned and compiled against.
+
+  Asked on first use, not at import: get_tpu_info() starts the TPU backend,
+  which jax.distributed.initialize() has to precede. Off TPU (the Pallas
+  interpreter) there is no chip to ask, so builds keep the v6e limit.
+  """
+  if jax.default_backend() != "tpu":
+    return MAX_VMEM_LIMIT_BYTES
+  return min(MAX_VMEM_LIMIT_BYTES, pltpu.get_tpu_info().vmem_capacity_bytes)
 
 MIN_NUM_STAGES = 2
 # Note (david): the KV-cache kernel issues the next block's DMA into slot

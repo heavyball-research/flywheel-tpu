@@ -18,8 +18,8 @@ from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
 from flywheel_tpu.pallas import fwd_pipeline
 from flywheel_tpu.pallas.block_sizes import (
     FWD_BLOCKS,
-    VMEM_LIMIT_BYTES,
     BlockSizes,
+    vmem_limit_bytes,
 )
 from flywheel_tpu.pallas.copy_utils import unpack_kv_planes
 from flywheel_tpu.pallas.flash_fwd_kvcache_extend import (
@@ -522,6 +522,28 @@ def test_ragged_cache_prefill_gqa_regression(layout):
   assert_extend_matches(actual, expected, case[5], case[6], 1)
 
 
+@pytest.mark.parametrize("layout", ["pair", "merged"])
+def test_extend_replays_when_later_block_raises_anchor(layout):
+  # The cached keys jump from 0 to 32 at position 1024, so the later blocks'
+  # scores sit hundreds of log2 units above the anchor the first block set: the
+  # fixed-anchor pass must notice and replay with the rescaling update instead
+  # of overflowing. Only out is checked: Q is scaled in bf16, a relative error
+  # that at an lse near 370 exceeds the lse tolerance.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(64,), prefixes=(2048,), heads=4, kv_heads=2, capacity=4096,
+      padding=0)
+  late_pages = table[0, 1024 // kc.shape[1]:]
+  kc = jnp.zeros_like(kc).at[late_pages].set(32.0)
+  vc = jnp.ones_like(vc).at[late_pages].set(3.0)
+  q, k, v = jnp.ones_like(q), jnp.full_like(k, 32.0), jnp.full_like(v, 3.0)
+  case = (q, kc, vc, k, v, cu, lengths, table)
+  if layout == "pair":
+    case = contiguous_case(*case)
+  expected = ragged_reference(*case, causal=True)
+  actual = run_extend(*case, layout=layout, return_lse=False, causal=True)
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
 @pytest.mark.skipif(INTERPRET,
                     reason="requires TPU optimized buffer assignment")
 @pytest.mark.parametrize("layout", ["pair", "merged"])
@@ -730,7 +752,7 @@ def test_paged_tiles_minimize_prefix_streams_within_vmem(
   def _prefix_streams(block_q, kv_group):
     return -(-max_seqlen_q_bucket // block_q) * (8 // kv_group)
 
-  assert _tpu_vmem_bytes(blocks, group) <= VMEM_LIMIT_BYTES
+  assert _tpu_vmem_bytes(blocks, group) <= vmem_limit_bytes()
   for block_q in FWD_BLOCKS:
     for kv_group in (1, 2, 4, 8):
       if (block_q > max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
@@ -739,7 +761,7 @@ def test_paged_tiles_minimize_prefix_streams_within_vmem(
         continue
       fewer_streams = dataclasses.replace(
           blocks, block_q=block_q, block_q_compute=min(256, block_q // 2))
-      assert _tpu_vmem_bytes(fewer_streams, kv_group) > VMEM_LIMIT_BYTES, (
+      assert _tpu_vmem_bytes(fewer_streams, kv_group) > vmem_limit_bytes(), (
           block_q, kv_group)
 
 

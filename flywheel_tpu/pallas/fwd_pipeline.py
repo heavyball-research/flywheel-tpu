@@ -16,13 +16,13 @@ from .block_sizes import (
   NT_DIM_NUMBERS,
   NUM_LANES,
   NUM_SUBLANES,
-  VMEM_LIMIT_BYTES,
   BlockSizes,
   PagedKVInfo,
   QKVLayout,
   TokenMajorInfo,
   from_head_minor,
   round_up,
+  vmem_limit_bytes,
 )
 from .copy_utils import (
   advance,
@@ -1531,7 +1531,8 @@ def forward_common(
         out_shape=out_shape,
         scratch_shapes=scratch_shapes,
         name=kernel_name,
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes()),
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*smem_operands, *kernel_inputs)
   if return_lse:

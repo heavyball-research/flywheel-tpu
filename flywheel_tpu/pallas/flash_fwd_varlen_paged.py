@@ -17,12 +17,12 @@ from .block_sizes import (
   FWD_Q_COMPUTE_BLOCKS,
   NUM_LANES,
   NUM_SUBLANES,
-  VMEM_LIMIT_BYTES,
   BlockSizes,
   PagedKVInfo,
   next_pow2,
   pick_tile,
   round_up,
+  vmem_limit_bytes,
 )
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import forward_common, fwd_body, overflow_guard_threshold
@@ -213,9 +213,9 @@ def resolve_paged_tiles(
 ) -> tuple[BlockSizes, int]:
   """(block_sizes, kv_heads_per_group) of one paged build.
 
-  Among the builds whose TPU staging fits VMEM_LIMIT_BYTES, picks the one that
-  streams the longest sequence's kv prefix the fewest times; a tie takes the
-  larger group, whose smaller q block pads short sequences less. A pinned
+  Among the builds whose TPU staging fits vmem_limit_bytes(), picks the one
+  that streams the longest sequence's kv prefix the fewest times; a tie takes
+  the larger group, whose smaller q block pads short sequences less. A pinned
   block_sizes or kv_heads_per_group fixes that axis of the search.
   """
   if block_sizes is not None:
@@ -257,14 +257,14 @@ def resolve_paged_tiles(
   }
   fitting = [
       candidate for candidate, estimate in estimates.items()
-      if estimate <= VMEM_LIMIT_BYTES
+      if estimate <= vmem_limit_bytes()
   ]
   if not fitting:
     (blocks, group), estimate = min(
         estimates.items(), key=lambda item: item[1])
     raise ValueError(
         "paged attention does not fit the scoped VMEM budget of"
-        f" {VMEM_LIMIT_BYTES} bytes: its smallest build (block_q="
+        f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
         f"{blocks.block_q}, block_kv={blocks.block_kv},"
         f" kv_heads_per_group={group}, head_fold"
         f" {group * q_heads_per_kv_head}) needs ~{estimate} bytes. A head"

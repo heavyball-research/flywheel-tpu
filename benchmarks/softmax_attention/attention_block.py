@@ -27,10 +27,14 @@ device time of that same executable into the qkv projection, layout, the
 attention kernel and the output projection. The kernel segment is the
 kernel-level number (kernel_tflops); the wall clock is the block-level one.
 
-Block sizes come from each impl's table: splash and RPA from
-splash_tuned_v6e.json and rpa_tuned_v6e.json next to this file, flywheel from
-flywheel_tpu's own lookup. A cell already recorded as ok in --output is
-skipped unless --trace is given.
+Block sizes come from each impl's table for the chip the cell runs on: splash
+and RPA from splash_tuned_<chip>.json and rpa_tuned_<chip>.json next to this
+file (v6e or v7x; tune_blocks.py searches them), flywheel from flywheel_tpu's
+own lookup. No chip stands in for another: on one with no tables, splash and
+RPA cells are an error until --splash-table / --rpa-table name a table. A cell
+its table does not hold runs the impl's own default: RPA's formula or Tokamax's
+heuristic. A cell already recorded as ok in --output is skipped unless --trace
+is given.
 """
 
 from __future__ import annotations
@@ -45,7 +49,13 @@ import sys
 import numpy as np
 
 from benchmarks.common.records import recorded, write_record
-from benchmarks.common.rpa import DEFAULT_RPA_SOURCE, load_rpa_v3, vllm_page_size
+from benchmarks.common.rpa import (
+    DEFAULT_RPA_SOURCE,
+    load_rpa_v3,
+    request_distribution,
+    unjitted_kernel,
+    vllm_page_size,
+)
 from benchmarks.common.rpa import FIELDS as RPA_FIELDS
 from benchmarks.common.splash import (
     DEFAULT_SPLASH_SOURCE,
@@ -58,6 +68,9 @@ from benchmarks.softmax_attention import segments as segments_lib
 
 RPA_TABLE = pathlib.Path(__file__).with_name("rpa_tuned_v6e.json")
 SPLASH_TABLE = pathlib.Path(__file__).with_name("splash_tuned_v6e.json")
+# Chip, as flywheel_tpu names it, -> the suffix of the tables searched on it.
+# There is no default: a chip missing here has no tables.
+TABLE_TAGS = {"TPU v6e": "v6e", "TPU v7": "v7x"}
 IMPLS = ("flywheel", "splash", "rpa")
 TRACE_CALLS = 3
 
@@ -84,6 +97,20 @@ class Cell:
     def key(self):
         return (f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
                 f"-{self.mask}-b{self.batch}-s{self.seq}")
+
+
+def tuned_table(impl, device_kind):
+    """The path of impl's tuned table for the chip JAX calls device_kind."""
+    from flywheel_tpu.tuned_block_sizes import get_device_variant_name
+
+    chip = get_device_variant_name(device_kind)
+    if chip not in TABLE_TAGS:
+        raise ValueError(
+            f"no tuned {impl} table for {device_kind!r} ({chip}): search one "
+            f"with tune_blocks.py and add the chip to TABLE_TAGS, or name a "
+            f"table with --{impl}-table.")
+    return pathlib.Path(__file__).with_name(
+        f"{impl}_tuned_{TABLE_TAGS[chip]}.json")
 
 
 def table_entry(path, cell, per_mask):
@@ -227,7 +254,7 @@ def build_rpa(cell, w, args):
         jnp.full((cell.batch,), cell.seq, jnp.int32),
         jnp.arange(num_pages, dtype=jnp.int32),
         jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.seq,
-        jnp.asarray(np.array([0, 0, cell.batch], np.int32)),
+        request_distribution(num_decode=0, num_seqs=cell.batch),
     )
 
     blocks = table_entry(args.rpa_table, cell, per_mask=False)
@@ -241,8 +268,7 @@ def build_rpa(cell, w, args):
         source = "formula"
     block_sizes = tuple(int(blocks[name]) for name in RPA_FIELDS)
 
-    kernel = getattr(rpa.ragged_paged_attention, "__wrapped__",
-                     rpa.ragged_paged_attention)
+    kernel = unjitted_kernel(rpa)
     scale = 1.0 / math.sqrt(cell.head_dim)
 
     def block(x, wq, wk, wv, wo, cache):
@@ -347,6 +373,10 @@ def main(argv=None):
 
     if jax.default_backend() != "tpu":
         raise RuntimeError(f"requires TPU; got {jax.default_backend()!r}.")
+    if (cell.impl in ("rpa", "splash")
+            and getattr(args, f"{cell.impl}_table") is None):
+        setattr(args, f"{cell.impl}_table",
+                tuned_table(cell.impl, jax.devices()[0].device_kind))
 
     record = run(cell, args)
     write_record(args.output, record)
@@ -380,9 +410,11 @@ def parse_args(argv=None):
                         help="directory for the profiler traces, one "
                              "subdirectory per cell")
     parser.add_argument("--rpa-table", type=pathlib.Path,
-                        default=RPA_TABLE)
+                        help="default: rpa_tuned_<chip>.json next to this "
+                             "file, for the chip the cell runs on")
     parser.add_argument("--splash-table", type=pathlib.Path,
-                        default=SPLASH_TABLE)
+                        help="default: splash_tuned_<chip>.json next to this "
+                             "file, for the chip the cell runs on")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,
