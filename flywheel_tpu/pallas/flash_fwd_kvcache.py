@@ -132,8 +132,28 @@ def load_kv_fragment(
       word_start = compute_start * head_pairs_per_token + pair_index
       lane = head_group % 2
     word_rows = pl.ds(word_start, block_kv_compute, head_pairs_per_token)
+    folds = head_dim // NUM_LANES
     if head_dim <= NUM_LANES:
       words = words_ref[word_rows]
+    elif head_pairs_per_token * folds <= 2 * NUM_SUBLANES:
+      # A wide head loads each 128-lane half with its own strided load and
+      # joins the halves along lanes. Loading (rows, halves, 128) and reshaping
+      # instead interleaves sublanes; on v7x decode at 32 heads of 256 that was
+      # 40K rotate/combine ops per 4096-token block, 8.55 against 5.22 ms a
+      # step at 4 KV heads. Past a 16-row stride the strided load breaks into
+      # one load per sublane and the reshape is cheaper (32 KV heads: 14.9
+      # against 18.6 ms).
+      lanes_ref = words_ref.reshape(
+          block_kv * head_pairs_per_token * folds, NUM_LANES
+      )
+      words = jnp.concatenate(
+          [
+              lanes_ref[pl.ds(word_start * folds + fold, block_kv_compute,
+                              head_pairs_per_token * folds)]
+              for fold in range(folds)
+          ],
+          axis=1,
+      )
     else:
       folded_words_ref = words_ref.reshape(
           block_kv * head_pairs_per_token, head_dim // NUM_LANES, NUM_LANES
