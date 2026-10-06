@@ -902,6 +902,12 @@ def paged_varlen_attn(
     )
   batch = cu_seqlens_q.shape[0] - 1
   cu_seqlens_q = cu_seqlens_q.astype(jnp.int32)
+  if (not isinstance(cu_seqlens_q, jax.core.Tracer)
+      and int(cu_seqlens_q[0]) != 0):
+    raise ValueError(
+        "with block_table, cu_seqlens_q must start at 0; got"
+        f" cu_seqlens_q[0]={int(cu_seqlens_q[0])}."
+    )
   if num_active is None:
     rotary_seqused_k = seqused_k
   else:
@@ -1005,7 +1011,8 @@ def flash_attn_varlen_func(
   axis, (total, nheads * headdim), and takes head_dim as flash_attn_func
   does. cu_seqlens_q / cu_seqlens_k are
   (num_seqs + 1,) int cumulative offsets and may be tracers; buffer rows past
-  cu_seqlens[-1] are padding that never attends or is attended.
+  cu_seqlens[-1] are padding that never attends or is attended. Padding q
+  rows return out = 0 and lse = -inf, as with a paged KV cache.
 
   causal and window_size are bottom-right aligned per sequence, as
   flash_attn_func aligns them on one sequence's own lengths; a row with no
@@ -1034,8 +1041,8 @@ def flash_attn_varlen_func(
   which the cache must already hold; max_seqlen_k bounds it. q / out stay
   head-major; token_major, window_size, softcap and rotary_k=True raise, and
   RoPE rotates Q only, at positions seqused_k - len_q + t. cu_seqlens_q[0]
-  may exceed 0: the rows below it are the caller's and come back
-  unspecified (the first q block may overwrite them). num_active (int
+  must be 0; a concrete one is checked, a traced one is the caller's
+  contract. A one-token sequence is an ordinary sequence. num_active (int
   or int32 scalar, possibly traced) keeps only the first num_active
   sequences; rows past the last kept one return out = 0 and lse = -inf. A
   concrete num_active outside [0, batch] raises; a traced one must lie in
@@ -1113,8 +1120,8 @@ def flash_attn_varlen_func(
       interleaved=rotary_interleaved, cu_q=cu_seqlens_q, cu_k=cu_seqlens_k,
       max_seqlen_k=max_seqlen_k)
 
-  # Note (david): cu_seqlens needs no adjustment for the padding, because the
-  # kernel appends each padded tail as a trailing sequence of its own.
+  # Note (david): cu_seqlens needs no adjustment for the padding, because rows
+  # past cu_seqlens_q[-1] own no q block and the kernel writes them as zeros.
   if blocks_override is None:
     padded_total_q = pad_seqlen(total_q)
     padded_total_k = pad_seqlen(total_k)

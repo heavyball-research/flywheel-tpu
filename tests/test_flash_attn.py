@@ -478,6 +478,36 @@ def test_flash_attn_varlen_unequal_totals(seqlens_q, seqlens_kv, causal):
         assert_lse_close(lse[None, :, rows], *segment, causal=causal)
 
 
+@pytest.mark.parametrize("seqlens_q,num_pad", [
+    ([17, 1, 0, 40], 23),
+    ([5], 600),
+    ([0, 0], 9),
+])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
+    # Note (david): buffer rows past cu_seqlens[-1] own no q block, so they
+    # come back out = 0 and lse = -inf even when their queries are NaN. A
+    # 600-row pad takes several fill windows, and an all-empty batch runs no
+    # block at all.
+    q, k, v, segments = packed_qkv(seqlens_q, 4, 2, 128)
+    pad_q, pad_k, pad_v = random_qkv(99, 1, num_pad, 4, 2, 128, jnp.bfloat16)
+    q = jnp.concatenate([q, jnp.full_like(pad_q[0], jnp.nan)])
+    k = jnp.concatenate([k, pad_k[0]])
+    v = jnp.concatenate([v, pad_v[0]])
+    cu = cu_seqlens_of(seqlens_q)
+    max_seqlen = max(max(seqlens_q), 1)
+    out, lse = flash_attn_varlen_func(
+        q, k, v, cu, cu, max_seqlen, max_seqlen, causal=causal,
+        return_softmax_lse=True, interpret=INTERPRET)
+    real = int(cu[-1])
+    assert jnp.array_equal(out[real:], jnp.zeros_like(out[real:]))
+    assert jnp.all(lse[:, real:] == -jnp.inf)
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu[index]), int(cu[index + 1]))
+        assert_close_to_reference(out[rows][None], *segment, causal=causal)
+        assert_lse_close(lse[None, :, rows], *segment, causal=causal)
+
+
 def test_flash_attn_varlen_differing_q_kv_splits():
     # Note (david): equal totals but cu_q != cu_k make the packed mask a general
     # block-diagonal; non-causal because sequence 0 has more queries than keys.

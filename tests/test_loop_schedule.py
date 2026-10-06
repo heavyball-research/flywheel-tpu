@@ -22,7 +22,6 @@ from flywheel_tpu.pallas.loop_schedule import (
     make_per_seq_fwd_schedule,
     per_seq_qblk_prefix,
 )
-from flywheel_tpu.pallas.seqlen_info import extend_cu_seqlens
 
 
 def static_mask(q_len, k_len, left, right, offset):
@@ -36,10 +35,8 @@ def static_mask(q_len, k_len, left, right, offset):
 
 def packed_mask(cu_q, cu_k, q_len, k_len, left, right):
   """Same sequence and flash_attn's bottom-right window on that sequence's own
-  lengths (None unbounded, causal is (None, 0)); the pad tail is one more
-  sequence."""
-  cu_q = [*cu_q, q_len]
-  cu_k = [*cu_k, k_len]
+  lengths (None unbounded, causal is (None, 0)); padding rows past cu_q[-1]
+  attend nothing."""
   mask = np.zeros((q_len, k_len), bool)
   for seq in range(len(cu_q) - 1):
     offset = cu_k[seq + 1] - cu_q[seq + 1]
@@ -130,13 +127,12 @@ class PerSeqRow(NamedTuple):
 def replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, window):
   """Walks one head group of the per-seq schedule; each visited block is
   (kv, first kv token, needs_bounds)."""
-  cu_q_ext = extend_cu_seqlens(jnp.asarray(cu_q, jnp.int32), q_pad)
-  cu_k_ext = extend_cu_seqlens(jnp.asarray(cu_k, jnp.int32), kv_pad)
-  cu_qblk = per_seq_qblk_prefix(cu_q_ext, bq)
+  cu_q_array = jnp.asarray(cu_q, jnp.int32)
+  cu_qblk = per_seq_qblk_prefix(cu_q_array, bq)
   num_rows = int(cu_qblk[-1])
   left, right = window
   sched = make_per_seq_fwd_schedule(
-      cu_q_ext, cu_k_ext, cu_qblk, num_head_groups=1, q_heads_per_kv_head=1,
+      cu_q_array, jnp.asarray(cu_k, jnp.int32), cu_qblk, num_head_groups=1, q_heads_per_kv_head=1,
       padded_total_q=q_pad, padded_total_k=kv_pad, bq=bq, bkv=bkv,
       left=left, right=right, num_rows=num_rows)
   rows = []
@@ -146,7 +142,7 @@ def replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, window):
     # the unclamped one is rebuilt from the layout: sequence r's i-th block
     # starts at align8(cu_q[r]) + i * bq.
     seq = int(np.searchsorted(np.asarray(cu_qblk), si, side="right")) - 1
-    aligned_q_start = (int(cu_q_ext[seq]) // 8 * 8
+    aligned_q_start = (cu_q[seq] // 8 * 8
                        + (si - int(cu_qblk[seq])) * bq)
     blocks = []
     for kv in range(int(lo), int(hi) + 1):
@@ -211,8 +207,9 @@ def test_per_seq_fwd_schedule_windows_and_masks(case, window):
       assert (int(row.ctx.kv_window_base) + kv * bkv) % 8 == 0, k_tok
       assert k_tok % 8 == 0, k_tok
 
-  # Note (david): the owned ranges must partition [0, q_pad) in si order, so
-  # every token is computed exactly once however the staged windows overlap.
+  # Note (david): the owned ranges must partition [0, cu_q[-1]) in si order,
+  # so every token is computed exactly once however the staged windows
+  # overlap; padding rows past cu_q[-1] get no block.
   cursor = 0
   for row in rows:
     start, end = row.owned_rows
@@ -220,7 +217,7 @@ def test_per_seq_fwd_schedule_windows_and_masks(case, window):
     assert row.staged_q_start <= start and end <= row.staged_q_start + bq, (
         row.si, row.owned_rows)
     cursor = end
-  assert cursor == q_pad
+  assert cursor == cu_q[-1]
 
   for row in rows:
     valid_rows = kept_rows(row, bq)
@@ -290,15 +287,19 @@ def test_per_seq_q_bounds_match_kept_rows(case, window):
 def test_per_seq_packed_write_blend_covers_every_row(case):
   # Note (david): host replay of fwd_body's packed-direct write: blocks write
   # their whole staged window in si order after blending rows [staged start,
-  # q_start) from the previous block's stage, and every packed row must end up
-  # with its owning block's value. The blend fixes the write, not the mask, so
-  # it does not depend on the window.
+  # q_start) from the previous block's stage and zeroing rows past cu_q[-1],
+  # then the fill writes zeros from the next 8-row tile on. Every packed row
+  # must end up with its owning block's value, and every padding row with the
+  # zero marker. The blend fixes the write, not the mask, so it does not
+  # depend on the window.
+  zero = -2
   cu_q, cu_k, q_pad, kv_pad, bq, bkv = case
   _, rows = replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, (None, 0))
-  owner = np.full(q_pad, -1)
+  packed_q_end = cu_q[-1]
+  owner = np.full(q_pad, zero)
   for row in rows:
     owner[slice(*row.owned_rows)] = row.si
-  assert (owner >= 0).all()
+  assert (owner[:packed_q_end] >= 0).all()
 
   out = np.full(q_pad, -1)
   prev_stage, prev_start = np.full(bq, -1), 0
@@ -318,8 +319,10 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
         and src_offset + -(-blend_width // 8) * 8 <= bq), (
             row.si, src_offset, blend_width)
     stage[:blend_width] = prev_stage[src_offset:src_offset + blend_width]
+    stage[packed >= packed_q_end] = zero
     out[row.staged_q_start:row.staged_q_start + bq] = stage
     prev_stage, prev_start = stage, row.staged_q_start
+  out[-(-packed_q_end // 8) * 8:] = zero
   np.testing.assert_array_equal(out, owner)
 
 
@@ -374,9 +377,9 @@ PAGED_CASES = [
     # Note (david): the last kv block of every sequence runs past its 14-page
     # table row, whose missing pages must clamp into the row.
     ([0, 300, 364, 1000], [590, 233, 1700], 1024, 256, 512, 128, 14),
-    # Note (david): cu_seqlens_q starts past 0 off the 8-row grid, with an
+    # Note (david): boundaries off the 8-row grid, a one-token request and an
     # empty request in the middle.
-    ([13, 30, 30, 75], [100, 0, 300], 128, 128, 256, 128, 3),
+    ([0, 13, 14, 14, 75], [100, 40, 0, 300], 128, 128, 256, 128, 3),
     # Note (david): the last block clamps from 288 to 256 at the padded end,
     # and rows past cu_q[-1] belong to no block.
     ([0, 128, 128, 165, 380], [128, 0, 37, 300], 384, 128, 128, 128, 3),
@@ -402,10 +405,11 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
     mask |= ((cu_q[seq] <= q_ids) & (q_ids < cu_q[seq + 1])
              & (k_ids < seqused_k[seq]) & visible)
 
-  cursor = cu_q[0]
+  assert cu_q[0] == 0
+  cursor = 0
   pages_per_block = bkv // page_size
   for row in rows:
-    # Note (david): the owned ranges partition [cu_q[0], cu_q[-1]) in si
+    # Note (david): the owned ranges partition [0, cu_q[-1]) in si
     # order; packed padding past cu_q[-1] gets no block.
     start, end = row.owned_rows
     assert start == cursor and start < end, (row.si, row.owned_rows)

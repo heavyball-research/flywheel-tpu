@@ -129,8 +129,9 @@ def paged_scratch_shapes(
     rotary_dtype: jnp.dtype | None,
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
-  one paged build, in its order: Q stage, KV staging, bounds rows, Q rotary
-  coefficients, out stage, row max, row sum, f32 accumulator, rescale, lse."""
+  one paged build, in its order: Q stage, KV staging, KV head planes, bounds
+  rows, Q rotary coefficients, out stage, row max, row sum, f32 accumulator,
+  rescale, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   head_fold = paged.kv_heads_per_group * q_heads_per_kv_head
@@ -150,6 +151,8 @@ def paged_scratch_shapes(
   num_kv_staging = 1 if paged.is_merged else 2
   shapes = [(q_stage_shape, bf16)]
   shapes += [(kv_staging_shape, bf16)] * num_kv_staging
+  if not paged.is_cache_head_major:
+    shapes.append(((2 * paged.kv_heads_per_group, bkv, head_dim), bf16))
   shapes.append(((1, 2, bkv), jnp.dtype(jnp.int32)))
   if rotary_dtype is not None:
     # Note (david): prepare_rotary's one batch plane is shared by every head
@@ -299,15 +302,15 @@ def flash_attn_varlen_paged(
   """Packed head-major attention over a paged KV cache, read-only.
 
   q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
-  entry may exceed 0. The bf16 cache is one merged (num_pages, page_size,
+  entry is 0. The bf16 cache is one merged (num_pages, page_size,
   2 * nheads_k, head_dim) pool holding a token's K heads then its V heads
   (v_cache None), or a K/V pair of (num_pages, page_size, nheads_k, head_dim).
   seqused_k is each sequence's kv length with its new tokens, which the cache
   must already hold; block_table entries past those tokens' pages are never
   dereferenced. Causal rows align to the end of their sequence's keys, and
   q_scale is softmax_scale * log2(e). Rows past cu_seqlens_q[-1] are out = 0,
-  lse = -inf; rows below cu_seqlens_q[0] are unspecified. max_seqlen_q and
-  max_seqlen_k only pick the tiles, so an underestimate is slow, not wrong.
+  lse = -inf. max_seqlen_q and max_seqlen_k only pick the tiles, so an
+  underestimate is slow, not wrong.
   rotary is prepare_rotary's (q coefficients, None) pair.
   """
   is_merged = v_cache is None
@@ -420,6 +423,15 @@ def flash_attn_varlen_paged(
       kv_heads_per_group=kv_heads_per_group,
   )
   bq = block_sizes.block_q
+  bkv = block_sizes.block_kv
+  # Note (david): fwd_body keys a staged block by (sequence, kv block, loaded
+  # 8-row tiles) in one int32.
+  num_kv_keys = batch * -(-capacity // bkv) * (bkv // NUM_SUBLANES + 1)
+  if num_kv_keys > 2**31 - 1:
+    raise ValueError(
+        f"{batch=} sequences of capacity {capacity} tokens in {bkv}-token"
+        f" blocks need {num_kv_keys} staging keys, past int32."
+    )
   head_fold = kv_heads_per_group * q_heads_per_kv_head
   paged = paged_kv_info(
       num_kv_heads=num_kv_heads, kv_heads_per_group=kv_heads_per_group,

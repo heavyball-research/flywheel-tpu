@@ -1,4 +1,4 @@
-"""Varlen forward kernel driven by the extended cu_seqlens pair in SMEM.
+"""Varlen forward kernel driven by the cu_seqlens pair in SMEM.
 
 The per-seq schedule cuts each sequence into its own q blocks and synthesizes
 its masks in-kernel: the sequence bounds plus the causal or window edges
@@ -8,6 +8,7 @@ around each sequence's own bottom-right diagonal.
 from functools import partial
 
 import jax
+import jax.numpy as jnp
 
 from .block_sizes import BlockSizes, QKVLayout, TokenMajorInfo
 from .fwd_pipeline import forward_common, fwd_body
@@ -16,11 +17,7 @@ from .loop_schedule import (
   make_per_seq_fwd_schedule,
   per_seq_qblk_prefix,
 )
-from .seqlen_info import (
-  check_cu_seqlens_pair,
-  extend_cu_seqlens,
-  split_pad_tail,
-)
+from .seqlen_info import check_cu_seqlens_pair
 
 
 def flash_fwd_varlen_kernel(
@@ -67,9 +64,6 @@ def flash_attn_forward_varlen(
     num_q_heads = q.shape[0]
   else:
     num_q_heads = (token_major.batch or 1) * token_major.num_q_heads
-  # Note (david): validate before extending, which would otherwise turn a
-  # malformed pair into a raw concatenate error or into one fabricated
-  # sequence.
   check_cu_seqlens_pair(cu_seqlens_k, cu_seqlens_q)
   # Note (david): per-seq blocks address HBM at arbitrary token offsets, which
   # only a second-minor (sublane) token axis supports.
@@ -78,13 +72,12 @@ def flash_attn_forward_varlen(
         "the per-seq varlen schedule requires a HEAD_DIM_MINOR qkv_layout"
         " and transposed_pv=False (token axis must stay second-minor)."
     )
-  # Note (david): giving the pad tail a square sequence of its own keeps pad
-  # rows off every unclaimed kv token.
-  cu_q_split, cu_k_split = split_pad_tail(
-      extend_cu_seqlens(cu_seqlens_q, q.shape[-2]),
-      extend_cu_seqlens(cu_seqlens_k, k.shape[-2]))
-  smem_operands = [cu_q_split, cu_k_split,
-                   per_seq_qblk_prefix(cu_q_split, block_sizes.block_q)]
+  # Note (david): padding rows past cu_seqlens_q[-1] own no q block and come
+  # back out = 0, lse = -inf, so they cost no attention; kv tokens past
+  # cu_seqlens_k[-1] are masked wherever a block loads them.
+  cu_q = jnp.asarray(cu_seqlens_q, jnp.int32)
+  smem_operands = [cu_q, jnp.asarray(cu_seqlens_k, jnp.int32),
+                   per_seq_qblk_prefix(cu_q, block_sizes.block_q)]
 
   kernel = partial(
       flash_fwd_varlen_kernel,

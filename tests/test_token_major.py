@@ -198,6 +198,37 @@ def test_tm_varlen_fwd_parity(seed, nheads_k, headdim, causal, cu, head_fold,
                            out_hm.transpose(1, 0, 2))
 
 
+@pytest.mark.parametrize("headdim,head_fold", [(128, 1), (128, 2), (64, 2)])
+def test_tm_varlen_padding_rows_are_zero(headdim, head_fold):
+    # Note (david): token-major fills the padding past cu[-1] through lane
+    # windows of each fold group, not head rows; it must read out = 0 and
+    # lse = -inf as in head-major, with NaN queries in the pad.
+    total, nheads, max_seqlen, real = 256, 4, 128, 150
+    keys = jax.random.split(jax.random.PRNGKey(46), 3)
+    q, k, v = (jax.random.normal(key, (total, nheads, headdim), jnp.bfloat16)
+               for key in keys)
+    q = q.at[real:].set(jnp.nan)
+    cu = jnp.array([0, 100, real], jnp.int32)
+    common = dict(
+        causal=True, head_fold=head_fold, return_lse=True,
+        interpret=INTERPRET, varlen_max_seqlen_kv=max_seqlen,
+        block_sizes=default_block_sizes(total, total, max_seqlen))
+    head_major = make_flash_attn_mha(
+        nheads, total, total, num_kv_heads=nheads, **common)
+    token_major = make_flash_attn_mha(
+        nheads, total, total, num_kv_heads=nheads,
+        token_major=token_major_info(None, nheads, nheads, headdim), **common)
+    out_hm, lse_hm = head_major(
+        *(x.transpose(1, 0, 2) for x in (q, k, v)), cu, cu)
+    out_tm, lse_tm = token_major(*(x.reshape(total, -1) for x in (q, k, v)),
+                                 cu, cu)
+    assert jnp.array_equal(out_tm.reshape(total, nheads, headdim),
+                           out_hm.transpose(1, 0, 2))
+    assert jnp.array_equal(lse_tm, lse_hm)
+    assert jnp.array_equal(out_tm[real:], jnp.zeros_like(out_tm[real:]))
+    assert jnp.all(lse_tm[:, real:] == -jnp.inf)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_tm_hybrid_fwd_parity(causal):
     # Note (david): the runtime schedule on 3-D storage is the padded-dense

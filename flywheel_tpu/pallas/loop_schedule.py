@@ -21,8 +21,11 @@ class PerSeqIntervals(NamedTuple):
 
   bottom_right_offset is kv_end - q_end, the sequence's causal offset;
   q_window_start is the block's DMA-clamped first q token; kv_window_base is
-  the aligned base of the sequence's kv windows. seq_idx (paged schedule only)
-  is the block's sequence, whose block table row its kv DMAs read.
+  the aligned base of the sequence's kv windows. seq_idx and kv_used_end are
+  set only by the paged schedule: the block's sequence, whose block table row
+  its kv DMAs read, and that sequence's kv length. There kv_end is the q
+  block's kv frontier (one past the last key any of its rows attends), which
+  is what the block loads and owns; bottom_right_offset still uses kv_used_end.
   """
   q_start: jax.Array
   q_end: jax.Array
@@ -32,6 +35,7 @@ class PerSeqIntervals(NamedTuple):
   q_window_start: jax.Array
   kv_window_base: jax.Array
   seq_idx: jax.Array | None = None
+  kv_used_end: jax.Array | None = None
 
 
 BlockIndex = jax.Array | int
@@ -63,10 +67,13 @@ class FwdSchedule:
       (q fold index h reads kv fold index h // q_heads_per_kv_head); an int B
       is a heads-outer fold of B sequences (q fold index n * B + b reads kv
       fold index (n // q_heads_per_kv_head) * B + b).
-    kv_page, packed_q_end: set only by the paged schedule. kv_page(seq_idx,
+    packed_q_end: per-seq only; cu_seqlens_q[-1], where the packed padding
+      rows fwd_body zero-fills begin.
+    kv_page, kv_frontier: set only by the paged schedule. kv_page(seq_idx,
       kv, page) is the physical page holding the page-th page of kv block kv
-      of sequence seq_idx; packed_q_end is cu_seqlens_q[-1], where the packed
-      padding rows fwd_body zero-fills begin.
+      of sequence seq_idx; kv_frontier(ctx, q_last) is one past the last key
+      that rows up to packed row q_last attend, so fwd_body skips compute
+      tiles at or past it.
   """
   num_head_groups: int
   num_rows: int | jax.Array
@@ -87,6 +94,7 @@ class FwdSchedule:
   heads_outer_batch: int | None = None
   kv_page: Callable[[jax.Array, BlockIndex, int], jax.Array] | None = None
   packed_q_end: jax.Array | None = None
+  kv_frontier: Callable[[PerSeqIntervals, jax.Array], jax.Array] | None = None
 
 
 class DenseFwdParams(NamedTuple):
@@ -270,16 +278,15 @@ def align_to_sublane_tile(token: jax.Array) -> jax.Array:
   return (token // NUM_SUBLANES) * NUM_SUBLANES
 
 
-def per_seq_qblk_prefix(cu_q_ext: jax.Array, bq: int) -> jax.Array:
+def per_seq_qblk_prefix(cu_seqlens_q: jax.Array, bq: int) -> jax.Array:
   """Host-side (jit-trace) prefix sum of per-sequence q-block counts.
 
   Entry r is the flat index of sequence r's first q block; the last entry is
   the runtime total the kernel's middle loop runs to. A sequence covers
   ceil((cu_q[r + 1] - align(cu_q[r])) / bq) blocks on the aligned grid, and an
-  empty sequence covers none. cu_q_ext includes the pad-tail sequence, so pad
-  rows get blocks of their own.
+  empty sequence covers none. Rows past cu_q[-1] get no block.
   """
-  cu_q = jnp.asarray(cu_q_ext, jnp.int32)
+  cu_q = jnp.asarray(cu_seqlens_q, jnp.int32)
   num_blocks_per_seq = jnp.where(
       jnp.diff(cu_q) > 0,
       -(-(cu_q[1:] - align_to_sublane_tile(cu_q[:-1])) // bq), 0)
@@ -318,9 +325,10 @@ def make_per_seq_fwd_schedule(
   Aligning a base down drags up to 7 rows of the previous sequence into the
   first block, and the last block runs past q_end. Those q rows are garbage:
   fwd_body blends rows [q_token, blend_start) from the previous block's stage
-  before the packed write, and tail rows are overwritten by the next block or
-  land in the discarded pad. Stray kv columns and the window edges are masked
-  through q_bounds, so this schedule needs no bounds operand.
+  before the packed write, and tail rows are overwritten by the next block or,
+  past cu_q[-1] (packed_q_end), written as out = 0, lse = -inf. Stray kv
+  columns and the window edges are masked through q_bounds, so this schedule
+  needs no bounds operand.
   """
   # Note (david): pl.multiple_of is an unchecked hint, and a lying hint
   # corrupts data silently instead of failing the verifier. A base of
@@ -430,6 +438,7 @@ def make_per_seq_fwd_schedule(
       q_bounds=_q_bounds,
       has_q_span=left is not None,
       blend_start=lambda ctx: ctx.q_start,
+      packed_q_end=cu_q_ref[cu_q_ref.shape[0] - 1],
   )
 
 
@@ -470,25 +479,32 @@ def make_paged_fwd_schedule(
       num_rows=num_rows,
   )
 
+  def _kv_frontier(kv_end, bottom_right_offset, q_last):
+    if causal:
+      return jnp.minimum(kv_end, q_last + bottom_right_offset + 1)
+    else:
+      return kv_end
+
   def _row_interval(si):
     seq_idx = seq_index_at(si, cu_qblk_ref)
     block_in_seq = si - cu_qblk_ref[seq_idx]
     q_start, q_end = cu_q_ref[seq_idx], cu_q_ref[seq_idx + 1]
-    kv_start, kv_end = jnp.int32(0), seqused_k_ref[seq_idx]
+    kv_start, kv_used_end = jnp.int32(0), seqused_k_ref[seq_idx]
     q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
     q_window_start = jnp.minimum(q_block_start, padded_total_q - bq)
-    bottom_right_offset = kv_end - q_end
-    if causal:
-      last_valid_q = jnp.minimum(q_block_start + bq, q_end) - 1
-      kv_hi_token = jnp.minimum(kv_end - 1, last_valid_q + bottom_right_offset)
-    else:
-      kv_hi_token = kv_end - 1
+    bottom_right_offset = kv_used_end - q_end
+    # Note (david): the block loads and owns keys only up to its own causal
+    # frontier, so a q block early in a chunk neither fetches nor scores the
+    # keys only later rows see. Rows of the window outside the sequence are
+    # overwritten or discarded, so the frontier follows the last owned row.
+    last_valid_q = jnp.minimum(q_block_start + bq, q_end) - 1
+    kv_end = _kv_frontier(kv_used_end, bottom_right_offset, last_valid_q)
     # Note (david): kv_len == 0 still gets one kv block, as on the per-seq
     # schedule; its page DMAs clip to zero tokens.
-    hi = jnp.clip(kv_hi_token // bkv, 0, num_kv_blocks - 1)
+    hi = jnp.clip((kv_end - 1) // bkv, 0, num_kv_blocks - 1)
     ctx = PerSeqIntervals(
         q_start, q_end, kv_start, kv_end, bottom_right_offset,
-        q_window_start, kv_start, seq_idx)
+        q_window_start, kv_start, seq_idx, kv_used_end)
     return jnp.int32(0), hi, ctx
 
   def _kv_page(seq_idx, kv, page):
@@ -501,7 +517,8 @@ def make_paged_fwd_schedule(
       per_seq,
       row_interval=_row_interval,
       kv_page=_kv_page,
-      packed_q_end=cu_q_ref[cu_q_ref.shape[0] - 1],
+      kv_frontier=lambda ctx, q_last: _kv_frontier(
+          ctx.kv_end, ctx.bottom_right_offset, q_last),
   )
 
 

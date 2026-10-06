@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
@@ -20,6 +21,7 @@ from flywheel_tpu.pallas.block_sizes import (
     VMEM_LIMIT_BYTES,
     BlockSizes,
 )
+from flywheel_tpu.pallas.copy_utils import unpack_kv_planes
 from flywheel_tpu.pallas.flash_fwd_kvcache_extend import (
     flash_attn_kvcache_extend_pallas,
 )
@@ -558,6 +560,7 @@ def test_ragged_cache_has_no_pool_sized_temporary(layout):
     ("rotary_k", NotImplementedError, "rotary_k"),
     ("window_size", NotImplementedError, "window"),
     ("softcap", NotImplementedError, "softcap"),
+    ("cu_seqlens_q_start", ValueError, "cu_seqlens_q"),
     ("num_active_past_batch", ValueError, "num_active"),
     ("num_active_jax_negative", ValueError, "num_active"),
     ("num_active_float", ValueError, "num_active"),
@@ -592,6 +595,8 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
     kwargs["window_size"] = (16, 0)
   elif case == "softcap":
     kwargs["softcap"] = 5.0
+  elif case == "cu_seqlens_q_start":
+    operands[3] = jnp.array([2, 3, total], jnp.int32)
   elif case == "num_active_past_batch":
     kwargs["num_active"] = 3
   elif case == "num_active_jax_negative":
@@ -901,27 +906,6 @@ def test_paged_unaligned_sequence_boundaries(padding, causal):
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
-@pytest.mark.parametrize("leading_rows,causal", [(13, True), (16, False)])
-def test_paged_rows_before_cu_seqlens_q_start_are_not_owned(leading_rows,
-                                                            causal):
-  # Note (david): serving starts cu_seqlens_q past the decode rows. The
-  # kernel's first block, aligned down to 8 rows, may overwrite
-  # [align8(start), start), which the caller restores, but NaN there must not
-  # reach any owned row.
-  lengths = (14, 0, 21, 7, 1)
-  q, kc, vc, k, v, cu, cache_seqlens, table = probe_case(
-      lengths, (5, 64, 130, 250, 127), padding=9, causal=causal)
-  q, k, v = (
-      jnp.concatenate((jnp.full((leading_rows, *tokens.shape[1:]), jnp.nan,
-                                tokens.dtype), tokens))
-      for tokens in (q, k, v))
-  case = (q, kc, vc, k, v, cu + leading_rows, cache_seqlens, table)
-  expected = ragged_reference(*case, causal=causal)
-  assert_probe_is_sharp(expected[4])
-  actual = run_paged(*case, causal=causal)
-  assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
-
-
 @pytest.mark.parametrize("lengths,prefixes,page_size,causal", [
     ((1300,), (4000,), 256, True),
     ((700, 300), (1500, 2900), 128, True),
@@ -992,6 +976,124 @@ def test_paged_serving_gqa_shape(heads, kv_heads, return_lse):
                      return_lse=return_lse, softmax_scale=scale,
                      max_seqlen_q=case[0].shape[0], max_seqlen_k=320 * 128)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
+
+
+@pytest.mark.parametrize("layout", ["pair", "merged"])
+def test_paged_fresh_chunk_q_blocks_share_one_kv_block(layout):
+  # Note (david): a 600-token fresh chunk in 128-row q blocks over one
+  # 2048-token kv block: each q block loads the block only up to its own
+  # frontier, so consecutive q blocks stage the same kv block with different
+  # extents and must not reuse each other's staging, and most kv compute
+  # tiles of every q tile lie past its frontier and are skipped.
+  lengths = (600,)
+  case = probe_case(lengths, (0,), pages_per_seq=16, padding=11, logit=16.0)
+  expected = ragged_reference(*case, causal=True)
+  assert_probe_is_sharp(expected[4])
+  actual = run_paged(*case, layout=layout, causal=True, max_seqlen_q=128,
+                     max_seqlen_k=16 * 128)
+  assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
+
+
+def test_paged_overflow_guard_checks_last_live_kv_tile():
+  # Note (david): keys [0, 512) score 0 and keys [512, 600) score ~200 nats,
+  # so rows past 512 anchor on the first kv tile and overflow on the second.
+  # Every q tile's frontier is below the block's last kv tile, which is
+  # skipped, so the overflow check must run at the last live tile for the
+  # replay to rescue those rows.
+  length, kv_heads, heads, head_dim = 600, 2, 4, 128
+  num_pages, page_size = 16, 128
+  scale = 1 / math.sqrt(head_dim)
+  direction = np.zeros(head_dim)
+  direction[0] = 1.0
+  magnitude = math.sqrt(200.0 / scale)
+  q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+  k = np.zeros((length, kv_heads, head_dim))
+  k[512:] = magnitude * direction
+  v = np.where(np.arange(length)[:, None, None] < 512, 1.0, 3.0) * np.ones(
+      (length, kv_heads, head_dim))
+  pages = np.zeros((num_pages, page_size, kv_heads, head_dim))
+
+  def bf16(array):
+    return jnp.asarray(array, jnp.bfloat16)
+
+  case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
+          jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
+          jnp.arange(num_pages, dtype=jnp.int32)[None])
+  expected = ragged_reference(*case, causal=True)
+  actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size)
+  assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
+@pytest.mark.parametrize(
+    "is_merged,num_kv_heads,group,kv_head,head_dim,is_bitcast_load", [
+        (True, 8, 8, 0, 128, True),
+        (True, 3, 3, 0, 128, True),
+        (False, 4, 2, 2, 128, True),
+        (True, 4, 1, 3, 128, True),
+        (True, 4, 4, 0, 256, True),
+        (True, 16, 16, 0, 256, True),
+        (True, 3, 3, 0, 128, False),
+        (False, 3, 1, 2, 128, False),
+    ])
+def test_unpack_kv_planes_copies_group_heads(
+    is_merged, num_kv_heads, group, kv_head, head_dim, is_bitcast_load):
+  # Note (david): the TPU interpreter behind forward_common rejects ref
+  # bitcasts, so the paged kernel runs its unpacked staging on CPU, and the
+  # pair-packed unpack the TPU build runs is checked here under the plain
+  # interpreter. The cases: Qwen3-4B's eight K and eight V pairs; three heads,
+  # where K2 and V0 share one word; separate K/V caches at the second group;
+  # an odd group at an odd kv_head, one word load per head; d256 at an 8-row
+  # word stride (per-half strided loads) and at a 32-row one (reshape). Tiles
+  # past num_tiles must keep their old contents.
+  stages, block_kv, block_kv_compute, num_tiles, slot = 2, 512, 128, 3, 1
+  staged_heads = 2 * num_kv_heads if is_merged else num_kv_heads
+  v_head_offset = num_kv_heads if is_merged else 0
+  rng = np.random.default_rng(3)
+
+  def staging():
+    return jnp.asarray(
+        rng.normal(size=(stages, block_kv, staged_heads, head_dim)),
+        jnp.bfloat16)
+
+  k_staged = staging()
+  v_staged = k_staged if is_merged else staging()
+  if is_bitcast_load:
+    pair_shape = (stages, block_kv, staged_heads // 2, 2, head_dim)
+    k_in, v_in = (staged.reshape(pair_shape)
+                  for staged in (k_staged, v_staged))
+  else:
+    k_in, v_in = k_staged, v_staged
+  sentinel = -7.0
+
+  def _kernel(scalars_ref, k_ref, v_ref, planes_ref):
+    planes_ref[...] = jnp.full(planes_ref.shape, sentinel, planes_ref.dtype)
+    unpack_kv_planes(
+        planes_ref, k_ref, k_ref if is_merged else v_ref, scalars_ref[0],
+        scalars_ref[1], scalars_ref[2],
+        block_kv_compute=block_kv_compute, v_head_offset=v_head_offset,
+        is_merged=is_merged, is_bitcast_load=is_bitcast_load,
+        is_kv_head_even=kv_head % 2 == 0)
+
+  vmem_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
+  planes = pl.pallas_call(
+      _kernel,
+      out_shape=jax.ShapeDtypeStruct(
+          (2 * group, block_kv, head_dim), jnp.bfloat16),
+      in_specs=[pl.BlockSpec(memory_space=pltpu.SMEM), vmem_spec, vmem_spec],
+      out_specs=vmem_spec,
+      interpret=True,
+  )(jnp.array([slot, kv_head, num_tiles], jnp.int32), k_in, v_in)
+
+  live_rows = num_tiles * block_kv_compute
+  heads = list(range(kv_head, kv_head + group))
+  expected = np.concatenate([
+      np.asarray(k_staged[slot, :live_rows][:, heads]),
+      np.asarray(v_staged[slot, :live_rows][
+          :, [v_head_offset + head for head in heads]]),
+  ], axis=1).transpose(1, 0, 2)
+  np.testing.assert_array_equal(np.asarray(planes[:, :live_rows]), expected)
+  assert np.all(np.asarray(planes[:, live_rows:], np.float32) == sentinel)
 
 
 def check_extend_kernel(case, *, causal, tilings, layout="pair"):

@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo
+from .block_sizes import NUM_LANES, NUM_SUBLANES, QKVLayout, TokenMajorInfo
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16
@@ -227,10 +227,8 @@ def load_kv_fragment(
         :,
     ].reshape(block_kv_compute, head_dim)
   else:
-    _, block_kv, head_pairs_per_token, _, _ = buffers.shape
-    words_ref = buffers.bitcast(jnp.uint32).at[slot].reshape(
-        block_kv * head_pairs_per_token, head_dim
-    )
+    head_pairs_per_token = buffers.shape[2]
+    words_ref = staged_words(buffers, slot)
     if is_kv_pair_tile:
       word_start = compute_start
       lane = kv_part
@@ -240,18 +238,132 @@ def load_kv_fragment(
       )
       word_start = compute_start * head_pairs_per_token + pair_index
       lane = head_group % 2
-    word_rows = pl.ds(word_start, block_kv_compute, head_pairs_per_token)
-    if head_dim <= NUM_LANES:
-      words = words_ref[word_rows]
-    else:
-      folded_words_ref = words_ref.reshape(
-          block_kv * head_pairs_per_token, head_dim // NUM_LANES, NUM_LANES
-      )
-      words = folded_words_ref[word_rows, :, :].reshape(
-          block_kv_compute, head_dim
-      )
+    words = load_staged_words(
+        words_ref, word_start, block_kv_compute, head_pairs_per_token)
     if kv_heads_per_fragment == 2:
       return pltpu.bitcast(words, jnp.bfloat16)
     else:
-      lane_bits = words >> jnp.uint32(lane * BF16_BITS)
-      return pltpu.bitcast(lane_bits.astype(jnp.uint16), jnp.bfloat16)
+      return bf16_half(words, lane)
+
+
+def staged_words(buffers: jax.Array, slot: jax.Array) -> jax.Array:
+  """A (block_kv * head_pairs, head_dim) u32 view of one pair-packed staging
+  slot of (stages, block_kv, head_pairs, 2, head_dim) bf16; word row
+  token * head_pairs + pair holds that pair's two heads."""
+  _, block_kv, head_pairs, _, head_dim = buffers.shape
+  return buffers.bitcast(jnp.uint32).at[slot].reshape(
+      block_kv * head_pairs, head_dim)
+
+
+def load_staged_words(
+    words_ref: jax.Array,
+    word_start: jax.Array | int,
+    num_rows: int,
+    stride: int,
+) -> jax.Array:
+  """(num_rows, head_dim) u32 words at rows word_start + i * stride."""
+  num_word_rows, head_dim = words_ref.shape
+  folds = head_dim // NUM_LANES
+  if head_dim <= NUM_LANES:
+    return words_ref[pl.ds(word_start, num_rows, stride)]
+  elif stride * folds <= 2 * NUM_SUBLANES:
+    # Note (david): a wide head loads each 128-lane half with its own strided
+    # load and joins the halves along lanes. Loading (rows, halves, 128) and
+    # reshaping instead interleaves sublanes; on v7x decode at 32 heads of 256
+    # that was 40K rotate/combine ops per 4096-token block, 8.55 against 5.22
+    # ms a step at 4 KV heads (flywheel-tpu PR #7). Past a 16-row stride the
+    # strided load breaks into one load per sublane and the reshape is cheaper
+    # (32 KV heads: 14.9 against 18.6 ms).
+    lanes_ref = words_ref.reshape(num_word_rows * folds, NUM_LANES)
+    return jnp.concatenate(
+        [
+            lanes_ref[pl.ds(word_start * folds + fold, num_rows,
+                            stride * folds)]
+            for fold in range(folds)
+        ],
+        axis=1,
+    )
+  else:
+    folded_words_ref = words_ref.reshape(num_word_rows, folds, NUM_LANES)
+    return folded_words_ref[pl.ds(word_start, num_rows, stride), :, :].reshape(
+        num_rows, head_dim)
+
+
+def bf16_half(words: jax.Array, lane: jax.Array | int) -> jax.Array:
+  """The bf16 head in a u32 word's low (lane 0) or high (lane 1) half."""
+  lane_bits = words >> jnp.uint32(lane * BF16_BITS)
+  return pltpu.bitcast(lane_bits.astype(jnp.uint16), jnp.bfloat16)
+
+
+def unpack_kv_planes(
+    planes: jax.Array,
+    k_buffers: jax.Array,
+    v_buffers: jax.Array,
+    slot: jax.Array,
+    kv_head: jax.Array,
+    num_tiles: jax.Array,
+    *,
+    block_kv_compute: int,
+    v_head_offset: int,
+    is_merged: bool,
+    is_bitcast_load: bool,
+    is_kv_head_even: bool,
+) -> None:
+  """Copy kv heads [kv_head, kv_head + G) of a staged paged block into planes.
+
+  planes is (2 * G, block_kv, head_dim) bf16: K heads, then V heads. A staged
+  token row holds K heads from 0 and V heads from v_head_offset (of k_buffers
+  when merged, else of v_buffers). Only the first num_tiles block_kv_compute
+  token tiles are copied. is_kv_head_even states that kv_head is even, so a
+  pair-packed word whose two heads are both planes is loaded once for both.
+  """
+  num_kv_heads_in_group = planes.shape[0] // 2
+  num_compute_tiles = planes.shape[1] // block_kv_compute
+  # Note (david): (buffer index, staged head offset from kv_head, plane) per
+  # plane; a merged row keeps K and V in one buffer.
+  v_buffer_index = 0 if is_merged else 1
+  plane_sources = [
+      (0, head, head) for head in range(num_kv_heads_in_group)
+  ] + [
+      (v_buffer_index, v_head_offset + head, num_kv_heads_in_group + head)
+      for head in range(num_kv_heads_in_group)
+  ]
+  buffers_by_index = (k_buffers, v_buffers)
+
+  for tile in range(num_compute_tiles):
+    @pl.when(tile < num_tiles)
+    def _unpack_tile(tile=tile):
+      tile_start = tile * block_kv_compute
+      tile_tokens = pl.ds(tile_start, block_kv_compute)
+      if not is_bitcast_load:
+        for buffer_index, head_offset, plane in plane_sources:
+          planes[plane, tile_tokens, :] = buffers_by_index[buffer_index][
+              slot, tile_tokens, pl.ds(kv_head + head_offset, 1), :
+          ].reshape(block_kv_compute, planes.shape[-1])
+      elif is_kv_head_even:
+        # Note (david): kv_head is even, so a staged head's pair and half are
+        # kv_head // 2 + offset // 2 and offset % 2: static except the base.
+        planes_by_pair = {}
+        for buffer_index, head_offset, plane in plane_sources:
+          planes_by_pair.setdefault(
+              (buffer_index, head_offset // 2), []).append(
+                  (head_offset % 2, plane))
+        for (buffer_index, pair_offset), halves in planes_by_pair.items():
+          buffers = buffers_by_index[buffer_index]
+          head_pairs = buffers.shape[2]
+          words = load_staged_words(
+              staged_words(buffers, slot),
+              tile_start * head_pairs + kv_head // 2 + pair_offset,
+              block_kv_compute, head_pairs)
+          for half, plane in halves:
+            planes[plane, tile_tokens, :] = bf16_half(words, half)
+      else:
+        for buffer_index, head_offset, plane in plane_sources:
+          buffers = buffers_by_index[buffer_index]
+          head_pairs = buffers.shape[2]
+          staged_head = kv_head + head_offset
+          words = load_staged_words(
+              staged_words(buffers, slot),
+              tile_start * head_pairs + staged_head // 2,
+              block_kv_compute, head_pairs)
+          planes[plane, tile_tokens, :] = bf16_half(words, staged_head % 2)
