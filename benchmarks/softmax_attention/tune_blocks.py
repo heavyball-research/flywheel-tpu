@@ -45,7 +45,8 @@ import sys
 import time
 
 from benchmarks.common.rpa import (DEFAULT_RPA_SOURCE, RPA_V3_GIT_SHA,
-                                   load_rpa_v3, vllm_page_size)
+                                   load_rpa_v3, request_distribution,
+                                   unjitted_kernel, vllm_page_size)
 from benchmarks.common.rpa import FIELDS as RPA_FIELDS
 from benchmarks.common.splash import (DEFAULT_SPLASH_SOURCE, HEURISTIC,
                                       SPLASH_GIT_SHA, load_splash)
@@ -294,7 +295,6 @@ class Rpa:
 
     def cache_and_metadata(self, cache_shape):
         import jax.numpy as jnp
-        import numpy as np
 
         cell = self.cell
         num_pages = cell.batch * self.pages_per_seq
@@ -302,7 +302,7 @@ class Rpa:
             jnp.full((cell.batch,), cell.seq, jnp.int32),
             jnp.arange(num_pages, dtype=jnp.int32),
             jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.seq,
-            jnp.asarray(np.array([0, 0, cell.batch], np.int32)),
+            request_distribution(num_decode=0, num_seqs=cell.batch),
         )
         return (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), metadata
 
@@ -316,8 +316,7 @@ class Rpa:
             cell.head_dim, jnp.bfloat16)
         fresh, metadata = self.cache_and_metadata(cache_shape)
         block_sizes = tuple(int(config[name]) for name in RPA_FIELDS)
-        kernel = getattr(rpa.ragged_paged_attention, "__wrapped__",
-                         rpa.ragged_paged_attention)
+        kernel = unjitted_kernel(rpa)
         scale = 1.0 / math.sqrt(cell.head_dim)
 
         def run(q, k, v, cache):

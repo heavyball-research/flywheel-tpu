@@ -95,6 +95,22 @@ def vllm_page_size(max_model_len: int, max_num_seqs: int) -> int:
     return max(page_size, min_page_size)
 
 
+def unjitted_kernel(rpa):
+    """ragged_paged_attention without its own jax.jit, which donates q, k and v
+    as well as the cache; the benchmarks jit it themselves, donating only the
+    cache, so the same q, k and v serve every call."""
+    return getattr(rpa.ragged_paged_attention, "__wrapped__",
+                   rpa.ragged_paged_attention)
+
+
+def request_distribution(*, num_decode: int, num_seqs: int):
+    """RPA's (decode_end, prefill_end, mixed_end) as vLLM's TPU runner sends
+    it: the first num_decode sequences decode, every other one is mixed."""
+    import jax.numpy as jnp
+
+    return jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+
+
 def self_test():
     assert vllm_page_size(1024, 8) == 64
     assert vllm_page_size(8192, 16) == 256

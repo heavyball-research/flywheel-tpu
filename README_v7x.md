@@ -124,6 +124,56 @@ chip's tables. It writes each table whole, and refuses when the table already
 holds cells the directory has no search for. A chip `attention_block.py` has
 no table suffix for needs an entry in its `TABLE_TAGS` first.
 
+## Serving with a KV cache
+
+The tables above time `flash_attn_func`, flywheel's dense prefill. In serving,
+flywheel's vLLM backend calls `flash_attn_with_kvcache` for a prefill chunk
+that attends to cached tokens and for decode, and RPA v3 serves both from the
+same paged cache. These two scenarios compare those kernels on one v7x core,
+32 query heads, head_dim 256, bf16, with 128-token pages shuffled across
+sequences:
+
+- **chunked_prefill**: one 16K-token sequence prefilled in 1K chunks. Each
+  chunk appends its K/V and attends causally to the chunks before it and to
+  itself. The time is the whole prefill, 16 calls.
+- **decode**: every sequence holds 15K cached tokens and decodes the last 1K:
+  1024 steps of one query token per sequence.
+
+RPA v3 runs with the request distribution vLLM's TPU runner sends (mixed for
+chunked prefill, decode for decode) and its own default blocks. At 32:32 those
+run out of VMEM, so it runs `[128, 256, 128, 256]`, the one config that fit its
+sweep; a decode call compiles RPA's mixed kernel as well, so that config is set
+there too. flywheel runs its defaults, sized to the core's VMEM by
+`vmem_limit_bytes()`.
+
+Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count):
+
+| | flywheel | RPA v3 | RPA v3 faster |
+|---|---|---|---|
+| 32:4 | 13.00 (338) | 11.86 (371) | 1.10x |
+| 32:32 | 56.54 (78) | 26.02 (169) | 2.17x |
+
+Decode, 15K cached tokens then 1024 steps, ms per step (cached K/V read per
+step, TB/s):
+
+| | flywheel | RPA v3 | RPA v3 faster |
+|---|---|---|---|
+| 32:4, 256 sequences | 8.548 (1.95) | 5.148 (3.23) | 1.66x |
+| 32:4, 128 sequences | 4.282 (1.94) | 2.574 (3.23) | 1.66x |
+| 32:32, 128 sequences | 29.323 (2.27) | 22.426 (2.97) | 1.31x |
+
+32:32 at 256 sequences needs 128 GiB of cache, more than a v7x core's
+94.7 GiB of HBM. A core's HBM peak is 3.7 TB/s.
+
+Unlike the dense prefill, flywheel's KV-cache kernels are slower than RPA v3
+here.
+
+To reproduce, sequentially on a v7x VM:
+
+```bash
+benchmarks/softmax_attention/kvcache_scenarios.sh results/benchmark/kvcache_scenarios
+```
+
 ## Not on v7x yet
 
 The fused GDN and KDA kernels and `flash_attn_varlen_func` do not compile on
