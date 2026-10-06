@@ -19,10 +19,10 @@ from .block_sizes import (
   NUM_LANES,
   NUM_SUBLANES,
   PAIRED_HEAD_DIM,
-  VMEM_LIMIT_BYTES,
   TokenMajorInfo,
   pick_tile,
   round_up,
+  vmem_limit_bytes,
 )
 from .bwd_pipeline import (
   DQ_DIM_NUMBERS,
@@ -51,13 +51,14 @@ from .mask import apply_causal_kv_major
 
 # Note (david): dq_acc is the only scratch that grows with q_seq_len; capping it
 # at half the VMEM budget leaves the other half to the block-sized stage
-# buffers and the live score tiles.
-DQ_ACC_VMEM_LIMIT_BYTES = VMEM_LIMIT_BYTES // 2
+# buffers and the live score tiles. None is half of vmem_limit_bytes(); tests
+# set a byte count to force q-row chunking.
+DQ_ACC_VMEM_LIMIT_BYTES: int | None = None
 
 # Note (david): every general-kernel scratch scales with head_fold; this
 # whole-scratch cap stays below the scoped limit to leave room for the
-# pipeline's live temporaries.
-FOLD_VMEM_LIMIT_BYTES = 80 * 1024 * 1024
+# pipeline's live temporaries: 80 MiB of v6e's 100 MiB.
+FOLD_VMEM_LIMIT_FRACTION = 0.8
 
 # Note (david): the head-fold gain saturates by about 8 heads. The single-block
 # kernel halves its target past FULL_FOLD_MAX_BLOCK so the fold-scaled buffers
@@ -333,7 +334,8 @@ def flash_attn_bwd_folded(
             head_dim_qk, head_dim_v),
         scratch_shapes=scratch_shapes,
         name="flash_attn_bwd_folded",
-        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=VMEM_LIMIT_BYTES),
+        compiler_params=pltpu.CompilerParams(
+            vmem_limit_bytes=vmem_limit_bytes()),
         interpret=pltpu.InterpretParams() if interpret else False,
     )(*operands)
 
@@ -695,14 +697,16 @@ def flash_attn_bwd(
       head_fold, kv_fold, q_seq_len=q_seq_len, bq=bq, bkv=bkv,
       head_dim_qk=head_dim_qk, head_dim_v=head_dim_v, num_stages=num_stages,
       itemsize=q.dtype.itemsize)
+  dq_acc_limit = DQ_ACC_VMEM_LIMIT_BYTES or vmem_limit_bytes() // 2
+  fold_limit = int(vmem_limit_bytes() * FOLD_VMEM_LIMIT_FRACTION)
   # Note (david): the general kernel keeps the whole group's dq in VMEM, so a
   # build past that gate runs as q-row chunks that each fit. Chunks are
   # equalized rather than filled to the gate, so a full-mask build compiles one
   # kernel, not two.
-  chunk_blocks = DQ_ACC_VMEM_LIMIT_BYTES // (dq_acc_bytes // num_q_blocks)
+  chunk_blocks = dq_acc_limit // (dq_acc_bytes // num_q_blocks)
   should_chunk = (
       (head_fold == 1 or is_gqa or is_lane_paired)
-      and dq_acc_bytes > DQ_ACC_VMEM_LIMIT_BYTES and chunk_blocks > 0)
+      and dq_acc_bytes > dq_acc_limit and chunk_blocks > 0)
   is_single_block_fold = head_fold > 1 and not (is_gqa or is_lane_paired)
 
   def _lse_log2_and_delta():
@@ -783,17 +787,17 @@ def flash_attn_bwd(
     if num_heads % head_fold:
       raise ValueError(
           f"head_fold {head_fold} must divide num_heads {num_heads}.")
-    if head_fold > 1 and scratch_bytes > FOLD_VMEM_LIMIT_BYTES:
+    if head_fold > 1 and scratch_bytes > fold_limit:
       raise ValueError(
           f"head_fold {head_fold} needs ~{scratch_bytes} bytes of scratch VMEM"
           f" at block {bq}, block_kv {bkv}, num_stages {num_stages}, above the"
-          f" {FOLD_VMEM_LIMIT_BYTES} byte limit; use a smaller head_fold or"
+          f" {fold_limit} byte limit; use a smaller head_fold or"
           " smaller blocks.")
-    if dq_acc_bytes > DQ_ACC_VMEM_LIMIT_BYTES:
+    if dq_acc_bytes > dq_acc_limit:
       raise ValueError(
           f"dq accumulator needs seq_len {q_seq_len} * head_fold {head_fold} *"
           f" head_dim {head_dim_qk} * 4 = {dq_acc_bytes} bytes of VMEM, above"
-          f" the {DQ_ACC_VMEM_LIMIT_BYTES} byte limit and not one q block's dq"
+          f" the {dq_acc_limit} byte limit and not one q block's dq"
           f" fits; lower block {bq}, or shard the sequence across chips.")
     lse_log2, delta = _lse_log2_and_delta()
     # Note (david): the general kernel runs unfolded for MHA, one kv head's q
