@@ -52,7 +52,7 @@ BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 256, 128)
 # 2.2x). Long chunks favor many rows against small per-head KV fragments,
 # short suffixes few rows against large pair-packed ones. Entries are
 # (rows, block_kv, block_kv_compute, kv_heads_per_fragment), rows descending.
-def default_tilings() -> tuple[TilingSpec, ...]:
+def default_tilings(query_heads_per_kv_head: int) -> tuple[TilingSpec, ...]:
   """The tilings resolve_tilings starts from, for the core's VMEM."""
   if vmem_limit_bytes() >= MAX_VMEM_LIMIT_BYTES:
     return (
@@ -62,16 +62,20 @@ def default_tilings() -> tuple[TilingSpec, ...]:
         (8, 1024, 1024, 2),
     )
   # On a core with less VMEM than v6e's, every tiling's K/V staging is a block
-  # of every head whatever its rows, so the four above squeeze each other: on
-  # v7x, with 32 heads of 256, a 16K prefill in 1K chunks ran out of VMEM at
-  # 32:4 and took 93.4 ms at 32:32 on one-page blocks. This one tiling takes
-  # 13.0 ms at 32:4 and 56.5 ms at 32:32, where the limit shrinks it to 256-key
-  # blocks. A request's last chunk runs it padded.
-  # TODO: tune across shapes. This is the fastest of a sweep of single tilings
-  # at one point: 32 query heads of 256, 4 and 32 KV heads, a 1K chunk at 8K
-  # context, 128-token pages. Other head dims, KV-head counts, chunk sizes and
-  # short requests are untested.
-  return ((128, 1024, 512, 1),)
+  # of every head whatever its rows, so the four above squeeze each other down
+  # to one-page blocks or out of VMEM. One tiling per build instead; a
+  # request's last chunk runs it padded. A score fragment holds rows times the
+  # KV head's query heads, so groups of 4 or more query heads take fewer rows
+  # and longer key blocks. 1K chunk at 8K context, 32 query heads of 256, on
+  # v7x, ms: 4 KV heads 0.595 (128, 1024, 1024); 8 KV heads 0.734; 32 KV heads
+  # 1.962 (256, 256, 256); 16 KV heads 1.248, where (256, 512, 256) took 1.047
+  # but sits near the VMEM limit, which the estimate undercounts by about
+  # 12 MiB at 256 rows.
+  # TODO: tune across head dims, chunk sizes and short requests, and close the
+  # VMEM estimate gap.
+  if query_heads_per_kv_head >= 4:
+    return ((128, 1024, 1024, 1),)
+  return ((256, 256, 256, 1),)
 
 
 def extend_kernel(
@@ -96,6 +100,10 @@ def extend_kernel(
     page_size: int,
     pages_per_seq: int,
     is_merged_cache: bool,
+    # A merged cache's K heads and V heads are staged as separate head blocks,
+    # each copied once, instead of whole token rows copied into both the K and
+    # the V buffer.
+    is_split_staging: bool,
     q_rows: int,
     lse_width: int,
 ) -> None:
@@ -119,12 +127,16 @@ def extend_kernel(
           0, num_scratch_per_tiling * num_tilings, num_scratch_per_tiling
       )
   ]
-  (sems,) = remaining_refs[num_scratch_per_tiling * num_tilings:]
+  guard_smem, sems = remaining_refs[num_scratch_per_tiling * num_tilings:]
+  guard_detect_bound = math.exp2(guard_threshold)
 
   num_active = num_active_ref[0]
   max_chunk = tilings[0][0]
   query_heads_per_kv_head = num_query_heads // num_kv_heads
-  staged_heads = 2 * num_kv_heads if is_merged_cache else num_kv_heads
+  staged_heads = (
+      2 * num_kv_heads
+      if is_merged_cache and not is_split_staging else num_kv_heads
+  )
 
   def _cache_tile(ref, page, num_tokens):
     if is_cache_head_major:
@@ -167,12 +179,19 @@ def extend_kernel(
             jnp.clip(load_size - page * page_size, 0, page_size), NUM_SUBLANES
         )
         physical_page = block_table_ref[table_base + page]
-        for cache_ref, buffers, sem_index in (
+        for part, (cache_ref, buffers, sem_index) in enumerate((
             (k_cache_ref, k_buffers, SEM_K),
             (v_cache_ref, v_buffers, SEM_V),
-        ):
+        )):
+          if is_split_staging:
+            source = cache_ref.at[
+                physical_page, pl.ds(0, num_tokens),
+                pl.ds(part * num_kv_heads, num_kv_heads), :,
+            ]
+          else:
+            source = _cache_tile(cache_ref, physical_page, num_tokens)
           pltpu.make_async_copy(
-              _cache_tile(cache_ref, physical_page, num_tokens),
+              source,
               _buffer_tile(
                   tiling, buffers, slot, page * page_size, num_tokens
               ),
@@ -393,7 +412,7 @@ def extend_kernel(
       def _kv_fragment(buffers, slot, head_group, kv_compute_index, kv_part):
         staged_head = (
             head_group + kv_part * num_kv_heads
-            if is_merged_cache else head_group
+            if is_merged_cache and not is_split_staging else head_group
         )
         return load_kv_fragment(
             buffers, slot, staged_head, kv_compute_index, kv_part,
@@ -454,7 +473,15 @@ def extend_kernel(
 
         _wait_kv(tiling, total_len, block_index, slot)
         _zero_value_tail(tiling, total_len, block_index, slot)
+        _block_pipeline(block_index, slot, fixed_anchor=True)
 
+      def _block_pipeline(block_index, slot, fixed_anchor):
+        # One block's masks, scores, softmax and PV, shared by its two
+        # callers: _attend_block with fixed_anchor=True, and the replay after
+        # the pass with False. fixed_anchor is the dense kernel's softmax: each
+        # row keeps the max of its first fragment as its anchor, so no fragment
+        # rescales the row sum or the accumulator; a pass whose row sums end
+        # past the overflow bound replays with the rescaling update.
         def _parity_mask():
           # Note (david): a pair-packed tile interleaves its two heads per
           # token, so each query head masks the off-parity columns. Full-shape
@@ -517,13 +544,24 @@ def extend_kernel(
           else:
             row_max_prev, row_sum_prev = row_max_carry, row_sum_carry
             is_first = False
-          probabilities, row_max, row_sum, rescale = static_anchor_update(
-              scores,
-              row_max_prev,
-              row_sum_prev,
-              is_first=is_first,
-              guard_threshold=guard_threshold,
-          )
+          if fixed_anchor:
+            row_max = jnp.where(
+                is_first, scores.max(axis=-1, keepdims=True), row_max_prev
+            )
+            probabilities = jnp.exp2(scores - row_max)
+            fragment_sum = probabilities.sum(axis=-1, keepdims=True)
+            row_sum = jnp.where(
+                is_first, fragment_sum, row_sum_prev + fragment_sum
+            )
+            rescale = None
+          else:
+            probabilities, row_max, row_sum, rescale = static_anchor_update(
+                scores,
+                row_max_prev,
+                row_sum_prev,
+                is_first=is_first,
+                guard_threshold=guard_threshold,
+            )
           if kv_compute_index == num_kv_compute_fragments - 1:
             # Note (david): one 128-lane state tile per row; lane 0 holds
             # row_max and the other lanes row_sum (read back from lane 1).
@@ -550,10 +588,13 @@ def extend_kernel(
               value,
               preferred_element_type=jnp.float32,
           ).reshape(group_heads, rows, head_dim)
-          rescaled = (
-              accumulator_ref[head_slice, :, :].astype(jnp.float32) * rescale
-              + weighted_values
+          accumulated_prev = accumulator_ref[head_slice, :, :].astype(
+              jnp.float32
           )
+          if rescale is None:
+            rescaled = accumulated_prev + weighted_values
+          else:
+            rescaled = accumulated_prev * rescale + weighted_values
           if kv_compute_index == 0:
             # Note (david): the accumulator is not cleared between passes, so
             # a pass's first fragment overwrites it instead of rescaling stale
@@ -561,7 +602,7 @@ def extend_kernel(
             accumulated = jnp.where(is_first, weighted_values, rescaled)
           else:
             accumulated = rescaled
-          accumulator_ref[head_slice, :, :] = accumulated.astype(q_ref.dtype)
+          accumulator_ref[head_slice, :, :] = accumulated
 
         def _run_pipeline(valid_masks):
           # Note (david): software pipeline; each fragment's scores are issued
@@ -616,6 +657,28 @@ def extend_kernel(
           _run_pipeline(_build_masks())
 
       lax.fori_loop(0, pass_blocks, _attend_block, None)
+
+      # A row sum bounds each of its probabilities, and once a score
+      # overflows the sum stays inf or NaN, so one check after the pass finds
+      # any row whose scores rose too far above its anchor. The replay stages
+      # each block synchronously in the slot the next pass's prefetch does not
+      # hold (the one this pass's last block used).
+      row_sums = row_state_ref[:, :, 1:2]
+      guard_smem[0] = jnp.any(
+          jnp.logical_not(row_sums <= guard_detect_bound)
+      ).astype(jnp.int32)
+
+      @pl.when(jnp.logical_and(pass_blocks > 0, guard_smem[0] > 0))
+      def _replay_with_rescaling():
+        replay_slot = lax.rem(kv_slot + pass_blocks + 1, num_kv_stages)
+
+        def _replay_block(block_index, _):
+          _start_kv(tiling, sequence, total_len, block_index, replay_slot)
+          _wait_kv(tiling, total_len, block_index, replay_slot)
+          _zero_value_tail(tiling, total_len, block_index, replay_slot)
+          _block_pipeline(block_index, replay_slot, fixed_anchor=False)
+
+        lax.fori_loop(0, pass_blocks, _replay_block, None)
 
       # Note (david): the previous pass's output DMA (possibly from another
       # tiling's stage) must land before this pass's write starts; with HBM
@@ -796,11 +859,11 @@ def estimate_vmem_bytes(
   Tracks what Mosaic reported for rejected v6e builds to within ~1%.
   """
   query_heads_per_kv_head = num_query_heads // num_kv_heads
-  # Note (david): per query head and row, four bf16 head_dim buffers
-  # (token-major q load and output stage, head-major q and accumulator) and a
-  # 128-lane f32 row state.
+  # Per query head and row: three bf16 head_dim buffers (token-major q load and
+  # output stage, head-major q), the f32 accumulator and a 128-lane f32 row
+  # state.
   row_buffer_bytes = num_query_heads * (
-      4 * head_dim * BF16_BYTES + NUM_LANES * F32_BYTES
+      3 * head_dim * BF16_BYTES + head_dim * F32_BYTES + NUM_LANES * F32_BYTES
   )
   if return_lse:
     bytes_per_row = row_buffer_bytes + lse_width * F32_BYTES
@@ -841,11 +904,11 @@ def resolve_tilings(
 ) -> tuple[TilingSpec, ...]:
   """Default static tilings for one build.
 
-  Each of default_tilings() is fit to the cache (whole-page blocks dividing the
-  capacity) and capped at the 8-aligned token count; a tiling whose rows no
-  longer fall below the previous one's is dropped. Blocks then shrink, from the
-  last tiling back, and finally the first tiling's rows, until the build fits
-  the scoped VMEM budget.
+  Each of default_tilings() is fit to the cache (whole-page blocks dividing
+  the capacity) and capped at the 8-aligned token count; a tiling whose rows
+  no longer fall below the previous one's is dropped. Blocks then shrink, from
+  the last tiling back, and finally the first tiling's rows, until the build
+  fits the scoped VMEM budget.
   """
   q_rows = round_up(total_rows, NUM_SUBLANES)
 
@@ -860,7 +923,7 @@ def resolve_tilings(
 
   tilings = []
   for rows, block_kv, block_kv_compute, kv_heads_per_fragment in (
-      default_tilings()
+      default_tilings(num_query_heads // num_kv_heads)
   ):
     fitted_block_kv = _fit_block(block_kv)
     fitted_block_kv_compute = next(
@@ -996,8 +1059,19 @@ def flash_attn_kvcache_extend_pallas(
   is_bitcast_load = not interpret and not is_cache_head_major
   lse_width = round_up(num_query_heads, NUM_LANES)
   q_rows = round_up(total_rows, NUM_SUBLANES)
-  # Note (david): every merged-cache load stages both K and V head blocks.
-  staged_heads = 2 * num_kv_heads if merged_cache else round_up(num_kv_heads, 2)
+  # A merged cache stages its K heads and V heads as separate head blocks, as
+  # decode reads them, when a head block is tile-aligned (the KV head counts
+  # decode supports); otherwise each of the K and V buffers stages whole token
+  # rows, K and V both, so every row is copied twice.
+  is_split_staging = merged_cache and (
+      num_kv_heads in (2, 4) or num_kv_heads % 8 == 0
+  )
+  if is_split_staging:
+    staged_heads = num_kv_heads
+  elif merged_cache:
+    staged_heads = 2 * num_kv_heads
+  else:
+    staged_heads = round_up(num_kv_heads, 2)
   if tilings is None:
     tiling_specs = resolve_tilings(
         total_rows, num_query_heads=num_query_heads,
@@ -1080,11 +1154,12 @@ def flash_attn_kvcache_extend_pallas(
         pltpu.VMEM((rows, num_query_heads, head_dim), q.dtype),
         pltpu.VMEM((rows, num_query_heads, head_dim), q.dtype),
         pltpu.VMEM((num_query_heads, rows, head_dim), q.dtype),
-        pltpu.VMEM((num_query_heads, rows, head_dim), q.dtype),
+        pltpu.VMEM((num_query_heads, rows, head_dim), jnp.float32),
         pltpu.VMEM((num_query_heads, rows, NUM_LANES), jnp.float32),
     ]
     if return_lse:
       scratch_shapes.append(pltpu.VMEM((rows, lse_width), jnp.float32))
+  scratch_shapes.append(pltpu.SMEM((1,), jnp.int32))
   scratch_shapes.append(
       pltpu.SemaphoreType.DMA((NUM_SEMS, NUM_KV_STAGES, len(tiling_specs)))
   )
@@ -1113,6 +1188,7 @@ def flash_attn_kvcache_extend_pallas(
       page_size=page_size,
       pages_per_seq=pages_per_seq,
       is_merged_cache=merged_cache,
+      is_split_staging=is_split_staging,
       q_rows=q_rows,
       lse_width=lse_width,
   )

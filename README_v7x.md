@@ -146,27 +146,28 @@ sweep; a decode call compiles RPA's mixed kernel as well, so that config is set
 there too. flywheel runs its defaults, sized to the core's VMEM by
 `vmem_limit_bytes()`.
 
-Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count):
+Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count),
+and our speedup over RPA v3:
 
-| | flywheel | RPA v3 | RPA v3 faster |
+| | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4 | 13.00 (338) | 11.86 (371) | 1.10x |
-| 32:32 | 56.54 (78) | 26.02 (169) | 2.17x |
+| 32:4 | 11.86 (371) | 8.61 (511) | 1.38x |
+| 32:32 | 26.02 (169) | 29.96 (147) | 0.87x |
 
 Decode, 15K cached tokens then 1024 steps, ms per step (cached K/V read per
 step, TB/s):
 
-| | flywheel | RPA v3 | RPA v3 faster |
+| | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4, 256 sequences | 8.548 (1.95) | 5.148 (3.23) | 1.66x |
-| 32:4, 128 sequences | 4.282 (1.94) | 2.574 (3.23) | 1.66x |
-| 32:32, 128 sequences | 29.323 (2.27) | 22.426 (2.97) | 1.31x |
+| 32:4, 256 sequences | 5.148 (3.23) | 5.219 (3.19) | 0.99x |
+| 32:4, 128 sequences | 2.574 (3.23) | 2.607 (3.19) | 0.99x |
+| 32:32, 128 sequences | 22.426 (2.97) | 29.324 (2.27) | 0.76x |
 
 32:32 at 256 sequences needs 128 GiB of cache, more than a v7x core's
 94.7 GiB of HBM. A core's HBM peak is 3.7 TB/s.
 
-Unlike the dense prefill, flywheel's KV-cache kernels are slower than RPA v3
-here.
+flywheel leads on chunked prefill at 32:4 and matches RPA v3 on decode at
+32:4; at 32:32 RPA v3 is ahead in both scenarios.
 
 To reproduce, sequentially on a v7x VM:
 

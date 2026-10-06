@@ -451,6 +451,28 @@ def test_ragged_cache_prefill_gqa_regression(layout):
   assert_extend_matches(actual, expected, case[5], case[6], 1)
 
 
+@pytest.mark.parametrize("layout", ["pair", "merged"])
+def test_extend_replays_when_later_block_raises_anchor(layout):
+  # The cached keys jump from 0 to 32 at position 1024, so the later blocks'
+  # scores sit hundreds of log2 units above the anchor the first block set: the
+  # fixed-anchor pass must notice and replay with the rescaling update instead
+  # of overflowing. Only out is checked: Q is scaled in bf16, a relative error
+  # that at an lse near 370 exceeds the lse tolerance.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(64,), prefixes=(2048,), heads=4, kv_heads=2, capacity=4096,
+      padding=0)
+  late_pages = table[0, 1024 // kc.shape[1]:]
+  kc = jnp.zeros_like(kc).at[late_pages].set(32.0)
+  vc = jnp.ones_like(vc).at[late_pages].set(3.0)
+  q, k, v = jnp.ones_like(q), jnp.full_like(k, 32.0), jnp.full_like(v, 3.0)
+  case = (q, kc, vc, k, v, cu, lengths, table)
+  if layout == "pair":
+    case = contiguous_case(*case)
+  expected = ragged_reference(*case, causal=True)
+  actual = run_extend(*case, layout=layout, return_lse=False, causal=True)
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
 @pytest.mark.skipif(INTERPRET,
                     reason="requires TPU optimized buffer assignment")
 @pytest.mark.parametrize("layout", ["pair", "merged"])
