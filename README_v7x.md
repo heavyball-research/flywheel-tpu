@@ -151,17 +151,17 @@ and our speedup over RPA v3:
 
 | | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4 | 11.86 (371) | 8.61 (511) | 1.38x |
-| 32:32 | 26.02 (169) | 29.96 (147) | 0.87x |
+| 32:4 | 11.86 (371) | 8.96 (491) | 1.32x |
+| 32:32 | 26.02 (169) | 30.07 (146) | 0.87x |
 
 Decode, 15K cached tokens then 1024 steps, ms per step (cached K/V read per
 step, TB/s):
 
 | | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4, 256 sequences | 5.148 (3.23) | 5.219 (3.19) | 0.99x |
-| 32:4, 128 sequences | 2.574 (3.23) | 2.607 (3.19) | 0.99x |
-| 32:32, 128 sequences | 22.426 (2.97) | 29.324 (2.27) | 0.76x |
+| 32:4, 256 sequences | 5.148 (3.23) | 5.217 (3.19) | 0.99x |
+| 32:4, 128 sequences | 2.574 (3.23) | 2.606 (3.19) | 0.99x |
+| 32:32, 128 sequences | 22.426 (2.97) | 29.317 (2.27) | 0.76x |
 
 32:32 at 256 sequences needs 128 GiB of cache, more than a v7x core's
 94.7 GiB of HBM. A core's HBM peak is 3.7 TB/s.

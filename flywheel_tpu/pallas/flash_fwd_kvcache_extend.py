@@ -43,6 +43,7 @@ NUM_KV_STAGES = 2
 # Note (david): the wrapper allocates and the kernel unpacks these per tiling
 # in one order: K and V staging, token-major q load and output stage,
 # head-major q, accumulator and row state, then the LSE stage when returned.
+# A merged cache has one staging buffer, whole K/V rows, in place of the two.
 NUM_TILING_SCRATCH = 7
 BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 256, 128)
 # Note (david): each request runs one monomorphic chunk loop per tiling whose
@@ -66,15 +67,15 @@ def default_tilings(query_heads_per_kv_head: int) -> tuple[TilingSpec, ...]:
   # to one-page blocks or out of VMEM. One tiling per build instead; a
   # request's last chunk runs it padded. A score fragment holds rows times the
   # KV head's query heads, so groups of 4 or more query heads take fewer rows
-  # and longer key blocks. 1K chunk at 8K context, 32 query heads of 256, on
-  # v7x, ms: 4 KV heads 0.595 (128, 1024, 1024); 8 KV heads 0.734; 32 KV heads
-  # 1.962 (256, 256, 256); 16 KV heads 1.248, where (256, 512, 256) took 1.047
-  # but sits near the VMEM limit, which the estimate undercounts by about
-  # 12 MiB at 256 rows.
+  # and longer key blocks. 1K chunk at 8K context, 32 query heads of 256, a
+  # merged cache, on v7x, ms: 4 KV heads 0.619 (128, 1024, 512); 8 KV heads
+  # 0.888; 32 KV heads 1.978 (256, 256, 256); 16 KV heads 1.357, where
+  # (256, 512, 256) took 1.193 but sits near the VMEM limit, which the estimate
+  # undercounts by about 12 MiB at 256 rows.
   # TODO: tune across head dims, chunk sizes and short requests, and close the
   # VMEM estimate gap.
   if query_heads_per_kv_head >= 4:
-    return ((128, 1024, 1024, 1),)
+    return ((128, 1024, 512, 1),)
   return ((256, 256, 256, 1),)
 
 
@@ -100,10 +101,6 @@ def extend_kernel(
     page_size: int,
     pages_per_seq: int,
     is_merged_cache: bool,
-    # A merged cache's K heads and V heads are staged as separate head blocks,
-    # each copied once, instead of whole token rows copied into both the K and
-    # the V buffer.
-    is_split_staging: bool,
     q_rows: int,
     lse_width: int,
 ) -> None:
@@ -112,16 +109,23 @@ def extend_kernel(
     # Note (david): merged caches stage whole K/V head rows to preserve the
     # serving-step cache layout, then select each part's heads in VMEM.
     k_cache_ref = v_cache_ref = remaining_refs.pop(0)
+    # Each row is staged once: K and V loads read the same buffer.
+    staging_parts = ((k_cache_ref, 0, SEM_K),)
   else:
     k_cache_ref, v_cache_ref = remaining_refs.pop(0), remaining_refs.pop(0)
+    staging_parts = ((k_cache_ref, 0, SEM_K), (v_cache_ref, 1, SEM_V))
   out_ref = remaining_refs.pop(0)
   lse_ref = remaining_refs.pop(0) if return_lse else None
   boundary_out_ref = remaining_refs.pop(0)
   boundary_lse_ref = remaining_refs.pop(0) if return_lse else None
   num_tilings = len(tilings)
-  num_scratch_per_tiling = NUM_TILING_SCRATCH + int(return_lse)
+  num_scratch_per_tiling = (
+      NUM_TILING_SCRATCH + int(return_lse) - int(is_merged_cache)
+  )
   tiling_scratch = [
-      tuple(remaining_refs[first_ref:first_ref + num_scratch_per_tiling])
+      # The merged cache's one staging buffer serves as both K and V staging.
+      (remaining_refs[first_ref],) * int(is_merged_cache)
+      + tuple(remaining_refs[first_ref:first_ref + num_scratch_per_tiling])
       + (() if return_lse else (None,))
       for first_ref in range(
           0, num_scratch_per_tiling * num_tilings, num_scratch_per_tiling
@@ -133,10 +137,7 @@ def extend_kernel(
   num_active = num_active_ref[0]
   max_chunk = tilings[0][0]
   query_heads_per_kv_head = num_query_heads // num_kv_heads
-  staged_heads = (
-      2 * num_kv_heads
-      if is_merged_cache and not is_split_staging else num_kv_heads
-  )
+  staged_heads = 2 * num_kv_heads if is_merged_cache else num_kv_heads
 
   def _cache_tile(ref, page, num_tokens):
     if is_cache_head_major:
@@ -179,21 +180,12 @@ def extend_kernel(
             jnp.clip(load_size - page * page_size, 0, page_size), NUM_SUBLANES
         )
         physical_page = block_table_ref[table_base + page]
-        for part, (cache_ref, buffers, sem_index) in enumerate((
-            (k_cache_ref, k_buffers, SEM_K),
-            (v_cache_ref, v_buffers, SEM_V),
-        )):
-          if is_split_staging:
-            source = cache_ref.at[
-                physical_page, pl.ds(0, num_tokens),
-                pl.ds(part * num_kv_heads, num_kv_heads), :,
-            ]
-          else:
-            source = _cache_tile(cache_ref, physical_page, num_tokens)
+        for cache_ref, part, sem_index in staging_parts:
           pltpu.make_async_copy(
-              source,
+              _cache_tile(cache_ref, physical_page, num_tokens),
               _buffer_tile(
-                  tiling, buffers, slot, page * page_size, num_tokens
+                  tiling, (k_buffers, v_buffers)[part], slot,
+                  page * page_size, num_tokens,
               ),
               sems.at[sem_index, slot, tiling],
           ).start()
@@ -207,8 +199,10 @@ def extend_kernel(
     # only the size matters.
     @pl.when(load_size > 0)
     def _wait():
-      for buffers, sem_index in ((k_buffers, SEM_K), (v_buffers, SEM_V)):
-        tile = _buffer_tile(tiling, buffers, slot, 0, load_size)
+      for _, part, sem_index in staging_parts:
+        tile = _buffer_tile(
+            tiling, (k_buffers, v_buffers)[part], slot, 0, load_size
+        )
         pltpu.make_async_copy(
             tile, tile, sems.at[sem_index, slot, tiling]
         ).wait()
@@ -412,7 +406,7 @@ def extend_kernel(
       def _kv_fragment(buffers, slot, head_group, kv_compute_index, kv_part):
         staged_head = (
             head_group + kv_part * num_kv_heads
-            if is_merged_cache and not is_split_staging else head_group
+            if is_merged_cache else head_group
         )
         return load_kv_fragment(
             buffers, slot, staged_head, kv_compute_index, kv_part,
@@ -850,6 +844,7 @@ def estimate_vmem_bytes(
     num_query_heads: int,
     num_kv_heads: int,
     staged_heads: int,
+    num_staging_buffers: int,
     head_dim: int,
     return_lse: bool,
     lse_width: int,
@@ -873,7 +868,7 @@ def estimate_vmem_bytes(
   temporary_bytes = 0
   for rows, block_kv, block_kv_compute, kv_heads_per_fragment in tilings:
     total_bytes += (
-        2 * NUM_KV_STAGES * block_kv * staged_heads
+        num_staging_buffers * NUM_KV_STAGES * block_kv * staged_heads
         * head_dim * BF16_BYTES
     )
     total_bytes += rows * bytes_per_row
@@ -895,6 +890,7 @@ def resolve_tilings(
     num_query_heads: int,
     num_kv_heads: int,
     staged_heads: int,
+    num_staging_buffers: int,
     head_dim: int,
     capacity: int,
     page_size: int,
@@ -942,8 +938,8 @@ def resolve_tilings(
 
   while estimate_vmem_bytes(
       tilings, num_query_heads=num_query_heads, num_kv_heads=num_kv_heads,
-      staged_heads=staged_heads, head_dim=head_dim, return_lse=return_lse,
-      lse_width=lse_width,
+      staged_heads=staged_heads, num_staging_buffers=num_staging_buffers,
+      head_dim=head_dim, return_lse=return_lse, lse_width=lse_width,
   ) > vmem_limit_bytes():
     shrinkable = [
         index for index, (_, block_kv, _, _) in enumerate(tilings)
@@ -1059,23 +1055,15 @@ def flash_attn_kvcache_extend_pallas(
   is_bitcast_load = not interpret and not is_cache_head_major
   lse_width = round_up(num_query_heads, NUM_LANES)
   q_rows = round_up(total_rows, NUM_SUBLANES)
-  # A merged cache stages its K heads and V heads as separate head blocks, as
-  # decode reads them, when a head block is tile-aligned (the KV head counts
-  # decode supports); otherwise each of the K and V buffers stages whole token
-  # rows, K and V both, so every row is copied twice.
-  is_split_staging = merged_cache and (
-      num_kv_heads in (2, 4) or num_kv_heads % 8 == 0
-  )
-  if is_split_staging:
-    staged_heads = num_kv_heads
-  elif merged_cache:
-    staged_heads = 2 * num_kv_heads
-  else:
-    staged_heads = round_up(num_kv_heads, 2)
+  # A merged cache stages whole token rows, K heads then V heads, once, in a
+  # single buffer; a K/V pair stages each part in its own.
+  staged_heads = 2 * num_kv_heads if merged_cache else round_up(num_kv_heads, 2)
+  num_staging_buffers = 1 if merged_cache else 2
   if tilings is None:
     tiling_specs = resolve_tilings(
         total_rows, num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads, staged_heads=staged_heads,
+        num_staging_buffers=num_staging_buffers,
         head_dim=head_dim, capacity=capacity,
         page_size=page_size,
         is_pair_packed=is_bitcast_load and not merged_cache,
@@ -1149,8 +1137,10 @@ def flash_attn_kvcache_extend_pallas(
     )
   for rows, block_kv, _, _ in tiling_specs:
     scratch_shapes += [
-        pltpu.VMEM(_staging_shape(block_kv), k_cache.dtype),
-        pltpu.VMEM(_staging_shape(block_kv), k_cache.dtype),
+        pltpu.VMEM(_staging_shape(block_kv), k_cache.dtype)
+        for _ in range(num_staging_buffers)
+    ]
+    scratch_shapes += [
         pltpu.VMEM((rows, num_query_heads, head_dim), q.dtype),
         pltpu.VMEM((rows, num_query_heads, head_dim), q.dtype),
         pltpu.VMEM((num_query_heads, rows, head_dim), q.dtype),
@@ -1188,7 +1178,6 @@ def flash_attn_kvcache_extend_pallas(
       page_size=page_size,
       pages_per_seq=pages_per_seq,
       is_merged_cache=merged_cache,
-      is_split_staging=is_split_staging,
       q_rows=q_rows,
       lse_width=lse_width,
   )
