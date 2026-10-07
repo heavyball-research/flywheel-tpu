@@ -321,11 +321,11 @@ def attn_with_vjp(
 
 
 def forward_only_attn(
-    kernel: functools.partial,
+    kernel: Callable[..., jax.Array | tuple[jax.Array, jax.Array]],
     reason: str,
     q: jax.Array,
     k: jax.Array,
-    v: jax.Array,
+    v: jax.Array | None,
     kernel_args: tuple[jax.Array, ...],
     rotary: tuple[jax.Array, jax.Array | None] | None,
     rotary_interleaved: bool,
@@ -978,8 +978,8 @@ def paged_varlen_attn(
   )
   # Note (david): K and V share the one merged cache operand k.
   return forward_only_attn(
-      lambda q, kv_cache, unused_v, *args, **kwargs: kernel(
-          q, kv_cache, *args, **kwargs),
+      lambda q, kv_cache, unused_v, *kernel_args, **rotary_kwargs: kernel(
+          q, kv_cache, *kernel_args, **rotary_kwargs),
       "flash_attn_varlen_func", q, k, None,
       (cu_seqlens_q, seqused_k, block_table), rotary, rotary_interleaved)
 
@@ -1097,110 +1097,110 @@ def flash_attn_varlen_func(
         "seqused_k and num_active describe a paged KV cache and need"
         " block_table; packed K/V takes cu_seqlens_k."
     )
-
-  expected_rank = 2 if token_major else 3
-  nheads, nheads_k, head_dim_qk, head_dim_v = parse_qkv(
-      q, k, v, head_dim, token_major, expected_rank, "htd")
-  if token_major:
-    token_axis = TOKEN_MAJOR_PACKED_AXIS
   else:
-    token_axis = HEAD_MAJOR_PACKED_AXIS
-  total_q, total_k = q.shape[token_axis], k.shape[token_axis]
+    expected_rank = 2 if token_major else 3
+    nheads, nheads_k, head_dim_qk, head_dim_v = parse_qkv(
+        q, k, v, head_dim, token_major, expected_rank, "htd")
+    if token_major:
+      token_axis = TOKEN_MAJOR_PACKED_AXIS
+    else:
+      token_axis = HEAD_MAJOR_PACKED_AXIS
+    total_q, total_k = q.shape[token_axis], k.shape[token_axis]
 
-  cu_seqlens_q = jnp.asarray(cu_seqlens_q)
-  cu_seqlens_k = jnp.asarray(cu_seqlens_k)
-  if cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape:
-    raise ValueError(
-        f"cu_seqlens_q and cu_seqlens_k must be equal-shaped 1-D arrays;"
-        f" got {cu_seqlens_q.shape=}, {cu_seqlens_k.shape=}."
-    )
-  for arg_name, seqlen_bound in (("max_seqlen_q", max_seqlen_q),
-                                 ("max_seqlen_k", max_seqlen_k)):
-    if isinstance(seqlen_bound, jax.core.Tracer):
-      # Note (david): a non-concrete bound is a ValueError in the public
-      # contract, not a TypeError.
+    cu_seqlens_q = jnp.asarray(cu_seqlens_q)
+    cu_seqlens_k = jnp.asarray(cu_seqlens_k)
+    if cu_seqlens_q.ndim != 1 or cu_seqlens_q.shape != cu_seqlens_k.shape:
       raise ValueError(
-          f"{arg_name} must be a concrete int (it picks the kernel's block"
-          " sizes); pass a static bucket bound, not a traced value."
+          f"cu_seqlens_q and cu_seqlens_k must be equal-shaped 1-D arrays;"
+          f" got {cu_seqlens_q.shape=}, {cu_seqlens_k.shape=}."
       )
-    if int(seqlen_bound) <= 0:
-      raise ValueError(f"{arg_name} must be positive; got {seqlen_bound}.")
+    for arg_name, seqlen_bound in (("max_seqlen_q", max_seqlen_q),
+                                   ("max_seqlen_k", max_seqlen_k)):
+      if isinstance(seqlen_bound, jax.core.Tracer):
+        # Note (david): a non-concrete bound is a ValueError in the public
+        # contract, not a TypeError.
+        raise ValueError(
+            f"{arg_name} must be a concrete int (it picks the kernel's block"
+            " sizes); pass a static bucket bound, not a traced value."
+        )
+      if int(seqlen_bound) <= 0:
+        raise ValueError(f"{arg_name} must be positive; got {seqlen_bound}.")
 
-  rotary = prepare_rotary(
-      rotary_cos, rotary_sin, head_dim=head_dim_qk, dtype=q.dtype,
-      rotate_k=rotary_k, seqlen_q=total_q, seqlen_k=total_k,
-      interleaved=rotary_interleaved, cu_q=cu_seqlens_q, cu_k=cu_seqlens_k,
-      max_seqlen_k=max_seqlen_k)
+    rotary = prepare_rotary(
+        rotary_cos, rotary_sin, head_dim=head_dim_qk, dtype=q.dtype,
+        rotate_k=rotary_k, seqlen_q=total_q, seqlen_k=total_k,
+        interleaved=rotary_interleaved, cu_q=cu_seqlens_q, cu_k=cu_seqlens_k,
+        max_seqlen_k=max_seqlen_k)
 
-  # Note (david): cu_seqlens needs no adjustment for the padding, because rows
-  # past cu_seqlens_q[-1] own no q block and the kernel writes them as zeros.
-  if blocks_override is None:
-    padded_total_q = pad_seqlen(total_q)
-    padded_total_k = pad_seqlen(total_k)
-  else:
-    padded_total_q = round_up(total_q, blocks_override[0])
-    padded_total_k = round_up(total_k, blocks_override[1])
-  num_pad_q = padded_total_q - total_q
-  num_pad_kv = padded_total_k - total_k
-  q = pad_axis(q, token_axis, num_pad_q)
-  k, v = (pad_axis(operand, token_axis, num_pad_kv) for operand in (k, v))
-  if rotary is None:
-    rotary_coeffs = None
-  else:
-    q_coeff, k_coeff = rotary
-    rotary_coeffs = (
-        pad_axis(q_coeff, ROTARY_TOKEN_AXIS, num_pad_q),
-        None if k_coeff is None
-        else pad_axis(k_coeff, ROTARY_TOKEN_AXIS, num_pad_kv),
+    # Note (david): cu_seqlens needs no adjustment for the padding, because rows
+    # past cu_seqlens_q[-1] own no q block and the kernel writes them as zeros.
+    if blocks_override is None:
+      padded_total_q = pad_seqlen(total_q)
+      padded_total_k = pad_seqlen(total_k)
+    else:
+      padded_total_q = round_up(total_q, blocks_override[0])
+      padded_total_k = round_up(total_k, blocks_override[1])
+    num_pad_q = padded_total_q - total_q
+    num_pad_kv = padded_total_k - total_k
+    q = pad_axis(q, token_axis, num_pad_q)
+    k, v = (pad_axis(operand, token_axis, num_pad_kv) for operand in (k, v))
+    if rotary is None:
+      rotary_coeffs = None
+    else:
+      q_coeff, k_coeff = rotary
+      rotary_coeffs = (
+          pad_axis(q_coeff, ROTARY_TOKEN_AXIS, num_pad_q),
+          None if k_coeff is None
+          else pad_axis(k_coeff, ROTARY_TOKEN_AXIS, num_pad_kv),
+      )
+
+    softmax_scale = (
+        1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
     )
-
-  softmax_scale = (
-      1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
-  )
-  # Note (david): the max_seqlen bounds only cap the block sizes but ride in
-  # the kernel cache key, so power-of-two buckets keep a wobbling longest
-  # sequence on one compiled kernel.
-  max_seqlen_k_bucket = min(padded_total_k, next_pow2(max_seqlen_k))
-  max_seqlen_q_bucket = min(padded_total_q, next_pow2(max_seqlen_q))
-  # Note (david): causal_offset stays 0 because packed causal and window
-  # masking is per-sequence bottom-right, derived from the cu_seqlens pair in
-  # the kernel.
-  build_kernel = functools.partial(
-      get_kernel,
-      num_heads=nheads,
-      num_kv_heads=nheads_k,
-      seqlen_q=padded_total_q,
-      seqlen_kv=padded_total_k,
-      causal=bool(causal),
-      window_size=window_size,
-      interpret=bool(interpret),
-      softcap=float(softcap),
-      head_dim=head_dim_qk,
-      head_dim_v=head_dim_v,
-      causal_offset=0,
-      varlen_max_seqlen_kv=max_seqlen_k_bucket,
-      varlen_max_seqlen_q=max_seqlen_q_bucket,
-      token_major=bool(token_major),
-      q_scale=float(fused_q_scale(softmax_scale, softcap)),
-      blocks_override=blocks_override,
-  )
-  # Note (david): varlen has no backward kernel, so every path, lse included,
-  # is forward-only and jax.grad names it instead of failing in the tracer.
-  kernel_output = forward_only_attn(
-      build_kernel(return_lse=bool(return_softmax_lse)),
-      "flash_attn_varlen_func", q, k, v,
-      (cu_seqlens_q, cu_seqlens_k), rotary_coeffs, rotary_interleaved)
-  if return_softmax_lse:
-    out, kernel_lse = kernel_output
-  else:
-    out = kernel_output
-  out = jax.lax.slice_in_dim(out, 0, total_q, axis=token_axis)
-  if return_softmax_lse:
-    # Note (david): the kernel emits lse as (nheads, padded_total_q) in both
-    # layouts.
-    return out, kernel_lse[:, :total_q]
-  else:
-    return out
+    # Note (david): the max_seqlen bounds only cap the block sizes but ride in
+    # the kernel cache key, so power-of-two buckets keep a wobbling longest
+    # sequence on one compiled kernel.
+    max_seqlen_k_bucket = min(padded_total_k, next_pow2(max_seqlen_k))
+    max_seqlen_q_bucket = min(padded_total_q, next_pow2(max_seqlen_q))
+    # Note (david): causal_offset stays 0 because packed causal and window
+    # masking is per-sequence bottom-right, derived from the cu_seqlens pair in
+    # the kernel.
+    build_kernel = functools.partial(
+        get_kernel,
+        num_heads=nheads,
+        num_kv_heads=nheads_k,
+        seqlen_q=padded_total_q,
+        seqlen_kv=padded_total_k,
+        causal=bool(causal),
+        window_size=window_size,
+        interpret=bool(interpret),
+        softcap=float(softcap),
+        head_dim=head_dim_qk,
+        head_dim_v=head_dim_v,
+        causal_offset=0,
+        varlen_max_seqlen_kv=max_seqlen_k_bucket,
+        varlen_max_seqlen_q=max_seqlen_q_bucket,
+        token_major=bool(token_major),
+        q_scale=float(fused_q_scale(softmax_scale, softcap)),
+        blocks_override=blocks_override,
+    )
+    # Note (david): varlen has no backward kernel, so every path, lse included,
+    # is forward-only and jax.grad names it instead of failing in the tracer.
+    kernel_output = forward_only_attn(
+        build_kernel(return_lse=bool(return_softmax_lse)),
+        "flash_attn_varlen_func", q, k, v,
+        (cu_seqlens_q, cu_seqlens_k), rotary_coeffs, rotary_interleaved)
+    if return_softmax_lse:
+      out, kernel_lse = kernel_output
+    else:
+      out = kernel_output
+    out = jax.lax.slice_in_dim(out, 0, total_q, axis=token_axis)
+    if return_softmax_lse:
+      # Note (david): the kernel emits lse as (nheads, padded_total_q) in both
+      # layouts.
+      return out, kernel_lse[:, :total_q]
+    else:
+      return out
 
 
 @functools.partial(
@@ -1385,13 +1385,13 @@ def flash_attn_with_kvcache(
         "Only bfloat16 is supported on TPU (v0); got"
         f" {tuple(str(operand.dtype) for operand in bf16_operands)}."
     )
-  if has_new:
-    expected_new_shape = (*q.shape[:-2], nheads_k, head_dim)
-    if k.shape != expected_new_shape or v.shape != expected_new_shape:
-      raise ValueError(
-          f"k and v must be {expected_new_shape} (matching q's token layout);"
-          f" got {k.shape=}, {v.shape=}."
-      )
+  expected_new_shape = (*q.shape[:-2], nheads_k, head_dim)
+  if has_new and (k.shape != expected_new_shape
+                  or v.shape != expected_new_shape):
+    raise ValueError(
+        f"k and v must be {expected_new_shape} (matching q's token layout);"
+        f" got {k.shape=}, {v.shape=}."
+    )
 
   cache_seqlens = jnp.asarray(cache_seqlens, jnp.int32)
   if cache_seqlens.ndim == 0:

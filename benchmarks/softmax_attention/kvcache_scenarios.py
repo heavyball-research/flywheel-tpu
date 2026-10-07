@@ -193,7 +193,8 @@ def build_flywheel(cell, inputs, args):
     from flywheel_tpu import flash_attn_with_kvcache
 
     calls, block_table, starts = inputs
-    # The merged cache: each kv head's K row, then its V row.
+    # Note (david): 2 * heads_k rows per token because the merged cache
+    # interleaves each kv head's K row and V row.
     shape = (cell.num_seqs * block_table.shape[1], cell.page_size,
              2 * cell.heads_k, cell.head_dim)
 

@@ -139,12 +139,14 @@ def run_extend(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
                num_active=None, **kwargs):
   """flash_attn_with_kvcache's packed call on the merged pool; returns (out,
   lse or None, updated_k, updated_v), the updated pool split back."""
-  *result, cache = flash_attn_with_kvcache(
+  *attention_outputs, kv_cache = flash_attn_with_kvcache(
       q, interleave(kc, vc), None, k, v, block_table=table,
       cache_seqlens=lengths, cu_seqlens_q=cu,
       num_active=None if num_active is None else jnp.int32(num_active),
       return_softmax_lse=return_lse, interpret=INTERPRET, **kwargs)
-  return (result[0], result[1] if return_lse else None, *deinterleave(cache))
+  return (attention_outputs[0],
+          attention_outputs[1] if return_lse else None,
+          *deinterleave(kv_cache))
 
 
 def run_paged(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
@@ -163,18 +165,20 @@ def run_paged(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
         jnp.full((1,), active, jnp.int32), page_size=kc.shape[1],
         pages_per_seq=table.shape[1], interpret=INTERPRET)
     seqused = lengths + jnp.diff(cu)
-  if max_seqlen_q is None:
-    max_seqlen_q = max(
-        1, int(np.diff(np.asarray(cu))[:active].max(initial=0)))
-  if max_seqlen_k is None:
-    max_seqlen_k = max(1, int(np.asarray(seqused)[:active].max(initial=0)))
-  result = flash_attn_varlen_func(
+  max_seqlen_q = (
+      max(1, int(np.diff(np.asarray(cu))[:active].max(initial=0)))
+      if max_seqlen_q is None else max_seqlen_q)
+  max_seqlen_k = (
+      max(1, int(np.asarray(seqused)[:active].max(initial=0)))
+      if max_seqlen_k is None else max_seqlen_k)
+  attention_outputs = flash_attn_varlen_func(
       q.transpose(1, 0, 2), kv_cache, None, cu, None, max_seqlen_q,
       max_seqlen_k, return_softmax_lse=return_lse, interpret=INTERPRET,
       block_table=table, seqused_k=seqused,
       num_active=None if num_active is None else jnp.int32(num_active),
       **kwargs)
-  out, lse = result if return_lse else (result, None)
+  out, lse = (attention_outputs if return_lse
+              else (attention_outputs, None))
   return out.transpose(1, 0, 2), lse, *deinterleave(kv_cache)
 
 
@@ -185,10 +189,12 @@ def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
   the caches match exactly; lse is None when the call did not return it."""
   out, lse, updated_k, updated_v = actual
   cu, lengths = np.asarray(cu), np.asarray(lengths)
-  real = int(cu[num_active])
-  checked = np.arange(int(cu[0]), real)
+  packed_q_end = int(cu[num_active])
+  owned_rows = np.arange(int(cu[0]), packed_q_end)
   if skip_unseen_rows:
-    checked = checked[np.isfinite(expected[1][0, checked])]
+    checked = owned_rows[np.isfinite(expected[1][0, owned_rows])]
+  else:
+    checked = owned_rows
   out = np.asarray(out, np.float32)
   mismatched = ~np.isclose(
       out[checked], expected[0][checked], **OUT_TOL).all(axis=(1, 2))
@@ -198,7 +204,7 @@ def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
     lse = np.asarray(lse)
     mismatched |= ~np.isclose(
         lse[:, checked], expected[1][:, checked], **LSE_TOL).all(axis=0)
-    padding_lse = lse[:, real:]
+    padding_lse = lse[:, packed_q_end:]
   rows = checked[mismatched]
   seqs = np.searchsorted(cu, rows, side="right") - 1
   first_mismatches = [(int(row), int(seq), int(row - cu[seq]),
@@ -207,7 +213,8 @@ def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
   assert not rows.size, (
       f"{rows.size}/{checked.size} checked rows differ; first (row, request,"
       f" offset, position): {first_mismatches}")
-  np.testing.assert_array_equal(out[real:], 0, err_msg="packed padding out")
+  np.testing.assert_array_equal(out[packed_q_end:], 0,
+                                err_msg="packed padding out")
   np.testing.assert_array_equal(padding_lse, -np.inf,
                                 err_msg="packed padding lse")
   np.testing.assert_array_equal(np.asarray(updated_k, np.float32), expected[2])
@@ -277,16 +284,16 @@ def test_ragged_cache_multiple_query_blocks_and_pages(head_dim, heads,
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
-@pytest.mark.parametrize("heads,kv_heads,dim", [
+@pytest.mark.parametrize("heads,kv_heads,head_dim", [
     (16, 16, 128), (24, 4, 256), (32, 16, 128), (6, 3, 128), (8, 1, 128),
     (8, 2, 256)])
-def test_ragged_cache_head_tiles(heads, kv_heads, dim):
+def test_ragged_cache_head_tiles(heads, kv_heads, head_dim):
   # Note (david): every group stages its kv head's (K, V) row pair, a 2-row
   # window of the interleaved head axis at any kv head, so any KV head count
   # works, odd ones and one included.
   case = random_ragged_case(lengths=(3, 5), prefixes=(37, 128), heads=heads,
-                            kv_heads=kv_heads, head_dim=dim, capacity=256,
-                            padding=0)
+                            kv_heads=kv_heads, head_dim=head_dim,
+                            capacity=256, padding=0)
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
@@ -367,20 +374,21 @@ def test_ragged_metadata_reuses_one_executable():
   compiled = jax.jit(paged_attn).lower(
       q.transpose(1, 0, 2), kv_pages, cu, lengths, table,
       jnp.int32(3)).compile()
-  for boundaries, active, lens, pages in (
+  for boundaries, active, lens, block_table in (
       (cu, 3, lengths, table),
       (jnp.array([0, 1, 6, 8], jnp.int32), 2,
        jnp.array([0, 127, -100], jnp.int32), table[::-1]),
   ):
     kc, vc = deinterleave(kv_pages)
-    expected = ragged_reference(q, kc, vc, k, v, boundaries, lens, pages,
-                                causal=True, num_active=active)
+    expected = ragged_reference(q, kc, vc, k, v, boundaries, lens,
+                                block_table, causal=True, num_active=active)
     kv_pages = append_ragged(
-        kv_pages, k, v, boundaries, lens, pages.reshape(-1),
+        kv_pages, k, v, boundaries, lens, block_table.reshape(-1),
         jnp.full((1,), active, jnp.int32), page_size=kv_pages.shape[1],
-        pages_per_seq=pages.shape[1], interpret=INTERPRET)
+        pages_per_seq=block_table.shape[1], interpret=INTERPRET)
     out = compiled(q.transpose(1, 0, 2), kv_pages, boundaries,
-                   lens + jnp.diff(boundaries), pages, jnp.int32(active))
+                   lens + jnp.diff(boundaries), block_table,
+                   jnp.int32(active))
     assert_extend_matches(
         (out.transpose(1, 0, 2), None, *deinterleave(kv_pages)),
         expected, boundaries, lens, active)
@@ -477,11 +485,11 @@ def test_ragged_cache_prefill_gqa_regression():
 
 
 def test_multitoken_replays_when_later_block_raises_anchor():
-  # The cached keys jump from 0 to 32 at position 1024, so the later blocks'
-  # scores sit hundreds of log2 units above the anchor the first block set: the
-  # fixed-anchor pass must notice and replay with the rescaling update instead
-  # of overflowing. Only out is checked: Q is scaled in bf16, a relative error
-  # that at an lse near 370 exceeds the lse tolerance.
+  # Note (david): the cached keys jump from 0 to 32 at position 1024, so the
+  # later blocks' scores sit hundreds of log2 units above the anchor the first
+  # block set: the fixed-anchor pass must notice and replay with the rescaling
+  # update instead of overflowing. Only out is checked: Q is scaled in bf16, a
+  # relative error that at an lse near 370 exceeds the lse tolerance.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
       lengths=(64,), prefixes=(2048,), heads=4, kv_heads=2, capacity=4096,
       padding=0)
@@ -537,16 +545,16 @@ def test_ragged_cache_has_no_pool_sized_temporary():
 ])
 def test_paged_varlen_rejects_unsupported_calls(case, error, message):
   # Note (david): each case changes one knob of an otherwise valid paged call.
-  heads, kv_heads, total, head_dim = 4, 2, 8, 128
-  q = jnp.zeros((heads, total, head_dim), jnp.bfloat16)
-  cu = jnp.array([0, 3, total], jnp.int32)
+  heads, kv_heads, total_q, head_dim = 4, 2, 8, 128
+  q = jnp.zeros((heads, total_q, head_dim), jnp.bfloat16)
+  cu = jnp.array([0, 3, total_q], jnp.int32)
   operands = [q, jnp.zeros((2, 128, 2 * kv_heads, head_dim), jnp.bfloat16),
               None, cu, None]
   kwargs = dict(causal=True, interpret=INTERPRET,
                 block_table=jnp.array([[0], [1]], jnp.int32),
                 seqused_k=jnp.array([5, 9], jnp.int32))
   if case == "seqused_k_without_block_table":
-    packed_kv = jnp.zeros((kv_heads, total, head_dim), jnp.bfloat16)
+    packed_kv = jnp.zeros((kv_heads, total_q, head_dim), jnp.bfloat16)
     operands[1:] = [packed_kv, packed_kv, cu, cu]
     kwargs["block_table"] = None
   elif case == "block_table_without_seqused_k":
@@ -554,7 +562,7 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
   elif case == "cu_seqlens_k_with_block_table":
     operands[4] = cu
   elif case == "token_major":
-    operands[0] = q.transpose(1, 0, 2).reshape(total, heads * head_dim)
+    operands[0] = q.transpose(1, 0, 2).reshape(total_q, heads * head_dim)
     kwargs.update(token_major=True, head_dim=head_dim)
   elif case == "rotary_k":
     rope_table = jnp.ones((128, head_dim // 2), jnp.float32)
@@ -564,7 +572,7 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
   elif case == "softcap":
     kwargs["softcap"] = 5.0
   elif case == "cu_seqlens_q_start":
-    operands[3] = jnp.array([2, 3, total], jnp.int32)
+    operands[3] = jnp.array([2, 3, total_q], jnp.int32)
   elif case == "num_active_past_batch":
     kwargs["num_active"] = 3
   elif case == "num_active_jax_negative":
@@ -581,7 +589,7 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
   else:
     operands[:2] = [operand[..., :64] for operand in operands[:2]]
   with pytest.raises(error, match=message):
-    flash_attn_varlen_func(*operands, total, 128, **kwargs)
+    flash_attn_varlen_func(*operands, total_q, 128, **kwargs)
 
 
 def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, head_dim=128,
@@ -669,10 +677,9 @@ def test_paged_tiles_minimize_prefix_streams_within_vmem(
   # budget, so the q block grows to the bucket (at most 2048 rows) and the
   # prefix is streamed once per q block; the kv block takes the most pages
   # within the 2048 x 1024 block area, so a 2048-row q block streams 1024-token
-  # kv blocks. A 384-row bucket takes one 256-row
-  # block fewer than three 128-row ones; a 640-token bucket (a five-page
-  # table row) is one five-page block, whose kv compute tile is 128, the
-  # largest one dividing it.
+  # kv blocks. A 384-row bucket takes one 256-row block fewer than three
+  # 128-row ones; a 640-token bucket (a five-page table row) is one five-page
+  # block, whose kv compute tile is 128, the largest one dividing it.
   blocks = paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket,
                        head_dim=head_dim)
   assert (blocks.block_q, blocks.block_kv) == expected
@@ -755,10 +762,12 @@ def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
   cache_seqlens[:active] = prefixes
   cu = np.zeros(batch + 1, np.int64)
   cu[1:active + 1] = np.cumsum(lengths)
-  cu[active + 1:] = cu[active]
-  total_q = int(cu[active]) + padding
   if tail_owned:
-    cu[active + 1:] += np.sort(rng.integers(0, padding + 1, batch - active))
+    cu[active + 1:] = cu[active] + np.sort(
+        rng.integers(0, padding + 1, batch - active))
+  else:
+    cu[active + 1:] = cu[active]
+  total_q = int(cu[active]) + padding
 
   def unit(shape):
     directions = rng.normal(size=shape)

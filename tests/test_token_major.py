@@ -203,30 +203,33 @@ def test_tm_varlen_padding_rows_are_zero(headdim, head_fold):
     # Note (david): token-major fills the padding past cu[-1] through lane
     # windows of each fold group, not head rows; it must read out = 0 and
     # lse = -inf as in head-major, with NaN queries in the pad.
-    total, nheads, max_seqlen, real = 256, 4, 128, 150
+    num_tokens, nheads, max_seqlen, packed_q_end = 256, 4, 128, 150
     keys = jax.random.split(jax.random.PRNGKey(46), 3)
-    q, k, v = (jax.random.normal(key, (total, nheads, headdim), jnp.bfloat16)
-               for key in keys)
-    q = q.at[real:].set(jnp.nan)
-    cu = jnp.array([0, 100, real], jnp.int32)
-    common = dict(
+    q, k, v = (
+        jax.random.normal(key, (num_tokens, nheads, headdim), jnp.bfloat16)
+        for key in keys)
+    q = q.at[packed_q_end:].set(jnp.nan)
+    cu = jnp.array([0, 100, packed_q_end], jnp.int32)
+    shared_kwargs = dict(
         causal=True, head_fold=head_fold, return_lse=True,
         interpret=INTERPRET, varlen_max_seqlen_kv=max_seqlen,
-        block_sizes=default_block_sizes(total, total, max_seqlen))
+        block_sizes=default_block_sizes(num_tokens, num_tokens, max_seqlen))
     head_major = make_flash_attn_mha(
-        nheads, total, total, num_kv_heads=nheads, **common)
+        nheads, num_tokens, num_tokens, num_kv_heads=nheads, **shared_kwargs)
     token_major = make_flash_attn_mha(
-        nheads, total, total, num_kv_heads=nheads,
-        token_major=token_major_info(None, nheads, nheads, headdim), **common)
+        nheads, num_tokens, num_tokens, num_kv_heads=nheads,
+        token_major=token_major_info(None, nheads, nheads, headdim),
+        **shared_kwargs)
     out_hm, lse_hm = head_major(
-        *(x.transpose(1, 0, 2) for x in (q, k, v)), cu, cu)
-    out_tm, lse_tm = token_major(*(x.reshape(total, -1) for x in (q, k, v)),
-                                 cu, cu)
-    assert jnp.array_equal(out_tm.reshape(total, nheads, headdim),
+        *(operand.transpose(1, 0, 2) for operand in (q, k, v)), cu, cu)
+    out_tm, lse_tm = token_major(
+        *(operand.reshape(num_tokens, -1) for operand in (q, k, v)), cu, cu)
+    assert jnp.array_equal(out_tm.reshape(num_tokens, nheads, headdim),
                            out_hm.transpose(1, 0, 2))
     assert jnp.array_equal(lse_tm, lse_hm)
-    assert jnp.array_equal(out_tm[real:], jnp.zeros_like(out_tm[real:]))
-    assert jnp.all(lse_tm[:, real:] == -jnp.inf)
+    assert jnp.array_equal(out_tm[packed_q_end:],
+                           jnp.zeros_like(out_tm[packed_q_end:]))
+    assert jnp.all(lse_tm[:, packed_q_end:] == -jnp.inf)
 
 
 @pytest.mark.parametrize("causal", [False, True])

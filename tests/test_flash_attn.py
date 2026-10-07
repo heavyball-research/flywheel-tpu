@@ -499,9 +499,10 @@ def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
     out, lse = flash_attn_varlen_func(
         q, k, v, cu, cu, max_seqlen, max_seqlen, causal=causal,
         return_softmax_lse=True, interpret=INTERPRET)
-    real = int(cu[-1])
-    assert jnp.array_equal(out[real:], jnp.zeros_like(out[real:]))
-    assert jnp.all(lse[:, real:] == -jnp.inf)
+    packed_q_end = int(cu[-1])
+    assert jnp.array_equal(out[packed_q_end:],
+                           jnp.zeros_like(out[packed_q_end:]))
+    assert jnp.all(lse[:, packed_q_end:] == -jnp.inf)
     for index, segment in enumerate(segments):
         rows = slice(int(cu[index]), int(cu[index + 1]))
         assert_close_to_reference(out[rows][None], *segment, causal=causal)

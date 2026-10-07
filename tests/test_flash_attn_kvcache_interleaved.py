@@ -9,7 +9,6 @@ from flywheel_tpu import flash_attn_with_kvcache
 from tests.test_flash_attn_kvcache import (
     INTERPRET,
     decode_reference,
-    decode_with_cache_copies,
     gather_pages,
     interleave_kv,
     random_paged_decode_inputs,
@@ -17,14 +16,6 @@ from tests.test_flash_attn_kvcache import (
 
 BATCH = 6
 PAGE_SIZE = 128
-
-
-def ragged_lengths(capacity):
-  # Note (david): a mid-page row, a page boundary, an empty row, the last
-  # slot, a block-crossing row and a long row.
-  return jnp.array(
-      [37, PAGE_SIZE, 0, capacity - 1, capacity // 2 + 3, capacity * 3 // 4],
-      jnp.int32)
 
 
 def assert_matches_reference(out, lse, q, k_cache, v_cache, total_seqlens,
@@ -51,7 +42,11 @@ def run_interleaved_decode(num_query_heads, num_kv_heads, head_dim, capacity,
   q, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
       seed, BATCH, capacity, PAGE_SIZE, num_query_heads, num_kv_heads,
       head_dim)
-  cache_seqlens = ragged_lengths(capacity)
+  # Note (david): a mid-page row, a page boundary, an empty row, the last
+  # slot, a block-crossing row and a long row.
+  cache_seqlens = jnp.array(
+      [37, PAGE_SIZE, 0, capacity - 1, capacity // 2 + 3, capacity * 3 // 4],
+      jnp.int32)
   active = BATCH if num_active is None else num_active
   rows = jnp.arange(active, dtype=jnp.int32)
   if append:
@@ -125,33 +120,6 @@ def test_interleaved_decode_matches_reference(
   np.testing.assert_array_equal(updated, expected_pool)
   assert_matches_reference(out, lse, q, expected_k, expected_v, total_seqlens,
                            rows)
-
-
-@pytest.mark.parametrize(
-    ("num_query_heads", "num_kv_heads", "head_dim"),
-    [(32, 8, 128), (16, 4, 256), (32, 4, 256), (32, 32, 128), (8, 1, 256)],
-)
-def test_interleaved_decode_matches_contiguous_pair(
-    num_query_heads, num_kv_heads, head_dim):
-  # Note (david): the contiguous K/V pair decodes the same keys and values
-  # through its own staging, which may score two heads per MXU pass where the
-  # interleaved build scores one, so out and lse match to a bf16 ulp.
-  capacity = 512
-  (out, lse, _, _, q, expected_k, expected_v, _, _) = run_interleaved_decode(
-      num_query_heads, num_kv_heads, head_dim, capacity, True, True, seed=5)
-  q_pair, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
-      5, BATCH, capacity, PAGE_SIZE, num_query_heads, num_kv_heads, head_dim)
-  out_pair, lse_pair, updated_k, updated_v = decode_with_cache_copies(
-      q_pair, gather_pages(k_pages, block_table),
-      gather_pages(v_pages, block_table), k, v,
-      cache_seqlens=ragged_lengths(capacity), return_softmax_lse=True,
-      interpret=INTERPRET)
-  np.testing.assert_array_equal(updated_k, expected_k)
-  np.testing.assert_array_equal(updated_v, expected_v)
-  np.testing.assert_allclose(out.astype(jnp.float32),
-                             out_pair.astype(jnp.float32), rtol=2e-2,
-                             atol=2e-3)
-  np.testing.assert_allclose(lse, lse_pair, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.parametrize(

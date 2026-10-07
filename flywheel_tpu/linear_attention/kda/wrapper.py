@@ -483,23 +483,24 @@ def outer_kernel(
             # Note (david): the window's head rows belong to the previous tile,
             # whose stage is still resident since only its outbound DMA reads
             # it. Both windows sit on the SUBLANE_ALIGN grid, so the previous
-            # stage holds them from row prev_row, a multiple of 8 that may sit
-            # mid stage tile, and the previous window always covers row
-            # window_base + delta - 1. Both stage tiles are read whole and the
-            # previous one's half is picked in f32, where 8 rows are one whole
-            # (8, 128) tile.
+            # stage holds them from row prev_stage_row, a multiple of 8 that
+            # may sit mid stage tile, and the previous window always covers
+            # row window_base + delta - 1. Both stage tiles are read whole and
+            # the previous one's half is picked in f32, where 8 rows are one
+            # whole (8, 128) tile.
             @pl.when(delta > 0)
             def _blend_head_rows():
-                prev_row = window_base - prev_window_base
+                prev_stage_row = window_base - prev_window_base
                 prev_slab_start = pl.multiple_of(
-                    prev_row - (prev_row & (stage_tile - 1)), stage_tile)
+                    prev_stage_row - (prev_stage_row & (stage_tile - 1)),
+                    stage_tile)
                 prev_slab = out_buf.at[other_slot][
                     pl.ds(prev_slab_start, stage_tile)].astype(jnp.float32)
                 own_slab = stage_ref[pl.ds(0, stage_tile)].astype(jnp.float32)
                 head_rows = lax.broadcasted_iota(
                     jnp.int32, (align, cfg.v_dim_size), 0)
                 prev_head = jnp.where(
-                    head_rows + (prev_row - prev_slab_start) < align,
+                    head_rows + (prev_stage_row - prev_slab_start) < align,
                     prev_slab[:align], prev_slab[align:])
                 own_head = jnp.where(head_rows < delta, prev_head,
                                      own_slab[:align])

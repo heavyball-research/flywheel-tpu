@@ -16,15 +16,13 @@ INTERPRET = jax.default_backend() != "tpu"
 def random_bits(rng, shape):
   """(device bf16 array, its uint16 bits on the host): every sign, exponent
   and mantissa pattern except NaNs and subnormals, which become +-inf and
-  +-0.
-
-  Note (david): on TPU any bf16 XLA op may canonicalize NaN payloads and
-  flush subnormals, including the relayout copy XLA inserts for a (T, 1, D)
-  operand at one kv head, so those patterns would test XLA, not the writer.
-  """
+  +-0."""
   bits = rng.integers(0, 2**16, shape, dtype=np.uint16)
   exponent = (bits >> 7) & 0xFF
   special = ((exponent == 0) | (exponent == 0xFF)) & ((bits & 0x7F) != 0)
+  # Note (david): on TPU any bf16 XLA op may canonicalize NaN payloads and
+  # flush subnormals, including the relayout copy XLA inserts for a (T, 1, D)
+  # operand at one kv head, so those patterns would test XLA, not the writer.
   bits[special] &= np.uint16(0xFF80)
   return (jax.lax.bitcast_convert_type(jnp.asarray(bits), jnp.bfloat16),
           bits)
@@ -60,22 +58,22 @@ def test_write_kv_cache_pages_matches_scatter(num_kv_heads, head_dim,
       len(lengths), pages_per_seq)
   num_pages = table.size
   slices = write_slices(lengths, prefixes, table, page_size)
-  total = sum(lengths)
-  k, k_bits = random_bits(rng, (total + 3, num_kv_heads, head_dim))
+  num_new_tokens = sum(lengths)
+  k, k_bits = random_bits(rng, (num_new_tokens + 3, num_kv_heads, head_dim))
   v, v_bits = random_bits(rng, k.shape)
   cache, expected = random_bits(
       rng, (num_pages, page_size, 2 * num_kv_heads, head_dim))
   expected = expected.copy()
-  flat = expected.reshape(num_pages * page_size, num_kv_heads, 2, head_dim)
+  expected_rows = expected.reshape(
+      num_pages * page_size, num_kv_heads, 2, head_dim)
   for cache_row, new_row, length in slices.T:
-    rows = slice(new_row, new_row + length)
-    flat[cache_row:cache_row + length, :, 0] = k_bits[rows]
-    flat[cache_row:cache_row + length, :, 1] = v_bits[rows]
-  padded = np.pad(slices, ((0, 0), (0, 5)))
+    new_rows = slice(new_row, new_row + length)
+    expected_rows[cache_row:cache_row + length, :, 0] = k_bits[new_rows]
+    expected_rows[cache_row:cache_row + length, :, 1] = v_bits[new_rows]
+  padded_slices = np.pad(slices, ((0, 0), (0, 5)))
   updated = write_kv_cache_pages(
-      k, v, cache, jnp.asarray(padded), jnp.asarray([slices.shape[1]],
-                                                    jnp.int32),
-      interpret=INTERPRET)
+      k, v, cache, jnp.asarray(padded_slices),
+      jnp.asarray([slices.shape[1]], jnp.int32), interpret=INTERPRET)
   np.testing.assert_array_equal(np.asarray(updated).view(np.uint16), expected)
 
 

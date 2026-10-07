@@ -80,22 +80,6 @@ def flash_fwd_varlen_paged_kernel(
            **body)
 
 
-def paged_kv_info(
-    *,
-    num_kv_heads: int,
-    page_size: int,
-    pages_per_seq: int,
-    interpret: bool,
-) -> PagedKVInfo:
-  """Staging layout of one paged build; interpret=False gives the TPU one."""
-  return PagedKVInfo(
-      num_kv_heads=num_kv_heads,
-      page_size=page_size,
-      pages_per_seq=pages_per_seq,
-      is_bitcast_load=not interpret,
-  )
-
-
 def vmem_buffer_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
   """Bytes of one VMEM scratch buffer under Mosaic's v6 memref tiling.
 
@@ -128,27 +112,30 @@ def paged_scratch_shapes(
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
-  shapes = [
+  if rotary_dtype is None:
+    rotary_shapes = []
+  else:
+    # Note (david): prepare_rotary's one batch plane is shared by every head,
+    # so one Q coefficient group is staged.
+    rotary_shapes = [
+        ((num_stages, 1, 2, bq, head_dim // 2), jnp.dtype(rotary_dtype))]
+  if return_lse:
+    lse_shapes = [((num_stages, bq, NUM_LANES), f32)]
+  else:
+    lse_shapes = []
+  return [
       ((num_stages, bq, head_dim), bf16),
       ((num_stages, bkv, 1, 2, head_dim), bf16),
       ((2, bkv, head_dim), bf16),
       ((1, 2, bkv), jnp.dtype(jnp.int32)),
-  ]
-  if rotary_dtype is not None:
-    # Note (david): prepare_rotary's one batch plane is shared by every head,
-    # so one Q coefficient group is staged.
-    shapes.append((
-        (num_stages, 1, 2, bq, head_dim // 2), jnp.dtype(rotary_dtype)))
-  shapes += [
+      *rotary_shapes,
       ((num_stages, bq, head_dim), bf16),
       ((bq, NUM_LANES), f32),
       ((2, bq, NUM_LANES), f32),
       ((2, bq, head_dim), f32),
       ((bq, NUM_LANES), f32),
+      *lse_shapes,
   ]
-  if return_lse:
-    shapes.append(((num_stages, bq, NUM_LANES), f32))
-  return shapes
 
 
 def estimate_vmem_bytes(
@@ -224,7 +211,8 @@ def resolve_paged_tiles(
       if estimate <= vmem_limit_bytes()
   ]
   if not fitting:
-    blocks, estimate = min(estimates.items(), key=lambda item: item[1])
+    blocks, estimate = min(
+        estimates.items(), key=lambda blocks_and_bytes: blocks_and_bytes[1])
     raise ValueError(
         "paged attention does not fit the scoped VMEM budget of"
         f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
@@ -319,19 +307,19 @@ def flash_attn_varlen_paged(
   pages_per_seq = block_table.shape[1]
   capacity = pages_per_seq * page_size
 
-  if block_sizes is not None:
-    if block_sizes.block_kv % page_size:
-      raise ValueError(
-          f"block_kv={block_sizes.block_kv} must be whole pages of"
-          f" page_size={page_size}.")
-    if (block_sizes.block_q % block_sizes.block_q_compute
-        or block_sizes.block_q // block_sizes.block_q_compute
-        < MIN_Q_TILES_PER_BLOCK):
-      raise ValueError(
-          "the static-anchor softmax needs block_q to hold >= 2 whole q"
-          f" compute tiles; got block_q={block_sizes.block_q},"
-          f" block_q_compute={block_sizes.block_q_compute}."
-      )
+  if block_sizes is not None and block_sizes.block_kv % page_size:
+    raise ValueError(
+        f"block_kv={block_sizes.block_kv} must be whole pages of"
+        f" page_size={page_size}.")
+  if block_sizes is not None and (
+      block_sizes.block_q % block_sizes.block_q_compute
+      or block_sizes.block_q // block_sizes.block_q_compute
+      < MIN_Q_TILES_PER_BLOCK):
+    raise ValueError(
+        "the static-anchor softmax needs block_q to hold >= 2 whole q"
+        f" compute tiles; got block_q={block_sizes.block_q},"
+        f" block_q_compute={block_sizes.block_q_compute}."
+    )
   if rotary is None:
     rotary_dtype = None
   else:
@@ -361,17 +349,17 @@ def flash_attn_varlen_paged(
         f" {capacity} tokens in {bkv}-token blocks need {num_kv_keys} staging"
         " keys, past int32."
     )
-  paged = paged_kv_info(
+  paged = PagedKVInfo(
       num_kv_heads=num_kv_heads, page_size=page_size,
-      pages_per_seq=pages_per_seq, interpret=interpret)
+      pages_per_seq=pages_per_seq, is_bitcast_load=not interpret)
 
   padded_total_q = round_up(total_q, bq)
   num_pad_q = padded_total_q - total_q
-  q_in = jnp.pad(q, ((0, 0), (0, num_pad_q), (0, 0)))
+  padded_q = jnp.pad(q, ((0, 0), (0, num_pad_q), (0, 0)))
   if rotary is None:
-    rotary_in = None
+    padded_rotary = None
   else:
-    rotary_in = (
+    padded_rotary = (
         jnp.pad(rotary[0], ((0, 0), (0, 0), (0, num_pad_q), (0, 0))), None)
 
   cu_q = cu_seqlens_q.astype(jnp.int32)
@@ -388,7 +376,7 @@ def flash_attn_varlen_paged(
       q_heads_per_kv_head=num_q_heads // num_kv_heads,
   )
   outputs = forward_common(
-      kernel, smem_operands, q_in, kv_cache, None,
+      kernel, smem_operands, padded_q, kv_cache, None,
       block_sizes=block_sizes,
       num_kv_heads=num_kv_heads,
       head_fold=PAGED_HEAD_FOLD,
@@ -398,7 +386,7 @@ def flash_attn_varlen_paged(
       interpret=interpret,
       token_major=None,
       is_per_seq=True,
-      rotary=rotary_in,
+      rotary=padded_rotary,
       rotary_interleaved=rotary_interleaved,
       paged=paged,
       guard_threshold=overflow_guard_threshold(capacity),

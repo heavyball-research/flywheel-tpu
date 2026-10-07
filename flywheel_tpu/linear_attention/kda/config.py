@@ -26,11 +26,11 @@ from jax.experimental.pallas import tpu as pltpu
 # axis of the native [batch, dim] layout is that tiled dimension.
 SUBLANE_ALIGN = 8
 
-# Note (david): VMEM is a different grid. Mosaic gives a bf16 scratch ref whose
-# row count is a multiple of 16 the large (16, 128) tiling (v7x does; v6e may
-# keep (8, 128)), and a dynamic vector load or store must start on that tile.
-# The bf16 output stage is therefore read and written in whole 16-row tiles,
-# which is legal under either tiling; the HBM DMAs stay on SUBLANE_ALIGN.
+# Note (david): Mosaic tiles a bf16 VMEM scratch ref whose row count is a
+# multiple of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic
+# vector load or store must start on that tile. The bf16 output stage is
+# therefore read and written in whole 16-row tiles, which is legal under either
+# tiling; the HBM DMAs stay on SUBLANE_ALIGN.
 STAGE_TILE_ROWS = 16
 
 NUM_BUFFERS = 2

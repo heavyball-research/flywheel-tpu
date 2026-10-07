@@ -80,14 +80,9 @@ def decode_with_cache_copies(q, k_cache, v_cache, *args, **kwargs):
 
 def interleave_kv(k_pages, v_pages):
   """The merged (..., 2 * heads, head_dim) pool, [k0, v0, k1, v1, ...]."""
-  *leading, heads, head_dim = k_pages.shape
+  *leading, num_kv_heads, head_dim = k_pages.shape
   return jnp.stack([k_pages, v_pages], axis=-2).reshape(
-      *leading, 2 * heads, head_dim)
-
-
-def split_interleaved(kv_pages):
-  """(k_pages, v_pages) of a merged pool, the inverse of interleave_kv."""
-  return kv_pages[..., 0::2, :], kv_pages[..., 1::2, :]
+      *leading, 2 * num_kv_heads, head_dim)
 
 
 def paged_decode_with_cache_copy(q, k_pages, v_pages, *args, **kwargs):
@@ -98,7 +93,7 @@ def paged_decode_with_cache_copy(q, k_pages, v_pages, *args, **kwargs):
   """
   out, lse, updated = flash_attn_with_kvcache(
       q, interleave_kv(k_pages, v_pages), None, *args, **kwargs)
-  return (out, lse, *split_interleaved(updated))
+  return (out, lse, updated[..., 0::2, :], updated[..., 1::2, :])
 
 
 def random_paged_cache(key, batch, pages_per_seq, page_size, num_kv_heads,
@@ -363,9 +358,9 @@ def test_flash_attn_with_kvcache_block_table_changes_under_one_executable():
     _, kv_pages = compiled(
         q, kv_pages, None, k, v, cache_seqlens=lens, block_table=table)
     slots = (table[rows, lens // page_size], lens % page_size)
-    slot_k, slot_v = split_interleaved(kv_pages[slots])
-    np.testing.assert_array_equal(slot_k, k[:, 0])
-    np.testing.assert_array_equal(slot_v, v[:, 0])
+    slot_kv = kv_pages[slots]
+    np.testing.assert_array_equal(slot_kv[..., 0::2, :], k[:, 0])
+    np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
   assert float(jnp.abs(kv_pages).sum()) == 4 * float(
       jnp.abs(k[0, 0]).sum() + jnp.abs(v[0, 0]).sum())
 

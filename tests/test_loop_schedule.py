@@ -132,9 +132,9 @@ def replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, window):
   num_rows = int(cu_qblk[-1])
   left, right = window
   sched = make_per_seq_fwd_schedule(
-      cu_q_array, jnp.asarray(cu_k, jnp.int32), cu_qblk, num_head_groups=1, q_heads_per_kv_head=1,
-      padded_total_q=q_pad, padded_total_k=kv_pad, bq=bq, bkv=bkv,
-      left=left, right=right, num_rows=num_rows)
+      cu_q_array, jnp.asarray(cu_k, jnp.int32), cu_qblk, num_head_groups=1,
+      q_heads_per_kv_head=1, padded_total_q=q_pad, padded_total_k=kv_pad,
+      bq=bq, bkv=bkv, left=left, right=right, num_rows=num_rows)
   rows = []
   for si in range(num_rows):
     lo, hi, ctx = sched.row_interval(jnp.int32(si))
@@ -292,11 +292,11 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
   # must end up with its owning block's value, and every padding row with the
   # zero marker. The blend fixes the write, not the mask, so it does not
   # depend on the window.
-  zero = -2
+  zero_marker = -2
   cu_q, cu_k, q_pad, kv_pad, bq, bkv = case
   _, rows = replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, (None, 0))
   packed_q_end = cu_q[-1]
-  owner = np.full(q_pad, zero)
+  owner = np.full(q_pad, zero_marker)
   for row in rows:
     owner[slice(*row.owned_rows)] = row.si
   assert (owner[:packed_q_end] >= 0).all()
@@ -319,10 +319,10 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
         and src_offset + -(-blend_width // 8) * 8 <= bq), (
             row.si, src_offset, blend_width)
     stage[:blend_width] = prev_stage[src_offset:src_offset + blend_width]
-    stage[packed >= packed_q_end] = zero
+    stage[packed >= packed_q_end] = zero_marker
     out[row.staged_q_start:row.staged_q_start + bq] = stage
     prev_stage, prev_start = stage, row.staged_q_start
-  out[-(-packed_q_end // 8) * 8:] = zero
+  out[-(-packed_q_end // 8) * 8:] = zero_marker
   np.testing.assert_array_equal(out, owner)
 
 
@@ -370,7 +370,6 @@ def replay_paged_fwd(cu_q, seqused_k, q_pad, bq, bkv, page_size,
 
 
 PAGED_CASES = [
-    # (cu_q, seqused_k, q_pad, bq, bkv, page_size, pages_per_seq)
     # Note (david): a misaligned start spills the second sequence into an
     # extra aligned q block.
     ([0, 100, 226], [150, 400], 256, 128, 256, 256, 2),
@@ -454,9 +453,10 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
       for page in range(pages_per_block):
         entry = int(sched.kv_page(row.ctx.seq_idx, jnp.int32(kv), page))
         logical_page = kv * pages_per_block + page
-        assert entry // PAGE_ID_STRIDE == seq, (row.si, kv, page, entry)
         if logical_page * page_size < seqused_k[seq]:
           assert entry == table[seq, logical_page], (row.si, kv, page, entry)
+        else:
+          assert entry // PAGE_ID_STRIDE == seq, (row.si, kv, page, entry)
   assert cursor == cu_q[-1]
 
 

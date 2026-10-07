@@ -90,7 +90,7 @@ def static_anchor_update(
 
 
 def load_kv_pair_fragment(
-    buffers: jax.Array,
+    kv_stage: jax.Array,
     slot: jax.Array,
     kv_head: int,
     kv_compute_index: int,
@@ -105,13 +105,13 @@ def load_kv_pair_fragment(
   num_kv_heads, 2, head_dim) bf16 with is_bitcast_load, else (stages,
   block_kv, 2 * num_kv_heads, head_dim).
   """
-  head_dim = buffers.shape[-1]
+  head_dim = kv_stage.shape[-1]
   compute_start = pl.multiple_of(
       kv_compute_index * block_kv_compute, MIN_BLOCK_KV
   )
   if not is_bitcast_load:
     keys, values = (
-        buffers[
+        kv_stage[
             slot,
             pl.ds(compute_start, block_kv_compute),
             pl.ds(2 * kv_head + kv_part, 1),
@@ -123,10 +123,14 @@ def load_kv_pair_fragment(
   else:
     # Note (david): the pair of KV head h is u32 word row token * num_kv_heads
     # + h, K in its low half and V in its high half, so one strided word load
-    # yields both.
-    num_kv_heads = buffers.shape[2]
+    # yields both. At one KV head this costs 1.4-1.5x the head-major decode of
+    # an unmerged K/V cache (6 query heads, head_dim 256, v6e), yet splitting
+    # the pair into dense K/V buffers per block (1.45-2.25x), folding the heads
+    # into the row width (6.5-12x) and scoring the pair interleaved
+    # (1.46-2.02x) all measured worse.
+    num_kv_heads = kv_stage.shape[2]
     words = load_staged_words(
-        staged_words(buffers, slot),
+        staged_words(kv_stage, slot),
         compute_start * num_kv_heads + kv_head,
         block_kv_compute,
         num_kv_heads,
@@ -160,9 +164,9 @@ def kvcache_kernel(
   block_table_ref = remaining_refs.pop(0) if page_size is not None else None
   num_active = num_active_ref[0]
   if is_merged_cache:
-    # Note (david): a merged build takes each row's new token as one
+    # Note (david): a merged build's new token arrives as one
     # (2 * num_kv_heads, head_dim) row already in the cache's [k0, v0, k1, v1,
-    # ...] head order.
+    # ...] head order, so the append writes it as a ready token row.
     (
         q_ref,
         new_kv_ref,
@@ -244,7 +248,6 @@ def kvcache_kernel(
         load_kv_fragment,
         block_kv_compute=block_kv_compute,
         kv_heads_per_fragment=kv_heads_per_fragment,
-        is_kv_pair_tile=False,
         is_cache_head_major=is_cache_head_major,
         is_bitcast_load=is_bitcast_load,
     )
@@ -484,7 +487,7 @@ def kvcache_kernel(
             k_buffers, slot, head_group, kv_compute_index
         )
       else:
-        key = kv_fragment(k_buffers, slot, head_group, kv_compute_index, 0)
+        key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
         value = None
       scores = jnp.where(
           is_valid,
@@ -553,12 +556,19 @@ def kvcache_kernel(
         )
       return probabilities, rescale, value, row_max, row_sum
 
-    def _pv(slot, head_group, kv_compute_index, probabilities, rescale, value):
+    def _pv(
+        slot,
+        head_group,
+        kv_compute_index,
+        probabilities,
+        rescale,
+        merged_value,
+    ):
       group_slice = pl.ds(head_group * rows_per_fragment, rows_per_fragment)
-      if value is None:
-        value = kv_fragment(
-            value_buffers, slot, head_group, kv_compute_index, 1
-        )
+      if is_merged_cache:
+        value = merged_value
+      else:
+        value = kv_fragment(value_buffers, slot, head_group, kv_compute_index)
       weighted_values = jnp.dot(
           probabilities.astype(jnp.bfloat16),
           value,
@@ -687,8 +697,7 @@ def kvcache_kernel(
 
       # Note (david): software pipeline; each fragment's scores are issued one
       # step ahead of its own pv, so the MXU has the next matmul queued while
-      # pv runs. pending_fragment is (head_group, kv_compute_index,
-      # probabilities, rescale, value, row_max, row_sum).
+      # pv runs.
       pending_fragment = None
       for fragment_index in range(num_head_groups * num_kv_compute_fragments):
         head_group, kv_compute_index = divmod(
@@ -795,28 +804,6 @@ def kvcache_kernel(
         copy.wait()
 
     _drain(num_kv_stages, _wait_cache_write)
-
-
-def resolve_block_kv(
-    capacity: int, num_kv_heads: int, head_dim: int, granule: int = MIN_BLOCK_KV
-) -> int:
-  """Largest multiple of granule that divides capacity, within the VMEM
-  budget and MAX_BLOCK_KV.
-
-  granule is the page size for paged caches (a block is whole pages) and
-  MIN_BLOCK_KV otherwise; capacity is a multiple of it either way.
-  """
-  packed_kv_heads = next_pow2(2 * num_kv_heads)
-  target_block_kv = min(
-      capacity,
-      STAGED_KV_ELEMENT_BUDGET // head_dim // packed_kv_heads,
-      MAX_BLOCK_KV,
-  )
-  aligned_target = max(target_block_kv // granule * granule, granule)
-  return next(
-      block for block in range(aligned_target, 0, -granule)
-      if capacity % block == 0
-  )
 
 
 def resolve_block_kv_compute(block_kv: int) -> int:
@@ -935,12 +922,6 @@ def flash_attn_kvcache_pallas(
           "token-major cache needs an even head axis (the packed load carries"
           f" two bf16 heads per u32 lane); got num_kv_heads={num_kv_heads}."
       )
-  # Note (david): a merged build reads K from the low and V from the high half
-  # of each staged (K, V) u32 word. At one KV head that costs 1.4-1.5x the
-  # head-major decode of an unmerged K/V cache (6 query heads, head_dim 256,
-  # v6e), yet splitting the pair into dense K/V buffers per block
-  # (1.45-2.25x), folding the heads into the row width (6.5-12x) and scoring
-  # the pair interleaved (1.46-2.02x) all measured worse.
   # Note (david): with a singleton head axis a token-major
   # (rows, capacity, 1, head_dim) cache is the same bytes as head-major
   # (rows, 1, capacity, head_dim), whose tile is a dense (block_kv, head_dim)
@@ -996,9 +977,18 @@ def flash_attn_kvcache_pallas(
         capacity=capacity,
     )
   else:
-    block_kv = resolve_block_kv(
-        capacity, num_kv_heads, head_dim,
-        granule=MIN_BLOCK_KV if page_size is None else page_size,
+    # Note (david): a paged block is whole pages, and capacity is a multiple of
+    # granule either way, so the divisor search always ends.
+    granule = MIN_BLOCK_KV if page_size is None else page_size
+    target_block_kv = min(
+        capacity,
+        STAGED_KV_ELEMENT_BUDGET // head_dim // next_pow2(2 * num_kv_heads),
+        MAX_BLOCK_KV,
+    )
+    aligned_target = max(target_block_kv // granule * granule, granule)
+    block_kv = next(
+        block for block in range(aligned_target, 0, -granule)
+        if capacity % block == 0
     )
     block_kv_compute = resolve_block_kv_compute(block_kv)
     num_kv_stages = DEFAULT_NUM_KV_STAGES

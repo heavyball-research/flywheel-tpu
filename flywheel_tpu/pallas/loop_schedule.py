@@ -297,7 +297,7 @@ def per_seq_qblk_prefix(cu_seqlens_q: jax.Array, bq: int) -> jax.Array:
 
 def make_per_seq_fwd_schedule(
     cu_q_ref: jax.Array,
-    cu_k_ref: jax.Array,
+    cu_k_ref: jax.Array | None,
     cu_qblk_ref: jax.Array,
     *,
     num_head_groups: int,
@@ -469,7 +469,7 @@ def make_paged_fwd_schedule(
   pages_per_block = bkv // page_size
   # Note (david): only the per-seq row_interval reads cu_k_ref, and it is
   # replaced below, so the base schedule is built without one.
-  per_seq = make_per_seq_fwd_schedule(
+  per_seq_schedule = make_per_seq_fwd_schedule(
       cu_q_ref, None, cu_qblk_ref,
       num_head_groups=num_head_groups,
       q_heads_per_kv_head=q_heads_per_kv_head,
@@ -514,7 +514,7 @@ def make_paged_fwd_schedule(
     return block_table_ref[seq_idx * pages_per_seq + table_index]
 
   return dataclasses.replace(
-      per_seq,
+      per_seq_schedule,
       row_interval=_row_interval,
       kv_page=_kv_page,
       kv_frontier=lambda ctx, q_last: _kv_frontier(

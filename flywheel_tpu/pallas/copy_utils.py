@@ -191,67 +191,58 @@ def fold_row(
 
 
 def load_kv_fragment(
-    buffers: jax.Array,
+    kv_stage: jax.Array,
     slot: jax.Array,
     head_group: int,
     kv_compute_index: int,
-    kv_part: int,
     *,
     block_kv_compute: int,
     kv_heads_per_fragment: int,
-    is_kv_pair_tile: bool,
     is_cache_head_major: bool,
     is_bitcast_load: bool,
 ) -> jax.Array:
-  """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 keys (kv_part 0)
-  or values (kv_part 1) of one head group, read from a KV staging slot."""
-  head_dim = buffers.shape[-1]
+  """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 rows of one head
+  group, read from a slot of kv_stage: keys from the K staging buffer, values
+  from the V staging buffer."""
+  head_dim = kv_stage.shape[-1]
   compute_start = pl.multiple_of(
       kv_compute_index * block_kv_compute, MIN_BLOCK_KV
   )
-  # Note (david): a K/V pair tile stages K as head 0 and V as head 1, so its
-  # u32 words hold K in lane 0 and V in lane 1.
-  staged_head = kv_part if is_kv_pair_tile else head_group
   if is_cache_head_major:
-    return buffers[
+    return kv_stage[
         slot,
-        pl.ds(staged_head, 1),
+        pl.ds(head_group, 1),
         pl.ds(compute_start, block_kv_compute),
         :,
     ].reshape(block_kv_compute, head_dim)
   elif not is_bitcast_load:
-    return buffers[
+    return kv_stage[
         slot,
         pl.ds(compute_start, block_kv_compute),
-        pl.ds(staged_head, 1),
+        pl.ds(head_group, 1),
         :,
     ].reshape(block_kv_compute, head_dim)
   else:
-    head_pairs_per_token = buffers.shape[2]
-    words_ref = staged_words(buffers, slot)
-    if is_kv_pair_tile:
-      word_start = compute_start
-      lane = kv_part
-    else:
-      pair_index = (
-          head_group if kv_heads_per_fragment == 2 else head_group // 2
-      )
-      word_start = compute_start * head_pairs_per_token + pair_index
-      lane = head_group % 2
+    head_pairs_per_token = kv_stage.shape[2]
+    words_ref = staged_words(kv_stage, slot)
+    pair_index = (
+        head_group if kv_heads_per_fragment == 2 else head_group // 2
+    )
+    word_start = compute_start * head_pairs_per_token + pair_index
     words = load_staged_words(
         words_ref, word_start, block_kv_compute, head_pairs_per_token)
     if kv_heads_per_fragment == 2:
       return pltpu.bitcast(words, jnp.bfloat16)
     else:
-      return bf16_half(words, lane)
+      return bf16_half(words, head_group % 2)
 
 
-def staged_words(buffers: jax.Array, slot: jax.Array) -> jax.Array:
+def staged_words(kv_stage: jax.Array, slot: jax.Array) -> jax.Array:
   """A (block_kv * head_pairs, head_dim) u32 view of one pair-packed staging
   slot of (stages, block_kv, head_pairs, 2, head_dim) bf16; word row
   token * head_pairs + pair holds that pair's two heads."""
-  _, block_kv, head_pairs, _, head_dim = buffers.shape
-  return buffers.bitcast(jnp.uint32).at[slot].reshape(
+  _, block_kv, head_pairs, _, head_dim = kv_stage.shape
+  return kv_stage.bitcast(jnp.uint32).at[slot].reshape(
       block_kv * head_pairs, head_dim)
 
 
