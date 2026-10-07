@@ -71,14 +71,17 @@ def store_out_rows(out_slot_ref: jax.Array, out: jax.Array,
     block-grid rows; BATCHED packs each sequence's real rows back to back from
     stage row delta.
     """
-    align = config.SUBLANE_ALIGN
     out_dtype = out_slot_ref.dtype
     if cfg.mode == config.KDAMode.PER_SEQ:
         compute_chunk = cfg.compute_chunk_size
         if isinstance(chunk_idx, int):
             row_offset = chunk_idx * compute_chunk
         else:
-            row_offset = pl.multiple_of(chunk_idx * compute_chunk, align)
+            # Note (david): out_window_rows makes the stage a multiple of
+            # STAGE_TILE_ROWS, which v7x tiles 16 rows deep, so an 8-row hint
+            # cannot prove this store aligned (E2003). The chunk grid can.
+            row_offset = pl.multiple_of(chunk_idx * compute_chunk,
+                                        compute_chunk)
         out_slot_ref[pl.ds(row_offset, compute_chunk)] = out[0].astype(
             out_dtype)
     else:
@@ -377,13 +380,13 @@ def outer_kernel(
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_qkv_in(qkv_buf.at[slot],
+            memory_ref.wait_qkv_in(qkv_ref, qkv_buf.at[slot],
                                    sems.at[config.STREAM_QKV, slot],
                                    *tile_args)
             memory_ref.wait_compact_in(b_buf.at[slot],
                                        sems.at[config.STREAM_B, slot],
                                        *tile_args)
-            memory_ref.wait_qkv_in(g_buf.at[slot],
+            memory_ref.wait_qkv_in(g_ref, g_buf.at[slot],
                                    sems.at[config.STREAM_G, slot], *tile_args)
             memory_ref.wait_state_in(conv_in_buf.at[slot],
                                      sems.at[config.STREAM_CONV_IN, slot],
@@ -408,7 +411,7 @@ def outer_kernel(
     def _wait_out(p_id, slot):
         with profile_scope("wait_out"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_out(out_buf.at[slot],
+            memory_ref.wait_out(out_ref, out_buf.at[slot],
                                 sems.at[config.STREAM_OUT, slot], *tile_args)
             memory_ref.wait_state_out(conv_out_buf.at[slot],
                                       sems.at[config.STREAM_CONV_OUT, slot],
