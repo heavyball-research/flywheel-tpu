@@ -1,8 +1,8 @@
 # FlyWheel on TPU v7x
 
 The benchmarks in the [README](README.md) were measured on v6e. This page has
-the softmax attention benchmark on v7x, measured the same way and on the same
-stack, `jax[tpu]==0.11.0` and `libtpu==0.0.44`.
+the softmax and linear attention benchmarks on v7x, measured the same way and
+on the same stack, `jax[tpu]==0.11.0` and `libtpu==0.0.44`.
 
 ## Softmax attention
 
@@ -175,12 +175,82 @@ To reproduce, sequentially on a v7x VM:
 benchmarks/softmax_attention/kvcache_scenarios.sh results/benchmark/kvcache_scenarios
 ```
 
+## Linear attention
+
+GDN prefill on one v7x core, n_kq = 16 and d_k = d_v = 128, with T tokens
+packed into 1 or 8 sequences. The row under each sequence length is our
+speedup over the vendored `gdn_v3` baseline (gray).
+
+![GDN prefill kernel throughput on v7x](assert/gdn_benchmark_v7x.png)
+
+A v7x core has 64 MiB of VMEM, half of v6e's, and n_v = 48 is where that
+shows:
+
+- **Decode tile.** Four sequences of 48 value heads do not fit the kernel's
+  VMEM limit, so plain decode runs 2 sequences per tile there. The kernel
+  picks this itself.
+- **Prefill tile.** The default 128-row prefill tile does not fit either, by
+  a small margin, and the kernel does not shrink it: `bench_gdn_fwd.py
+  --v-heads 48` stops with a VMEM error. The n_v = 48 numbers here are with
+  `--mixed-tile-size 64`.
+
+Wall clock in ms:
+
+| n_v = 16 | `gdn_v3`, 1 seq | flywheel | speedup | `gdn_v3`, 8 seqs | flywheel | speedup |
+|---|---|---|---|---|---|---|
+| 1K | 0.160 | 0.103 | 1.56x | 0.167 | 0.106 | 1.57x |
+| 2K | 0.277 | 0.150 | 1.85x | 0.294 | 0.154 | 1.90x |
+| 4K | 0.499 | 0.243 | 2.06x | 0.533 | 0.279 | 1.91x |
+| 8K | 0.947 | 0.432 | 2.19x | 0.982 | 0.463 | 2.12x |
+| 16K | 1.823 | 0.797 | 2.29x | 1.881 | 0.833 | 2.26x |
+
+| n_v = 32 | `gdn_v3`, 1 seq | flywheel | speedup | `gdn_v3`, 8 seqs | flywheel | speedup |
+|---|---|---|---|---|---|---|
+| 1K | 0.246 | 0.126 | 1.96x | 0.257 | 0.134 | 1.92x |
+| 2K | 0.436 | 0.198 | 2.21x | 0.460 | 0.203 | 2.26x |
+| 4K | 0.818 | 0.337 | 2.43x | 0.857 | 0.370 | 2.32x |
+| 8K | 1.585 | 0.619 | 2.56x | 1.611 | 0.649 | 2.48x |
+| 16K | 3.059 | 1.166 | 2.62x | 3.100 | 1.222 | 2.54x |
+
+| n_v = 48 | `gdn_v3`, 1 seq | flywheel | speedup | `gdn_v3`, 8 seqs | flywheel | speedup |
+|---|---|---|---|---|---|---|
+| 1K | 0.295 | 0.174 | 1.69x | 0.306 | 0.179 | 1.71x |
+| 2K | 0.530 | 0.293 | 1.81x | 0.549 | 0.329 | 1.67x |
+| 4K | 1.027 | 0.532 | 1.93x | 1.051 | 0.567 | 1.85x |
+| 8K | 1.970 | 1.006 | 1.96x | 2.000 | 1.028 | 1.95x |
+| 16K | 3.851 | 1.982 | 1.94x | 3.843 | 1.961 | 1.96x |
+
+Fused KDA, 16 heads, against the chunked forward baseline (`--impl baseline`),
+ms:
+
+| KDA | chunked, 1 seq | fused | speedup | chunked, 8 seqs | fused | speedup |
+|---|---|---|---|---|---|---|
+| 1K | 3.58 | 0.154 | 23.2x | 6.37 | 0.158 | 40.3x |
+| 2K | 7.36 | 0.251 | 29.3x | 10.94 | 0.256 | 42.7x |
+| 4K | 15.65 | 0.437 | 35.8x | 20.99 | 0.475 | 44.2x |
+| 8K | 32.32 | 0.817 | 39.5x | 40.98 | 0.850 | 48.2x |
+| 16K | 63.82 | 1.579 | 40.4x | 78.57 | 1.611 | 48.8x |
+
+To reproduce, sequentially on a v7x VM:
+
+```bash
+for nv in 16 32; do
+  PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_gdn_fwd.py \
+      --v-heads $nv --output results/gdn_fwd_nv$nv.json
+done
+PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_gdn_fwd.py \
+    --v-heads 48 --mixed-tile-size 64 --output results/gdn_fwd_nv48.json
+PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_kda_fwd.py \
+    --pkgs flywheel_tpu.linear_attention.kda --output results/kda_fwd.json
+PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_kda_fwd.py \
+    --impl baseline --output results/kda_fwd_baseline.json
+```
+
 ## Not on v7x yet
 
-The fused GDN and KDA kernels and `flash_attn_varlen_func` do not compile on
-v7x with this stack. Mosaic stops at
-`E2003: CompileTimeMosaicUnprovenMemoryAccessAlignment: cannot statically
-prove that index in dimension 0 is a multiple of 16` (dimension 1 for varlen):
-v7x tiles bf16 VMEM in 16 rows, and these kernels address it in 8-row slabs.
-So the README's linear attention benchmark has no flywheel number on v7x. Its
-`gdn_v3` baseline runs, at 6.4 to 9.0 M tokens/s for n_v = 16.
+`flash_attn_varlen_func` has not been run on v7x since its fix. Before it,
+Mosaic stopped at `E2003: CompileTimeMosaicUnprovenMemoryAccessAlignment:
+cannot statically prove that index in dimension 1 is a multiple of 16`: on v7x
+its bf16 VMEM stage is tiled 16 rows deep, and the per-seq head blend read it
+in 8-row slabs at a row it could only prove to be a multiple of 8. The blend
+now reads and writes whole 16-row tiles, which is not verified on v7x yet.

@@ -776,6 +776,18 @@ def fused_conv1d_kda(
                 spec_tile_budget // bytes_per_seq))
     else:
         decode_tile_size = min(decode_tile_size, batch_size)
+        # Note (david): every state ring slot holds each sequence's initial
+        # state and its one checkpoint. Where the rings cannot fit the scoped
+        # VMEM limit (v7x has half of v6e's VMEM: 4 sequences of 48 value heads
+        # at head_dim 128), the tile shrinks until they do, with one more state
+        # per sequence left for the compiler's temporaries.
+        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
+        ring_bytes_per_seq = config.NUM_BUFFERS * 2 * (
+            state_bytes + (kernel_size - 1) * dim * F32_BYTES)
+        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+        if decode_tile_size * ring_bytes_per_seq > vmem_limit:
+            decode_tile_size = max(
+                1, vmem_limit // (ring_bytes_per_seq + state_bytes))
 
     # Note (david): b keeps the compact [batch, 1, heads] layout: it is tiny,
     # and its untiled leading token axis keeps ragged DMAs offset-free. g is as
