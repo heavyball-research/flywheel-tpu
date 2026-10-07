@@ -655,7 +655,9 @@ def test_paged_vmem_estimate_tracks_forward_common_scratch(
 @pytest.mark.parametrize(
     "head_dim,max_seqlen_q_bucket,max_seqlen_k_bucket,expected", [
         (128, 128, 40960, (128, 2048)),
-        (128, 8192, 40960, (2048, 2048)),
+        (128, 8192, 40960, (2048, 1024)),
+        (128, 2048, 32768, (2048, 1024)),
+        (128, 1024, 32768, (1024, 2048)),
         (128, 64, 128, (128, 128)),
         (128, 384, 640, (256, 640)),
         (256, 1024, 16384, (1024, 2048)),
@@ -665,7 +667,9 @@ def test_paged_tiles_minimize_prefix_streams_within_vmem(
     head_dim, max_seqlen_q_bucket, max_seqlen_k_bucket, expected):
   # Note (david): one q head per group keeps every build far inside the VMEM
   # budget, so the q block grows to the bucket (at most 2048 rows) and the
-  # prefix is streamed once per q block. A 384-row bucket takes one 256-row
+  # prefix is streamed once per q block; the kv block takes the most pages
+  # within the 2048 x 1024 block area, so a 2048-row q block streams 1024-token
+  # kv blocks. A 384-row bucket takes one 256-row
   # block fewer than three 128-row ones; a 640-token bucket (a five-page
   # table row) is one five-page block, whose kv compute tile is 128, the
   # largest one dividing it.

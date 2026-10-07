@@ -43,6 +43,11 @@ SCORE_TEMPORARY_BYTES = 5 * F32_BYTES + 1
 # against 10.6 ms) with a 15x longer compile, while re-staging the kv head per
 # q head hides under the compute.
 PAGED_HEAD_FOLD = 1
+# Note (david): a 2048 x 2048 q x kv block ran 3.4x slower than 2048 x 1024
+# on v6e (Qwen3-4B's 32:8 heads of 128, a 2040-token chunk over a 16K prefix:
+# 7.72 against 2.19 ms) though it fits VMEM, and 1024 x 2048 ran at par, so
+# the block area is capped at 2048 x 1024.
+MAX_PAGED_BLOCK_AREA = 2048 * 1024
 
 
 def flash_fwd_varlen_paged_kernel(
@@ -179,18 +184,22 @@ def resolve_paged_tiles(
 ) -> BlockSizes:
   """block_sizes of one paged build.
 
-  Among the builds whose TPU staging fits vmem_limit_bytes(), picks the one
-  that streams the longest sequence's kv prefix the fewest times, the smaller
-  q block on a tie. A pinned block_sizes is only checked against the budget.
+  Among the builds whose TPU staging fits vmem_limit_bytes() and whose q x kv
+  block area is at most MAX_PAGED_BLOCK_AREA, picks the one that streams the
+  longest sequence's kv prefix the fewest times, then the smaller q block,
+  then the larger kv block. A pinned block_sizes is only checked against the
+  budget.
   """
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
   else:
     # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
     # five or three pages (1920 tokens), where no power-of-two block ends on a
-    # page edge.
+    # page edge; smaller kv blocks halve the page count.
     kv_block_cap = max(min(max_seqlen_k_bucket, FWD_BLOCKS[0]), page_size)
-    block_kv = kv_block_cap // page_size * page_size
+    max_kv_pages = kv_block_cap // page_size
+    kv_blocks = [page_size * (max_kv_pages >> shift)
+                 for shift in range(max_kv_pages.bit_length())]
     q_block_cap = max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
     candidate_blocks = [
         BlockSizes(
@@ -201,6 +210,8 @@ def resolve_paged_tiles(
                 FWD_Q_COMPUTE_BLOCKS, block_q // MIN_Q_TILES_PER_BLOCK),
         )
         for block_q in FWD_BLOCKS if block_q <= q_block_cap
+        for block_kv in kv_blocks
+        if block_q * block_kv <= MAX_PAGED_BLOCK_AREA
     ]
   estimates = {
       blocks: estimate_vmem_bytes(
@@ -222,7 +233,8 @@ def resolve_paged_tiles(
     )
 
   def _prefix_streams(blocks):
-    return (-(-max_seqlen_q_bucket // blocks.block_q), blocks.block_q)
+    return (-(-max_seqlen_q_bucket // blocks.block_q), blocks.block_q,
+            -blocks.block_kv)
 
   return min(fitting, key=_prefix_streams)
 
