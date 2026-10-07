@@ -345,6 +345,9 @@ def outer_kernel(
     del aliased_out_ref, conv_state_out_ref, recurrent_state_out_ref
 
     align = config.SUBLANE_ALIGN
+    stage_tile = config.STAGE_TILE_ROWS
+    # Note (david): the head blend picks one SUBLANE_ALIGN half of a stage tile.
+    assert stage_tile == 2 * align, (stage_tile, align)
     num_tiles = metadata_ref.num_tiles[...]
     first_window_base, _, _, _ = memory_ref.out_window(0, metadata_ref, cfg)
     profile_scope = compute_kda.profile_scope
@@ -464,33 +467,44 @@ def outer_kernel(
         with profile_scope("out_fixup"):
             # Note (david): rows past the tile's last real one hold stale stage
             # data (a chunk the tail path skipped, or the rotate's zero pad).
-            # Only the slab holding used_rows can still fall inside the DMA
-            # window; the next tile's window overwrites it, and the last tile's
-            # lands in the padded tail, which the zero fill below expects zero.
+            # Only the stage tile holding used_rows can still fall inside the
+            # DMA window; the next tile's window overwrites it, and the last
+            # tile's lands in the padded tail, which the zero fill below
+            # expects zero.
             stage_ref = out_buf.at[slot]
             tail_slab_start = pl.multiple_of(
-                used_rows - (used_rows & (align - 1)), align)
+                used_rows - (used_rows & (stage_tile - 1)), stage_tile)
             tail_slab_rows = tail_slab_start + lax.broadcasted_iota(
-                jnp.int32, (align, cfg.v_dim_size), 0)
-            stage_ref[pl.ds(tail_slab_start, align)] = jnp.where(
+                jnp.int32, (stage_tile, cfg.v_dim_size), 0)
+            stage_ref[pl.ds(tail_slab_start, stage_tile)] = jnp.where(
                 tail_slab_rows < used_rows,
-                stage_ref[pl.ds(tail_slab_start, align)], 0)
+                stage_ref[pl.ds(tail_slab_start, stage_tile)], 0)
 
             # Note (david): the window's head rows belong to the previous tile,
             # whose stage is still resident since only its outbound DMA reads
-            # it. Both windows sit on the SUBLANE_ALIGN grid, so the copy is
-            # slab to slab and the previous window always covers row
-            # window_base + delta - 1.
+            # it. Both windows sit on the SUBLANE_ALIGN grid, so the previous
+            # stage holds them from row prev_row, a multiple of 8 that may sit
+            # mid stage tile, and the previous window always covers row
+            # window_base + delta - 1. Both stage tiles are read whole and the
+            # previous one's half is picked in f32, where 8 rows are one whole
+            # (8, 128) tile.
             @pl.when(delta > 0)
             def _blend_head_rows():
-                prev_stage_row = pl.multiple_of(window_base - prev_window_base,
-                                                align)
+                prev_row = window_base - prev_window_base
+                prev_slab_start = pl.multiple_of(
+                    prev_row - (prev_row & (stage_tile - 1)), stage_tile)
+                prev_slab = out_buf.at[other_slot][
+                    pl.ds(prev_slab_start, stage_tile)].astype(jnp.float32)
+                own_slab = stage_ref[pl.ds(0, stage_tile)].astype(jnp.float32)
                 head_rows = lax.broadcasted_iota(
                     jnp.int32, (align, cfg.v_dim_size), 0)
-                stage_ref[pl.ds(0, align)] = jnp.where(
-                    head_rows < delta,
-                    out_buf.at[other_slot][pl.ds(prev_stage_row, align)],
-                    stage_ref[pl.ds(0, align)])
+                prev_head = jnp.where(
+                    head_rows + (prev_row - prev_slab_start) < align,
+                    prev_slab[:align], prev_slab[align:])
+                own_head = jnp.where(head_rows < delta, prev_head,
+                                     own_slab[:align])
+                stage_ref[pl.ds(0, stage_tile)] = jnp.concatenate(
+                    [own_head, own_slab[align:]]).astype(stage_ref.dtype)
 
         _start_out(tile_idx, slot)
 

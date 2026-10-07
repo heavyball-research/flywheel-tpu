@@ -26,6 +26,13 @@ from jax.experimental.pallas import tpu as pltpu
 # axis of the native [batch, dim] layout is that tiled dimension.
 SUBLANE_ALIGN = 8
 
+# Note (david): VMEM is a different grid. Mosaic gives a bf16 scratch ref whose
+# row count is a multiple of 16 the large (16, 128) tiling (v7x does; v6e may
+# keep (8, 128)), and a dynamic vector load or store must start on that tile.
+# The bf16 output stage is therefore read and written in whole 16-row tiles,
+# which is legal under either tiling; the HBM DMAs stay on SUBLANE_ALIGN.
+STAGE_TILE_ROWS = 16
+
 NUM_BUFFERS = 2
 
 # Note (david): one DMA semaphore row per HBM <-> VMEM stream. The state streams
@@ -132,10 +139,13 @@ class KDAConfig:
     def out_window_rows(self) -> int:
         # Note (david): the token-major output tiles its token axis, so a tile's
         # output DMA snaps to the SUBLANE_ALIGN grid and the tile's own rows
-        # start r_base % SUBLANE_ALIGN into the window; one extra sublane tile
-        # holds that head slack.
+        # start r_base % SUBLANE_ALIGN into the window, so at most
+        # tile_rows + SUBLANE_ALIGN - 1 rows are used. Rounding past that to
+        # whole stage tiles keeps the 16-row tile holding the last used row,
+        # and the DMA window, inside the stage.
         tile_rows = self.seq_tile_size * self.chunk_size
-        return (pl.cdiv(tile_rows, SUBLANE_ALIGN) + 1) * SUBLANE_ALIGN
+        return (pl.cdiv(tile_rows + SUBLANE_ALIGN, STAGE_TILE_ROWS) *
+                STAGE_TILE_ROWS)
 
     @property
     def v_dim_size(self) -> int:

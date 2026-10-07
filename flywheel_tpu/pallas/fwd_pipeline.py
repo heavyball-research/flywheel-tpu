@@ -11,6 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import (
+  BF16_TILE_ROWS,
   DEFAULT_MASK_VALUE,
   NN_DIM_NUMBERS,
   NT_DIM_NUMBERS,
@@ -956,29 +957,52 @@ def fwd_body(
       # Note (david): a per-seq window sits on the 8-row grid and may reach
       # below blend_start into rows the previous output block computed
       # correctly. That stage is still resident (num_stages >= 2 and only its
-      # outbound DMA reads it), and both windows are 8-aligned, so the copy is
-      # tile-to-tile and never reads past the source stage.
+      # outbound DMA reads it), so the rows are copied over from it. The bf16
+      # stage is accessed in whole 16-row tiles, but the two windows are only
+      # 8-aligned apart, so each own tile reads the two source tiles it
+      # straddles and picks their 8-row halves in f32, where 8 rows are one
+      # whole (8, 128) tile.
       num_blend_rows = schedule.blend_start(ctx) - q_tok
 
       @pl.when(jnp.logical_and(is_last, num_blend_rows > 0))
       def _blend_head_rows():
         prev_slot = (num_out_copies - 1) % num_stages
         src_row_offset = q_tok - prev_out_tok
+        src_half = src_row_offset & (BF16_TILE_ROWS - 1)
+        half_rows = BF16_TILE_ROWS // 2
 
         def _tile_index(stage_ref, slot, row_start):
           return (slot,) + (slice(None),) * (len(stage_ref.shape) - 3) + (
-              pl.ds(pl.multiple_of(row_start, NUM_SUBLANES), NUM_SUBLANES),
+              pl.ds(pl.multiple_of(row_start, BF16_TILE_ROWS), BF16_TILE_ROWS),
               slice(None))
 
         def _blend_stage(stage_ref, tile):
-          own_index = _tile_index(stage_ref, out_slot, tile * NUM_SUBLANES)
-          own_rows = stage_ref[own_index]
-          prev_rows = stage_ref[_tile_index(
-              stage_ref, prev_slot, src_row_offset + tile * NUM_SUBLANES)]
-          row_ids = tile * NUM_SUBLANES + lax.broadcasted_iota(
-              jnp.int32, own_rows.shape, len(own_rows.shape) - 2)
+          own_index = _tile_index(stage_ref, out_slot, tile * BF16_TILE_ROWS)
+          own_rows = stage_ref[own_index].astype(jnp.float32)
+          lo_start = src_row_offset - src_half + tile * BF16_TILE_ROWS
+          # Note (david): the upper source tile is used only when src_half is 8
+          # and this tile's upper half blends, and then it lies inside the
+          # source stage; the clamp keeps the unused read in bounds otherwise.
+          hi_start = jnp.minimum(lo_start + BF16_TILE_ROWS,
+                                 stage_ref.shape[-2] - BF16_TILE_ROWS)
+          lo = stage_ref[_tile_index(stage_ref, prev_slot, lo_start)].astype(
+              jnp.float32)
+          hi = stage_ref[_tile_index(stage_ref, prev_slot, hi_start)].astype(
+              jnp.float32)
+          half_ids = lax.broadcasted_iota(
+              jnp.int32, lo[..., :half_rows, :].shape, lo.ndim - 2)
+          is_src_on_tile = half_ids + src_half < half_rows
+          prev_rows = jnp.concatenate([
+              jnp.where(is_src_on_tile, lo[..., :half_rows, :],
+                        lo[..., half_rows:, :]),
+              jnp.where(is_src_on_tile, lo[..., half_rows:, :],
+                        hi[..., :half_rows, :]),
+          ], axis=-2)
+          row_ids = tile * BF16_TILE_ROWS + lax.broadcasted_iota(
+              jnp.int32, own_rows.shape, own_rows.ndim - 2)
           stage_ref[own_index] = jnp.where(
-              row_ids < num_blend_rows, prev_rows, own_rows)
+              row_ids < num_blend_rows, prev_rows, own_rows).astype(
+                  stage_ref.dtype)
 
         def _blend_tile(tile, carry):
           _blend_stage(o_stage, tile)
@@ -987,7 +1011,7 @@ def fwd_body(
           return carry
 
         lax.fori_loop(
-            0, (num_blend_rows + NUM_SUBLANES - 1) // NUM_SUBLANES,
+            0, (num_blend_rows + BF16_TILE_ROWS - 1) // BF16_TILE_ROWS,
             _blend_tile, None)
 
     if is_per_seq:
@@ -1211,6 +1235,11 @@ def forward_common(
     raise ValueError(
         f"{bq_compute=} must be a multiple of {NUM_SUBLANES}."
     )
+  if is_per_seq and bq % BF16_TILE_ROWS:
+    # Note (david): the per-seq head blend steps the output stage in whole
+    # 16-row tiles.
+    raise ValueError(
+        f"per-seq {bq=} must be a multiple of {BF16_TILE_ROWS}.")
 
   if paged is None and k.shape[:-1] != v.shape[:-1]:
     raise ValueError(
