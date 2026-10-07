@@ -78,6 +78,18 @@ def decode_with_cache_copies(q, k_cache, v_cache, *args, **kwargs):
       q, jnp.copy(k_cache), jnp.copy(v_cache), *args, **kwargs)
 
 
+def interleave_kv(k_pages, v_pages):
+  """The merged (..., 2 * heads, head_dim) pool, [k0, v0, k1, v1, ...]."""
+  *leading, heads, head_dim = k_pages.shape
+  return jnp.stack([k_pages, v_pages], axis=-2).reshape(
+      *leading, 2 * heads, head_dim)
+
+
+def split_interleaved(kv_pages):
+  """(k_pages, v_pages) of a merged pool, the inverse of interleave_kv."""
+  return kv_pages[..., 0::2, :], kv_pages[..., 1::2, :]
+
+
 def paged_decode_with_cache_copy(q, k_pages, v_pages, *args, **kwargs):
   """flash_attn_with_kvcache on the merged pool of k_pages and v_pages.
 
@@ -85,8 +97,8 @@ def paged_decode_with_cache_copy(q, k_pages, v_pages, *args, **kwargs):
   its K and V heads so exact checks against both page pools cover every byte.
   """
   out, lse, updated = flash_attn_with_kvcache(
-      q, jnp.concatenate([k_pages, v_pages], axis=2), None, *args, **kwargs)
-  return (out, lse, *jnp.split(updated, 2, axis=2))
+      q, interleave_kv(k_pages, v_pages), None, *args, **kwargs)
+  return (out, lse, *split_interleaved(updated))
 
 
 def random_paged_cache(key, batch, pages_per_seq, page_size, num_kv_heads,
@@ -265,9 +277,8 @@ def test_mha_token_major_cache_across_compute_fragments(
         # a 2048-token row spans two blocks of whole pages.
         (256, 8, 8, True, (-1, -1), 128, 2048),
         (256, 8, 8, False, (-1, -1), 256, 2048),
-        # Note (david): a merged cache at head_dim 64 needs 1 or a multiple of
-        # 8 KV heads.
         (64, 8, 8, False, (-1, -1), 128, 256),
+        (64, 8, 2, False, (-1, -1), 128, 256),
     ],
 )
 def test_flash_attn_with_kvcache_block_table_matches_reference(
@@ -311,11 +322,13 @@ def test_flash_attn_with_kvcache_block_table_matches_reference(
 
 def test_flash_attn_with_kvcache_block_table_matches_contiguous_kernel():
   # Note (david): capacity 1024 resolves to one 1024-token block either way,
-  # and paging and the merged head axis only change addressing, so the two
-  # must agree bit for bit.
-  batch, page_size, capacity, heads, head_dim = 3, 128, 1024, 4, 128
+  # and 8 query heads per KV head make the pair build score one head per
+  # fragment like the merged build, so paging and the interleaved row only
+  # change addressing and the two must agree bit for bit.
+  batch, page_size, capacity, head_dim = 3, 128, 1024, 128
+  num_query_heads, num_kv_heads = 16, 2
   q, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
-      7, batch, capacity, page_size, heads, heads, head_dim)
+      7, batch, capacity, page_size, num_query_heads, num_kv_heads, head_dim)
   cache_seqlens = jnp.array([1, 700, capacity - 1], jnp.int32)
   out_paged, lse_paged, _, _ = paged_decode_with_cache_copy(
       q, k_pages, v_pages, k, v, cache_seqlens=cache_seqlens,
@@ -350,8 +363,9 @@ def test_flash_attn_with_kvcache_block_table_changes_under_one_executable():
     _, kv_pages = compiled(
         q, kv_pages, None, k, v, cache_seqlens=lens, block_table=table)
     slots = (table[rows, lens // page_size], lens % page_size)
-    np.testing.assert_array_equal(kv_pages[slots][:, :heads], k[:, 0])
-    np.testing.assert_array_equal(kv_pages[slots][:, heads:], v[:, 0])
+    slot_k, slot_v = split_interleaved(kv_pages[slots])
+    np.testing.assert_array_equal(slot_k, k[:, 0])
+    np.testing.assert_array_equal(slot_v, v[:, 0])
   assert float(jnp.abs(kv_pages).sum()) == 4 * float(
       jnp.abs(k[0, 0]).sum() + jnp.abs(v[0, 0]).sum())
 
@@ -463,10 +477,11 @@ def test_padding_rows_past_num_active_cost_nothing():
 )
 def test_flash_attn_with_kvcache_paged_merged_matches_contiguous_pair(
     num_query_heads, num_kv_heads, head_dim, append, num_active):
-  # Note (david): with one KV head the merged build reads the lanes of a
-  # staged K/V pair tile instead of the pair's head-major rows, so a fragment
-  # may round differently: out and lse match to a bf16 ulp. The append is a
-  # byte copy, so the whole pool is checked exactly.
+  # Note (david): the merged build reads the halves of staged (K, V) u32 words
+  # one head per fragment, where the pair build may score two heads per pass
+  # or read head-major rows, so a fragment may round differently: out and lse
+  # match to a bf16 ulp. The append is a byte copy, so the whole pool is
+  # checked exactly.
   batch, page_size, capacity = 6, 128, 512
   q, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
       41, batch, capacity, page_size, num_query_heads, num_kv_heads, head_dim)
@@ -489,7 +504,7 @@ def test_flash_attn_with_kvcache_paged_merged_matches_contiguous_pair(
   out_pair, lse_pair, _, _ = decode_with_cache_copies(
       q, gather_pages(k_pages, block_table),
       gather_pages(v_pages, block_table), k, v, **kwargs)
-  merged = jnp.concatenate([k_pages, v_pages], axis=2)
+  merged = interleave_kv(k_pages, v_pages)
   pointer = merged.unsafe_buffer_pointer()
   out, lse, updated = flash_attn_with_kvcache(
       q, merged, None, k, v, block_table=block_table, **kwargs)
@@ -501,8 +516,7 @@ def test_flash_attn_with_kvcache_paged_merged_matches_contiguous_pair(
                              rtol=2e-2, atol=2e-3)
   np.testing.assert_allclose(lse[:active], lse_pair[:active], rtol=2e-3,
                              atol=2e-3)
-  np.testing.assert_array_equal(
-      updated, jnp.concatenate([expected_k, expected_v], axis=2))
+  np.testing.assert_array_equal(updated, interleave_kv(expected_k, expected_v))
 
 
 @pytest.mark.parametrize(("paged", "num_active"),

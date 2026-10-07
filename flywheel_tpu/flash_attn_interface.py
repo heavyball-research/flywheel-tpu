@@ -867,6 +867,12 @@ def paged_varlen_attn(
         "with block_table, pass cu_seqlens_k=None: seqused_k gives each"
         " sequence's kv length."
     )
+  if v is not None:
+    raise ValueError(
+        "with block_table, pass one merged (num_pages, page_size,"
+        " 2 * nheads_k, headdim) cache as k and v=None; separate paged K and"
+        " V caches are not supported."
+    )
   if seqused_k is None:
     raise ValueError(
         "block_table needs seqused_k, the (batch,) kv length of each sequence"
@@ -902,11 +908,14 @@ def paged_varlen_attn(
     )
   batch = cu_seqlens_q.shape[0] - 1
   cu_seqlens_q = cu_seqlens_q.astype(jnp.int32)
-  if (not isinstance(cu_seqlens_q, jax.core.Tracer)
-      and int(cu_seqlens_q[0]) != 0):
+  # Note (david): under a trace even a closed-over concrete array indexes to
+  # a tracer, so the check runs on the indexed entry.
+  first_boundary = cu_seqlens_q[0]
+  if (not isinstance(first_boundary, jax.core.Tracer)
+      and int(first_boundary) != 0):
     raise ValueError(
         "with block_table, cu_seqlens_q must start at 0; got"
-        f" cu_seqlens_q[0]={int(cu_seqlens_q[0])}."
+        f" cu_seqlens_q[0]={int(first_boundary)}."
     )
   if num_active is None:
     rotary_seqused_k = seqused_k
@@ -967,8 +976,11 @@ def paged_varlen_attn(
       interpret=bool(interpret),
       block_sizes=paged_block_sizes,
   )
+  # Note (david): K and V share the one merged cache operand k.
   return forward_only_attn(
-      kernel, "flash_attn_varlen_func", q, k, v,
+      lambda q, kv_cache, unused_v, *args, **kwargs: kernel(
+          q, kv_cache, *args, **kwargs),
+      "flash_attn_varlen_func", q, k, None,
       (cu_seqlens_q, seqused_k, block_table), rotary, rotary_interleaved)
 
 
@@ -1033,9 +1045,9 @@ def flash_attn_varlen_func(
 
   Paged KV cache (block_table given; read-only, as in FlashAttention): k is
   one merged bf16 (num_pages, page_size, 2 * nheads_k, headdim) cache whose
-  token rows hold the K heads, then the V heads, with v None, or k and v are
-  a (num_pages, page_size, nheads_k, headdim) pair; headdim and page_size are
-  multiples of 128. block_table: (batch, max_pages_per_seq) int, never read
+  token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
+  ...], and v is None; headdim and page_size are multiples of 128, any
+  nheads_k. block_table: (batch, max_pages_per_seq) int, never read
   past a sequence's own pages. cu_seqlens_k must be None and seqused_k
   ((batch,) int) is each sequence's kv length, its new tokens included,
   which the cache must already hold; max_seqlen_k bounds it. q / out stay
@@ -1227,16 +1239,17 @@ def flash_attn_with_kvcache(
     capacity a multiple of 128. cache_batch_idx: optional (batch,) cache row
     per query row, identity by default.
   - block_table given, paged merged: k_cache is one (num_pages, page_size,
-    2 * nheads_k, head_dim) pool whose token rows hold that token's nheads_k
-    K heads, then its nheads_k V heads, page_size a multiple of 128, and
-    v_cache is None. block_table: (batch, max_pages_per_seq) int mapping each
-    row's positions to pages; cache_batch_idx must be None. Pages an append
-    writes must be private to the request.
+    2 * nheads_k, head_dim) pool whose token rows hold each KV head's K then
+    its V, [k0, v0, k1, v1, ...] (RPA v3's head order), page_size a multiple
+    of 128, and v_cache is None. block_table: (batch, max_pages_per_seq) int
+    mapping each row's positions to pages; cache_batch_idx must be None.
+    Pages an append writes must be private to the request.
 
-  In both, nheads % nheads_k == 0, and nheads_k must be even or 1 because the
-  cache load packs two bf16 heads into one u32 lane. Paged single-token
-  decode reads K and V as head blocks of the merged row and needs nheads_k of
-  1, 2, 4 or a multiple of 8 (1 or a multiple of 8 at head_dim 64).
+  In both, nheads % nheads_k == 0. The contiguous pair needs nheads_k even or
+  1 because its cache load packs two bf16 heads into one u32 lane, and it
+  serves single-token decode only; the paged merged cache takes any nheads_k,
+  and multi-token and packed calls (chunked prefill) need it: they append the
+  new tokens, then run flash_attn_varlen_func's paged kernel over the pages.
 
   q: (batch, seqlen_q, nheads, head_dim), or packed (total_q, nheads,
   head_dim) with cu_seqlens_q, (batch + 1,) nondecreasing int boundaries from
@@ -1251,8 +1264,10 @@ def flash_attn_with_kvcache(
   these may be tracers.
 
   causal is bottom-right aligned per request. window_size works only for
-  single-token decode. A row with nothing to attend returns out = 0 and
-  lse = -inf. Forward-only.
+  single-token decode. A decode row with nothing to attend returns out = 0
+  and lse = -inf; on multi-token and packed calls, as in
+  flash_attn_varlen_func, a row with no visible key is unspecified.
+  Forward-only.
 
   Returns (out, k_cache, v_cache) for the contiguous pair and (out, kv_cache)
   for the paged merged cache, with lse after out when return_softmax_lse:
@@ -1294,6 +1309,12 @@ def flash_attn_with_kvcache(
   # Note (david): a paged cache is always the merged one, a contiguous cache
   # always the K/V pair.
   is_paged = block_table is not None
+  if is_extend and not is_paged:
+    raise NotImplementedError(
+        "Multi-token and packed KV-cache attention needs the paged merged"
+        " cache (block_table); the contiguous K/V pair serves single-token"
+        " decode only."
+    )
   if is_paged:
     if v_cache is not None:
       raise ValueError(
@@ -1309,7 +1330,7 @@ def flash_attn_with_kvcache(
     if k_cache.ndim != 4 or k_cache.shape[2] % 2:
       raise ValueError(
           "With block_table, k_cache must be (num_pages, page_size,"
-          " 2 * nheads_k, head_dim), K heads then V heads; got"
+          " 2 * nheads_k, head_dim), each KV head's K then its V; got"
           f" {k_cache.shape=}."
       )
     if k_cache.shape[1] % PAGE_SIZE_MULTIPLE:
@@ -1404,12 +1425,10 @@ def flash_attn_with_kvcache(
     else:
       packed_k = packed_v = None
     kernel_outputs = flash_attn_kvcache_varlen(
-        packed_q, k_cache, v_cache, packed_k, packed_v,
-        packed_cu_seqlens_q, row_cache_seqlens, cache_batch_idx,
-        flat_block_table, num_active,
+        packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
+        row_cache_seqlens, flat_block_table, num_active,
         q_scale=float(fused_q_scale(softmax_scale, 0.0)), causal=bool(causal),
         return_lse=bool(return_softmax_lse), interpret=bool(interpret),
-        merged_cache=is_paged,
     )
   else:
     # Note (david): the decode kernel runs its softmax in log2 units straight

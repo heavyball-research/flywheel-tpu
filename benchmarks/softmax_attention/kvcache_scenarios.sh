@@ -13,7 +13,7 @@
 #     PYTHON          interpreter (default: .venv/bin/python)
 #     IMPLS           default "flywheel rpa"
 #     HEADS_K         default "4 32"
-#     DECODE_BATCHES  default "256 128"
+#     DECODE_BATCHES  default "256 128"; empty skips decode
 #     RPA_K32_BLOCKS  RPA blocks at 32 KV heads (default 128,256,128,256);
 #                     empty runs RPA's own formula
 
@@ -25,7 +25,7 @@ PYTHON=${PYTHON:-.venv/bin/python}
 OUT=${1:-results/benchmark/kvcache_scenarios/$(date +%Y%m%d_%H%M%S)}
 IMPLS=${IMPLS:-"flywheel rpa"}
 HEADS_K=${HEADS_K:-"4 32"}
-DECODE_BATCHES=${DECODE_BATCHES:-"256 128"}
+DECODE_BATCHES=${DECODE_BATCHES-"256 128"}
 # At 32 KV heads of 256, RPA's default blocks run out of VMEM on v7x; this is
 # the one config that fit its sweep (its v7x prefill entry). A decode call
 # compiles RPA's mixed kernel as well, so it needs these blocks there too.

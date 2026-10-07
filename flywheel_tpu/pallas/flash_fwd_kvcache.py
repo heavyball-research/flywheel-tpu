@@ -20,7 +20,13 @@ from .block_sizes import (
   next_pow2,
   vmem_limit_bytes,
 )
-from .copy_utils import MIN_BLOCK_KV, load_kv_fragment
+from .copy_utils import (
+  MIN_BLOCK_KV,
+  bf16_half,
+  load_kv_fragment,
+  load_staged_words,
+  staged_words,
+)
 from .fwd_pipeline import overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
@@ -80,6 +86,51 @@ def static_anchor_update(
   return probabilities, row_max, row_sum, rescale
 
 
+def load_kv_pair_fragment(
+    buffers: jax.Array,
+    slot: jax.Array,
+    kv_head: int,
+    kv_compute_index: int,
+    *,
+    block_kv_compute: int,
+    is_bitcast_load: bool,
+) -> tuple[jax.Array, jax.Array]:
+  """(keys, values) of kv_head, each (block_kv_compute, head_dim) bf16, read
+  from a merged-cache staging slot.
+
+  A staged token row holds every KV head's (K, V) pair: (stages, block_kv,
+  num_kv_heads, 2, head_dim) bf16 with is_bitcast_load, else (stages,
+  block_kv, 2 * num_kv_heads, head_dim).
+  """
+  head_dim = buffers.shape[-1]
+  compute_start = pl.multiple_of(
+      kv_compute_index * block_kv_compute, MIN_BLOCK_KV
+  )
+  if not is_bitcast_load:
+    keys, values = (
+        buffers[
+            slot,
+            pl.ds(compute_start, block_kv_compute),
+            pl.ds(2 * kv_head + kv_part, 1),
+            :,
+        ].reshape(block_kv_compute, head_dim)
+        for kv_part in range(2)
+    )
+    return keys, values
+  else:
+    # Note (david): the pair of KV head h is u32 word row token * num_kv_heads
+    # + h, K in its low half and V in its high half, so one strided word load
+    # yields both.
+    num_kv_heads = buffers.shape[2]
+    words = load_staged_words(
+        staged_words(buffers, slot),
+        compute_start * num_kv_heads + kv_head,
+        block_kv_compute,
+        num_kv_heads,
+    )
+    return bf16_half(words, 0), bf16_half(words, 1)
+
+
 def kvcache_kernel(
     cache_seqlens_ref: jax.Array,
     cache_batch_idx_ref: jax.Array,
@@ -101,26 +152,23 @@ def kvcache_kernel(
     page_size: int | None,
     pages_per_seq: int | None,
     is_merged_cache: bool,
-    is_kv_pair_tile: bool,
 ) -> None:
   remaining_refs = list(refs)
   block_table_ref = remaining_refs.pop(0) if page_size is not None else None
   num_active = num_active_ref[0]
   if is_merged_cache:
+    # Note (david): a merged build takes each row's new token as one
+    # (2 * num_kv_heads, head_dim) row already in the cache's [k0, v0, k1, v1,
+    # ...] head order.
     (
         q_ref,
-        k_ref,
-        v_ref,
-        kv_cache_ref,
+        new_kv_ref,
+        k_cache_ref,
         out_ref,
-        kv_out_ref,
+        k_out_ref,
         *remaining_refs,
     ) = remaining_refs
-    k_cache_ref = v_cache_ref = kv_cache_ref
-    k_out_ref = v_out_ref = kv_out_ref
-    # Note (david): a K/V pair-tile build copies whole (..., 2, head_dim) pair
-    # tiles, so it addresses the operand without picking a K or V part.
-    k_plane, v_plane = (None, None) if is_kv_pair_tile else (0, 1)
+    k_ref = v_ref = v_cache_ref = v_out_ref = None
   else:
     (
         q_ref,
@@ -133,7 +181,7 @@ def kvcache_kernel(
         v_out_ref,
         *remaining_refs,
     ) = remaining_refs
-    k_plane = v_plane = None
+    new_kv_ref = None
   lse_ref = remaining_refs.pop(0) if return_lse else None
   (
       k_buffers,
@@ -148,27 +196,22 @@ def kvcache_kernel(
       sems,
   ) = remaining_refs
 
-  def _cache_view(ref, plane, index):
-    # Note (david): a merged operand holds the K heads then the V heads on its
-    # head axis, so a part is a head-block view of the row.
-    if plane is None:
-      return ref.at[index]
-    else:
-      row = ref.at[index[0], :, pl.ds(plane * num_kv_heads, num_kv_heads), :]
-      return row.at[index[1:]]
-
   query_heads_per_kv_head = num_query_heads // num_kv_heads
-  staged_kv_heads = 2 if is_kv_pair_tile else num_kv_heads
+  # Note (david): a merged build stages whole token rows, every KV head's
+  # (K, V) pair.
+  staged_kv_heads = 2 * num_kv_heads if is_merged_cache else num_kv_heads
   num_kv_compute_fragments = block_kv // block_kv_compute
   # Note (david): a bitcast head-pair tile interleaves its two heads per token,
   # so both heads' query groups ride one MXU pass with the off-parity columns
   # masked. That is free while the pair's query rows fit one 8-sublane f32
   # tile; past it the masked half doubles the softmax work, so larger groups
-  # unpack one head per fragment.
+  # unpack one head per fragment. A merged row's u32 word pairs a head's K
+  # with its V instead, so a merged build always unpacks one head per
+  # fragment.
   if (
       is_bitcast_load
       and 2 * query_heads_per_kv_head <= NUM_SUBLANES
-      and not is_kv_pair_tile
+      and not is_merged_cache
   ):
     kv_heads_per_fragment = 2
   else:
@@ -187,14 +230,21 @@ def kvcache_kernel(
     parity_mask = (
         column_index[None, :] % kv_heads_per_fragment == row_parity[:, None]
     )
-  kv_fragment = functools.partial(
-      load_kv_fragment,
-      block_kv_compute=block_kv_compute,
-      kv_heads_per_fragment=kv_heads_per_fragment,
-      is_kv_pair_tile=is_kv_pair_tile,
-      is_cache_head_major=is_cache_head_major,
-      is_bitcast_load=is_bitcast_load,
-  )
+  if is_merged_cache:
+    kv_pair_fragment = functools.partial(
+        load_kv_pair_fragment,
+        block_kv_compute=block_kv_compute,
+        is_bitcast_load=is_bitcast_load,
+    )
+  else:
+    kv_fragment = functools.partial(
+        load_kv_fragment,
+        block_kv_compute=block_kv_compute,
+        kv_heads_per_fragment=kv_heads_per_fragment,
+        is_kv_pair_tile=False,
+        is_cache_head_major=is_cache_head_major,
+        is_bitcast_load=is_bitcast_load,
+    )
 
   def _cache_copy_size(cache_len, block_index):
     copy_limit = (
@@ -206,16 +256,15 @@ def kvcache_kernel(
     )
     return pl.multiple_of(copy_size, NUM_SUBLANES)
 
-  def _cache_tile(ref, plane, hbm_row, token_start, num_tokens):
+  def _cache_tile(ref, hbm_row, token_start, num_tokens):
     if is_cache_head_major:
-      index = (
+      return ref.at[
           hbm_row, slice(None), pl.ds(token_start, num_tokens), slice(None)
-      )
+      ]
     else:
-      index = (
+      return ref.at[
           hbm_row, pl.ds(token_start, num_tokens), slice(None), slice(None)
-      )
-    return _cache_view(ref, plane, index)
+      ]
 
   def _buffer_tile(buffers, slot, token_start, num_tokens):
     if is_cache_head_major:
@@ -227,19 +276,18 @@ def kvcache_kernel(
     else:
       return buffers.at[slot, pl.ds(token_start, num_tokens), :, :]
 
-  # Note (david): a K/V pair tile carries V next to K, so a pair-tile build
-  # stages, appends and writes back through the K buffers only.
-  k_load = (k_cache_ref, k_plane, k_buffers, SEM_K)
-  k_write = (k_write_buffers, k_out_ref, k_plane, SEM_K_WRITE)
-  if is_kv_pair_tile:
+  # Note (david): a merged row carries each head's V next to its K, so a
+  # merged build stages, appends and writes back whole token rows through the
+  # K buffers only, one contiguous DMA per page or appended tile.
+  k_load = (k_cache_ref, k_buffers, SEM_K)
+  k_write = (k_write_buffers, k_out_ref, SEM_K_WRITE)
+  if is_merged_cache:
     load_parts = (k_load,)
     write_parts = (k_write,)
     value_buffers = k_buffers
   else:
-    load_parts = (k_load, (v_cache_ref, v_plane, v_buffers, SEM_V))
-    write_parts = (
-        k_write, (v_write_buffers, v_out_ref, v_plane, SEM_V_WRITE)
-    )
+    load_parts = (k_load, (v_cache_ref, v_buffers, SEM_V))
+    write_parts = (k_write, (v_write_buffers, v_out_ref, SEM_V_WRITE))
     value_buffers = v_buffers
 
   def _load_segments(cache_row, block_index, load_size):
@@ -274,9 +322,9 @@ def kvcache_kernel(
       for hbm_row, hbm_start, num_tokens, buffer_start in _load_segments(
           cache_row, block_index, load_size
       ):
-        for cache_ref, plane, buffers, sem_index in load_parts:
+        for cache_ref, buffers, sem_index in load_parts:
           pltpu.make_async_copy(
-              _cache_tile(cache_ref, plane, hbm_row, hbm_start, num_tokens),
+              _cache_tile(cache_ref, hbm_row, hbm_start, num_tokens),
               _buffer_tile(buffers, slot, buffer_start, num_tokens),
               sems.at[sem_index, slot, 0],
           ).start()
@@ -290,7 +338,7 @@ def kvcache_kernel(
     # because only the size matters.
     @pl.when(load_size > 0)
     def _wait():
-      for _, _, buffers, sem_index in load_parts:
+      for _, buffers, sem_index in load_parts:
         tile = _buffer_tile(buffers, slot, 0, load_size)
         pltpu.make_async_copy(tile, tile, sems.at[sem_index, slot, 0]).wait()
 
@@ -316,20 +364,16 @@ def kvcache_kernel(
       return [
           pltpu.make_async_copy(
               buffers.at[slot, pl.ds(head_offset, 1), :, :],
-              _cache_view(
-                  out_ref_hbm,
-                  plane,
-                  (
-                      hbm_row,
-                      pl.ds(head_offset, 1),
-                      pl.ds(tile_start, NUM_SUBLANES),
-                      slice(None),
-                  ),
-              ),
+              out_ref_hbm.at[
+                  hbm_row,
+                  pl.ds(head_offset, 1),
+                  pl.ds(tile_start, NUM_SUBLANES),
+                  :,
+              ],
               sems.at[sem_index, slot, head_offset],
           )
           for head_offset in range(num_kv_heads)
-          for buffers, out_ref_hbm, plane, sem_index in write_parts
+          for buffers, out_ref_hbm, sem_index in write_parts
       ]
     else:
       return [
@@ -337,19 +381,10 @@ def kvcache_kernel(
               buffers.at[slot].reshape(NUM_SUBLANES, staged_kv_heads, head_dim)
               if is_bitcast_load
               else buffers.at[slot],
-              _cache_view(
-                  out_ref_hbm,
-                  plane,
-                  (
-                      hbm_row,
-                      pl.ds(tile_start, NUM_SUBLANES),
-                      slice(None),
-                      slice(None),
-                  ),
-              ),
+              out_ref_hbm.at[hbm_row, pl.ds(tile_start, NUM_SUBLANES), :, :],
               sems.at[sem_index, slot, 0],
           )
-          for buffers, out_ref_hbm, plane, sem_index in write_parts
+          for buffers, out_ref_hbm, sem_index in write_parts
       ]
 
   def _q_copy(batch_index, slot):
@@ -436,7 +471,18 @@ def kvcache_kernel(
       group_start = head_group * rows_per_fragment
       group_slice = pl.ds(group_start, rows_per_fragment)
       query = queries[group_start : group_start + rows_per_fragment, :]
-      key = kv_fragment(k_buffers, slot, head_group, kv_compute_index, 0)
+      if is_merged_cache:
+        # Note (david): a head's K and V share their u32 words, so the score's
+        # word load also yields the values, held until this fragment's pv.
+        # Loading the words again for pv cost 1.30x the blocked layout's MHA
+        # decode (32 KV heads of 256, batch 32, v6e), whose 32-row word stride
+        # takes the costly strided load; one load is at parity.
+        key, value = kv_pair_fragment(
+            k_buffers, slot, head_group, kv_compute_index
+        )
+      else:
+        key = kv_fragment(k_buffers, slot, head_group, kv_compute_index, 0)
+        value = None
       scores = jnp.where(
           is_valid,
           jnp.dot(query, key.T, preferred_element_type=jnp.float32),
@@ -502,11 +548,14 @@ def kvcache_kernel(
         row_sum_ref[group_slice, :] = jnp.broadcast_to(
             row_sum, (rows_per_fragment, NUM_LANES)
         )
-      return probabilities, rescale, row_max, row_sum
+      return probabilities, rescale, value, row_max, row_sum
 
-    def _pv(slot, head_group, kv_compute_index, probabilities, rescale):
+    def _pv(slot, head_group, kv_compute_index, probabilities, rescale, value):
       group_slice = pl.ds(head_group * rows_per_fragment, rows_per_fragment)
-      value = kv_fragment(value_buffers, slot, head_group, kv_compute_index, 1)
+      if value is None:
+        value = kv_fragment(
+            value_buffers, slot, head_group, kv_compute_index, 1
+        )
       weighted_values = jnp.dot(
           probabilities.astype(jnp.bfloat16),
           value,
@@ -552,8 +601,6 @@ def kvcache_kernel(
           local_tile_start = pl.multiple_of(
               local_index // NUM_SUBLANES * NUM_SUBLANES, NUM_SUBLANES
           )
-          new_key = k_ref[local_batch_index, :, :]
-          new_value = v_ref[local_batch_index, :, :]
           token_row = jnp.arange(NUM_SUBLANES, dtype=jnp.int32)
           tile_tokens = pl.ds(local_tile_start, NUM_SUBLANES)
           if is_cache_head_major:
@@ -572,12 +619,14 @@ def kvcache_kernel(
             token_rows = token_row[:, None, None]
             expand = lambda token: token[None]
           is_new_row = token_rows == local_index - local_tile_start
-          if is_kv_pair_tile:
-            new_tokens = (jnp.concatenate([new_key, new_value], axis=0),)
+          if is_merged_cache:
+            new_tokens = (new_kv_ref[local_batch_index, :, :],)
           else:
-            new_tokens = (new_key, new_value)
+            new_tokens = (
+                k_ref[local_batch_index, :, :], v_ref[local_batch_index, :, :]
+            )
           updated_tiles = []
-          for (_, _, buffers, _), new_token in zip(load_parts, new_tokens):
+          for (_, buffers, _), new_token in zip(load_parts, new_tokens):
             staged_tile = buffers[tile_index]
             updated_tile = jnp.where(is_new_row, expand(new_token), staged_tile)
             buffers[tile_index] = updated_tile
@@ -595,7 +644,7 @@ def kvcache_kernel(
             ):
               copy.wait()
 
-          for (write_buffers, _, _, _), updated_tile in zip(
+          for (write_buffers, _, _), updated_tile in zip(
               write_parts, updated_tiles
           ):
             write_buffers[write_slot] = updated_tile
@@ -636,7 +685,7 @@ def kvcache_kernel(
       # Note (david): software pipeline; each fragment's scores are issued one
       # step ahead of its own pv, so the MXU has the next matmul queued while
       # pv runs. pending_fragment is (head_group, kv_compute_index,
-      # probabilities, rescale, row_max, row_sum).
+      # probabilities, rescale, value, row_max, row_sum).
       pending_fragment = None
       for fragment_index in range(num_head_groups * num_kv_compute_fragments):
         head_group, kv_compute_index = divmod(
@@ -650,15 +699,15 @@ def kvcache_kernel(
             valid_masks[kv_compute_index],
             fragment_has_valid_keys[kv_compute_index],
             *(
-                pending_fragment[4:]
+                pending_fragment[5:]
                 if pending_fragment is not None
                 else (None, None)
             ),
         )
         if pending_fragment is not None:
-          _pv(slot, *pending_fragment[:4])
+          _pv(slot, *pending_fragment[:5])
         pending_fragment = (head_group, kv_compute_index, *current_fragment)
-      _pv(slot, *pending_fragment[:4])
+      _pv(slot, *pending_fragment[:5])
       return jnp.logical_or(
           has_prefetched_next_sequence, should_prefetch_next_sequence
       )
@@ -846,10 +895,11 @@ def flash_attn_kvcache_pallas(
   pages_per_seq * page_size.
 
   merged_cache (v_cache=None, token-major) makes k_cache one
-  (rows, capacity, 2 * num_kv_heads, head_dim) array holding a token's K heads
-  followed by its V heads, and returns (out, kv_cache[, lse]) instead of
-  (out, k_cache, v_cache[, lse]); lse is (batch, num_query_heads, 128) float32
-  with each value broadcast over lanes.
+  (rows, capacity, 2 * num_kv_heads, head_dim) array whose token rows hold
+  each KV head's K then its V, [k0, v0, k1, v1, ...] (RPA v3's head order),
+  and returns (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[,
+  lse]). lse is (batch, num_query_heads, 128) float32 with each value
+  broadcast over lanes.
 
   num_active: rows at or past it are padding (RPA's distribution[-1]
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
@@ -866,27 +916,11 @@ def flash_attn_kvcache_pallas(
   cache_shape = k_cache.shape
   batch, num_query_heads, head_dim = q.shape
   if merged_cache:
+    # Note (david): a merged build stages, appends and writes back whole token
+    # rows, so no DMA cuts the head axis, and a staged u32 word holds one
+    # head's K and V, so no word spans two heads: the head count needs no
+    # tile alignment or parity.
     row_tokens, num_kv_heads = cache_shape[1], cache_shape[2] // 2
-    if num_kv_heads != 1 and num_kv_heads % 2:
-      raise ValueError(
-          "a merged cache needs one KV head per shard or an even number (the"
-          " packed load carries two bf16 heads per u32 lane); got"
-          f" num_kv_heads={num_kv_heads}."
-      )
-    # Note (david): past one KV head, K and V are head-block DMAs out of the
-    # merged row, which need a tile-aligned head offset and count. Measured on
-    # v6e (jax 0.11.0): 6 or 12 KV heads fail to compile, and 2 or 4 at
-    # head_dim 64 read and append the wrong bytes without an error.
-    is_head_block_aligned = num_kv_heads % NUM_SUBLANES == 0 or (
-        head_dim >= NUM_LANES and NUM_SUBLANES % num_kv_heads == 0
-    )
-    if num_kv_heads > 1 and not is_head_block_aligned:
-      raise ValueError(
-          "a merged cache needs 1, 2, 4 or a multiple of 8 KV heads per shard"
-          " (1 or a multiple of 8 at head_dim 64), since its K and V head"
-          " blocks are DMA'd at tile-aligned offsets; got"
-          f" num_kv_heads={num_kv_heads}, head_dim={head_dim}."
-      )
   elif cache_head_major:
     num_kv_heads, row_tokens = cache_shape[1], cache_shape[2]
   else:
@@ -900,14 +934,12 @@ def flash_attn_kvcache_pallas(
           "token-major cache needs an even head axis (the packed load carries"
           f" two bf16 heads per u32 lane); got num_kv_heads={num_kv_heads}."
       )
-  # Note (david): one merged KV head leaves a (2, head_dim) head axis whose
-  # one-head slice is not tile-aligned, so the build stages the whole K/V pair
-  # tile and reads K from lane 0 and V from lane 1 of its u32 words. That costs
-  # 1.4-1.5x the head-major decode of an unmerged K/V cache (6 query heads,
-  # head_dim 256, v6e), yet splitting the pair into dense K/V buffers per
-  # block (1.45-2.25x), folding the heads into the row width (6.5-12x) and
-  # scoring the pair interleaved (1.46-2.02x) all measured worse.
-  is_kv_pair_tile = merged_cache and num_kv_heads == 1
+  # Note (david): a merged build reads K from the low and V from the high half
+  # of each staged (K, V) u32 word. At one KV head that costs 1.4-1.5x the
+  # head-major decode of an unmerged K/V cache (6 query heads, head_dim 256,
+  # v6e), yet splitting the pair into dense K/V buffers per block
+  # (1.45-2.25x), folding the heads into the row width (6.5-12x) and scoring
+  # the pair interleaved (1.46-2.02x) all measured worse.
   # Note (david): with a singleton head axis a token-major
   # (rows, capacity, 1, head_dim) cache is the same bytes as head-major
   # (rows, 1, capacity, head_dim), whose tile is a dense (block_kv, head_dim)
@@ -993,7 +1025,7 @@ def flash_attn_kvcache_pallas(
   # Note (david): the pair-packed load bitcasts refs, which only the TPU build
   # supports; interpret mode reads the staged heads as bf16.
   is_bitcast_load = not interpret and not is_cache_head_major
-  staged_kv_heads = 2 if is_kv_pair_tile else num_kv_heads
+  staged_kv_heads = 2 * num_kv_heads if merged_cache else num_kv_heads
 
   def _staging_shape(num_tokens):
     if is_cache_head_major:
@@ -1005,10 +1037,10 @@ def flash_attn_kvcache_pallas(
 
   cache_buffer_shape = _staging_shape(block_kv)
   write_buffer_shape = _staging_shape(NUM_SUBLANES)
-  # Note (david): a pair-tile build never touches the V staging, so it shrinks
-  # to the write-tile size instead of a whole KV block.
+  # Note (david): a merged build never touches the V staging, so it shrinks to
+  # the write-tile size instead of a whole KV block.
   value_buffer_shape = (
-      write_buffer_shape if is_kv_pair_tile else cache_buffer_shape
+      write_buffer_shape if merged_cache else cache_buffer_shape
   )
   io_buffer_shape = (NUM_IO_STAGES, num_query_heads, head_dim)
   state_shape = (num_query_heads, NUM_LANES)
@@ -1035,7 +1067,17 @@ def flash_attn_kvcache_pallas(
         cache_seqlens, cache_batch_idx, num_active_array, block_table
     )
   num_prefetch = len(scalar_prefetches)
-  dense_inputs = (q, k, v)
+  if merged_cache:
+    # Note (david): the new K and V are interleaved into the cache's head order
+    # here, a (batch, 2 * num_kv_heads, head_dim) op far below one cache read,
+    # so the kernel appends a ready token row and writes each appended tile
+    # back with one contiguous DMA.
+    new_kv_shape = (batch, 2 * num_kv_heads, head_dim)
+    dense_inputs = (q, jnp.stack([k, v], axis=2).reshape(new_kv_shape))
+    new_token_specs = (pl.BlockSpec(new_kv_shape, lambda *_: (0, 0, 0)),)
+  else:
+    dense_inputs = (q, k, v)
+    new_token_specs = (kv_spec, kv_spec)
   # Note (david): q aliases out (same shape and dtype) and each cache aliases
   # its own output, so the append lands in place.
   input_output_aliases = {num_prefetch: 0} | {
@@ -1060,14 +1102,13 @@ def flash_attn_kvcache_pallas(
       page_size=page_size,
       pages_per_seq=pages_per_seq,
       is_merged_cache=merged_cache,
-      is_kv_pair_tile=is_kv_pair_tile,
   )
   call = pl.pallas_call(
       kernel,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=num_prefetch,
           grid=(1,),
-          in_specs=(hbm_spec, kv_spec, kv_spec)
+          in_specs=(hbm_spec, *new_token_specs)
           + (hbm_spec,) * len(kernel_caches),
           out_specs=out_specs,
           scratch_shapes=scratch_shapes,

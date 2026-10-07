@@ -136,22 +136,17 @@ class TokenMajorInfo:
 class PagedKVInfo:
   """Static addressing facts for a paged KV cache; None means packed K/V.
 
-  A merged cache is one operand whose token rows hold the K heads, then the V
-  heads. is_cache_head_major views a one-head K/V pair as (num_pages, 1,
-  page_size, head_dim); is_bitcast_load packs two bf16 heads per u32 word.
+  The cache is one merged (num_pages, page_size, 2 * num_kv_heads, head_dim)
+  operand whose token rows interleave each head's K and V rows, [k0, v0, k1,
+  v1, ...], so one head's (K, V) row pair is one 2-row window of the head
+  axis. is_bitcast_load reads a staged pair as one u32 word per lane (K in the
+  low half, V in the high half), which only the TPU build supports; the
+  Pallas interpreter indexes the two rows instead.
   """
   num_kv_heads: int
-  kv_heads_per_group: int
   page_size: int
   pages_per_seq: int
-  is_merged: bool
-  is_cache_head_major: bool
   is_bitcast_load: bool
-
-  @property
-  def staged_kv_heads(self) -> int:
-    """Heads per staged token row of one load part."""
-    return 2 * self.num_kv_heads if self.is_merged else self.num_kv_heads
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
