@@ -120,7 +120,7 @@ flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_se
                        return_attn_probs=False, return_softmax_lse=False, interpret=False,
                        head_dim=None, token_major=False, block_sizes=None, *,
                        rotary_cos=None, rotary_sin=None, rotary_interleaved=True,
-                       rotary_k=True):
+                       rotary_k=True, block_table=None, seqused_k=None, num_active=None):
 """Attention over sequences packed along the token axis. Unlike flash-attn, the default layout
 is head-major, (nheads, total, headdim), which is the kernel's own layout, so no operand is
 relaid out.
@@ -146,6 +146,16 @@ Arguments:
     block_sizes [optional]: (block_q, block_kv, block_q_compute, block_kv_compute). Pins the
         forward tiles instead of the tuned or analytic ones; block_q and block_kv must be
         multiples of 128.
+    block_table [optional]: (batch_size, max_num_blocks_per_seq), int. Reads k as a paged KV
+        cache, read-only: one merged (num_blocks, page_block_size, 2 * nheads_k, headdim)
+        cache whose token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
+        ...], with v and cu_seqlens_k None. page_block_size and headdim are multiples of 128;
+        any nheads_k. q stays head-major; token_major, window_size, softcap and rotary_k=True
+        are not supported.
+    seqused_k [optional]: (batch_size,), int. With block_table, each sequence's kv length,
+        its new tokens included, which the cache must already hold; max_seqlen_k bounds it.
+    num_active [optional]: int, may be traced. With block_table, only the first num_active
+        sequences attend; rows past the last of them return out = 0 and lse = -inf.
     The other arguments are as in flash_attn_func.
 Return:
     out: (nheads, total_q, headdim_v), or (total_q, nheads * headdim_v) with token_major=True.
