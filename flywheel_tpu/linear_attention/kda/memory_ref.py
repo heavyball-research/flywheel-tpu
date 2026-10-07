@@ -205,6 +205,18 @@ def wait_row_dma(buf_ref: jax.Ref, num_rows: jax.Array,
     pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
+def qkv_copy_refs(
+    hbm_ref: jax.Ref, buf_ref: jax.Ref, p_id: int | jax.Array, idx: int,
+    metadata_ref: MetadataRef
+) -> tuple[jax.Ref, jax.Ref]:
+    """Source and destination of the DMA that fetches record idx's rows of a
+    native [batch, dim] input, widened to their aligned window."""
+    record = metadata_ref.get_record(p_id, idx)
+    window_base, window_rows = aligned_window(record.r_base, record.r_size)
+    return (hbm_ref.at[pl.ds(window_base, window_rows)],
+            buf_ref.at[idx, pl.ds(0, window_rows)])
+
+
 def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
                  p_id: int | jax.Array, metadata_ref: MetadataRef,
                  cfg: config.KDAConfig) -> None:
@@ -215,23 +227,23 @@ def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     rather than at row 0, and the rows past r_size are not the record's.
     """
     for idx in range(cfg.seq_tile_size):
-        record = metadata_ref.get_record(p_id, idx)
-        window_base, window_rows = aligned_window(record.r_base, record.r_size)
         pltpu.make_async_copy(
-            hbm_ref.at[pl.ds(window_base, window_rows)],
-            buf_ref.at[idx, pl.ds(0, window_rows)],
-            sem,
-        ).start()
+            *qkv_copy_refs(hbm_ref, buf_ref, p_id, idx, metadata_ref),
+            sem).start()
 
 
-def wait_qkv_in(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
-    num_rows = 0
+def wait_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                p_id: int | jax.Array, metadata_ref: MetadataRef,
+                cfg: config.KDAConfig) -> None:
+    # Each copy is waited on itself. These rows are the block's tiled axis,
+    # and where Mosaic tiles the block 16 rows deep (v7x, a verify window's
+    # 16-row block) wait_row_dma's one self-copy of the summed rows left the
+    # semaphore nonzero at kernel exit: three 8-row copies against a 24-row
+    # self-copy. A copy's own descriptor takes back exactly what it added.
     for idx in range(cfg.seq_tile_size):
-        record = metadata_ref.get_record(p_id, idx)
-        _, window_rows = aligned_window(record.r_base, record.r_size)
-        num_rows += window_rows
-    wait_row_dma(buf_ref, pl.multiple_of(num_rows, config.SUBLANE_ALIGN), sem)
+        pltpu.make_async_copy(
+            *qkv_copy_refs(hbm_ref, buf_ref, p_id, idx, metadata_ref),
+            sem).wait()
 
 
 def start_compact_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
@@ -293,23 +305,33 @@ def out_window(
     return window_base, window_rows, delta, delta + tile_rows
 
 
+def out_copy_refs(
+    hbm_ref: jax.Ref, buf_ref: jax.Ref, p_id: int | jax.Array,
+    metadata_ref: MetadataRef, cfg: config.KDAConfig
+) -> tuple[jax.Ref, jax.Ref]:
+    """Source and destination of the one DMA that writes the tile's whole
+    aligned output window."""
+    window_base, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
+    return (buf_ref.at[pl.ds(0, window_rows)],
+            hbm_ref.at[pl.ds(window_base, window_rows)])
+
+
 def start_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
               p_id: int | jax.Array, metadata_ref: MetadataRef,
               cfg: config.KDAConfig) -> None:
-    """Write the tile's whole aligned output window in one DMA."""
-    window_base, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
     pltpu.make_async_copy(
-        buf_ref.at[pl.ds(0, window_rows)],
-        hbm_ref.at[pl.ds(window_base, window_rows)],
-        sem,
-    ).start()
+        *out_copy_refs(hbm_ref, buf_ref, p_id, metadata_ref, cfg),
+        sem).start()
 
 
-def wait_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-             metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
-    _, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
-    wait_ref = buf_ref.at[pl.ds(0, window_rows)]
-    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+def wait_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+             p_id: int | jax.Array, metadata_ref: MetadataRef,
+             cfg: config.KDAConfig) -> None:
+    # The tile's one output DMA is waited on itself, for the reason
+    # wait_qkv_in gives: the stage's rows are its tiled axis.
+    pltpu.make_async_copy(
+        *out_copy_refs(hbm_ref, buf_ref, p_id, metadata_ref, cfg),
+        sem).wait()
 
 
 def start_state_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,

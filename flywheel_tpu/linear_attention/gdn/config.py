@@ -25,6 +25,12 @@ from jax.experimental.pallas import tpu as pltpu
 # dimension to be provably a multiple of the sublane tile height, and the token
 # axis of the native [batch, dim] layout is that tiled dimension.
 SUBLANE_ALIGN = 8
+# A load or store of the bf16 output stage at a traced row works on this many
+# rows, on this grid. Mosaic may tile a bf16 VMEM ref 16 rows deep (v7x does
+# when the ref's row count is a multiple of 16) and then cannot prove an 8-row
+# offset aligned. DMA windows stay on SUBLANE_ALIGN, the grid of the HBM
+# arrays.
+STAGE_SLAB_ROWS = 2 * SUBLANE_ALIGN
 
 NUM_BUFFERS = 2
 
@@ -133,7 +139,11 @@ class GDNConfig:
         # start r_base % SUBLANE_ALIGN into the window; one extra sublane tile
         # holds that head slack.
         tile_rows = self.seq_tile_size * self.chunk_size
-        return (pl.cdiv(tile_rows, SUBLANE_ALIGN) + 1) * SUBLANE_ALIGN
+        # The output fix-up rewrites the whole STAGE_SLAB_ROWS slab around the
+        # row after the tile's last one, so the stage ends on that grid past
+        # the last row a tile can use.
+        max_used_rows = SUBLANE_ALIGN - 1 + tile_rows
+        return (max_used_rows // STAGE_SLAB_ROWS + 1) * STAGE_SLAB_ROWS
 
     @property
     def v_dim_size(self) -> int:
