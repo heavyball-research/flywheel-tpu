@@ -41,9 +41,12 @@ SEM_OUT = 5
 NUM_SEMS = 6
 BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 384, 256, 128)
 STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
-WIDE_HEAD_DIM = 256
-WIDE_HEAD_MIN_KV_HEADS = 8
-WIDE_HEAD_MAX_BLOCK_KV = 1024
+# Note (david): a row computes every kv compute tile of its staged block,
+# masked or not, so a short row costs a whole block. At Qwen3-4B's 32:8 heads
+# of 128 with a 32K-token table row on v6e, 256 rows of 64-1024 tokens took
+# 2.42 ms with 4096-token blocks against 0.76 ms with 1024-token ones (RPA v3:
+# 1.33 ms), while a 16K context took 15.33 against 15.10 ms.
+MAX_BLOCK_KV = 1024
 
 
 def static_anchor_update(
@@ -797,20 +800,18 @@ def kvcache_kernel(
 def resolve_block_kv(
     capacity: int, num_kv_heads: int, head_dim: int, granule: int = MIN_BLOCK_KV
 ) -> int:
-  """Largest VMEM-sized multiple of granule that divides capacity.
+  """Largest multiple of granule that divides capacity, within the VMEM
+  budget and MAX_BLOCK_KV.
 
   granule is the page size for paged caches (a block is whole pages) and
   MIN_BLOCK_KV otherwise; capacity is a multiple of it either way.
   """
   packed_kv_heads = next_pow2(2 * num_kv_heads)
-  budget_block_kv = min(
+  target_block_kv = min(
       capacity,
       STAGED_KV_ELEMENT_BUDGET // head_dim // packed_kv_heads,
+      MAX_BLOCK_KV,
   )
-  if head_dim == WIDE_HEAD_DIM and num_kv_heads >= WIDE_HEAD_MIN_KV_HEADS:
-    target_block_kv = min(budget_block_kv, WIDE_HEAD_MAX_BLOCK_KV)
-  else:
-    target_block_kv = budget_block_kv
   aligned_target = max(target_block_kv // granule * granule, granule)
   return next(
       block for block in range(aligned_target, 0, -granule)
