@@ -70,14 +70,14 @@ def store_out_rows(out_slot_ref: jax.Array, out: jax.Array,
     block-grid rows; BATCHED packs each sequence's real rows back to back from
     stage row delta.
     """
-    align = config.SUBLANE_ALIGN
     out_dtype = out_slot_ref.dtype
     if cfg.mode == config.GDNMode.PER_SEQ:
         compute_chunk = cfg.compute_chunk_size
         if isinstance(chunk_idx, int):
             row_offset = chunk_idx * compute_chunk
         else:
-            row_offset = pl.multiple_of(chunk_idx * compute_chunk, align)
+            row_offset = pl.multiple_of(chunk_idx * compute_chunk,
+                                        compute_chunk)
         out_slot_ref[pl.ds(row_offset, compute_chunk)] = out[0].astype(
             out_dtype)
     else:
@@ -342,6 +342,7 @@ def outer_kernel(
     del aliased_out_ref, conv_state_out_ref, recurrent_state_out_ref
 
     align = config.SUBLANE_ALIGN
+    slab = config.STAGE_SLAB_ROWS
     num_tiles = metadata_ref.num_tiles[...]
     first_window_base, _, _, _ = memory_ref.out_window(0, metadata_ref, cfg)
     profile_scope = compute_gdn.profile_scope
@@ -369,7 +370,7 @@ def outer_kernel(
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_qkv_in(qkv_buf.at[slot],
+            memory_ref.wait_qkv_in(qkv_ref, qkv_buf.at[slot],
                                    sems.at[config.STREAM_QKV, slot],
                                    *tile_args)
             memory_ref.wait_compact_in(b_buf.at[slot],
@@ -401,7 +402,7 @@ def outer_kernel(
     def _wait_out(p_id, slot):
         with profile_scope("wait_out"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_out(out_buf.at[slot],
+            memory_ref.wait_out(out_ref, out_buf.at[slot],
                                 sems.at[config.STREAM_OUT, slot], *tile_args)
             memory_ref.wait_state_out(conv_out_buf.at[slot],
                                       sems.at[config.STREAM_CONV_OUT, slot],
@@ -465,12 +466,12 @@ def outer_kernel(
             # lands in the padded tail, which the zero fill below expects zero.
             stage_ref = out_buf.at[slot]
             tail_slab_start = pl.multiple_of(
-                used_rows - (used_rows & (align - 1)), align)
+                used_rows - (used_rows & (slab - 1)), slab)
             tail_slab_rows = tail_slab_start + lax.broadcasted_iota(
-                jnp.int32, (align, cfg.v_dim_size), 0)
-            stage_ref[pl.ds(tail_slab_start, align)] = jnp.where(
+                jnp.int32, (slab, cfg.v_dim_size), 0)
+            stage_ref[pl.ds(tail_slab_start, slab)] = jnp.where(
                 tail_slab_rows < used_rows,
-                stage_ref[pl.ds(tail_slab_start, align)], 0)
+                stage_ref[pl.ds(tail_slab_start, slab)], 0)
 
             # Note (david): the window's head rows belong to the previous tile,
             # whose stage is still resident since only its outbound DMA reads
@@ -481,12 +482,18 @@ def outer_kernel(
             def _blend_head_rows():
                 prev_stage_row = pl.multiple_of(window_base - prev_window_base,
                                                 align)
+                # The previous stage is read a STAGE_SLAB_ROWS slab at a time,
+                # and the head rows are that slab's lower or upper half.
+                prev_slab_start = pl.multiple_of(
+                    prev_stage_row - (prev_stage_row & (slab - 1)), slab)
+                prev_slab = out_buf.at[other_slot][pl.ds(prev_slab_start,
+                                                         slab)]
+                prev_head = jnp.where(prev_stage_row == prev_slab_start,
+                                      prev_slab[:align], prev_slab[align:])
                 head_rows = lax.broadcasted_iota(
                     jnp.int32, (align, cfg.v_dim_size), 0)
                 stage_ref[pl.ds(0, align)] = jnp.where(
-                    head_rows < delta,
-                    out_buf.at[other_slot][pl.ds(prev_stage_row, align)],
-                    stage_ref[pl.ds(0, align)])
+                    head_rows < delta, prev_head, stage_ref[pl.ds(0, align)])
 
         _start_out(tile_idx, slot)
 
@@ -736,6 +743,18 @@ def fused_conv1d_gdn(
                 spec_tile_budget // bytes_per_seq))
     else:
         decode_tile_size = min(decode_tile_size, batch_size)
+        # Plain decode keeps that tile wherever its state rings fit VMEM: every
+        # ring slot holds each sequence's initial state and its one checkpoint.
+        # Where they cannot fit (v7x has half of v6e's VMEM: 4 sequences of 48
+        # value heads at head_dim 128), the tile shrinks until they do with one
+        # more state per sequence left over for the compiler's temporaries.
+        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
+        ring_bytes_per_seq = config.NUM_BUFFERS * 2 * (
+            state_bytes + (kernel_size - 1) * dim * F32_BYTES)
+        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+        if decode_tile_size * ring_bytes_per_seq > vmem_limit:
+            decode_tile_size = max(
+                1, vmem_limit // (ring_bytes_per_seq + state_bytes))
 
     # Note (david): b and a keep the compact [batch, 1, heads] layout: they are
     # tiny, and their untiled leading token axis keeps ragged DMAs offset-free.
