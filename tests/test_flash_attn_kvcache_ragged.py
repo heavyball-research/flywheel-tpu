@@ -466,8 +466,8 @@ def test_empty_packed_allocation(append):
 
 @pytest.mark.parametrize("heads,kv_heads", [(132, 6), (128, 8)])
 def test_ragged_cache_many_heads(heads, kv_heads):
-  # Note (david): one q head per group, so 128+ q heads at d256 are as many
-  # groups, each re-staging its kv head.
+  # Note (david): a group is one kv head whose 22 or 16 q heads fold into the
+  # score fragment rows, so the q compute tile shrinks to 32 or 64 tokens.
   case = random_ragged_case(lengths=(67, 11), prefixes=(3, 128), heads=heads,
                             kv_heads=kv_heads, head_dim=256, capacity=256,
                             padding=0)
@@ -593,13 +593,13 @@ def test_paged_varlen_rejects_unsupported_calls(case, error, message):
 
 
 def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, head_dim=128,
-                page_size=128, block_sizes=None):
+                page_size=128, gqa_fold=1, block_sizes=None):
   """resolve_paged_tiles with no lse or rotary."""
   return resolve_paged_tiles(
       max_seqlen_q_bucket=max_seqlen_q_bucket,
       max_seqlen_k_bucket=max_seqlen_k_bucket, page_size=page_size,
       head_dim=head_dim, return_lse=False, rotary_dtype=None,
-      block_sizes=block_sizes)
+      gqa_fold=gqa_fold, block_sizes=block_sizes)
 
 
 @pytest.mark.parametrize("shape,dtype,expected_bytes", [
@@ -657,7 +657,7 @@ def test_paged_vmem_estimate_tracks_forward_common_scratch(
                if ref.memory_space == pltpu.VMEM]
   assert allocated == paged_scratch_shapes(
       blocks, head_dim=head_dim, return_lse=return_lse,
-      rotary_dtype=rotary_dtype)
+      rotary_dtype=rotary_dtype, gqa_fold=heads // kv_heads)
 
 
 @pytest.mark.parametrize(
@@ -673,8 +673,9 @@ def test_paged_vmem_estimate_tracks_forward_common_scratch(
     ])
 def test_paged_tiles_minimize_prefix_streams_within_vmem(
     head_dim, max_seqlen_q_bucket, max_seqlen_k_bucket, expected):
-  # Note (david): one q head per group keeps every build far inside the VMEM
-  # budget, so the q block grows to the bucket (at most 2048 rows) and the
+  # Note (david): an unfolded group (one q head per kv head) keeps every build
+  # far inside the VMEM budget, so the q block grows to the bucket (at most
+  # 2048 rows), its q compute tile is half of it (at most 1024 rows), and the
   # prefix is streamed once per q block; the kv block takes the most pages
   # within the 2048 x 1024 block area, so a 2048-row q block streams 1024-token
   # kv blocks. A 384-row bucket takes one 256-row block fewer than three
@@ -683,14 +684,14 @@ def test_paged_tiles_minimize_prefix_streams_within_vmem(
   blocks = paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket,
                        head_dim=head_dim)
   assert (blocks.block_q, blocks.block_kv) == expected
-  assert blocks.block_q_compute == min(256, blocks.block_q // 2)
+  assert blocks.block_q_compute == blocks.block_q // 2
   if blocks.block_kv == 640:
     assert blocks.block_kv_compute == 128
   else:
     assert blocks.block_kv_compute == min(512, blocks.block_kv)
   assert estimate_vmem_bytes(
       blocks, head_dim=head_dim, return_lse=False,
-      rotary_dtype=None) <= vmem_limit_bytes()
+      rotary_dtype=None, gqa_fold=1) <= vmem_limit_bytes()
 
 
 def test_paged_tiles_pins_and_page_multiples():
@@ -706,6 +707,28 @@ def test_paged_tiles_pins_and_page_multiples():
     blocks = paged_tiles(128, kv_bucket, page_size=page_size)
     assert (blocks.block_kv, blocks.block_kv_compute) == (
         block_kv, block_kv_compute)
+
+
+@pytest.mark.parametrize("gqa_fold,head_dim,max_seqlen_q_bucket,expected", [
+    (8, 256, 1024, (512, 512, 128, 512)),
+    (4, 256, 1024, (1024, 512, 256, 512)),
+    (2, 256, 1024, (1024, 1024, 512, 512)),
+    (6, 128, 1024, (512, 512, 128, 512)),
+    (16, 128, 2048, (256, 512, 64, 512)),
+])
+def test_paged_tiles_fold_q_heads_into_fragment_rows(
+    gqa_fold, head_dim, max_seqlen_q_bucket, expected):
+  # Note (david): a kv head's gqa_fold q heads share one fragment, so the q
+  # compute tile keeps gqa_fold * block_q_compute within 1024 rows, the block
+  # area counts every folded row, and no larger q block is bought with a kv
+  # block below one full 512-key compute tile.
+  blocks = paged_tiles(max_seqlen_q_bucket, 16384, head_dim=head_dim,
+                       gqa_fold=gqa_fold)
+  assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
+          blocks.block_kv_compute) == expected
+  assert estimate_vmem_bytes(
+      blocks, head_dim=head_dim, return_lse=False, rotary_dtype=None,
+      gqa_fold=gqa_fold) <= vmem_limit_bytes()
 
 
 def test_paged_tiles_reject_pinned_vmem_overflow():

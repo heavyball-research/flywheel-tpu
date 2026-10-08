@@ -110,6 +110,7 @@ def fwd_body(
     rotary_groups: int = 1,
     rotary_k: bool = True,
     paged: PagedKVInfo | None = None,
+    gqa_fold: int = 1,
 ) -> None:
   """Run the fragment pipeline over every block the schedule yields.
 
@@ -118,6 +119,11 @@ def fwd_body(
   pre-multiplied by log2(e). paged (per-seq only) reads K and V from the one
   merged interleaved cache operand (k_hbm is v_hbm). A per-seq schedule writes
   the packed padding rows past schedule.packed_q_end as out = 0, lse = -inf.
+
+  gqa_fold > 1 (paged only) stages gqa_fold consecutive q heads of one kv head
+  per group and stacks them over the rows of every score fragment: fragment
+  row r holds head r // bq_compute at token r % bq_compute of the q tile, so
+  bq and bq_compute count tokens per head.
   """
   is_per_seq = schedule.q_token is not None
   is_paged = paged is not None
@@ -170,6 +176,16 @@ def fwd_body(
   num_k_compute_tiles = bkv // bkv_compute
   num_q_compute_tiles = bq // bq_compute
   num_compute_tiles = num_k_compute_tiles * num_q_compute_tiles
+  # Note (david): a group stages group_heads q heads. head_fold runs one
+  # fragment pipeline per head, while gqa_fold stacks its heads over the rows
+  # of one fragment, so each K and V tile the MXU holds serves frag_rows rows.
+  # The row state of pipeline head g is its group_bq rows, ordered (q tile,
+  # folded head, token).
+  assert gqa_fold == 1 or (is_paged and head_fold == 1), (gqa_fold, head_fold)
+  group_heads = head_fold * gqa_fold
+  group_bq = gqa_fold * bq
+  frag_rows = gqa_fold * bq_compute
+  token_tile_shape = (bq_compute, bkv_compute)
   # Note (david): fragment skipping assumes the diagonal sits at qi == kv with
   # bq == bkv (zero-offset square causal, or no mask). Any other window masks
   # every fragment of a partial block, which costs compute, never correctness.
@@ -224,7 +240,7 @@ def fwd_body(
     return pltpu.make_async_copy(
         hbm_window(q_hbm, head, tok, bq, width=width_qk,
                    heads_per_row=q_heads_per_row, layout=qkv_layout,
-                   token_major=token_major, fold=head_fold),
+                   token_major=token_major, fold=group_heads),
         q_buf.at[slot], sems.at[SEM_Q, slot])
 
   def _rotary_copies(coeff_hbm, coeff_buf, head, tok, block, slot,
@@ -251,6 +267,18 @@ def fwd_body(
       head_ref[...] = (rotated if half is None
                        else _set_half(staged, half, lane_width_qk, rotated))
 
+  def _rotate_gqa_folded_q(slot):
+    # Note (david): the gqa-folded heads share the paged build's one Q
+    # coefficient plane, and a rolled loop keeps one copy of the rotation.
+    def _rotate_head(h, carry):
+      head_ref = q_buf.at[slot, h]
+      head_ref[...] = rotate_tile(
+          head_ref[...], rotary_q_buf[slot, 0, 0], rotary_q_buf[slot, 0, 1],
+          interleaved=rotary_interleaved, head_dim_minor=is_head_dim_minor)
+      return carry
+
+    lax.fori_loop(0, gqa_fold, _rotate_head, None)
+
   def _start_q_row(head, tok, slot):
     _q_copy(head, tok, slot).start()
     if rotary_dim:
@@ -264,7 +292,10 @@ def fwd_body(
       for dma in _rotary_copies(rotary_q_hbm, rotary_q_buf, 0, 0, bq, slot,
                                 rotary_q_heads, SEM_ROTARY_Q):
         dma.wait()
-      _rotate_staged(q_buf, rotary_q_buf, slot, bq)
+      if gqa_fold > 1:
+        _rotate_gqa_folded_q(slot)
+      else:
+        _rotate_staged(q_buf, rotary_q_buf, slot, bq)
     if q_scale != 1.0:
       # Note (david): each staged Q tile is waited on exactly once per row, so
       # scaling it here replaces an HBM pre-scaled Q copy with the same f32
@@ -309,12 +340,13 @@ def fwd_body(
         o_stage.at[slot],
         hbm_window(o_hbm, head, tok, bq, width=width_v,
                    heads_per_row=q_heads_per_row, layout=o_layout,
-                   token_major=token_major, fold=head_fold),
+                   token_major=token_major, fold=group_heads),
         sems.at[SEM_OUT, slot])
 
-  # Note (david): a paged group is one q head, which reads its kv head's
-  # (K, V) row pair; the pair of one page is the 2-row window [2 * kv_head,
-  # 2 * kv_head + 2) of the interleaved cache's head axis, one DMA.
+  # Note (david): a paged group is the gqa_fold q heads of one kv head, which
+  # read its (K, V) row pair; the pair of one page is the 2-row window
+  # [2 * kv_head, 2 * kv_head + 2) of the interleaved cache's head axis, one
+  # DMA.
   assert not is_paged or head_fold == 1, head_fold
 
   def _paged_buffer_tile(slot, token_start, num_tokens):
@@ -444,7 +476,7 @@ def fwd_body(
       q_tok = (schedule.first_row + si) * bq
       kv_tok = kv * bkv
       next_block_kv_tok = (kv + 1) * bkv
-    base_head = group * head_fold
+    base_head = group * group_heads
     # Note (david): the heads-outer fold flattens (heads, batch) with
     # B = heads_outer_batch, so q index n * B + b reads kv index
     # (n // q_heads_per_kv_head) * B + b; the batch-outer fold flattens
@@ -561,13 +593,21 @@ def fwd_body(
       return kv_planes[kv_part, pl.ds(tile_start, bkv_compute), :]
 
     def _qk(g, kv_compute_index, q_compute_index):
-      q_ref, q_half = _fold_lane(q_buf.at[q_slot], g, bq, lane_width_qk)
       slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
       if is_paged:
-        q = q_ref[slice_q, :]
+        if gqa_fold > 1:
+          # Note (david): the q tile's tokens of every folded head, stacked
+          # head-major over the fragment rows; bq_compute is whole bf16 tiles,
+          # so the reshape moves no data.
+          q = q_buf[q_slot, :, slice_q, :].reshape(
+              frag_rows, q_buf.shape[-1])
+        else:
+          q_ref, _ = _fold_lane(q_buf.at[q_slot], g, bq, lane_width_qk)
+          q = q_ref[slice_q, :]
         k = _paged_fragment(kv_compute_index, 0)
         dim_numbers = NT_DIM_NUMBERS
       else:
+        q_ref, q_half = _fold_lane(q_buf.at[q_slot], g, bq, lane_width_qk)
         k_ref, k_half = _fold_lane(k_buf.at[kv_slot], g, bkv, lane_width_qk)
         slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
         if is_head_dim_minor:
@@ -580,24 +620,15 @@ def fwd_body(
           dim_numbers = NN_DIM_NUMBERS
       raw_logits = lax.dot_general(
           q, k, dim_numbers, preferred_element_type=jnp.float32)
-      assert raw_logits.shape == (bq_compute, bkv_compute)
+      assert raw_logits.shape == (frag_rows, bkv_compute)
       if softcap:
         # Note (david): the softcap is applied before masking.
         return jnp.tanh(raw_logits) * softcap
       else:
         return raw_logits
 
-    def _online_softmax(
-        g, kv_compute_index, q_compute_index, logits, needs_mask,
-        guard_recovery, apply_bounds,
-    ):
-      head_rows = pl.ds(g * bq, bq)
-      new_parity, old_parity = _head_parities(g)
-      row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
-      row_max_scratch_g = row_max_scratch.at[head_rows]
-      rescale_scratch_g = rescale_scratch.at[head_rows]
-
-      slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
+    def _masked_scores(kv_compute_index, q_compute_index, logits, needs_mask,
+                       apply_bounds):
       # Note (david): per-seq bounds live in unshifted q coordinates, while the
       # static window lives in coordinates shifted by causal_offset.
       q_unshifted = q_tok + q_compute_index * bq_compute
@@ -606,8 +637,8 @@ def fwd_body(
 
       def _apply_window_mask(scores):
         left, right = window
-        q_ids = q_abs + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
-        k_ids = k_abs + lax.broadcasted_iota(jnp.int32, scores.shape, 1)
+        q_ids = q_abs + lax.broadcasted_iota(jnp.int32, token_tile_shape, 0)
+        k_ids = k_abs + lax.broadcasted_iota(jnp.int32, token_tile_shape, 1)
         if left is None:
           left_masked = scores
         else:
@@ -619,8 +650,15 @@ def fwd_body(
           return jnp.where(
               k_ids <= q_ids + right, left_masked, DEFAULT_MASK_VALUE)
 
+      # Note (david): a mask depends on the row's token alone, so a gqa fold
+      # masks the (gqa_fold, bq_compute, bkv_compute) view of the fragment,
+      # and one token-plane comparison broadcasts over its heads.
+      if gqa_fold > 1:
+        token_logits = logits.reshape(gqa_fold, *token_tile_shape)
+      else:
+        token_logits = logits
       window_masked = lax.cond(
-          needs_mask, _apply_window_mask, lambda scores: scores, logits)
+          needs_mask, _apply_window_mask, lambda scores: scores, token_logits)
 
       if apply_bounds:
         # Note (david): apply_bounds is static so interior blocks never trace
@@ -628,7 +666,7 @@ def fwd_body(
         # block, so they sit in slot 0; the span row exists only under a left
         # window, so every other build keeps a single comparison.
         q_ids = q_unshifted + lax.broadcasted_iota(
-            jnp.int32, window_masked.shape, 0)
+            jnp.int32, token_tile_shape, 0)
         slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
         staged_bounds = bounds_buf.at[0]
         if schedule.has_q_span:
@@ -646,6 +684,21 @@ def fwd_body(
           )
       else:
         scores = window_masked
+      return scores.reshape(logits.shape)
+
+    def _online_softmax(
+        g, kv_compute_index, q_compute_index, logits, needs_mask,
+        guard_recovery, apply_bounds,
+    ):
+      head_rows = pl.ds(g * group_bq, group_bq)
+      new_parity, old_parity = _head_parities(g)
+      row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
+      row_max_scratch_g = row_max_scratch.at[head_rows]
+      rescale_scratch_g = rescale_scratch.at[head_rows]
+
+      slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
+      scores = _masked_scores(kv_compute_index, q_compute_index, logits,
+                              needs_mask, apply_bounds)
 
       read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
       row_sum_read_ref = row_sum_scratch.at[read_parity, head_rows]
@@ -712,7 +765,7 @@ def fwd_body(
         g, kv_compute_index, q_compute_index, probs, is_row_start,
         guard_recovery,
     ):
-      head_rows = pl.ds(g * bq, bq)
+      head_rows = pl.ds(g * group_bq, group_bq)
       new_parity, old_parity = _head_parities(g)
       rescale_scratch_g = rescale_scratch.at[head_rows]
 
@@ -739,7 +792,7 @@ def fwd_body(
               probs, v_ref[:, slice_k], NT_DIM_NUMBERS,
               preferred_element_type=jnp.float32)
 
-      slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
+      slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
       read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
       if transposed_pv:
         # Note (david): q is the lane axis of the transposed o scratch, and
@@ -901,25 +954,49 @@ def fwd_body(
             apply_bounds=is_masked and is_per_seq,
         )
 
+    def _stage_gqa_folded_lse(row_sum_ref):
+      # Note (david): lse is row_max + log2(row_sum) as below. Every lane of a
+      # row state holds the row's value, and the rows of a q tile run (folded
+      # head, token), so each head's token rows reach its own lse lane through
+      # one lane select per head.
+      lane_ids = lax.broadcasted_iota(
+          jnp.int32, (bq_compute, NUM_LANES), 1)
+      for q_compute_index in range(num_q_compute_tiles):
+        tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
+        tile_lse = (
+            (row_max_scratch[tile_rows, :]
+             + jnp.log2(row_sum_ref[tile_rows, :])) * math.log(2.0)
+        ).reshape(gqa_fold, bq_compute, NUM_LANES)
+        head_lanes = tile_lse[0]
+        for h in range(1, gqa_fold):
+          head_lanes = jnp.where(lane_ids == h, tile_lse[h], head_lanes)
+        lse_stage[out_slot,
+                  pl.ds(q_compute_index * bq_compute, bq_compute), :] = (
+                      head_lanes)
+
     @pl.when(is_last)
     def _finalize():
       def _finalize_head(g):
-        head_rows = pl.ds(g * bq, bq)
+        head_rows = pl.ds(g * group_bq, group_bq)
         new_parity, _ = _head_parities(g)
         row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
         # Note (david): o_stage keeps an explicit fold axis (leading on
         # head-major, lanes on token-major) while o_scratch stays flat-row
-        # addressed, so only o_stage goes through _fold_lane.
+        # addressed, so only o_stage goes through _fold_lane. A gqa fold
+        # writes all of its heads at once.
         o_new_ref = (
             o_scratch.at[new_parity, :, head_rows] if transposed_pv
             else o_scratch.at[new_parity, head_rows]
         )
-        o_stage_g, o_half = _fold_lane(
-            o_stage.at[out_slot], g, bq, lane_width_v, layout=o_layout
-        )
+        if gqa_fold > 1:
+          o_stage_g, o_half = o_stage.at[out_slot], None
+        else:
+          o_stage_g, o_half = _fold_lane(
+              o_stage.at[out_slot], g, bq, lane_width_v, layout=o_layout
+          )
 
         def _finalize_fragment(q_compute_index, carry):
-          slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
+          slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
           row_sum = row_sum_new_ref[slice_q, :]
           if transposed_pv:
             tile_index = (slice(None), slice_q)
@@ -931,7 +1008,11 @@ def fwd_body(
             )[..., :o_scratch.shape[-1]]
           o_normalized = (
               o_new_ref[tile_index] * inverse_row_sum).astype(o_stage.dtype)
-          if o_half is None:
+          if gqa_fold > 1:
+            o_stage_g[:, pl.ds(q_compute_index * bq_compute, bq_compute),
+                      :] = o_normalized.reshape(
+                          gqa_fold, bq_compute, o_normalized.shape[-1])
+          elif o_half is None:
             o_stage_g[tile_index] = o_normalized
           else:
             # Note (david): the stage tile holds both heads of the pair, and the
@@ -949,7 +1030,9 @@ def fwd_body(
             unroll=True,
         )
 
-        if return_lse:
+        if return_lse and gqa_fold > 1:
+          _stage_gqa_folded_lse(row_sum_new_ref)
+        elif return_lse:
           # Note (david): the static anchor keeps sum_j exp2(logit_j) ==
           # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
           # units; scale by ln(2) for the natural-log lse that is returned.
@@ -1064,7 +1147,7 @@ def fwd_body(
           # 128-lane minor axis is copied whole, avoiding the rejected dynamic
           # minor-axis slice at the head offset.
           lse_copies = [(lse_stage.at[out_slot],
-                         lse_hbm.at[base_head // head_fold, pl.ds(q_tok, bq), :])]
+                         lse_hbm.at[group, pl.ds(q_tok, bq), :])]
         elif head_fold % NUM_SUBLANES == 0:
           # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned fold
           # is one group-wide copy; a smaller fold copies row by row, since
@@ -1102,7 +1185,7 @@ def fwd_body(
     next_g = jnp.where(is_row_end, jnp.minimum(g + 1, num_head_groups - 1), g)
     next_si = jnp.where(is_grid_end, si, jnp.where(is_row_end, 0, si + 1))
     next_lo, _, next_ctx = schedule.row_interval(next_si)
-    next_head = next_g * head_fold
+    next_head = next_g * group_heads
     next_kv = jnp.where(is_grid_end, hi, next_lo)
     if is_per_seq:
       next_q_tok = schedule.q_token(next_ctx)
@@ -1175,17 +1258,17 @@ def fwd_body(
       fill_rows = pl.ds(0, num_fill_rows)
       # Note (david): only a head-major fold stages a leading fold axis; a
       # token-major fold rides the lanes.
-      if token_major is None and head_fold > 1:
+      if token_major is None and group_heads > 1:
         o_fill = o_stage.at[0, :, fill_rows, :]
       else:
         o_fill = o_stage.at[0, fill_rows, :]
       for group in range(num_head_groups):
         o_fill_copy = (
             o_fill,
-            hbm_window(o_hbm, group * head_fold, row_start, num_fill_rows,
+            hbm_window(o_hbm, group * group_heads, row_start, num_fill_rows,
                        width=width_v, heads_per_row=q_heads_per_row,
                        layout=o_layout, token_major=token_major,
-                       fold=head_fold),
+                       fold=group_heads),
             SEM_OUT,
         )
         if return_lse:
@@ -1225,6 +1308,7 @@ def forward_common(
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = True,
     paged: PagedKVInfo | None = None,
+    gqa_fold: int = 1,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Validate q/k/v, allocate scratch and run a fwd_body kernel.
@@ -1236,7 +1320,9 @@ def forward_common(
   or (o, lse) with a (num_q_heads, q_seq_len) float32 natural-log lse.
 
   paged (per-seq, head-major q only) makes k the merged interleaved cache
-  paged describes and v None; the kernel then takes (q, k, *rotary).
+  paged describes and v None; the kernel then takes (q, k, *rotary). Only a
+  paged build takes gqa_fold > 1, the q heads per kv head that fwd_body
+  stacks over the rows of one score fragment.
   """
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   bkv_compute = block_sizes.block_kv_compute
@@ -1255,6 +1341,19 @@ def forward_common(
     # 16-row tiles.
     raise ValueError(
         f"per-seq {bq=} must be a multiple of {BF16_TILE_ROWS}.")
+  if gqa_fold > 1 and (paged is None or head_fold != 1 or transposed_pv
+                       or gqa_fold > NUM_LANES):
+    # Note (david): a folded group's lse rides one 128-lane row per token.
+    raise ValueError(
+        f"{gqa_fold=} needs a paged build with head_fold == 1, no transposed"
+        f" pv and at most {NUM_LANES} folded heads; got {head_fold=},"
+        f" {transposed_pv=}.")
+  if gqa_fold > 1 and bq_compute % BF16_TILE_ROWS:
+    # Note (david): a folded q tile collapses (gqa_fold, bq_compute) into
+    # fragment rows, which moves no data only on whole bf16 tiles.
+    raise ValueError(
+        f"a gqa fold needs {bq_compute=} to be a multiple of"
+        f" {BF16_TILE_ROWS}.")
 
   if paged is None and k.shape[:-1] != v.shape[:-1]:
     raise ValueError(
@@ -1269,6 +1368,10 @@ def forward_common(
       )
     num_q_heads, q_seq_len, head_dim_qk = q.shape
     head_dim_v = head_dim_qk
+    if gqa_fold > 1 and num_q_heads != num_kv_heads * gqa_fold:
+      raise ValueError(
+          "a gqa fold stacks all of a kv head's q heads; got"
+          f" {num_q_heads=}, {num_kv_heads=}, {gqa_fold=}.")
     # Note (david): seqused_k bounds every sequence's kv blocks, so the kv
     # axis only needs its block count; the padded capacity stands in for its
     # length.
@@ -1405,15 +1508,17 @@ def forward_common(
       token_major=token_major, rotary_dim=rotary_dim,
       rotary_interleaved=rotary_interleaved, rotary_batch=rotary_batch,
       rotary_q_heads=rotary_q_heads, rotary_k_heads=rotary_k_heads,
-      rotary_groups=rotary_groups, rotary_k=rotary_k, paged=paged, **body,
+      rotary_groups=rotary_groups, rotary_k=rotary_k, paged=paged,
+      gqa_fold=gqa_fold, **body,
   )
 
-  folded_bq = head_fold * bq
+  group_heads = head_fold * gqa_fold
+  folded_bq = group_heads * bq
   o_layout = QKVLayout.SEQ_MINOR if transposed_pv else QKVLayout.HEAD_DIM_MINOR
   vmem = pltpu.VMEM
 
   def _staged_shape(rows, head_dim, layout):
-    if head_fold == 1:
+    if group_heads == 1:
       return (num_stages, *from_head_minor((rows, head_dim), layout))
     elif token_major is not None:
       # Note (david): a token-major group is head_fold * head_dim consecutive
@@ -1425,7 +1530,8 @@ def forward_common(
       # slices, so XLA never materializes a reshaped q/k/v copy, which
       # dominated wall time at short sequences when head_dim < 128 needed lane
       # padding.
-      return (num_stages, head_fold, *from_head_minor((rows, head_dim), layout))
+      return (num_stages, group_heads,
+              *from_head_minor((rows, head_dim), layout))
 
   q_buf = vmem(_staged_shape(bq, head_dim_qk, qkv_layout), q.dtype)
   if paged is None:
@@ -1490,10 +1596,10 @@ def forward_common(
         *q.shape[:-2], q_seq_len, token_major.num_q_heads * head_dim_v)
   # Note (david): per-seq LSE gives every head group an explicit minor axis of
   # whole 128-lane tiles, so fwd_body DMAs complete tiles at offset zero and
-  # groups never alias in the physical layout; only the first head_fold lanes
+  # groups never alias in the physical layout; only the first group_heads lanes
   # are returned.
   lse_shape = (
-      (num_q_heads // head_fold, q_seq_len, NUM_LANES)
+      (num_q_heads // group_heads, q_seq_len, NUM_LANES)
       if is_per_seq else (num_q_heads, q_seq_len)
   )
   if return_lse:
@@ -1528,7 +1634,7 @@ def forward_common(
   if not return_lse:
     return o
   elif is_per_seq:
-    return o, lse_kernel[:, :, :head_fold].swapaxes(1, 2).reshape(
+    return o, lse_kernel[:, :, :group_heads].swapaxes(1, 2).reshape(
         num_q_heads, q_seq_len)
   else:
     return o, lse_kernel

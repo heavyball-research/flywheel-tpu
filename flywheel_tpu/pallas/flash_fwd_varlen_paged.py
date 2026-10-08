@@ -3,8 +3,9 @@
 Each sequence attends its own cache prefix [0, seqused_k[r]), staged page by
 page through its block table row. The cache is one merged (num_pages,
 page_size, 2 * nheads_k, head_dim) pool whose token rows interleave each kv
-head's K and V rows, [k0, v0, k1, v1, ...]. Every head group is one q head,
-which stages only its kv head's (K, V) row pair of each page.
+head's K and V rows, [k0, v0, k1, v1, ...]. Every head group is one kv head,
+which stages only its (K, V) row pair of each page, and whose q heads are
+stacked over the rows of every score fragment.
 """
 
 import math
@@ -17,7 +18,6 @@ from .block_sizes import (
   F32_BYTES,
   FWD_BLOCKS,
   FWD_KV_COMPUTE_BLOCKS,
-  FWD_Q_COMPUTE_BLOCKS,
   NUM_LANES,
   NUM_SUBLANES,
   BlockSizes,
@@ -28,7 +28,12 @@ from .block_sizes import (
   vmem_limit_bytes,
 )
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
-from .fwd_pipeline import forward_common, fwd_body, overflow_guard_threshold
+from .fwd_pipeline import (
+  BF16_TILE_ROWS,
+  forward_common,
+  fwd_body,
+  overflow_guard_threshold,
+)
 from .loop_schedule import make_paged_fwd_schedule, per_seq_qblk_prefix
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
@@ -37,16 +42,26 @@ PAGE_SIZE_MULTIPLE = 128
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.
 SCORE_TEMPORARY_BYTES = 5 * F32_BYTES + 1
-# Note (david): one q head per group. The fragment pipeline is fully unrolled
-# over head_fold * compute tiles, and folding a kv head's q heads together
-# measured 2.1x slower on v6e (h32 k4 d256, 1024-token chunks over 16K: 22.6
-# against 10.6 ms) with a 15x longer compile, while re-staging the kv head per
-# q head hides under the compute.
+# Note (david): no per-head fold. The fragment pipeline is fully unrolled over
+# head_fold * compute tiles, and folding a kv head's q heads that way measured
+# 2.1x slower on v6e (h32 k4 d256, 1024-token chunks over 16K: 22.6 against
+# 10.6 ms) with a 15x longer compile. The kv head's q heads are folded into the
+# fragment rows instead (fwd_body's gqa_fold).
 PAGED_HEAD_FOLD = 1
+# Note (david): a K or V tile pushed to the MXU serves the fragment's
+# gqa_fold * block_q_compute rows, so the q compute tile is the largest that
+# keeps a fragment within this many rows. v6e, chunks over 16K, heads of 256:
+# 32:4 with 1024-token chunks ran 9.14 ms at 1024
+# rows against 10.03 at 2048 (and 10.78 unfolded at 512); 32:32 ran 10.60 at
+# 512 rows against 11.03 at 256, and with 2048-token chunks 10.38 at 1024
+# rows against 10.54 at 512.
+MAX_FRAGMENT_ROWS = 1024
 # Note (david): a 2048 x 2048 q x kv block ran 3.4x slower than 2048 x 1024
 # on v6e (Qwen3-4B's 32:8 heads of 128, a 2040-token chunk over a 16K prefix:
 # 7.72 against 2.19 ms) though it fits VMEM, and 1024 x 2048 ran at par, so
-# the block area is capped at 2048 x 1024.
+# the block area is capped at 2048 x 1024. It counts every folded q row: at
+# 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
+# 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
 
 
@@ -104,6 +119,7 @@ def paged_scratch_shapes(
     head_dim: int,
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
+    gqa_fold: int,
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) pair staging, K and V planes,
@@ -112,6 +128,11 @@ def paged_scratch_shapes(
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
+  if gqa_fold > 1:
+    stage_shape = (num_stages, gqa_fold, bq, head_dim)
+  else:
+    stage_shape = (num_stages, bq, head_dim)
+  group_bq = gqa_fold * bq
   if rotary_dtype is None:
     rotary_shapes = []
   else:
@@ -124,16 +145,16 @@ def paged_scratch_shapes(
   else:
     lse_shapes = []
   return [
-      ((num_stages, bq, head_dim), bf16),
+      (stage_shape, bf16),
       ((num_stages, bkv, 1, 2, head_dim), bf16),
       ((2, bkv, head_dim), bf16),
       ((1, 2, bkv), jnp.dtype(jnp.int32)),
       *rotary_shapes,
-      ((num_stages, bq, head_dim), bf16),
-      ((bq, NUM_LANES), f32),
-      ((2, bq, NUM_LANES), f32),
-      ((2, bq, head_dim), f32),
-      ((bq, NUM_LANES), f32),
+      (stage_shape, bf16),
+      ((group_bq, NUM_LANES), f32),
+      ((2, group_bq, NUM_LANES), f32),
+      ((2, group_bq, head_dim), f32),
+      ((group_bq, NUM_LANES), f32),
       *lse_shapes,
   ]
 
@@ -144,6 +165,7 @@ def estimate_vmem_bytes(
     head_dim: int,
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
+    gqa_fold: int,
 ) -> int:
   """Scoped VMEM bytes of one paged build: its scratch plus the score
   temporaries of one compute fragment."""
@@ -151,9 +173,9 @@ def estimate_vmem_bytes(
       vmem_buffer_bytes(shape, dtype)
       for shape, dtype in paged_scratch_shapes(
           block_sizes, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype))
+          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold))
   temporary_bytes = (
-      block_sizes.block_q_compute * block_sizes.block_kv_compute
+      gqa_fold * block_sizes.block_q_compute * block_sizes.block_kv_compute
       * SCORE_TEMPORARY_BYTES)
   return scratch_bytes + temporary_bytes
 
@@ -167,15 +189,17 @@ def resolve_paged_tiles(
     head_dim: int,
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
+    gqa_fold: int,
     block_sizes: BlockSizes | None = None,
 ) -> BlockSizes:
-  """block_sizes of one paged build.
+  """block_sizes of one paged build, whose q sizes count tokens per head.
 
-  Among the builds whose TPU staging fits vmem_limit_bytes() and whose q x kv
-  block area is at most MAX_PAGED_BLOCK_AREA, picks the one that streams the
-  longest sequence's kv prefix the fewest times, then the smaller q block,
-  then the larger kv block. A pinned block_sizes is only checked against the
-  budget.
+  Among the builds whose TPU staging fits vmem_limit_bytes() and whose
+  (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
+  one that streams the longest sequence's kv prefix the fewest times, then the
+  smaller q block, then the larger kv block. The q compute tile keeps a
+  fragment within MAX_FRAGMENT_ROWS rows. A pinned block_sizes is only checked
+  against the budget.
   """
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
@@ -187,23 +211,35 @@ def resolve_paged_tiles(
     max_kv_pages = kv_block_cap // page_size
     kv_blocks = [page_size * (max_kv_pages >> shift)
                  for shift in range(max_kv_pages.bit_length())]
+    # Note (david): a fragment reloads its rows' softmax state per kv compute
+    # tile, so no larger q block is bought with a kv block below one full kv
+    # compute tile. At 32:4 heads of 256 (1024-token chunks over 16K, v6e,
+    # gqa fold 8) a 1024 x 256 block took 12.44 ms
+    # against 9.14 at 512 x 512.
+    min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
+    kv_blocks = [block_kv for block_kv in kv_blocks
+                 if block_kv >= min_kv_block]
     q_block_cap = max(max_seqlen_q_bucket, FWD_BLOCKS[-1])
+    # Note (david): FWD_BLOCKS are powers of two, so the smaller of two powers
+    # of two divides the q block; a folded tile stays whole bf16 tiles.
+    head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
+    q_compute_cap = max(BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1))
     candidate_blocks = [
         BlockSizes(
             block_q=block_q,
             block_kv=block_kv,
             block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
-            block_q_compute=pick_tile(
-                FWD_Q_COMPUTE_BLOCKS, block_q // MIN_Q_TILES_PER_BLOCK),
+            block_q_compute=min(
+                q_compute_cap, block_q // MIN_Q_TILES_PER_BLOCK),
         )
         for block_q in FWD_BLOCKS if block_q <= q_block_cap
         for block_kv in kv_blocks
-        if block_q * block_kv <= MAX_PAGED_BLOCK_AREA
+        if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
     ]
   estimates = {
       blocks: estimate_vmem_bytes(
           blocks, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype)
+          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold)
       for blocks in candidate_blocks
   }
   fitting = [
@@ -324,6 +360,7 @@ def flash_attn_varlen_paged(
     rotary_dtype = None
   else:
     rotary_dtype = jnp.dtype(rotary[0].dtype)
+  gqa_fold = num_q_heads // num_kv_heads
   # Note (david): the bounds key the tile cache, so power-of-two buckets keep
   # a wobbling longest sequence on one build. The caps hold because no q
   # block passes the 128-padded buffer and no sequence outgrows its table row.
@@ -335,6 +372,7 @@ def flash_attn_varlen_paged(
       head_dim=head_dim,
       return_lse=return_lse,
       rotary_dtype=rotary_dtype,
+      gqa_fold=gqa_fold,
       block_sizes=block_sizes,
   )
   bq = block_sizes.block_q
@@ -372,8 +410,8 @@ def flash_attn_varlen_paged(
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
       causal=causal,
-      num_head_groups=num_q_heads // PAGED_HEAD_FOLD,
-      q_heads_per_kv_head=num_q_heads // num_kv_heads,
+      num_head_groups=num_kv_heads,
+      q_heads_per_kv_head=gqa_fold,
   )
   outputs = forward_common(
       kernel, smem_operands, padded_q, kv_cache, None,
@@ -389,6 +427,7 @@ def flash_attn_varlen_paged(
       rotary=padded_rotary,
       rotary_interleaved=rotary_interleaved,
       paged=paged,
+      gqa_fold=gqa_fold,
       guard_threshold=overflow_guard_threshold(capacity),
       window=(None, None),
       causal_offset=0,
