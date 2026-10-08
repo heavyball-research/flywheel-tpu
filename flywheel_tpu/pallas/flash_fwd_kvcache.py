@@ -28,7 +28,7 @@ from .copy_utils import (
   load_staged_words,
   staged_words,
 )
-from .fwd_pipeline import overflow_guard_threshold
+from .fwd_pipeline import BF16_TILE_ROWS, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2
@@ -617,12 +617,22 @@ def kvcache_kernel(
 
         @pl.when(block_index == append_block)
         def _append():
+          # Note (david): a head-major stage puts tokens on its bf16 sublane
+          # axis, which v7x tiles 16 rows deep (BF16_TILE_ROWS), so the append
+          # reads and writes the stage in a whole 16-row tile (E2003 at an
+          # 8-row one). A token-major stage puts tokens on a leading axis,
+          # where an 8-row tile is aligned already.
+          staged_tile_rows = (
+              BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
+          )
           local_index = cache_len - block_index * block_kv
           local_tile_start = pl.multiple_of(
-              local_index // NUM_SUBLANES * NUM_SUBLANES, NUM_SUBLANES
+              local_index // staged_tile_rows * staged_tile_rows,
+              staged_tile_rows,
           )
-          token_row = jnp.arange(NUM_SUBLANES, dtype=jnp.int32)
-          tile_tokens = pl.ds(local_tile_start, NUM_SUBLANES)
+          new_row = local_index - local_tile_start
+          token_row = jnp.arange(staged_tile_rows, dtype=jnp.int32)
+          tile_tokens = pl.ds(local_tile_start, staged_tile_rows)
           if is_cache_head_major:
             tile_index = (slot, slice(None), tile_tokens, slice(None))
             token_rows = token_row[None, :, None]
@@ -638,7 +648,7 @@ def kvcache_kernel(
             tile_index = (slot, tile_tokens, slice(None), slice(None))
             token_rows = token_row[:, None, None]
             expand = lambda token: token[None]
-          is_new_row = token_rows == local_index - local_tile_start
+          is_new_row = token_rows == new_row
           if is_merged_cache:
             new_tokens = (new_kv_ref[local_batch_index, :, :],)
           else:
@@ -650,6 +660,16 @@ def kvcache_kernel(
             staged_tile = buffers[tile_index]
             updated_tile = jnp.where(is_new_row, expand(new_token), staged_tile)
             buffers[tile_index] = updated_tile
+            if is_cache_head_major:
+              # Note (david): the write-back stays on the 8-row HBM grid, so it
+              # takes the 16-row tile's half that holds the new token, picked
+              # in f32, where 8 rows are one whole (8, 128) tile.
+              rows = updated_tile.astype(jnp.float32)
+              updated_tile = jnp.where(
+                  new_row < NUM_SUBLANES,
+                  rows[:, :NUM_SUBLANES, :],
+                  rows[:, NUM_SUBLANES:, :],
+              ).astype(updated_tile.dtype)
             updated_tiles.append(updated_tile)
 
           write_slot = lax.rem(local_batch_index, num_kv_stages)
