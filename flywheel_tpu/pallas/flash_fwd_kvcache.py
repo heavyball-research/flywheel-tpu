@@ -22,6 +22,7 @@ from .block_sizes import (
 )
 from .copy_utils import (
   MIN_BLOCK_KV,
+  bank_safe_word_stride,
   bf16_half,
   load_kv_fragment,
   load_staged_words,
@@ -102,8 +103,8 @@ def load_kv_pair_fragment(
   from a merged-cache staging slot.
 
   A staged token row holds every KV head's (K, V) pair: (stages, block_kv,
-  num_kv_heads, 2, head_dim) bf16 with is_bitcast_load, else (stages,
-  block_kv, 2 * num_kv_heads, head_dim).
+  word_stride, 2, head_dim) bf16 with is_bitcast_load, its first num_kv_heads
+  word rows live, else (stages, block_kv, 2 * num_kv_heads, head_dim).
   """
   head_dim = kv_stage.shape[-1]
   compute_start = pl.multiple_of(
@@ -121,19 +122,22 @@ def load_kv_pair_fragment(
     )
     return keys, values
   else:
-    # Note (david): the pair of KV head h is u32 word row token * num_kv_heads
+    # Note (david): the pair of KV head h is u32 word row token * word_stride
     # + h, K in its low half and V in its high half, so one strided word load
     # yields both. At one KV head this costs 1.4-1.5x the head-major decode of
     # an unmerged K/V cache (6 query heads, head_dim 256, v6e), yet splitting
     # the pair into dense K/V buffers per block (1.45-2.25x), folding the heads
     # into the row width (6.5-12x) and scoring the pair interleaved
-    # (1.46-2.02x) all measured worse.
-    num_kv_heads = kv_stage.shape[2]
+    # (1.46-2.02x) all measured worse. Scoring it interleaved at one query
+    # head per KV head (32 KV heads of 256) doubles the MXU pushes and lost
+    # too: 9750 against 7149 v7x bundles per 512-token block, 9.38 against
+    # 6.19 ms a compute-only v6e step at batch 32.
+    word_stride = kv_stage.shape[2]
     words = load_staged_words(
         staged_words(kv_stage, slot),
-        compute_start * num_kv_heads + kv_head,
+        compute_start * word_stride + kv_head,
         block_kv_compute,
-        num_kv_heads,
+        word_stride,
     )
     return bf16_half(words, 0), bf16_half(words, 1)
 
@@ -276,9 +280,12 @@ def kvcache_kernel(
     if is_cache_head_major:
       return buffers.at[slot, :, pl.ds(token_start, num_tokens), :]
     elif is_bitcast_load:
+      # Note (david): the staged rows past staged_kv_heads are the bank pad,
+      # which no DMA fills.
+      word_stride = buffers.shape[2]
       return buffers.at[slot].reshape(
-          block_kv, staged_kv_heads, head_dim
-      ).at[pl.ds(token_start, num_tokens), :, :]
+          block_kv, 2 * word_stride, head_dim
+      ).at[pl.ds(token_start, num_tokens), pl.ds(0, staged_kv_heads), :]
     else:
       return buffers.at[slot, pl.ds(token_start, num_tokens), :, :]
 
@@ -621,8 +628,8 @@ def kvcache_kernel(
             token_rows = token_row[None, :, None]
             expand = lambda token: token[:, None, :]
           elif is_bitcast_load:
-            tile_index = (slot, tile_tokens, slice(None), slice(None),
-                          slice(None))
+            tile_index = (slot, tile_tokens, pl.ds(0, staged_kv_heads // 2),
+                          slice(None), slice(None))
             token_rows = token_row[:, None, None, None]
             expand = lambda token: token.reshape(
                 staged_kv_heads // 2, 2, head_dim
@@ -838,10 +845,11 @@ def validate_kvcache_config(
         f"num_kv_stages must be one of {STAGES}; got {num_kv_stages}."
     )
   # Note (david): this must mirror the scratch shapes below; the extra
-  # NUM_SUBLANES rows per stage are the cache write tile.
+  # NUM_SUBLANES rows per stage are the cache write tile, and the two extra
+  # heads per token bound a staged block's bank pad word row.
   kv_staging_bytes = (
-      2 * num_kv_stages * (block_kv + NUM_SUBLANES) * num_kv_heads * head_dim
-      * BF16_BYTES)
+      2 * num_kv_stages * (block_kv + NUM_SUBLANES) * (num_kv_heads + 2)
+      * head_dim * BF16_BYTES)
   q_o_buffer_bytes = 2 * 2 * num_query_heads * head_dim * BF16_BYTES
   row_state_bytes = 2 * num_query_heads * NUM_LANES * F32_BYTES
   accumulator_bytes = num_query_heads * head_dim * BF16_BYTES
@@ -1018,16 +1026,21 @@ def flash_attn_kvcache_pallas(
   is_bitcast_load = not interpret and not is_cache_head_major
   staged_kv_heads = 2 * num_kv_heads if merged_cache else num_kv_heads
 
-  def _staging_shape(num_tokens):
+  def _staging_shape(num_tokens, word_stride):
     if is_cache_head_major:
       return (num_kv_stages, num_kv_heads, num_tokens, head_dim)
     elif is_bitcast_load:
-      return (num_kv_stages, num_tokens, staged_kv_heads // 2, 2, head_dim)
+      return (num_kv_stages, num_tokens, word_stride, 2, head_dim)
     else:
       return (num_kv_stages, num_tokens, staged_kv_heads, head_dim)
 
-  cache_buffer_shape = _staging_shape(block_kv)
-  write_buffer_shape = _staging_shape(NUM_SUBLANES)
+  # Note (david): only the staged blocks are read with strided word loads,
+  # so only they take the bank pad; the write tiles stay dense for their
+  # one-DMA write-back.
+  head_pairs = staged_kv_heads // 2
+  cache_buffer_shape = _staging_shape(
+      block_kv, bank_safe_word_stride(head_pairs))
+  write_buffer_shape = _staging_shape(NUM_SUBLANES, head_pairs)
   # Note (david): a merged build never touches the V staging, so it shrinks to
   # the write-tile size instead of a whole KV block.
   value_buffer_shape = (

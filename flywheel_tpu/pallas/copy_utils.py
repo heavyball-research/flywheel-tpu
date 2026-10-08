@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import NUM_LANES, NUM_SUBLANES, QKVLayout, TokenMajorInfo
+from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16
@@ -223,27 +223,40 @@ def load_kv_fragment(
         :,
     ].reshape(block_kv_compute, head_dim)
   else:
-    head_pairs_per_token = kv_stage.shape[2]
+    word_stride = kv_stage.shape[2]
     words_ref = staged_words(kv_stage, slot)
     pair_index = (
         head_group if kv_heads_per_fragment == 2 else head_group // 2
     )
-    word_start = compute_start * head_pairs_per_token + pair_index
+    word_start = compute_start * word_stride + pair_index
     words = load_staged_words(
-        words_ref, word_start, block_kv_compute, head_pairs_per_token)
+        words_ref, word_start, block_kv_compute, word_stride)
     if kv_heads_per_fragment == 2:
       return pltpu.bitcast(words, jnp.bfloat16)
     else:
       return bf16_half(words, head_group % 2)
 
 
+def bank_safe_word_stride(head_pairs: int) -> int:
+  """u32 word rows a pair-packed staging slot gives each token: its
+  head_pairs, plus one unused pad row when head_pairs is even."""
+  # Note (david): a strided word load reads its 8 sublanes from rows stride
+  # apart, and an even stride lands several of them in one VMEM bank, which
+  # splits the load into one per bank collision joined with vor. An odd
+  # stride keeps the 8 rows in distinct banks (RPA v3's has_bank_conflicts
+  # pad). v7x merged decode, block-loop bundles: 32 KV heads of 256 (one
+  # load per sublane unpadded) 22753 against 7149 per 512 tokens, 4 KV heads
+  # (a 2-way split) 2450 against 1758 per 1024 tokens.
+  return head_pairs + 1 if head_pairs % 2 == 0 else head_pairs
+
+
 def staged_words(kv_stage: jax.Array, slot: jax.Array) -> jax.Array:
-  """A (block_kv * head_pairs, head_dim) u32 view of one pair-packed staging
-  slot of (stages, block_kv, head_pairs, 2, head_dim) bf16; word row
-  token * head_pairs + pair holds that pair's two heads."""
-  _, block_kv, head_pairs, _, head_dim = kv_stage.shape
+  """A (block_kv * word_stride, head_dim) u32 view of one pair-packed staging
+  slot of (stages, block_kv, word_stride, 2, head_dim) bf16; word row
+  token * word_stride + pair holds that pair's two heads."""
+  _, block_kv, word_stride, _, head_dim = kv_stage.shape
   return kv_stage.bitcast(jnp.uint32).at[slot].reshape(
-      block_kv * head_pairs, head_dim)
+      block_kv * word_stride, head_dim)
 
 
 def load_staged_words(
@@ -257,14 +270,12 @@ def load_staged_words(
   folds = head_dim // NUM_LANES
   if head_dim <= NUM_LANES:
     return words_ref[pl.ds(word_start, num_rows, stride)]
-  elif stride * folds <= 2 * NUM_SUBLANES:
+  else:
     # Note (david): a wide head loads each 128-lane half with its own strided
     # load and joins the halves along lanes. Loading (rows, halves, 128) and
     # reshaping instead interleaves sublanes; on v7x decode at 32 heads of 256
     # that was 40K rotate/combine ops per 4096-token block, 8.55 against 5.22
-    # ms a step at 4 KV heads (flywheel-tpu PR #7). Past a 16-row stride the
-    # strided load breaks into one load per sublane and the reshape is cheaper
-    # (32 KV heads: 14.9 against 18.6 ms).
+    # ms a step at 4 KV heads (flywheel-tpu PR #7).
     lanes_ref = words_ref.reshape(num_word_rows * folds, NUM_LANES)
     return jnp.concatenate(
         [
@@ -274,10 +285,6 @@ def load_staged_words(
         ],
         axis=1,
     )
-  else:
-    folded_words_ref = words_ref.reshape(num_word_rows, folds, NUM_LANES)
-    return folded_words_ref[pl.ds(word_start, num_rows, stride), :, :].reshape(
-        num_rows, head_dim)
 
 
 def bf16_half(words: jax.Array, lane: jax.Array | int) -> jax.Array:
