@@ -50,6 +50,25 @@ STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
 MAX_BLOCK_KV = 1024
 
 
+def lane_broadcast(value: jax.Array, width: int) -> jax.Array:
+  """(rows, width) from (rows, w) with w == 1 or w dividing width.
+
+  A (rows, 128) value whose lanes all hold the row's number repeats along
+  the lane axis as whole vregs, which costs no data movement, where a
+  (rows, 1) slice loaded from VMEM needs a cross-lane broadcast per use.
+  """
+  rows, current = value.shape
+  if current == width:
+    return value
+  elif current == 1:
+    return jnp.broadcast_to(value, (rows, width))
+  elif width < current:
+    return value[:, :width]
+  else:
+    assert width % current == 0, (current, width)
+    return jnp.concatenate([value] * (width // current), axis=1)
+
+
 def static_anchor_update(
     scores: jax.Array,
     row_max_prev: jax.Array,
@@ -58,9 +77,11 @@ def static_anchor_update(
     is_first: bool | jax.Array,
     guard_threshold: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-  """Online-softmax step in log2 units over (rows, 1) running state.
+  """Online-softmax step in log2 units over (rows, w) running state, w == 1
+  or NUM_LANES with every lane holding its row's value.
 
-  Returns (probabilities, row_max, row_sum, rescale).
+  Returns (probabilities, row_max, row_sum, rescale), the state at the
+  width it came in.
   """
   # Note (david): row_max moves only once a fragment's max exceeds it by more
   # than guard_threshold, which keeps every exp2 finite without tracking the
@@ -79,7 +100,7 @@ def static_anchor_update(
           row_max_prev,
       ),
   )
-  probabilities = jnp.exp2(scores - row_max)
+  probabilities = jnp.exp2(scores - lane_broadcast(row_max, scores.shape[-1]))
   fragment_sum = probabilities.sum(axis=-1, keepdims=True)
   rescale = jnp.where(is_first, 1.0, jnp.exp2(row_max_prev - row_max))
   row_sum = jnp.where(
@@ -227,9 +248,39 @@ def kvcache_kernel(
     kv_heads_per_fragment = 2
   else:
     kv_heads_per_fragment = 1
-  num_head_groups = num_kv_heads // kv_heads_per_fragment
-  rows_per_fragment = query_heads_per_kv_head * kv_heads_per_fragment
+  # Note (david): a merged build whose KV head serves fewer than 8 query
+  # heads scores several KV heads through one 8-row query tile: each head's
+  # keys are pushed once, as before, but the LHS carries the whole group's
+  # query rows, and the head keeps its own rows of the result. The group then
+  # runs one softmax over a full f32 tile instead of one per head over a
+  # mostly empty one, and its running max, sum and accumulator are whole
+  # tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block loop went
+  # from 7149 to 5223 bundles (RPA v3: 7165), losing the per-head cross-lane
+  # broadcasts, sublane rotates and single-row state stores.
+  if (
+      is_merged_cache
+      and NUM_SUBLANES % query_heads_per_kv_head == 0
+      and num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head) == 0
+  ):
+    kv_heads_per_group = NUM_SUBLANES // query_heads_per_kv_head
+  else:
+    kv_heads_per_group = 1
+  num_head_groups = num_kv_heads // kv_heads_per_fragment // kv_heads_per_group
+  rows_per_fragment = (
+      query_heads_per_kv_head * kv_heads_per_fragment * kv_heads_per_group
+  )
   fragment_keys = kv_heads_per_fragment * block_kv_compute
+  # Note (david): row r of a group's tile belongs to the group's KV head
+  # r // query_heads_per_kv_head.
+  if kv_heads_per_group == 1:
+    score_row_head = pv_row_head = None
+  else:
+    score_row_head = lax.broadcasted_iota(
+        jnp.int32, (rows_per_fragment, fragment_keys), 0
+    ) // query_heads_per_kv_head
+    pv_row_head = lax.broadcasted_iota(
+        jnp.int32, (rows_per_fragment, head_dim), 0
+    ) // query_heads_per_kv_head
   if kv_heads_per_fragment == 1:
     parity_mask = None
   else:
@@ -503,21 +554,37 @@ def kvcache_kernel(
         # Loading the words again for pv cost 1.30x the blocked layout's MHA
         # decode (32 KV heads of 256, batch 32, v6e), whose 32-row word stride
         # takes the costly strided load; one load is at parity.
-        key, value = kv_pair_fragment(
-            k_buffers, slot, head_group, kv_compute_index
-        )
+        scores = None
+        values = []
+        for group_member in range(kv_heads_per_group):
+          key, value = kv_pair_fragment(
+              k_buffers,
+              slot,
+              head_group * kv_heads_per_group + group_member,
+              kv_compute_index,
+          )
+          values.append(value)
+          member_scores = jnp.dot(
+              query, key.T, preferred_element_type=jnp.float32
+          )
+          if scores is None:
+            scores = member_scores
+          else:
+            scores = jnp.where(
+                score_row_head == group_member, member_scores, scores
+            )
       else:
         key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
-        value = None
-      scores = jnp.where(
-          is_valid,
-          jnp.dot(query, key.T, preferred_element_type=jnp.float32),
-          -jnp.inf,
-      )
+        values = None
+        scores = jnp.dot(query, key.T, preferred_element_type=jnp.float32)
+      scores = jnp.where(is_valid, scores, -jnp.inf)
 
+      # Note (david): the running state is read as whole (rows, 128) tiles
+      # with every lane holding its row's value, so every broadcast against
+      # the scores or the accumulator is a vreg repeat, not a cross-lane op.
       if kv_compute_index == 0:
-        row_max_prev = row_max_ref[group_slice, 0:1]
-        row_sum_prev = row_sum_ref[group_slice, 0:1]
+        row_max_prev = row_max_ref[group_slice, :]
+        row_sum_prev = row_sum_ref[group_slice, :]
       else:
         row_max_prev = row_max_carry
         row_sum_prev = row_sum_carry
@@ -568,13 +635,9 @@ def kvcache_kernel(
             jnp.ones_like(candidate_rescale),
         )
       if kv_compute_index == num_kv_compute_fragments - 1:
-        row_max_ref[group_slice, :] = jnp.broadcast_to(
-            row_max, (rows_per_fragment, NUM_LANES)
-        )
-        row_sum_ref[group_slice, :] = jnp.broadcast_to(
-            row_sum, (rows_per_fragment, NUM_LANES)
-        )
-      return probabilities, rescale, value, row_max, row_sum
+        row_max_ref[group_slice, :] = row_max
+        row_sum_ref[group_slice, :] = row_sum
+      return probabilities, rescale, values, row_max, row_sum
 
     def _pv(
         slot,
@@ -582,23 +645,33 @@ def kvcache_kernel(
         kv_compute_index,
         probabilities,
         rescale,
-        merged_value,
+        merged_values,
     ):
       group_slice = pl.ds(head_group * rows_per_fragment, rows_per_fragment)
+      probabilities = probabilities.astype(jnp.bfloat16)
       if is_merged_cache:
-        value = merged_value
+        weighted_values = None
+        for group_member, value in enumerate(merged_values):
+          member_values = jnp.dot(
+              probabilities, value, preferred_element_type=jnp.float32
+          )
+          if weighted_values is None:
+            weighted_values = member_values
+          else:
+            weighted_values = jnp.where(
+                pv_row_head == group_member, member_values, weighted_values
+            )
       else:
         value = kv_fragment(value_buffers, slot, head_group, kv_compute_index)
-      weighted_values = jnp.dot(
-          probabilities.astype(jnp.bfloat16),
-          value,
-          preferred_element_type=jnp.float32,
-      )
+        weighted_values = jnp.dot(
+            probabilities, value, preferred_element_type=jnp.float32
+        )
       # Note (david): the accumulator is stored in q's dtype while rescale and
       # weighted_values are f32; the explicit upcast keeps the kernel tracing
       # under jax_numpy_dtype_promotion=strict.
       accumulator_ref[group_slice, :] = (
-          accumulator_ref[group_slice, :].astype(jnp.float32) * rescale
+          accumulator_ref[group_slice, :].astype(jnp.float32)
+          * lane_broadcast(rescale, head_dim)
           + weighted_values
       ).astype(q_ref.dtype)
 
@@ -769,21 +842,20 @@ def kvcache_kernel(
     def _wait_previous_output():
       _output_copy(local_batch_index - NUM_IO_STAGES, output_slot).wait()
 
-    row_sum = row_sum_ref[:, 0:1]
+    row_sum = row_sum_ref[...]
     inverse_row_sum = jnp.where(
         row_sum > 0, pl.reciprocal(row_sum, approx=True), 0.0
     )
     out_buffers[output_slot] = (
-        accumulator_ref[...].astype(jnp.float32) * inverse_row_sum
+        accumulator_ref[...].astype(jnp.float32)
+        * lane_broadcast(inverse_row_sum, head_dim)
     ).astype(q_ref.dtype)
     if return_lse:
-      lse_log2 = row_max_ref[:, 0:1] + jnp.log2(row_sum)
+      lse_log2 = row_max_ref[...] + jnp.log2(row_sum)
       lse = jnp.where(
           row_sum > 0, lse_log2 * math.log(2.0), -jnp.inf
       ).astype(jnp.float32)
-      lse_ref[pl.ds(local_batch_index, 1), :, :] = jnp.broadcast_to(
-          lse[None, :, :], (1, num_query_heads, NUM_LANES)
-      )
+      lse_ref[pl.ds(local_batch_index, 1), :, :] = lse[None, :, :]
     _output_copy(local_batch_index, output_slot).start()
     num_blocks = end_block - first_block
     next_initial_slot = lax.rem(
