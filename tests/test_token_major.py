@@ -198,6 +198,40 @@ def test_tm_varlen_fwd_parity(seed, nheads_k, headdim, causal, cu, head_fold,
                            out_hm.transpose(1, 0, 2))
 
 
+@pytest.mark.parametrize("headdim,head_fold", [(128, 1), (128, 2), (64, 2)])
+def test_tm_varlen_padding_rows_are_zero(headdim, head_fold):
+    # Note (david): token-major fills the padding past cu[-1] through lane
+    # windows of each fold group, not head rows; it must read out = 0 and
+    # lse = -inf as in head-major, with NaN queries in the pad.
+    num_tokens, nheads, max_seqlen, packed_q_end = 256, 4, 128, 150
+    keys = jax.random.split(jax.random.PRNGKey(46), 3)
+    q, k, v = (
+        jax.random.normal(key, (num_tokens, nheads, headdim), jnp.bfloat16)
+        for key in keys)
+    q = q.at[packed_q_end:].set(jnp.nan)
+    cu = jnp.array([0, 100, packed_q_end], jnp.int32)
+    shared_kwargs = dict(
+        causal=True, head_fold=head_fold, return_lse=True,
+        interpret=INTERPRET, varlen_max_seqlen_kv=max_seqlen,
+        block_sizes=default_block_sizes(num_tokens, num_tokens, max_seqlen))
+    head_major = make_flash_attn_mha(
+        nheads, num_tokens, num_tokens, num_kv_heads=nheads, **shared_kwargs)
+    token_major = make_flash_attn_mha(
+        nheads, num_tokens, num_tokens, num_kv_heads=nheads,
+        token_major=token_major_info(None, nheads, nheads, headdim),
+        **shared_kwargs)
+    out_hm, lse_hm = head_major(
+        *(operand.transpose(1, 0, 2) for operand in (q, k, v)), cu, cu)
+    out_tm, lse_tm = token_major(
+        *(operand.reshape(num_tokens, -1) for operand in (q, k, v)), cu, cu)
+    assert jnp.array_equal(out_tm.reshape(num_tokens, nheads, headdim),
+                           out_hm.transpose(1, 0, 2))
+    assert jnp.array_equal(lse_tm, lse_hm)
+    assert jnp.array_equal(out_tm[packed_q_end:],
+                           jnp.zeros_like(out_tm[packed_q_end:]))
+    assert jnp.all(lse_tm[:, packed_q_end:] == -jnp.inf)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 def test_tm_hybrid_fwd_parity(causal):
     # Note (david): the runtime schedule on 3-D storage is the padded-dense

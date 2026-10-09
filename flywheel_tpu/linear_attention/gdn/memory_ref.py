@@ -205,6 +205,19 @@ def wait_row_dma(buf_ref: jax.Ref, num_rows: jax.Array,
     pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
+def qkv_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+             p_id: int | jax.Array, idx: int, metadata_ref: MetadataRef):
+    """The DMA that fetches record idx's rows of a native [batch, dim] input,
+    widened to their aligned window."""
+    record = metadata_ref.get_record(p_id, idx)
+    window_base, window_rows = aligned_window(record.r_base, record.r_size)
+    return pltpu.make_async_copy(
+        hbm_ref.at[pl.ds(window_base, window_rows)],
+        buf_ref.at[idx, pl.ds(0, window_rows)],
+        sem,
+    )
+
+
 def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
                  p_id: int | jax.Array, metadata_ref: MetadataRef,
                  cfg: config.GDNConfig) -> None:
@@ -215,23 +228,20 @@ def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     rather than at row 0, and the rows past r_size are not the record's.
     """
     for idx in range(cfg.seq_tile_size):
-        record = metadata_ref.get_record(p_id, idx)
-        window_base, window_rows = aligned_window(record.r_base, record.r_size)
-        pltpu.make_async_copy(
-            hbm_ref.at[pl.ds(window_base, window_rows)],
-            buf_ref.at[idx, pl.ds(0, window_rows)],
-            sem,
-        ).start()
+        qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).start()
 
 
-def wait_qkv_in(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                metadata_ref: MetadataRef, cfg: config.GDNConfig) -> None:
-    num_rows = 0
+def wait_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                p_id: int | jax.Array, metadata_ref: MetadataRef,
+                cfg: config.GDNConfig) -> None:
+    # Note (david): each copy is waited on with its own descriptor, not one
+    # wait_row_dma sized to the summed rows. These rows are the block's tiled
+    # axis, and where Mosaic tiles the block 16 rows deep (v7x, e.g. a verify
+    # window's 16-row block) the summed self-copy left the semaphore nonzero at
+    # kernel exit and halted the core: three 8-row copies against one 24-row
+    # wait. A copy's own descriptor takes back exactly what it added.
     for idx in range(cfg.seq_tile_size):
-        record = metadata_ref.get_record(p_id, idx)
-        _, window_rows = aligned_window(record.r_base, record.r_size)
-        num_rows += window_rows
-    wait_row_dma(buf_ref, pl.multiple_of(num_rows, config.SUBLANE_ALIGN), sem)
+        qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).wait()
 
 
 def start_compact_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
@@ -293,23 +303,30 @@ def out_window(
     return window_base, window_rows, delta, delta + tile_rows
 
 
-def start_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-              p_id: int | jax.Array, metadata_ref: MetadataRef,
-              cfg: config.GDNConfig) -> None:
-    """Write the tile's whole aligned output window in one DMA."""
+def out_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+             p_id: int | jax.Array, metadata_ref: MetadataRef,
+             cfg: config.GDNConfig):
+    """The one DMA that writes the tile's whole aligned output window."""
     window_base, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
-    pltpu.make_async_copy(
+    return pltpu.make_async_copy(
         buf_ref.at[pl.ds(0, window_rows)],
         hbm_ref.at[pl.ds(window_base, window_rows)],
         sem,
-    ).start()
+    )
 
 
-def wait_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-             metadata_ref: MetadataRef, cfg: config.GDNConfig) -> None:
-    _, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
-    wait_ref = buf_ref.at[pl.ds(0, window_rows)]
-    pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+def start_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+              p_id: int | jax.Array, metadata_ref: MetadataRef,
+              cfg: config.GDNConfig) -> None:
+    out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).start()
+
+
+def wait_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+             p_id: int | jax.Array, metadata_ref: MetadataRef,
+             cfg: config.GDNConfig) -> None:
+    # Note (david): waited on with its own descriptor, for the reason
+    # wait_qkv_in gives: the stage's rows are its tiled axis.
+    out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).wait()
 
 
 def start_state_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,

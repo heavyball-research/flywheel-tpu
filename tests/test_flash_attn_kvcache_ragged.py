@@ -1,4 +1,9 @@
-"""Packed multi-token extend through flash_attn_with_kvcache and its kernel."""
+"""Packed multi-token attention over a paged KV cache vs a NumPy reference.
+
+flash_attn_varlen_func(block_table=...) reads the merged interleaved cache
+append_ragged filled; flash_attn_with_kvcache's multi-token and packed calls
+run that same append and kernel.
+"""
 
 import math
 
@@ -6,15 +11,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu import flash_attn_with_kvcache
-from flywheel_tpu.pallas.flash_fwd_kvcache_extend import (
-    flash_attn_kvcache_extend_pallas,
+from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.pallas import fwd_pipeline
+from flywheel_tpu.pallas.block_sizes import BlockSizes, vmem_limit_bytes
+from flywheel_tpu.pallas.flash_fwd_kvcache_varlen import append_ragged
+from flywheel_tpu.pallas.flash_fwd_varlen_paged import (
+    estimate_vmem_bytes,
+    flash_attn_varlen_paged,
+    paged_scratch_shapes,
+    resolve_paged_tiles,
+    vmem_buffer_bytes,
 )
 
 INTERPRET = jax.default_backend() != "tpu"
-TPU_ONLY = pytest.mark.skipif(
-    INTERPRET, reason="pair-packed loads bitcast on TPU only")
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)
 LSE_TOL = dict(rtol=2e-3, atol=4e-3)
 
@@ -109,88 +120,101 @@ def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
   return out, lse, kc, vc, np.concatenate(top2)
 
 
-def contiguous_case(q, kc, vc, k, v, cu, lengths, table):
-  """A random_ragged_case over the contiguous K/V pair: each request's pages
-  gathered into one (capacity, kv_heads, head_dim) cache row, which the
-  reference reads as that row's single page."""
-  batch, pages_per_seq = table.shape
-  kc, vc = (pages[table].reshape(
-      batch, pages_per_seq * pages.shape[1], *pages.shape[2:])
-            for pages in (kc, vc))
-  return (q, kc, vc, k, v, cu, lengths,
-          jnp.arange(batch, dtype=jnp.int32)[:, None])
+def interleave(kc, vc):
+  """The merged cache of K and V pages (pages, page_size, kv_heads, dim): each
+  token row holds each head's K row then its V row, [k0, v0, k1, v1, ...]."""
+  num_pages, page_size, kv_heads, head_dim = kc.shape
+  return jnp.stack((kc, vc), axis=3).reshape(
+      num_pages, page_size, 2 * kv_heads, head_dim)
 
 
-def run_extend(q, kc, vc, k, v, cu, lengths, table, *, layout="merged",
-               return_lse=True, num_active=None, **kwargs):
-  """flash_attn_with_kvcache on the "merged" pool (with the block table, the
-  updated pool split back into its K and V heads) or on a contiguous_case's
-  "pair" rows; returns (out, lse or None, updated_k, updated_v)."""
-  kwargs.update(
+def deinterleave(kv_cache):
+  """interleave's inverse: the (K pages, V pages) of a merged cache."""
+  num_pages, page_size, cache_heads, head_dim = kv_cache.shape
+  pairs = kv_cache.reshape(num_pages, page_size, cache_heads // 2, 2, head_dim)
+  return pairs[..., 0, :], pairs[..., 1, :]
+
+
+def run_extend(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
+               num_active=None, **kwargs):
+  """flash_attn_with_kvcache's packed call on the merged pool; returns (out,
+  lse or None, updated_k, updated_v), the updated pool split back."""
+  *attention_outputs, kv_cache = flash_attn_with_kvcache(
+      q, interleave(kc, vc), None, k, v, block_table=table,
       cache_seqlens=lengths, cu_seqlens_q=cu,
       num_active=None if num_active is None else jnp.int32(num_active),
-      return_softmax_lse=return_lse, interpret=INTERPRET)
-  if layout == "merged":
-    *result, cache = flash_attn_with_kvcache(
-        q, jnp.concatenate((kc, vc), axis=2), None, k, v, block_table=table,
-        **kwargs)
-    updated = jnp.split(cache, 2, axis=2)
+      return_softmax_lse=return_lse, interpret=INTERPRET, **kwargs)
+  return (attention_outputs[0],
+          attention_outputs[1] if return_lse else None,
+          *deinterleave(kv_cache))
+
+
+def run_paged(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
+              num_active=None, max_seqlen_q=None, max_seqlen_k=None,
+              **kwargs):
+  """Appends k/v (when given) with append_ragged, then reads the merged pool
+  through flash_attn_varlen_func; q/out stay token-major here. Returns (out,
+  lse or None, k_pages, v_pages)."""
+  active = table.shape[0] if num_active is None else num_active
+  kv_cache = interleave(kc, vc)
+  if k is None:
+    seqused = lengths
   else:
-    *result, updated_k, updated_v = flash_attn_with_kvcache(
-        q, kc, vc, k, v, **kwargs)
-    updated = (updated_k, updated_v)
-  return (result[0], result[1] if return_lse else None, *updated)
+    kv_cache = append_ragged(
+        kv_cache, k, v, cu, lengths, table.reshape(-1),
+        jnp.full((1,), active, jnp.int32), page_size=kc.shape[1],
+        pages_per_seq=table.shape[1], interpret=INTERPRET)
+    seqused = lengths + jnp.diff(cu)
+  max_seqlen_q = (
+      max(1, int(np.diff(np.asarray(cu))[:active].max(initial=0)))
+      if max_seqlen_q is None else max_seqlen_q)
+  max_seqlen_k = (
+      max(1, int(np.asarray(seqused)[:active].max(initial=0)))
+      if max_seqlen_k is None else max_seqlen_k)
+  attention_outputs = flash_attn_varlen_func(
+      q.transpose(1, 0, 2), kv_cache, None, cu, None, max_seqlen_q,
+      max_seqlen_k, return_softmax_lse=return_lse, interpret=INTERPRET,
+      block_table=table, seqused_k=seqused,
+      num_active=None if num_active is None else jnp.int32(num_active),
+      **kwargs)
+  out, lse = (attention_outputs if return_lse
+              else (attention_outputs, None))
+  return out.transpose(1, 0, 2), lse, *deinterleave(kv_cache)
 
 
-def extend_in_place(q, kc, vc, k, v, *, merged, **kwargs):
-  """flash_attn_with_kvcache donating kc and vc (as one merged pool when
-  merged); returns (*result, updated_k, updated_v) after checking the append
-  landed in the donated buffers."""
-  if merged:
-    cache = jnp.concatenate((kc, vc), axis=2)
-    pointers = (cache.unsafe_buffer_pointer(),)
-    *result, updated = flash_attn_with_kvcache(q, cache, None, k, v, **kwargs)
-    updated_pointers = (updated.unsafe_buffer_pointer(),)
-    updated_k, updated_v = jnp.split(updated, 2, axis=2)
-  else:
-    pointers = (kc.unsafe_buffer_pointer(), vc.unsafe_buffer_pointer())
-    *result, updated_k, updated_v = flash_attn_with_kvcache(q, kc, vc, k, v,
-                                                            **kwargs)
-    updated_pointers = (updated_k.unsafe_buffer_pointer(),
-                        updated_v.unsafe_buffer_pointer())
-  # Note (david): donation must append in place instead of copying the pool;
-  # interpret mode does not honor aliasing.
-  assert INTERPRET or updated_pointers == pointers
-  return (*result, updated_k, updated_v)
-
-
-def assert_extend_matches(actual, expected, cu, lengths, num_active):
-  """Real rows match the reference, packed padding rows are out = 0 and
-  lse = -inf, and the appended caches match exactly. lse is None when the
-  call did not return it."""
+def assert_extend_matches(actual, expected, cu, lengths, num_active, *,
+                          skip_unseen_rows=False):
+  """Rows [cu[0], cu[num_active]) match the reference (skip_unseen_rows drops
+  the rows that see no key), packed padding is out = 0 and lse = -inf, and
+  the caches match exactly; lse is None when the call did not return it."""
   out, lse, updated_k, updated_v = actual
   cu, lengths = np.asarray(cu), np.asarray(lengths)
-  real = int(cu[num_active])
+  packed_q_end = int(cu[num_active])
+  owned_rows = np.arange(int(cu[0]), packed_q_end)
+  if skip_unseen_rows:
+    checked = owned_rows[np.isfinite(expected[1][0, owned_rows])]
+  else:
+    checked = owned_rows
   out = np.asarray(out, np.float32)
+  mismatched = ~np.isclose(
+      out[checked], expected[0][checked], **OUT_TOL).all(axis=(1, 2))
   if lse is None:
-    lse_mismatched = np.zeros(real, bool)
     padding_lse = np.full(0, -np.inf)
   else:
     lse = np.asarray(lse)
-    lse_mismatched = ~np.isclose(
-        lse[:, :real], expected[1][:, :real], **LSE_TOL).all(axis=0)
-    padding_lse = lse[:, real:]
-  mismatched = ~np.isclose(
-      out[:real], expected[0][:real], **OUT_TOL).all(axis=(1, 2))
-  rows = np.flatnonzero(mismatched | lse_mismatched)
+    mismatched |= ~np.isclose(
+        lse[:, checked], expected[1][:, checked], **LSE_TOL).all(axis=0)
+    padding_lse = lse[:, packed_q_end:]
+  rows = checked[mismatched]
   seqs = np.searchsorted(cu, rows, side="right") - 1
   first_mismatches = [(int(row), int(seq), int(row - cu[seq]),
                        int(lengths[seq] + row - cu[seq]))
                       for row, seq in zip(rows[:8], seqs[:8])]
   assert not rows.size, (
-      f"{rows.size}/{real} real rows differ; first (row, request, offset,"
-      f" position): {first_mismatches}")
-  np.testing.assert_array_equal(out[real:], 0, err_msg="packed padding out")
+      f"{rows.size}/{checked.size} checked rows differ; first (row, request,"
+      f" offset, position): {first_mismatches}")
+  np.testing.assert_array_equal(out[packed_q_end:], 0,
+                                err_msg="packed padding out")
   np.testing.assert_array_equal(padding_lse, -np.inf,
                                 err_msg="packed padding lse")
   np.testing.assert_array_equal(np.asarray(updated_k, np.float32), expected[2])
@@ -199,44 +223,79 @@ def assert_extend_matches(actual, expected, cu, lengths, num_active):
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("append", [False, True])
-@pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_ragged_cache_matches_reference(causal, append, layout):
-  case = random_ragged_case()
-  q, kc, vc, k, v, cu, lengths, table = (
-      case if layout == "merged" else contiguous_case(*case))
+def test_ragged_cache_matches_reference(causal, append):
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
   k, v = (k, v) if append else (None, None)
   expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
                               causal=causal)
-  kwargs = dict(cache_seqlens=lengths, cu_seqlens_q=cu, causal=causal,
-                return_softmax_lse=True, interpret=INTERPRET)
-  if layout == "merged":
-    kwargs["block_table"] = table
-  actual = extend_in_place(q, kc, vc, k, v, merged=layout == "merged",
-                           **kwargs)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table, causal=causal)
+  assert_extend_matches(actual, expected, cu, lengths, len(lengths))
+
+
+@pytest.mark.parametrize("interleaved,causal,append", [
+    (True, True, True), (False, False, False)])
+def test_ragged_cache_rotary_q_matches_reference(interleaved, causal, append):
+  # Note (david): the paged cache holds K already rotated, so only Q turns, at
+  # its bottom-right position seqused_k - q_len + t.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
+  k, v = (k, v) if append else (None, None)
+  head_dim = q.shape[-1]
+  frequency = 10000.0 ** (-np.arange(0, head_dim, 2) / head_dim)
+  angle = np.arange(table.shape[1] * kc.shape[1])[:, None] * frequency
+  cos, sin = np.cos(angle).astype(np.float32), np.sin(angle).astype(np.float32)
+  if interleaved:
+    first_lanes = np.arange(0, head_dim, 2)
+    second_lanes = np.arange(1, head_dim, 2)
+  else:
+    first_lanes = np.arange(head_dim // 2)
+    second_lanes = np.arange(head_dim // 2, head_dim)
+  boundaries = np.asarray(cu)
+  seqused = np.asarray(lengths) + (np.diff(boundaries) if append else 0)
+  reference_q = np.array(q, np.float32)
+  for seq in range(len(lengths)):
+    start, end = boundaries[seq:seq + 2]
+    positions = seqused[seq] - (end - start) + np.arange(end - start)
+    cosine, sine = cos[positions][:, None], sin[positions][:, None]
+    first = reference_q[start:end, :, first_lanes]
+    second = reference_q[start:end, :, second_lanes]
+    reference_q[start:end, :, first_lanes] = first * cosine - second * sine
+    reference_q[start:end, :, second_lanes] = first * sine + second * cosine
+  expected = ragged_reference(reference_q, kc, vc, k, v, cu, lengths, table,
+                              causal=causal)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table,
+                     causal=causal, rotary_cos=jnp.asarray(cos),
+                     rotary_sin=jnp.asarray(sin),
+                     rotary_interleaved=interleaved, rotary_k=False)
   assert_extend_matches(actual, expected, cu, lengths, len(lengths))
 
 
 @pytest.mark.parametrize("head_dim,heads,kv_heads",
-                         [(64, 4, 2), (128, 4, 1), (256, 4, 4)])
+                         [(128, 4, 2), (128, 4, 1), (256, 4, 4)])
 def test_ragged_cache_multiple_query_blocks_and_pages(head_dim, heads,
                                                       kv_heads):
+  # Note (david): 128-token bounds (an underestimate is slow, not wrong) cap
+  # both block sizes at one page, so the 131-row request spans two q blocks
+  # and every cache several kv blocks.
   case = random_ragged_case(lengths=(131, 17), prefixes=(123, 255),
                             heads=heads, kv_heads=kv_heads, head_dim=head_dim,
                             padding=3)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, causal=True)
+  actual = run_paged(*case, causal=True, max_seqlen_q=128, max_seqlen_k=128)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
-@pytest.mark.parametrize("heads,kv_heads,dim", [(6, 6, 64), (16, 8, 128),
-                                               (16, 16, 128), (24, 4, 256),
-                                               (32, 16, 128)])
-def test_ragged_cache_head_tiles(heads, kv_heads, dim):
+@pytest.mark.parametrize("heads,kv_heads,head_dim", [
+    (16, 16, 128), (24, 4, 256), (32, 16, 128), (6, 3, 128), (8, 1, 128),
+    (8, 2, 256)])
+def test_ragged_cache_head_tiles(heads, kv_heads, head_dim):
+  # Note (david): every group stages its kv head's (K, V) row pair, a 2-row
+  # window of the interleaved head axis at any kv head, so any KV head count
+  # works, odd ones and one included.
   case = random_ragged_case(lengths=(3, 5), prefixes=(37, 128), heads=heads,
-                            kv_heads=kv_heads, head_dim=dim, capacity=256,
-                            padding=0)
+                            kv_heads=kv_heads, head_dim=head_dim,
+                            capacity=256, padding=0)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, causal=True)
+  actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
@@ -250,40 +309,43 @@ def test_ragged_cache_empty_prefix_and_inactive_metadata(num_active):
   lengths = lengths.at[num_active:].set(-100)
   expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
                               causal=True, num_active=num_active)
-  actual = run_extend(q, kc, vc, k, v, cu, lengths, table,
-                      num_active=num_active, causal=True)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table,
+                     num_active=num_active, causal=True)
   assert_extend_matches(actual, expected, cu, lengths, num_active)
 
 
-def test_ragged_read_only_short_cache_and_nan_padding():
+@pytest.mark.parametrize("causal", [False, True])
+def test_ragged_read_only_short_cache_and_nan_padding(causal):
   # Note (david): NaN in every slot past the two live tokens catches any read
-  # outside the valid range; the empty cache has no valid page at all.
+  # outside the valid range; the empty cache has no valid page at all. Rows
+  # that see no key (the empty cache's, and causal rows above the short
+  # cache's diagonal) are unspecified on the paged path and go unchecked.
   q, kc, vc, _, _, cu, lengths, table = random_ragged_case(
       lengths=(5, 3), prefixes=(2, 0), padding=0)
   kc = jnp.full_like(kc, jnp.nan).at[table[0, 0], :2].set(1)
   vc = jnp.full_like(vc, jnp.nan).at[table[0, 0], :2].set(2)
   table = table.at[1].set(-1)
   expected = ragged_reference(q, kc, vc, None, None, cu, lengths, table,
-                              causal=True)
-  actual = run_extend(q, kc, vc, None, None, cu, lengths, table,
-                      causal=True)
-  assert_extend_matches(actual, expected, cu, lengths, 2)
+                              causal=causal)
+  actual = run_paged(q, kc, vc, None, None, cu, lengths, table,
+                     causal=causal)
+  assert_extend_matches(actual, expected, cu, lengths, 2,
+                        skip_unseen_rows=True)
 
 
-@pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_ragged_read_only_empty_cache_between_cached_requests(layout):
+def test_ragged_read_only_empty_cache_between_cached_requests():
   # Note (david): rows over an empty cache run no KV block, so they issue no
   # prefetch for the next request; a kernel that counts that prefetch as
-  # issued waits on it forever.
-  case = random_ragged_case(lengths=(4, 3, 9, 2), prefixes=(0, 130, 0, 5),
-                            padding=5)
-  q, kc, vc, _, _, cu, lengths, table = (
-      case if layout == "merged" else contiguous_case(*case))
+  # issued waits on it forever. Those rows see no key, so they are
+  # unspecified and go unchecked.
+  q, kc, vc, _, _, cu, lengths, table = random_ragged_case(
+      lengths=(4, 3, 9, 2), prefixes=(0, 130, 0, 5), padding=5)
   expected = ragged_reference(q, kc, vc, None, None, cu, lengths, table,
                               causal=False)
   actual = run_extend(q, kc, vc, None, None, cu, lengths, table,
-                      layout=layout, causal=False)
-  assert_extend_matches(actual, expected, cu, lengths, 4)
+                      causal=False)
+  assert_extend_matches(actual, expected, cu, lengths, 4,
+                        skip_unseen_rows=True)
 
 
 def test_ragged_cache_shared_read_only_prefix_and_private_append_pages():
@@ -292,172 +354,142 @@ def test_ragged_cache_shared_read_only_prefix_and_private_append_pages():
   table = table.at[1, 0].set(table[0, 0])
   expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
                               causal=True)
-  actual = run_extend(q, kc, vc, k, v, cu, lengths, table,
-                      return_lse=False, causal=True)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table,
+                     return_lse=False, causal=True)
   assert_extend_matches(actual, expected, cu, lengths, 2)
 
 
 def test_ragged_metadata_reuses_one_executable():
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(padding=0)
-  kv_pages = jnp.concatenate((kc, vc), axis=2)
-  compiled = flash_attn_with_kvcache.lower(
-      q, kv_pages, None, k, v, cache_seqlens=lengths, cu_seqlens_q=cu,
-      block_table=table, num_active=jnp.int32(3), causal=True,
-      interpret=INTERPRET).compile()
-  for boundaries, active, lens, pages in (
+  kv_pages = interleave(kc, vc)
+
+  def paged_attn(q, kv_pages, cu, seqused, table, num_active):
+    # Note (david): the static bounds cover every metadata set below: the
+    # whole packed buffer and a request's full table row.
+    return flash_attn_varlen_func(
+        q, kv_pages, None, cu, None, q.shape[1],
+        table.shape[1] * kv_pages.shape[1], causal=True, interpret=INTERPRET,
+        block_table=table, seqused_k=seqused, num_active=num_active)
+
+  compiled = jax.jit(paged_attn).lower(
+      q.transpose(1, 0, 2), kv_pages, cu, lengths, table,
+      jnp.int32(3)).compile()
+  for boundaries, active, lens, block_table in (
       (cu, 3, lengths, table),
-      (jnp.array([0, 1, 6, 8], jnp.int32), 2, jnp.array([0, 127, -100]),
-       table[::-1]),
+      (jnp.array([0, 1, 6, 8], jnp.int32), 2,
+       jnp.array([0, 127, -100], jnp.int32), table[::-1]),
   ):
-    kc, vc = jnp.split(kv_pages, 2, axis=2)
-    expected = ragged_reference(q, kc, vc, k, v, boundaries, lens, pages,
-                                causal=True, num_active=active)
-    out, kv_pages = compiled(q, kv_pages, None, k, v, cache_seqlens=lens,
-                             cu_seqlens_q=boundaries, block_table=pages,
-                             num_active=jnp.int32(active))
-    assert_extend_matches((out, None, *jnp.split(kv_pages, 2, axis=2)),
-                          expected, boundaries, lens, active)
+    kc, vc = deinterleave(kv_pages)
+    expected = ragged_reference(q, kc, vc, k, v, boundaries, lens,
+                                block_table, causal=True, num_active=active)
+    kv_pages = append_ragged(
+        kv_pages, k, v, boundaries, lens, block_table.reshape(-1),
+        jnp.full((1,), active, jnp.int32), page_size=kv_pages.shape[1],
+        pages_per_seq=block_table.shape[1], interpret=INTERPRET)
+    out = compiled(q.transpose(1, 0, 2), kv_pages, boundaries,
+                   lens + jnp.diff(boundaries), block_table,
+                   jnp.int32(active))
+    assert_extend_matches(
+        (out.transpose(1, 0, 2), None, *deinterleave(kv_pages)),
+        expected, boundaries, lens, active)
 
 
-@pytest.mark.parametrize("dense", [False, True])
-@pytest.mark.parametrize("head_dim", [64, 128])
-def test_multitoken_contiguous_cache_and_mapping(dense, head_dim):
+def test_multitoken_contiguous_cache_and_mapping():
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
-      lengths=(3, 3), prefixes=(127, 509), head_dim=head_dim, padding=0)
-  kc = kc[table].reshape(2, 512, 2, head_dim)
-  vc = vc[table].reshape(2, 512, 2, head_dim)
-  mapping = jnp.array([1, 0], jnp.int32)
-  # Note (david): a contiguous cache is one 512-token page per row.
-  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, mapping[:, None],
+      lengths=(3, 3), prefixes=(127, 509), padding=0)
+  kc = kc[table].reshape(2, 512, 2, 128)
+  vc = vc[table].reshape(2, 512, 2, 128)
+  # Note (david): a contiguous cache is one 512-token page per row behind a
+  # one-column block table (cache_batch_idx's role); the second request
+  # fills its row exactly.
+  mapping = jnp.array([[1], [0]], jnp.int32)
+  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, mapping,
                               causal=True)
-  if dense:
-    q, k, v = (tokens.reshape(2, 3, *tokens.shape[1:]) for tokens in (q, k, v))
-    expected_lse = expected[1].reshape(4, 2, 3).transpose(1, 0, 2)
-  else:
-    expected_lse = expected[1]
-  out, lse, updated_k, updated_v = flash_attn_with_kvcache(
-      q, kc, vc, k, v, cache_seqlens=lengths, cache_batch_idx=mapping,
-      cu_seqlens_q=None if dense else cu, causal=True,
-      return_softmax_lse=True, interpret=INTERPRET)
-  np.testing.assert_allclose(
-      np.asarray(out, np.float32).reshape(-1, 4, head_dim), expected[0],
-      **OUT_TOL)
-  np.testing.assert_allclose(lse, expected_lse, **LSE_TOL)
-  np.testing.assert_array_equal(np.asarray(updated_k, np.float32), expected[2])
-  np.testing.assert_array_equal(np.asarray(updated_v, np.float32), expected[3])
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, mapping, causal=True)
+  assert_extend_matches(actual, expected, cu, lengths, 2)
 
 
 @pytest.mark.parametrize(
-    "dense,paged,heads,kv_heads,causal,append,return_lse,num_active", [
-        (False, True, 8, 1, True, True, True, None),
-        (False, True, 8, 2, False, True, True, 2),
-        (False, False, 16, 4, True, True, False, 2),
-        (False, True, 32, 8, True, False, True, None),
-        (True, False, 8, 1, False, True, True, None),
-        (True, True, 16, 2, True, True, True, 2),
-        (True, False, 32, 8, True, True, False, None),
-        (True, True, 16, 4, False, False, True, None),
+    "uniform,heads,kv_heads,causal,append,return_lse,num_active", [
+        (False, 8, 1, True, True, True, None),
+        (False, 8, 2, False, True, True, 2),
+        (False, 16, 4, True, True, False, 2),
+        (False, 32, 8, True, False, True, None),
+        (True, 8, 1, False, True, True, None),
+        (True, 16, 2, True, True, True, 2),
+        (True, 32, 8, True, True, False, None),
+        (True, 16, 4, False, False, True, None),
     ])
-def test_multitoken_kept_layouts_match_reference(
-    dense, paged, heads, kv_heads, causal, append, return_lse, num_active):
-  # Note (david): the inactive request carries garbage lengths and page rows
-  # (or cache rows) that must never be read. No row sees a single key, whose
-  # lse carries Q's full bf16 rounding (~LSE_TOL).
+def test_multitoken_matches_reference(
+    uniform, heads, kv_heads, causal, append, return_lse, num_active):
+  # Note (david): the inactive request carries garbage lengths and table rows
+  # that must never be read. No row sees a single key, whose lse carries Q's
+  # full bf16 rounding (~LSE_TOL). uniform requests (no packed padding) stand
+  # for the dense (batch, seqlen_q) calls.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
-      lengths=(6, 6, 6) if dense else (13, 1, 21), prefixes=(127, 3, 251),
-      heads=heads, kv_heads=kv_heads, padding=0 if dense else 7)
-  batch = len(lengths)
-  active = batch if num_active is None else num_active
+      lengths=(6, 6, 6) if uniform else (13, 1, 21), prefixes=(127, 3, 251),
+      heads=heads, kv_heads=kv_heads, padding=0 if uniform else 7)
+  active = len(lengths) if num_active is None else num_active
   lengths = lengths.at[active:].set(-100)
-  if paged:
-    table = table.at[active:].set(-1)
-    reference_table = table
-    metadata = dict(block_table=table)
-  else:
-    # Note (david): a contiguous cache is one 512-token page per row, mapped
-    # to its query row through cache_batch_idx.
-    kc, vc = (pages[table].reshape(batch, 512, kv_heads, 128)
-              for pages in (kc, vc))
-    mapping = jnp.array([2, 0, 1], jnp.int32).at[active:].set(-1)
-    reference_table = mapping[:, None]
-    metadata = dict(cache_batch_idx=mapping)
+  table = table.at[active:].set(-1)
   k, v = (k, v) if append else (None, None)
-  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, reference_table,
+  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
                               causal=causal, num_active=active)
-  kwargs = dict(cache_seqlens=lengths, causal=causal,
-                num_active=None if num_active is None else jnp.int32(active),
-                return_softmax_lse=return_lse, interpret=INTERPRET, **metadata)
-  if dense:
-    q, k, v = (None if tokens is None
-               else tokens.reshape(batch, 6, *tokens.shape[1:])
-               for tokens in (q, k, v))
-  else:
-    kwargs["cu_seqlens_q"] = cu
-
-  *result, updated_k, updated_v = extend_in_place(q, kc, vc, k, v,
-                                                  merged=paged, **kwargs)
-  # Note (david): a dense call returns out as (batch, seqlen_q, heads,
-  # head_dim) and lse as (batch, heads, seqlen_q); the reference is packed.
-  out = np.asarray(result[0], np.float32).reshape(-1, heads, 128)
-  if not return_lse:
-    lse = None
-  elif dense:
-    lse = np.asarray(result[1]).transpose(1, 0, 2).reshape(heads, -1)
-  else:
-    lse = np.asarray(result[1])
-  assert_extend_matches((out, lse, updated_k, updated_v), expected, cu,
-                        lengths, active)
+  actual = run_extend(q, kc, vc, k, v, cu, lengths, table,
+                      num_active=num_active, return_lse=return_lse,
+                      causal=causal)
+  assert_extend_matches(actual, expected, cu, lengths, active)
 
 
 @pytest.mark.parametrize("page_size", [256, 512, 1024])
 def test_ragged_cache_page_sizes(page_size):
   case = random_ragged_case(lengths=(5, 11), prefixes=(page_size - 2, 3),
                             page_size=page_size, capacity=2 * page_size,
-                            heads=2, kv_heads=1, head_dim=64)
+                            heads=2, kv_heads=1, head_dim=128)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, causal=True)
+  actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
 @pytest.mark.parametrize("append", [False, True])
 def test_empty_packed_allocation(append):
+  # Note (david): a zero-row buffer is outside the varlen contract (the
+  # packed path rejects it too), so the allocation holds packed padding only.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
-      lengths=(0, 0), prefixes=(0, 0), padding=0)
+      lengths=(0, 0), prefixes=(0, 0), padding=8)
   k, v = (k, v) if append else (None, None)
   expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
                               causal=True)
-  actual = run_extend(q, kc, vc, k, v, cu, lengths, table, causal=True)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table, causal=True)
   assert_extend_matches(actual, expected, cu, lengths, 2)
 
 
-@pytest.mark.parametrize("heads,kv_heads", [(132, 6), (256, 1), (128, 8)])
-def test_ragged_cache_large_head_fold(heads, kv_heads):
+@pytest.mark.parametrize("heads,kv_heads", [(132, 6), (128, 8)])
+def test_ragged_cache_many_heads(heads, kv_heads):
+  # Note (david): a group is one kv head whose 22 or 16 q heads fold into the
+  # score fragment rows, so the q compute tile shrinks to 32 or 64 tokens.
   case = random_ragged_case(lengths=(67, 11), prefixes=(3, 128), heads=heads,
                             kv_heads=kv_heads, head_dim=256, capacity=256,
                             padding=0)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, causal=True)
+  actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
-@pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_ragged_cache_prefill_gqa_regression(layout):
+def test_ragged_cache_prefill_gqa_regression():
   case = random_ragged_case(lengths=(237,), prefixes=(2048,), heads=32,
                             kv_heads=8, capacity=3072, padding=19)
-  if layout == "pair":
-    case = contiguous_case(*case)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, layout=layout, causal=True)
+  actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 1)
 
 
-@pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_extend_replays_when_later_block_raises_anchor(layout):
-  # The cached keys jump from 0 to 32 at position 1024, so the later blocks'
-  # scores sit hundreds of log2 units above the anchor the first block set: the
-  # fixed-anchor pass must notice and replay with the rescaling update instead
-  # of overflowing. Only out is checked: Q is scaled in bf16, a relative error
-  # that at an lse near 370 exceeds the lse tolerance.
+def test_multitoken_replays_when_later_block_raises_anchor():
+  # Note (david): the cached keys jump from 0 to 32 at position 1024, so the
+  # later blocks' scores sit hundreds of log2 units above the anchor the first
+  # block set: the fixed-anchor pass must notice and replay with the rescaling
+  # update instead of overflowing. Only out is checked: Q is scaled in bf16, a
+  # relative error that at an lse near 370 exceeds the lse tolerance.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
       lengths=(64,), prefixes=(2048,), heads=4, kv_heads=2, capacity=4096,
       padding=0)
@@ -466,42 +498,246 @@ def test_extend_replays_when_later_block_raises_anchor(layout):
   vc = jnp.ones_like(vc).at[late_pages].set(3.0)
   q, k, v = jnp.ones_like(q), jnp.full_like(k, 32.0), jnp.full_like(v, 3.0)
   case = (q, kc, vc, k, v, cu, lengths, table)
-  if layout == "pair":
-    case = contiguous_case(*case)
   expected = ragged_reference(*case, causal=True)
-  actual = run_extend(*case, layout=layout, return_lse=False, causal=True)
+  actual = run_extend(*case, return_lse=False, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], 1)
 
 
 @pytest.mark.skipif(INTERPRET,
                     reason="requires TPU optimized buffer assignment")
-@pytest.mark.parametrize("layout", ["pair", "merged"])
-def test_ragged_cache_has_no_pool_sized_temporary(layout):
-  q = jax.ShapeDtypeStruct((16, 8, 128), jnp.bfloat16)
-  kv = jax.ShapeDtypeStruct((16, 4, 128), jnp.bfloat16)
-  kwargs = dict(cache_seqlens=jax.ShapeDtypeStruct((2,), jnp.int32),
-                cu_seqlens_q=jax.ShapeDtypeStruct((3,), jnp.int32),
-                causal=True)
-  if layout == "merged":
-    cache = jax.ShapeDtypeStruct((1024, 128, 4, 128), jnp.bfloat16)
-    pool = jax.ShapeDtypeStruct(
-        (*cache.shape[:2], 2 * cache.shape[2], cache.shape[3]), cache.dtype)
-    compiled = flash_attn_with_kvcache.lower(
-        q, pool, None, kv, kv,
-        block_table=jax.ShapeDtypeStruct((2, 256), jnp.int32),
-        **kwargs).compile()
-  else:
-    # Note (david): the same bytes per cache as the paged pool, as 16 rows.
-    cache = jax.ShapeDtypeStruct((16, 8192, 4, 128), jnp.bfloat16)
-    compiled = flash_attn_with_kvcache.lower(
-        q, cache, cache, kv, kv, **kwargs).compile()
+def test_ragged_cache_has_no_pool_sized_temporary():
+  q = jax.ShapeDtypeStruct((8, 16, 128), jnp.bfloat16)
+  cache = jax.ShapeDtypeStruct((1024, 128, 8, 128), jnp.bfloat16)
+
+  def paged_attn(q, kv_cache, cu, seqused, table):
+    return flash_attn_varlen_func(
+        q, kv_cache, None, cu, None, 16, 256 * 128, causal=True,
+        block_table=table, seqused_k=seqused)
+
+  compiled = jax.jit(paged_attn).lower(
+      q, cache, jax.ShapeDtypeStruct((3,), jnp.int32),
+      jax.ShapeDtypeStruct((2,), jnp.int32),
+      jax.ShapeDtypeStruct((2, 256), jnp.int32)).compile()
   memory = compiled.memory_analysis()
-  pool_bytes = 2 * math.prod(cache.shape) * jnp.dtype(cache.dtype).itemsize
-  assert memory.alias_size_in_bytes >= pool_bytes
-  # Note (david): a cache layout conversion or a dense gather of the cache
-  # would allocate at least half the pool; query transforms and scratch are
-  # far smaller.
+  pool_bytes = math.prod(cache.shape) * jnp.dtype(cache.dtype).itemsize
+  # Note (david): the read-only kernel aliases nothing. A cache layout
+  # conversion or a dense gather of the cache would allocate at least half the
+  # pool; query transforms and scratch are far smaller.
   assert memory.temp_size_in_bytes < pool_bytes // 4, memory
+
+
+@pytest.mark.parametrize("case,error,message", [
+    ("seqused_k_without_block_table", ValueError, "seqused_k"),
+    ("block_table_without_seqused_k", ValueError, "seqused_k"),
+    ("cu_seqlens_k_with_block_table", ValueError, "cu_seqlens_k"),
+    ("token_major", NotImplementedError, "(?i)token.major"),
+    ("rotary_k", NotImplementedError, "rotary_k"),
+    ("window_size", NotImplementedError, "window"),
+    ("softcap", NotImplementedError, "softcap"),
+    ("cu_seqlens_q_start", ValueError, "cu_seqlens_q"),
+    ("num_active_past_batch", ValueError, "num_active"),
+    ("num_active_jax_negative", ValueError, "num_active"),
+    ("num_active_float", ValueError, "num_active"),
+    ("float32", NotImplementedError, "(?i)bf16|bfloat16"),
+    ("head_dim_64", ValueError, "head_dim"),
+    ("kv_pair", ValueError, "merged"),
+    ("odd_cache_heads", ValueError, "merged"),
+])
+def test_paged_varlen_rejects_unsupported_calls(case, error, message):
+  # Note (david): each case changes one knob of an otherwise valid paged call.
+  heads, kv_heads, total_q, head_dim = 4, 2, 8, 128
+  q = jnp.zeros((heads, total_q, head_dim), jnp.bfloat16)
+  cu = jnp.array([0, 3, total_q], jnp.int32)
+  operands = [q, jnp.zeros((2, 128, 2 * kv_heads, head_dim), jnp.bfloat16),
+              None, cu, None]
+  kwargs = dict(causal=True, interpret=INTERPRET,
+                block_table=jnp.array([[0], [1]], jnp.int32),
+                seqused_k=jnp.array([5, 9], jnp.int32))
+  if case == "seqused_k_without_block_table":
+    packed_kv = jnp.zeros((kv_heads, total_q, head_dim), jnp.bfloat16)
+    operands[1:] = [packed_kv, packed_kv, cu, cu]
+    kwargs["block_table"] = None
+  elif case == "block_table_without_seqused_k":
+    kwargs["seqused_k"] = None
+  elif case == "cu_seqlens_k_with_block_table":
+    operands[4] = cu
+  elif case == "token_major":
+    operands[0] = q.transpose(1, 0, 2).reshape(total_q, heads * head_dim)
+    kwargs.update(token_major=True, head_dim=head_dim)
+  elif case == "rotary_k":
+    rope_table = jnp.ones((128, head_dim // 2), jnp.float32)
+    kwargs.update(rotary_cos=rope_table, rotary_sin=rope_table, rotary_k=True)
+  elif case == "window_size":
+    kwargs["window_size"] = (16, 0)
+  elif case == "softcap":
+    kwargs["softcap"] = 5.0
+  elif case == "cu_seqlens_q_start":
+    operands[3] = jnp.array([2, 3, total_q], jnp.int32)
+  elif case == "num_active_past_batch":
+    kwargs["num_active"] = 3
+  elif case == "num_active_jax_negative":
+    kwargs["num_active"] = jnp.int32(-1)
+  elif case == "num_active_float":
+    kwargs["num_active"] = jnp.float32(1.0)
+  elif case == "float32":
+    operands[:2] = [operand.astype(jnp.float32) for operand in operands[:2]]
+  elif case == "kv_pair":
+    pages = jnp.zeros((2, 128, kv_heads, head_dim), jnp.bfloat16)
+    operands[1:3] = [pages, pages]
+  elif case == "odd_cache_heads":
+    operands[1] = jnp.zeros((2, 128, 3, head_dim), jnp.bfloat16)
+  else:
+    operands[:2] = [operand[..., :64] for operand in operands[:2]]
+  with pytest.raises(error, match=message):
+    flash_attn_varlen_func(*operands, total_q, 128, **kwargs)
+
+
+def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, head_dim=128,
+                page_size=128, gqa_fold=1, block_sizes=None):
+  """resolve_paged_tiles with no lse or rotary."""
+  return resolve_paged_tiles(
+      max_seqlen_q_bucket=max_seqlen_q_bucket,
+      max_seqlen_k_bucket=max_seqlen_k_bucket, page_size=page_size,
+      head_dim=head_dim, return_lse=False, rotary_dtype=None,
+      gqa_fold=gqa_fold, block_sizes=block_sizes)
+
+
+@pytest.mark.parametrize("shape,dtype,expected_bytes", [
+    ((2, 512, 12, 128), jnp.bfloat16, 2 * 512 * 16 * 128 * 2),
+    ((2, 512, 1, 2, 128), jnp.bfloat16, 2 * 512 * 2 * 128 * 2),
+    ((2, 1, 2, 128, 64), jnp.float32, 2 * 2 * 128 * 128 * 4),
+    ((1, 2, 512), jnp.int32, 2 * 512 * 4),
+])
+def test_vmem_buffer_bytes_pads_to_mosaic_tiles(shape, dtype, expected_bytes):
+  # Note (david): an odd second-minor axis pads to a power of two (12 to 16),
+  # a staged bf16 (K, V) row pair costs nothing, a half-lane rotary plane pads
+  # to 128, and the two int32 bounds rows pad to 2, not 8.
+  assert vmem_buffer_bytes(shape, jnp.dtype(dtype)) == expected_bytes
+
+
+class CapturedPallasCall(Exception):
+  """Stops forward_common at its intercepted pallas_call."""
+
+
+@pytest.mark.parametrize("heads,kv_heads,head_dim,interpret,return_lse,rotary", [
+    (32, 8, 128, False, False, False),
+    (32, 8, 128, True, True, True),
+    (6, 3, 128, False, True, False),
+    (8, 1, 256, False, True, True),
+])
+def test_paged_vmem_estimate_tracks_forward_common_scratch(
+    monkeypatch, heads, kv_heads, head_dim, interpret, return_lse, rotary):
+  # Note (david): forward_common's pallas_call is intercepted before any
+  # lowering, so the TPU build (interpret=False) is inspected on CPU as well.
+  captured = []
+
+  def _capture_pallas_call(*unused_args, scratch_shapes, **unused_kwargs):
+    captured.extend(scratch_shapes)
+    raise CapturedPallasCall
+
+  monkeypatch.setattr(fwd_pipeline.pl, "pallas_call", _capture_pallas_call)
+  page_size, pages_per_seq, total_q = 128, 4, 200
+  cache = jnp.zeros((8, page_size, 2 * kv_heads, head_dim), jnp.bfloat16)
+  blocks = BlockSizes(block_q=256, block_kv=256, block_kv_compute=128,
+                      block_q_compute=128)
+  if rotary:
+    rotary_dtype = jnp.dtype(jnp.float32)
+    rotary_pair = (
+        jnp.zeros((2, 1, total_q, head_dim // 2), rotary_dtype), None)
+  else:
+    rotary_dtype, rotary_pair = None, None
+  with pytest.raises(CapturedPallasCall):
+    flash_attn_varlen_paged(
+        jnp.zeros((heads, total_q, head_dim), jnp.bfloat16), cache,
+        jnp.array([0, 90, 180], jnp.int32), jnp.array([300, 500], jnp.int32),
+        jnp.zeros((2, pages_per_seq), jnp.int32), max_seqlen_q=90,
+        max_seqlen_k=500, causal=True, q_scale=1.0, return_lse=return_lse,
+        interpret=interpret, block_sizes=blocks, rotary=rotary_pair)
+  allocated = [(tuple(ref.shape), jnp.dtype(ref.dtype)) for ref in captured
+               if ref.memory_space == pltpu.VMEM]
+  assert allocated == paged_scratch_shapes(
+      blocks, head_dim=head_dim, return_lse=return_lse,
+      rotary_dtype=rotary_dtype, gqa_fold=heads // kv_heads)
+
+
+@pytest.mark.parametrize(
+    "head_dim,max_seqlen_q_bucket,max_seqlen_k_bucket,expected", [
+        (128, 128, 40960, (128, 2048)),
+        (128, 8192, 40960, (2048, 1024)),
+        (128, 2048, 32768, (2048, 1024)),
+        (128, 1024, 32768, (1024, 2048)),
+        (128, 64, 128, (128, 128)),
+        (128, 384, 640, (256, 640)),
+        (256, 1024, 16384, (1024, 2048)),
+        (256, 2048, 256, (2048, 256)),
+    ])
+def test_paged_tiles_minimize_prefix_streams_within_vmem(
+    head_dim, max_seqlen_q_bucket, max_seqlen_k_bucket, expected):
+  # Note (david): an unfolded group (one q head per kv head) keeps every build
+  # far inside the VMEM budget, so the q block grows to the bucket (at most
+  # 2048 rows), its q compute tile is half of it (at most 1024 rows), and the
+  # prefix is streamed once per q block; the kv block takes the most pages
+  # within the 2048 x 1024 block area, so a 2048-row q block streams 1024-token
+  # kv blocks. A 384-row bucket takes one 256-row block fewer than three
+  # 128-row ones; a 640-token bucket (a five-page table row) is one five-page
+  # block, whose kv compute tile is 128, the largest one dividing it.
+  blocks = paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket,
+                       head_dim=head_dim)
+  assert (blocks.block_q, blocks.block_kv) == expected
+  assert blocks.block_q_compute == blocks.block_q // 2
+  if blocks.block_kv == 640:
+    assert blocks.block_kv_compute == 128
+  else:
+    assert blocks.block_kv_compute == min(512, blocks.block_kv)
+  assert estimate_vmem_bytes(
+      blocks, head_dim=head_dim, return_lse=False,
+      rotary_dtype=None, gqa_fold=1) <= vmem_limit_bytes()
+
+
+def test_paged_tiles_pins_and_page_multiples():
+  # Note (david): a pinned build is only checked against the budget; block_kv
+  # holds the most whole pages, at least one, within the kv bucket and 2048
+  # tokens, for any multiple-of-128 page size.
+  pinned = BlockSizes(block_q=1024, block_kv=512, block_kv_compute=256,
+                      block_q_compute=256)
+  assert paged_tiles(8192, 40960, block_sizes=pinned) == pinned
+  for page_size, kv_bucket, block_kv, block_kv_compute in [
+      (384, 128, 384, 384), (512, 1536, 1536, 512), (640, 4096, 1920, 384),
+      (4096, 8192, 4096, 512)]:
+    blocks = paged_tiles(128, kv_bucket, page_size=page_size)
+    assert (blocks.block_kv, blocks.block_kv_compute) == (
+        block_kv, block_kv_compute)
+
+
+@pytest.mark.parametrize("gqa_fold,head_dim,max_seqlen_q_bucket,expected", [
+    (8, 256, 1024, (512, 512, 128, 512)),
+    (4, 256, 1024, (1024, 512, 256, 512)),
+    (2, 256, 1024, (1024, 1024, 512, 512)),
+    (6, 128, 1024, (512, 512, 128, 512)),
+    (16, 128, 2048, (256, 512, 64, 512)),
+])
+def test_paged_tiles_fold_q_heads_into_fragment_rows(
+    gqa_fold, head_dim, max_seqlen_q_bucket, expected):
+  # Note (david): a kv head's gqa_fold q heads share one fragment, so the q
+  # compute tile keeps gqa_fold * block_q_compute within 1024 rows, the block
+  # area counts every folded row, and no larger q block is bought with a kv
+  # block below one full 512-key compute tile.
+  blocks = paged_tiles(max_seqlen_q_bucket, 16384, head_dim=head_dim,
+                       gqa_fold=gqa_fold)
+  assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
+          blocks.block_kv_compute) == expected
+  assert estimate_vmem_bytes(
+      blocks, head_dim=head_dim, return_lse=False, rotary_dtype=None,
+      gqa_fold=gqa_fold) <= vmem_limit_bytes()
+
+
+def test_paged_tiles_reject_pinned_vmem_overflow():
+  # Note (david): a pinned build past the budget raises; nothing shrinks
+  # behind the pin. A 65536-token kv block stages ~200 MiB at d256.
+  with pytest.raises(ValueError, match="VMEM"):
+    paged_tiles(8192, 65536, head_dim=256, block_sizes=BlockSizes(
+        block_q=2048, block_kv=65536, block_kv_compute=512,
+        block_q_compute=256))
 
 
 # Note (david): with N(0, 1) inputs attention spreads over the whole visible
@@ -511,11 +747,11 @@ def test_ragged_cache_has_no_pool_sized_temporary(layout):
 # positions with a 12-16 nat logit, so a visibility, paging or row-placement
 # error moves out/lse by O(1). Stale cache slots hold copies of live codes, so
 # attending one is loud too.
-def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=64,
+def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
                page_size=128, pages_per_seq=None, padding=0, batch=None,
                tail_owned=False, unused_pages=None, causal=True, logit=12.0,
                softmax_scale=None, seed=7):
-  """Needle-probe extend inputs in random_ragged_case's tuple layout.
+  """Needle-probe inputs in random_ragged_case's tuple layout.
 
   lengths/prefixes describe the active requests (num_active = len(lengths)).
   Slots past them, up to batch, are inactive with garbage cache_seqlens and
@@ -549,10 +785,12 @@ def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=64,
   cache_seqlens[:active] = prefixes
   cu = np.zeros(batch + 1, np.int64)
   cu[1:active + 1] = np.cumsum(lengths)
-  cu[active + 1:] = cu[active]
-  total_q = int(cu[active]) + padding
   if tail_owned:
-    cu[active + 1:] += np.sort(rng.integers(0, padding + 1, batch - active))
+    cu[active + 1:] = cu[active] + np.sort(
+        rng.integers(0, padding + 1, batch - active))
+  else:
+    cu[active + 1:] = cu[active]
+  total_q = int(cu[active]) + padding
 
   def unit(shape):
     directions = rng.normal(size=shape)
@@ -628,7 +866,7 @@ def assert_probe_is_sharp(top2):
 
 @pytest.mark.parametrize("padding,causal", [
     (0, True), (5, True), (27, True), (27, False)])
-def test_extend_unaligned_sequence_boundaries(padding, causal):
+def test_paged_unaligned_sequence_boundaries(padding, causal):
   # Note (david): cu = 0 1 15 15 36 43 46 47 58 61 puts boundaries at every
   # residue mod 8, with an empty request in the middle, one-row requests, and
   # the last request ending at the buffer end or inside the pad tail.
@@ -637,7 +875,7 @@ def test_extend_unaligned_sequence_boundaries(padding, causal):
                     pages_per_seq=4, padding=padding, causal=causal)
   expected = ragged_reference(*case, causal=causal)
   assert_probe_is_sharp(expected[4])
-  actual = run_extend(*case, causal=causal)
+  actual = run_paged(*case, causal=causal)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
@@ -646,35 +884,37 @@ def test_extend_unaligned_sequence_boundaries(padding, causal):
     ((700, 300), (1500, 2900), 128, True),
     ((300, 700), (2900, 1500), 128, False),
 ])
-def test_extend_chunked_prefill_long_prefix(lengths, prefixes, page_size,
-                                            causal):
-  # Note (david): a q chunk longer than any kernel q chunk splits one request
-  # across several kernel chunks, and its causal limit must advance row by
-  # row across every chunk edge.
+def test_paged_chunked_prefill_long_prefix(lengths, prefixes, page_size,
+                                           causal):
+  # Note (david): max_seqlen_q = 256 underestimates the chunks, which only caps
+  # the q block, so one request splits across several q blocks and its causal
+  # limit must advance row by row across every block edge.
   case = probe_case(lengths, prefixes, head_dim=128, page_size=page_size,
                     padding=13, causal=causal, logit=16.0)
   expected = ragged_reference(*case, causal=causal)
   assert_probe_is_sharp(expected[4])
-  actual = run_extend(*case, causal=causal)
+  actual = run_paged(*case, causal=causal, max_seqlen_q=256)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
-@pytest.mark.parametrize("page_size", [384, 640, 1024, 2048])
-def test_extend_kv_tiles_end_inside_pages(page_size):
-  # Note (david): power-of-two KV tiles end strictly inside these pages, and
-  # the causal limits (2000 -> 2096, 1023 -> 1068, 500 -> 520) cross
-  # 512/1024/2048 mid-chunk, so the limit falls inside a tile.
+@pytest.mark.parametrize("page_size", [128, 384, 640, 1024, 2048])
+def test_paged_causal_limits_inside_kv_blocks(page_size):
+  # Note (david): a paged KV block holds whole pages, from many 128-token
+  # pages through five 384-token or three 640-token pages (1920 tokens, on no
+  # power-of-two edge) down to one 2048-token page, and the causal limits
+  # (2000 -> 2096, 1023 -> 1068, 500 -> 520) cross 512/1024/2048 mid-chunk,
+  # so the limit falls inside a block.
   lengths = (96, 45, 20)
   case = probe_case(lengths, (2000, 1023, 500), page_size=page_size,
                     padding=7, logit=16.0)
   expected = ragged_reference(*case, causal=True)
   assert_probe_is_sharp(expected[4])
-  actual = run_extend(*case, causal=True)
+  actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
 @pytest.mark.parametrize("tail_owned", [False, True])
-def test_extend_mixed_prefixes_and_inactive_garbage(tail_owned):
+def test_paged_mixed_prefixes_and_inactive_garbage(tail_owned):
   # Note (david): prefixes 0, 1 and both sides of a page edge sit next to a
   # long one, in a 9-slot batch whose 3 inactive slots carry garbage lengths
   # and table rows; active table entries past the live pages are -1.
@@ -684,17 +924,19 @@ def test_extend_mixed_prefixes_and_inactive_garbage(tail_owned):
                     unused_pages=-1, logit=14.0)
   expected = ragged_reference(*case, causal=True, num_active=len(lengths))
   assert_probe_is_sharp(expected[4])
-  actual = run_extend(*case, causal=True, num_active=len(lengths))
+  actual = run_paged(*case, causal=True, num_active=len(lengths))
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
 @pytest.mark.parametrize("heads,kv_heads,return_lse", [
     (32, 8, False), (32, 8, True), (16, 4, False), (8, 2, True)])
-def test_extend_serving_gqa_shape(heads, kv_heads, return_lse):
-  # Note (david): the tpu-inference FlyWheel backend's extend layout for Qwen3-4B:
-  # 64 padded slots with 320-page table rows, 3 active requests in a 512-token
-  # bucket, called without lse when serving. The 16/4 and 8/2 cases are one
-  # TP 2 / TP 4 shard's heads, where few KV heads share one merged row.
+def test_paged_serving_gqa_shape(heads, kv_heads, return_lse):
+  # Note (david): the tpu-inference FlyWheel backend's prefill step for
+  # Qwen3-4B: 64 padded slots with 320-page table rows, 3 active requests in a
+  # 512-token bucket, called without lse when serving. The 16/4 and 8/2 cases
+  # are one TP 2 / TP 4 shard's heads, where few KV heads share one merged
+  # row. The bounds are the backend's: the token bucket, and the table row's
+  # capacity for max_model_len.
   lengths = (150, 131, 169)
   scale = 1 / math.sqrt(128)
   case = probe_case(lengths, (600, 641, 577), heads=heads, kv_heads=kv_heads,
@@ -703,72 +945,53 @@ def test_extend_serving_gqa_shape(heads, kv_heads, return_lse):
   expected = ragged_reference(*case, causal=True, num_active=len(lengths),
                               softmax_scale=scale)
   assert_probe_is_sharp(expected[4])
-  actual = run_extend(*case, causal=True, num_active=len(lengths),
-                      return_lse=return_lse, softmax_scale=scale)
+  actual = run_paged(*case, causal=True, num_active=len(lengths),
+                     return_lse=return_lse, softmax_scale=scale,
+                     max_seqlen_q=case[0].shape[0], max_seqlen_k=320 * 128)
   assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
-def check_extend_kernel(case, *, causal, tilings, layout="pair"):
-  """The extend kernel on caches the reference already appended to.
-
-  layout "pair" passes separate K/V pools and "merged" one
-  (pages, page_size, 2 * kv_heads, dim) pool.
-  """
-  q, kc, vc, k, v, cu, lengths, table = case
-  expected = ragged_reference(q, kc, vc, k, v, cu, lengths, table,
-                              causal=causal)
-  k_pages = jnp.asarray(expected[2], jnp.bfloat16)
-  v_pages = jnp.asarray(expected[3], jnp.bfloat16)
-  if layout == "pair":
-    cache_operands = (k_pages, v_pages)
-  else:
-    cache_operands = (jnp.concatenate((k_pages, v_pages), axis=2), None)
-  out, lse = flash_attn_kvcache_extend_pallas(
-      q, *cache_operands, cu, (lengths + jnp.diff(cu)).astype(jnp.int32),
-      table.reshape(-1), jnp.int32(len(lengths)),
-      q_scale=float(np.log2(np.e)) / np.sqrt(q.shape[-1]), causal=causal,
-      return_lse=True, interpret=INTERPRET, tilings=tilings,
-      merged_cache=layout == "merged")
-  np.testing.assert_allclose(np.asarray(out, np.float32), expected[0],
-                             **OUT_TOL)
-  np.testing.assert_allclose(lse, expected[1], **LSE_TOL)
+def test_paged_fresh_chunk_q_blocks_share_one_kv_block():
+  # Note (david): a 600-token fresh chunk in 128-row q blocks over one
+  # 2048-token kv block: each q block loads the block only up to its own
+  # frontier, so consecutive q blocks stage the same kv block with different
+  # extents and must not reuse each other's staging, and most kv compute
+  # tiles of every q tile lie past its frontier and are skipped.
+  lengths = (600,)
+  case = probe_case(lengths, (0,), pages_per_seq=16, padding=11, logit=16.0)
+  expected = ragged_reference(*case, causal=True)
+  assert_probe_is_sharp(expected[4])
+  actual = run_paged(*case, causal=True, max_seqlen_q=128,
+                     max_seqlen_k=16 * 128)
+  assert_extend_matches(actual, expected, case[5], case[6], len(lengths))
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("tilings", [
-    ((8, 128, 128, 1),),
-    ((16, 256, 128, 1),),
-    ((24, 512, 256, 1),),
-    ((32, 256, 256, 1), (16, 512, 256, 1), (8, 128, 128, 1)),
-    pytest.param(((32, 256, 128, 1), (8, 512, 256, 2)), marks=TPU_ONLY),
-])
-def test_extend_kernel_small_chunks_and_boundary_blends(causal, tilings):
-  # Note (david): chunks far smaller than the requests force several KV passes
-  # per request, 1-row requests share one 8-row output tile three times in a
-  # row, and mixed tilings prefetch across staging buffers of different sizes.
-  case = random_ragged_case(lengths=(13, 1, 1, 1, 0, 29, 3),
-                            prefixes=(200, 0, 7, 128, 5, 300, 1),
-                            capacity=512, padding=11)
-  check_extend_kernel(case, causal=causal, tilings=tilings)
+def test_paged_overflow_guard_checks_last_live_kv_tile():
+  # Note (david): keys [0, 512) score 0 and keys [512, 600) score ~200 nats,
+  # so rows past 512 anchor on the first kv tile and overflow on the second.
+  # Every q tile's frontier is below the block's last kv tile, which is
+  # skipped, so the overflow check must run at the last live tile for the
+  # replay to rescue those rows.
+  length, kv_heads, heads, head_dim = 600, 2, 4, 128
+  num_pages, page_size = 16, 128
+  scale = 1 / math.sqrt(head_dim)
+  direction = np.zeros(head_dim)
+  direction[0] = 1.0
+  magnitude = math.sqrt(200.0 / scale)
+  q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+  k = np.zeros((length, kv_heads, head_dim))
+  k[512:] = magnitude * direction
+  v = np.where(np.arange(length)[:, None, None] < 512, 1.0, 3.0) * np.ones(
+      (length, kv_heads, head_dim))
+  pages = np.zeros((num_pages, page_size, kv_heads, head_dim))
 
+  def bf16(array):
+    return jnp.asarray(array, jnp.bfloat16)
 
-@pytest.mark.parametrize("tilings", [
-    ((16, 256, 128, 1),),
-    ((32, 256, 256, 1), (8, 1024, 512, 1)),
-    pytest.param(((16, 256, 128, 2),), marks=TPU_ONLY),
-    pytest.param(((32, 256, 256, 1), (8, 1024, 512, 2)), marks=TPU_ONLY),
-])
-def test_extend_kernel_gqa_multi_block_prefix(tilings):
-  case = random_ragged_case(lengths=(40, 21, 5), prefixes=(700, 1000, 998),
-                            heads=16, kv_heads=8, capacity=1024, padding=5)
-  check_extend_kernel(case, causal=True, tilings=tilings)
-
-
-@pytest.mark.parametrize("kv_heads", [1, 2, 4])
-def test_extend_kernel_merged_cache_head_counts(kv_heads):
-  # Note (david): one KV head makes the merged row a single K/V head pair; two
-  # and four heads are head blocks inside one (8, 128) HBM tile of the row.
-  case = random_ragged_case(lengths=(40, 1, 21), prefixes=(300, 129, 0),
-                            heads=8, kv_heads=kv_heads, capacity=512,
-                            padding=3)
-  check_extend_kernel(case, causal=True, tilings=None, layout="merged")
+  case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
+          jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
+          jnp.arange(num_pages, dtype=jnp.int32)[None])
+  expected = ragged_reference(*case, causal=True)
+  actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size)
+  assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+  assert_extend_matches(actual, expected, case[5], case[6], 1)

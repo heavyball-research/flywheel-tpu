@@ -120,7 +120,7 @@ flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_se
                        return_attn_probs=False, return_softmax_lse=False, interpret=False,
                        head_dim=None, token_major=False, block_sizes=None, *,
                        rotary_cos=None, rotary_sin=None, rotary_interleaved=True,
-                       rotary_k=True):
+                       rotary_k=True, block_table=None, seqused_k=None, num_active=None):
 """Attention over sequences packed along the token axis. Unlike flash-attn, the default layout
 is head-major, (nheads, total, headdim), which is the kernel's own layout, so no operand is
 relaid out.
@@ -146,6 +146,16 @@ Arguments:
     block_sizes [optional]: (block_q, block_kv, block_q_compute, block_kv_compute). Pins the
         forward tiles instead of the tuned or analytic ones; block_q and block_kv must be
         multiples of 128.
+    block_table [optional]: (batch_size, max_num_blocks_per_seq), int. Reads k as a paged KV
+        cache, read-only: one merged (num_blocks, page_block_size, 2 * nheads_k, headdim)
+        cache whose token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
+        ...], with v and cu_seqlens_k None. page_block_size and headdim are multiples of 128;
+        any nheads_k. q stays head-major; token_major, window_size, softcap and rotary_k=True
+        are not supported.
+    seqused_k [optional]: (batch_size,), int. With block_table, each sequence's kv length,
+        its new tokens included, which the cache must already hold; max_seqlen_k bounds it.
+    num_active [optional]: int, may be traced. With block_table, only the first num_active
+        sequences attend; rows past the last of them return out = 0 and lse = -inf.
     The other arguments are as in flash_attn_func.
 Return:
     out: (nheads, total_q, headdim_v), or (total_q, nheads * headdim_v) with token_major=True.
@@ -175,15 +185,17 @@ you can use cache_seqlens to keep track of the current sequence lengths of each 
 the batch.
 
 Unlike flash_attn_func, q is token-major, as in flash-attn. Decode is q with seqlen_q = 1;
-seqlen_q > 1 or a packed q with cu_seqlens_q runs chunked prefill against the cache.
+seqlen_q > 1 or a packed q with cu_seqlens_q runs chunked prefill against the cache, which
+needs the paged cache (block_table): the new tokens are appended, then flash_attn_varlen_func's
+paged kernel attends the updated pages. The contiguous cache serves single-token decode only.
 
-Supports MQA/GQA as flash_attn_func does. nheads_k must be even or 1, because the cache load
-packs two bf16 heads into one u32 lane. Paged single-token decode also needs nheads_k of
-1, 2, 4 or a multiple of 8 (1 or a multiple of 8 at headdim 64).
+Supports MQA/GQA as flash_attn_func does. The paged cache takes any nheads_k; the contiguous
+cache needs nheads_k even or 1, because its cache load packs two bf16 heads into one u32 lane.
 
 If causal=True, the causal mask is aligned to the bottom right corner of each request's
-attention matrix, as in flash_attn_func. A row with nothing to attend returns out = 0 and
-lse = -inf.
+attention matrix, as in flash_attn_func. A decode row with nothing to attend returns out = 0
+and lse = -inf; on multi-token and packed calls, as in flash_attn_varlen_func, a row with no
+visible key is unspecified.
 
 If window_size != (-1, -1), implements sliding window local attention, for single-token
 decode only.
@@ -194,8 +206,9 @@ Arguments:
     k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         seqlen_cache a multiple of 128,
         or (num_blocks, page_block_size, 2 * nheads_k, headdim) if there's a block_table
-        (i.e. paged KV cache). The paged cache merges K and V: each token row holds its
-        nheads_k K heads, then its nheads_k V heads. page_block_size must be a multiple of 128.
+        (i.e. paged KV cache). The paged cache merges K and V: each token row interleaves
+        each KV head's K row and V row, [k0, v0, k1, v1, ...] (RPA v3's head order).
+        page_block_size must be a multiple of 128.
     v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         or None if there's a block_table.
     k [optional]: (batch_size, seqlen_new, nheads_k, headdim), or (total_q, nheads_k, headdim)

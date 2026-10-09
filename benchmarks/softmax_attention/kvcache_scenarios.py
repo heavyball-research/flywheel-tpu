@@ -18,10 +18,12 @@ decode           --batch sequences each hold seq - decode_tokens tokens of KV
 
 Both kernels read and write a paged cache of --page-size token pages (128,
 the page flywheel's vLLM backend allocates), with pages shuffled across
-sequences. flywheel runs flash_attn_with_kvcache, which its vLLM backend calls
-for both phases. RPA v3 runs ragged_paged_attention with the request
-distribution vLLM's TPU runner sends, mixed for chunked prefill and decode for
-decode, and its own default block sizes unless --rpa-blocks names some.
+sequences; flywheel's is the merged cache whose token rows interleave each kv
+head's K and V rows. flywheel runs flash_attn_with_kvcache: its decode kernel
+for decode, and for chunked prefill its ragged append plus the paged varlen
+kernel. RPA v3 runs ragged_paged_attention with the request distribution
+vLLM's TPU runner sends, mixed for chunked prefill and decode for decode, and
+its own default block sizes unless --rpa-blocks names some.
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -191,7 +193,8 @@ def build_flywheel(cell, inputs, args):
     from flywheel_tpu import flash_attn_with_kvcache
 
     calls, block_table, starts = inputs
-    # The merged cache: a token's K heads, then its V heads.
+    # Note (david): 2 * heads_k rows per token because the merged cache
+    # interleaves each kv head's K row and V row.
     shape = (cell.num_seqs * block_table.shape[1], cell.page_size,
              2 * cell.heads_k, cell.head_dim)
 

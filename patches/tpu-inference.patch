@@ -595,10 +595,10 @@ index 000000000..58d482ea3
 +# limitations under the License.
 diff --git a/tests/kernels/flywheel_tpu/attention_wrapper_test.py b/tests/kernels/flywheel_tpu/attention_wrapper_test.py
 new file mode 100644
-index 000000000..07fa43293
+index 000000000..11e226143
 --- /dev/null
 +++ b/tests/kernels/flywheel_tpu/attention_wrapper_test.py
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,206 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""flywheel_tpu backend wrapper against the RPA v3 reference on one cache."""
 +
@@ -615,20 +615,6 @@ index 000000000..07fa43293
 +jax.config.parse_flags_with_absl()
 +
 +HEAD_DIM = 256
-+
-+
-+def v3_to_merged(kv_cache_v3: jax.Array) -> jax.Array:
-+    """The RPA v3 fused cache in this backend's layout: every K head, then
-+    every V head, on one head axis."""
-+    return jnp.concatenate(
-+        [kv_cache_v3[:, :, :, 0, :], kv_cache_v3[:, :, :, 1, :]], axis=2)
-+
-+
-+def merged_to_v3(merged: jax.Array) -> jax.Array:
-+    """Inverse of v3_to_merged."""
-+    num_kv_heads = merged.shape[2] // 2
-+    return jnp.stack(
-+        [merged[:, :, :num_kv_heads], merged[:, :, num_kv_heads:]], axis=3)
 +
 +
 +@jtu.with_config(jax_numpy_dtype_promotion="standard")
@@ -728,7 +714,11 @@ index 000000000..07fa43293
 +        run = jax.jit(fa.flywheel_tpu_attention,
 +                      static_argnames=tuple(static_kwargs),
 +                      donate_argnums=(3, ))
-+        cache = v3_to_merged(kv_cache_v3)
++        # Note (david): the backend's [k0, v0, k1, v1, ...] head axis is the
++        # v3 (pages, page_size, kv_heads, 2, head_dim) cache with its (K, V)
++        # pair axis folded in, so a reshape converts either way.
++        cache = kv_cache_v3.reshape(num_pages, page_size, 2 * num_kv_heads,
++                                    HEAD_DIM)
 +        if should_check_cache_copies:
 +            hlo = run.lower(q, k, v, cache, kv_lens_arr, page_indices,
 +                            cu_q_lens, kv_write_slices, kv_write_num_slices,
@@ -750,10 +740,11 @@ index 000000000..07fa43293
 +                            expected[:total].astype(jnp.float32),
 +                            atol=5e-2,
 +                            rtol=5e-2)
-+        self.assertArraysEqual(merged_to_v3(updated), expected_cache_v3)
++        self.assertArraysEqual(updated.reshape(kv_cache_v3.shape),
++                               expected_cache_v3)
 +
-+    # Note (david): (8, 1) is one KV head per chip, whose (K, V) row the
-+    # kernels stage as one pair tile; four heads are two head blocks per row.
++    # Note (david): (8, 1) covers one KV head per chip, whose cache token row
++    # is a single (K, V) row pair; (24, 4) and (16, 4) put four pairs in a row.
 +    @parameterized.product(num_heads=[(24, 4), (16, 4), (8, 1)],
 +                           page_size=[128, 256])
 +    def test_decode_only(self, num_heads, page_size):
@@ -1978,10 +1969,10 @@ index 000000000..24b4d62ac
 +                                   err_msg=f"recurrent slot {slot}")
 diff --git a/tests/kernels/ragged_kv_cache_update_output_test.py b/tests/kernels/ragged_kv_cache_update_output_test.py
 new file mode 100644
-index 000000000..6fe1c09bb
+index 000000000..eaf3be490
 --- /dev/null
 +++ b/tests/kernels/ragged_kv_cache_update_output_test.py
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,59 @@
 +import jax.numpy as jnp
 +
 +from tpu_inference.kernels.ragged_paged_attention.v2 import \
@@ -2035,69 +2026,12 @@ index 000000000..6fe1c09bb
 +        output_cache,
 +        scratch,
 +        object(),
-+        kv_head_start=None,
 +    )
 +
 +    outgoing = [copy for copy in copies if copy[0][0] is scratch]
 +    assert len(outgoing) == scratch.shape[0]
 +    assert all(copy[1][0] is output_cache for copy in outgoing)
 +    assert all(copy[1][0] is not input_cache for copy in outgoing)
-diff --git a/tests/kernels/ragged_kv_cache_update_v2_test.py b/tests/kernels/ragged_kv_cache_update_v2_test.py
-index 189afe008..15396a117 100644
---- a/tests/kernels/ragged_kv_cache_update_v2_test.py
-+++ b/tests/kernels/ragged_kv_cache_update_v2_test.py
-@@ -94,6 +94,51 @@ class KVCacheUpdateTest(jtu.JaxTestCase):
-                             atol=1e-4,
-                             rtol=1e-4)
- 
-+    @parameterized.product(
-+        num_heads=[2, 4, 8],
-+        kv_head_start=[0, 1],  # in units of num_heads: K window, V window
-+        num_slices_per_block=[None, 8],
-+    )
-+    def test_head_window(self, num_heads: int, kv_head_start: int,
-+                         num_slices_per_block: int):
-+        # new_kv fills heads [start, start + num_heads) of rows twice as wide
-+        # (the merged K/V layout); the other half of every row is untouched.
-+        page_size, head_dim = 32, 128
-+        new_kv, slot_mapping, _, num_slices = self._generate_data(
-+            page_size, num_heads, head_dim)
-+        kv_cache = jax.random.normal(jax.random.key(7),
-+                                     (20 * page_size, 2 * num_heads, head_dim),
-+                                     dtype=jnp.bfloat16)
-+        head_start = kv_head_start * num_heads
-+        window = slice(head_start, head_start + num_heads)
-+        expected = np.array(kv_cache)
-+        expected[:, window] = kv_cache_update_ref(new_kv,
-+                                                  np.asarray(slot_mapping),
-+                                                  kv_cache[:, window])
-+        updated_kv_cache = kv_cache_update(
-+            new_kv,
-+            slot_mapping,
-+            kv_cache,
-+            num_slices,
-+            page_size=page_size,
-+            num_slices_per_block=num_slices_per_block,
-+            kv_head_start=head_start)
-+        self.assertArraysEqual(updated_kv_cache, expected)
-+
-+    def test_head_window_rejects_mesh(self):
-+        new_kv, slot_mapping, _, num_slices = self._generate_data(32, 8, 128)
-+        kv_cache = jnp.zeros((20 * 32, 16, 128), dtype=jnp.bfloat16)
-+        mesh = Mesh(jax.devices()[:1], 'x')
-+        with self.assertRaisesRegex(ValueError, "kv_head_start"):
-+            kv_cache_update(new_kv,
-+                            slot_mapping,
-+                            kv_cache,
-+                            num_slices,
-+                            page_size=32,
-+                            mesh=mesh,
-+                            kv_cache_pspec=P(None, 'x', None),
-+                            kv_head_start=8)
-+
-     @parameterized.product(
-         page_size=[32, 33],
-         combined_kv_head_num=[16, 32],
 diff --git a/tests/kernels/test_gdn_metadata_smem.py b/tests/kernels/test_gdn_metadata_smem.py
 new file mode 100644
 index 000000000..8b19479b3
@@ -2219,10 +2153,10 @@ index 000000000..8b19479b3
 +                                  large_words[:num_tiles])
 diff --git a/tests/layers/common/test_flywheel_pcp_attention.py b/tests/layers/common/test_flywheel_pcp_attention.py
 new file mode 100644
-index 000000000..06d36dd02
+index 000000000..121037f8b
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_pcp_attention.py
-@@ -0,0 +1,301 @@
+@@ -0,0 +1,302 @@
 +import jax
 +import jax.numpy as jnp
 +import numpy as np
@@ -2360,8 +2294,8 @@ index 000000000..06d36dd02
 +    q_natural = (q_natural % 19 / 19).astype(jnp.bfloat16)
 +    kv_natural = q_natural[:, :kv_heads]
 +    if query_layout == "head_tail":
-+        row_order = [c for rank in range(pcp_size)
-+                     for c in (rank, 2 * pcp_size - 1 - rank)]
++        row_order = [chunk for rank in range(pcp_size)
++                     for chunk in (rank, 2 * pcp_size - 1 - rank)]
 +    else:
 +        row_order = list(range(2 * pcp_size))
 +
@@ -2398,20 +2332,22 @@ index 000000000..06d36dd02
 +        return (out, lse) if return_softmax_lse else out
 +
 +    def reference_writer(k_arg, v_arg, cache, slices, counts):
-+        flat = cache.reshape(-1, cache.shape[-2], dim)
-+        source = jnp.concatenate((k_arg, v_arg), axis=1)
-+        for source_index in range(source.shape[0]):
-+            matches = ((source_index >= slices[1]) &
-+                       (source_index < slices[1] + slices[2]) &
-+                       (jnp.arange(slices.shape[1]) < counts[0]))
-+            valid = jnp.any(matches)
-+            selected = jnp.argmax(matches)
-+            destination = (slices[0, selected] + source_index -
-+                           slices[1, selected])
-+            old = flat[destination]
-+            flat = flat.at[destination].set(
-+                jnp.where(valid, source[source_index], old))
-+        return flat.reshape(cache.shape)
++        flat_cache = cache.reshape(-1, cache.shape[-2], dim)
++        # Note (david): stacked on a pair axis after the head axis so each row
++        # matches the backend writer's interleaved [k0, v0, k1, v1, ...] rows.
++        new_rows = jnp.stack((k_arg, v_arg), axis=2).reshape(
++            k_arg.shape[0], -1, dim)
++        for new_row in range(new_rows.shape[0]):
++            piece_matches = ((new_row >= slices[1]) &
++                             (new_row < slices[1] + slices[2]) &
++                             (jnp.arange(slices.shape[1]) < counts[0]))
++            is_written = jnp.any(piece_matches)
++            piece = jnp.argmax(piece_matches)
++            cache_row = slices[0, piece] + new_row - slices[1, piece]
++            old_row = flat_cache[cache_row]
++            flat_cache = flat_cache.at[cache_row].set(
++                jnp.where(is_written, new_rows[new_row], old_row))
++        return flat_cache.reshape(cache.shape)
 +
 +    monkeypatch.setattr(flywheel_pcp, "flash_attn_func", reference_flash)
 +    monkeypatch.setattr(
@@ -2471,11 +2407,10 @@ index 000000000..06d36dd02
 +    for position in range(num_current):
 +        owner = position % pcp_size
 +        slot = owner * 128 + position // pcp_size
-+        # Every K head of the row, then every V head.
-+        expected_cache = expected_cache.at[0, slot, :kv_heads].set(
-+            kv_natural[position])
-+        expected_cache = expected_cache.at[0, slot, kv_heads:].set(
-+            kv_natural[position])
++        # Note (david): K and V are the same rows here, so repeating each head
++        # twice builds the interleaved [k0, v0, k1, v1, ...] cache row.
++        expected_cache = expected_cache.at[0, slot].set(
++            jnp.repeat(kv_natural[position], 2, axis=0))
 +    np.testing.assert_array_equal(updated, expected_cache)
 +
 +
@@ -2526,10 +2461,10 @@ index 000000000..06d36dd02
 +                                  jnp.zeros_like(output[:, 1:]))
 diff --git a/tests/layers/common/test_flywheel_pcp_cache_layout.py b/tests/layers/common/test_flywheel_pcp_cache_layout.py
 new file mode 100644
-index 000000000..24155fad2
+index 000000000..c1da39c51
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_pcp_cache_layout.py
-@@ -0,0 +1,81 @@
+@@ -0,0 +1,86 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from types import SimpleNamespace
@@ -2552,19 +2487,20 @@ index 000000000..24155fad2
 +
 +@pytest.mark.parametrize("num_kv_heads", [2, 4])
 +def test_merged_multihead_extend_history_matches_reference(num_kv_heads):
-+    num_query_heads, head_dim, visible = 8, 128, 37
++    num_query_heads, head_dim, num_visible_tokens = 8, 128, 37
 +    q = (jnp.arange(8 * num_query_heads * head_dim, dtype=jnp.float32).reshape(
 +        8, num_query_heads, head_dim) % 17 / 17).astype(jnp.bfloat16)
 +    key = (jnp.arange(128 * num_kv_heads * head_dim,
 +                      dtype=jnp.float32).reshape(128, num_kv_heads, head_dim) %
 +           13 / 13).astype(jnp.bfloat16)
 +    value = jnp.flip(key, axis=0)
-+    cache = jnp.concatenate((key, value), axis=1)[None]
++    cache = jnp.stack((key, value), axis=2).reshape(
++        128, 2 * num_kv_heads, head_dim)[None]
 +    out, lse, _ = flash_attn_with_kvcache(
 +        q,
 +        cache,
 +        None,
-+        cache_seqlens=jnp.array([visible], jnp.int32),
++        cache_seqlens=jnp.array([num_visible_tokens], jnp.int32),
 +        block_table=jnp.array([[0]], jnp.int32),
 +        num_active=1,
 +        cu_seqlens_q=jnp.array([0, 8], jnp.int32),
@@ -2572,9 +2508,13 @@ index 000000000..24155fad2
 +        causal=False,
 +        return_softmax_lse=True,
 +        interpret=True)
-+    repeats = num_query_heads // num_kv_heads
-+    keys = jnp.repeat(key[:visible].astype(jnp.float32), repeats, axis=1)
-+    values = jnp.repeat(value[:visible].astype(jnp.float32), repeats, axis=1)
++    num_q_per_kv = num_query_heads // num_kv_heads
++    keys = jnp.repeat(key[:num_visible_tokens].astype(jnp.float32),
++                      num_q_per_kv,
++                      axis=1)
++    values = jnp.repeat(value[:num_visible_tokens].astype(jnp.float32),
++                        num_q_per_kv,
++                        axis=1)
 +    scores = jnp.einsum("qhd,khd->hqk", q.astype(jnp.float32), keys)
 +    scaled_scores = scores / np.sqrt(head_dim)
 +    expected = jnp.einsum("hqk,khd->qhd", jax.nn.softmax(scaled_scores,
@@ -2697,14 +2637,14 @@ index 000000000..eff712b9d
 +    call.assert_called_once()
 diff --git a/tests/layers/common/test_flywheel_tpu_attention.py b/tests/layers/common/test_flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..dfe014854
+index 000000000..fc59479e9
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_attention.py
-@@ -0,0 +1,1172 @@
+@@ -0,0 +1,1139 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""CPU tests for the flywheel_tpu backend glue and its dispatch."""
 +
-+from typing import NamedTuple
++import functools
 +from unittest.mock import MagicMock
 +
 +import jax
@@ -2730,15 +2670,6 @@ index 000000000..dfe014854
 +DENSE_BATCH, DENSE_SEQ = NUM_SEQS, TOTAL_TOKENS // NUM_SEQS
 +ROPE_THETA = 1000000.0
 +STUB_Q_HEADS, STUB_KV_HEADS = 4, 2
-+
-+
-+class WriteRun(NamedTuple):
-+    """One run of the KV cache update kernel inside write_kv_cache."""
-+    new_kv: jax.Array
-+    slices: jax.Array
-+    flat_cache_shape: tuple[int, ...]
-+    slices_per_block: int
-+    kv_head_start: int | None
 +
 +
 +@pytest.fixture
@@ -2873,13 +2804,13 @@ index 000000000..dfe014854
 +        assert fa.get_kv_cache_shape(64, 128, 4, 200,
 +                                     jnp.bfloat16) == (64, 128, 8, 256)
 +
-+    @pytest.mark.parametrize("num_kv_heads", [0, 3])
-+    def test_rejects_kv_heads_the_kernels_cannot_pack(self, num_kv_heads):
-+        with pytest.raises(NotImplementedError, match="even number"):
-+            fa.get_kv_cache_shape(64, 128, num_kv_heads, 256, jnp.bfloat16)
++    def test_rejects_zero_kv_heads(self):
++        with pytest.raises(ValueError, match="at least one KV head"):
++            fa.get_kv_cache_shape(64, 128, 0, 256, jnp.bfloat16)
 +
 +    @pytest.mark.parametrize(("num_kv_heads", "expected"), [
 +        (4, (64, 128, 8, 256)),
++        (3, (64, 128, 6, 256)),
 +        (1, (64, 128, 2, 256)),
 +    ])
 +    def test_runner_shape_when_enabled(self, mesh, flywheel_flag, num_kv_heads,
@@ -3077,62 +3008,38 @@ index 000000000..dfe014854
 +
 +class TestWriteKvCache:
 +
-+    def record_write_runs(
-+        self, monkeypatch: pytest.MonkeyPatch, num_kv_heads: int
-+    ) -> tuple[list[WriteRun], jax.Array, jax.Array, jax.Array]:
-+        """The writer runs of one write_kv_cache call, plus the K, V and slice
-+        table it was given."""
-+        runs = []
-+
-+        def _fake_update(new_kv, slices, cache, num_slices, **kwargs):
-+            runs.append(
-+                WriteRun(new_kv, slices, cache.shape,
-+                         kwargs["num_slices_per_block"],
-+                         kwargs.get("kv_head_start")))
-+            return cache
-+
-+        monkeypatch.setattr(fa, "kv_cache_update", _fake_update)
-+        k = jnp.zeros((16, num_kv_heads, 128), jnp.bfloat16)
-+        v = jnp.ones((16, num_kv_heads, 128), jnp.bfloat16)
-+        cache = jnp.zeros(
-+            fa.get_kv_cache_shape(4, 128, num_kv_heads, 128, jnp.bfloat16),
++    @pytest.mark.parametrize("num_kv_heads", [1, 2, 8])
++    def test_writes_interleaved_rows(self, monkeypatch, num_kv_heads):
++        # Note (david): every written token row is [k0, v0, k1, v1, ...]; the
++        # pieces start mid-page and wrap pages, and rows the table does not
++        # name keep their contents.
++        monkeypatch.setattr(
++            fa, "write_kv_cache_pages",
++            functools.partial(fa.write_kv_cache_pages, interpret=True))
++        rng = np.random.default_rng(num_kv_heads)
++        k = jnp.asarray(rng.normal(size=(16, num_kv_heads, 128)),
++                        jnp.bfloat16)
++        v = jnp.asarray(rng.normal(size=k.shape), jnp.bfloat16)
++        cache = jnp.asarray(
++            rng.normal(size=fa.get_kv_cache_shape(4, 128, num_kv_heads, 128,
++                                                  jnp.bfloat16)),
 +            jnp.bfloat16)
-+        table = jnp.arange(30, dtype=jnp.int32).reshape(3, 10)
-+        updated = fa.write_kv_cache(k, v, cache, table,
-+                                    jnp.zeros((1, ), jnp.int32))
-+        assert updated.shape == cache.shape
-+        return runs, k, v, table
-+
-+    def test_concatenates_a_single_head_shard(self, monkeypatch):
-+        # Note (david): a size-1 slice of a one-head shard's (K, V) axis does
-+        # not compile, so K and V ride one run in the cache's own head order.
-+        runs, k, v, table = self.record_write_runs(monkeypatch, num_kv_heads=1)
-+        [(new_kv, slices, flat_shape, per_block, head_start)] = runs
-+        assert flat_shape == (4 * 128, 2, 128) and per_block == 64
-+        assert head_start is None
-+        np.testing.assert_array_equal(new_kv, jnp.concatenate([k, v], axis=1))
-+        assert slices.shape == (3, 64)
-+        np.testing.assert_array_equal(slices[:, :10], table)
-+
-+    @pytest.mark.parametrize("num_kv_heads", [2, 8])
-+    def test_writes_k_and_v_head_windows(self, monkeypatch, num_kv_heads):
-+        # Note (david): with more heads a row's K and V halves are head
-+        # windows, so each part is written from its own buffer, with one
-+        # padded table, and nothing is concatenated.
-+        runs, k, v, table = self.record_write_runs(monkeypatch, num_kv_heads)
-+        assert len(runs) == 2
-+        for (new_kv, slices, flat_shape, per_block,
-+             head_start), rows, window in zip(runs, (k, v), (0, num_kv_heads)):
-+            assert flat_shape == (4 * 128, 2 * num_kv_heads, 128)
-+            # Note (david): each run stages num_kv_heads heads, so the block
-+            # size follows that page, not the whole row.
-+            assert per_block == 64
-+            assert head_start == window
-+            np.testing.assert_array_equal(new_kv, rows)
-+            assert slices.shape == (3, 64)
-+            np.testing.assert_array_equal(slices[:, :10], table)
-+            # Note (david): the padded pieces must copy nothing.
-+            assert not slices[:, 10:].any()
++        slice_table = np.zeros((3, 10), np.int32)
++        slice_table[:, 0] = (2 * 128 + 5, 0, 10)
++        slice_table[:, 1] = (0, 10, 6)
++        expected = np.array(cache, np.float32).reshape(
++            4 * 128, num_kv_heads, 2, 128)
++        for cache_row, new_row, length in slice_table[:, :2].T:
++            new_rows = slice(new_row, new_row + length)
++            expected[cache_row:cache_row + length, :, 0] = np.asarray(
++                k[new_rows], np.float32)
++            expected[cache_row:cache_row + length, :, 1] = np.asarray(
++                v[new_rows], np.float32)
++        updated = fa.write_kv_cache(k, v, cache, jnp.asarray(slice_table),
++                                    jnp.array([2], jnp.int32))
++        np.testing.assert_array_equal(
++            np.asarray(updated, np.float32).reshape(expected.shape),
++            expected)
 +
 +
 +class TestKvWriteSlices:
@@ -3875,10 +3782,10 @@ index 000000000..dfe014854
 +        assert seen["attention"]["fused_q_rope_theta"] is None
 diff --git a/tests/layers/common/test_flywheel_tpu_extend.py b/tests/layers/common/test_flywheel_tpu_extend.py
 new file mode 100644
-index 000000000..0a37a0411
+index 000000000..93d3534f0
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_extend.py
-@@ -0,0 +1,699 @@
+@@ -0,0 +1,715 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Cached-prefix dispatch and paged extend numerics, mixed batches included."""
 +
@@ -4026,28 +3933,30 @@ index 000000000..0a37a0411
 +        for row in range(start, end):
 +            page, offset = divmod(prefix + row - start, PAGE_SIZE)
 +            page = batch.block_table[req, page]
-+            updated[page,
-+                    offset] = np.concatenate([batch.k[row], batch.v[row]])
++            updated[page, offset] = np.stack(
++                [batch.k[row], batch.v[row]], axis=1).reshape(-1, HEAD_DIM)
 +    for req in range(batch.num_reqs):
 +        start, end = batch.cu_q_lens[req:req + 2]
 +        keys, values = [], []
 +        for pos in range(batch.kv_lens[req]):
 +            page = batch.block_table[req, pos // PAGE_SIZE]
 +            offset = pos % PAGE_SIZE
-+            key, value = np.split(updated[page, offset], 2)
++            kv_pair = updated[page, offset].reshape(kv_heads, 2, HEAD_DIM)
++            key, value = kv_pair[:, 0], kv_pair[:, 1]
 +            keys.append(key)
 +            values.append(value)
-+        keys, values = (np.repeat(np.array(x, np.float32),
++        keys, values = (np.repeat(np.array(kv_rows, np.float32),
 +                                  QUERY_HEADS // kv_heads,
-+                                  axis=1) for x in (keys, values))
++                                  axis=1) for kv_rows in (keys, values))
 +        for row in range(start, end):
-+            visible = batch.kv_lens[req] - (end - row) + 1
++            num_visible = batch.kv_lens[req] - (end - row) + 1
 +            scores = np.einsum("hd,khd->hk", np.array(
-+                batch.q[row], np.float32), keys[:visible]) / np.sqrt(
++                batch.q[row], np.float32), keys[:num_visible]) / np.sqrt(
 +                    batch.q.shape[-1])
 +            probs = np.exp(scores - scores.max(axis=-1, keepdims=True))
 +            probs /= probs.sum(axis=-1, keepdims=True)
-+            output[row] = np.einsum("hk,khd->hd", probs, values[:visible])
++            output[row] = np.einsum("hk,khd->hd", probs,
++                                    values[:num_visible])
 +    return output, updated
 +
 +
@@ -4055,17 +3964,19 @@ index 000000000..0a37a0411
 +    """A write_kv_cache stand-in that runs the host slice table itself, so the
 +    kernels under test must read the updated pages."""
 +
-+    def _write(k_in, v_in, old, pieces, num_pieces):
-+        executed_pieces.append(int(num_pieces[0]))
-+        result = old
-+        for index in range(int(num_pieces[0])):
-+            dest, source, size = map(int, pieces[:, index])
-+            for offset in range(size):
-+                page, token = divmod(dest + offset, PAGE_SIZE)
-+                row = source + offset
-+                result = result.at[page, token].set(
-+                    jnp.concatenate([k_in[row], v_in[row]]))
-+        return result
++    def _write(k_in, v_in, kv_cache, kv_write_slices, kv_write_num_slices):
++        executed_pieces.append(int(kv_write_num_slices[0]))
++        updated_cache = kv_cache
++        for piece in range(int(kv_write_num_slices[0])):
++            cache_row_start, new_row_start, length = map(
++                int, kv_write_slices[:, piece])
++            for offset in range(length):
++                page, token = divmod(cache_row_start + offset, PAGE_SIZE)
++                new_row = new_row_start + offset
++                updated_cache = updated_cache.at[page, token].set(
++                    jnp.stack([k_in[new_row], v_in[new_row]],
++                              axis=1).reshape(-1, k_in.shape[-1]))
++        return updated_cache
 +
 +    return _write
 +
@@ -4286,26 +4197,34 @@ index 000000000..0a37a0411
 +                        softmax_scale,
 +                        cu_seqlens_q=None,
 +                        causal=False):
-+        # Note (david): one entry point serves both kernels; a packed call
-+        # (cu_seqlens_q) is the extend one. Both take the paged merged cache
-+        # as the one k_cache operand.
-+        assert v_cache is None
-+        if cu_seqlens_q is None:
-+            seen.update(k=k_rows,
-+                        v=v_rows,
-+                        rows=q_rows.shape[0],
-+                        cache_seqlens=np.asarray(cache_seqlens),
-+                        num_active=int(num_active))
-+            return jnp.full(q_rows.shape, 7, q_rows.dtype), kv_cache
++        # Note (david): only the decode rows reach flash_attn_with_kvcache,
++        # with the paged merged cache as the one k_cache operand.
++        assert v_cache is None and cu_seqlens_q is None and not causal
++        seen.update(k=k_rows,
++                    v=v_rows,
++                    rows=q_rows.shape[0],
++                    cache_seqlens=np.asarray(cache_seqlens),
++                    num_active=int(num_active))
++        return jnp.full(q_rows.shape, 7, q_rows.dtype), kv_cache
++
++    def _paged_varlen(q_heads, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, *,
++                      max_seqlen_q, max_seqlen_k, softmax_scale, causal,
++                      token_major, block_table, seqused_k, num_active):
++        assert q_heads.shape == (QUERY_HEADS, batch.q.shape[0], HEAD_DIM)
++        assert k_cache.shape == batch.kv_cache.shape
++        assert v_cache is None and cu_seqlens_k is None
++        assert token_major is False and softmax_scale == SM_SCALE
 +        seen.update(cu_q_lens=np.asarray(cu_seqlens_q),
-+                    kv_lens=np.asarray(cache_seqlens),
++                    kv_lens=np.asarray(seqused_k),
 +                    block_table=np.asarray(block_table),
-+                    extend_active=int(num_active),
-+                    extend_causal=causal)
-+        return jnp.full(q_rows.shape, 3, q_rows.dtype), kv_cache
++                    varlen_num_active=int(num_active),
++                    varlen_causal=causal,
++                    max_seqlens=(max_seqlen_q, max_seqlen_k))
++        return jnp.full(q_heads.shape, 3, q_heads.dtype)
 +
 +    monkeypatch.setattr(fa, "write_kv_cache", lambda k, v, c, *args: c)
 +    monkeypatch.setattr(fa, "flash_attn_with_kvcache", _merged_kvcache)
++    monkeypatch.setattr(fa, "flash_attn_varlen_func", _paged_varlen)
 +    out, _ = fa.flywheel_tpu_attention(
 +        batch.q,
 +        batch.k,
@@ -4325,24 +4244,27 @@ index 000000000..0a37a0411
 +    np.testing.assert_array_equal(seen["cache_seqlens"],
 +                                  batch.kv_lens[:seen["rows"]])
 +    assert seen["num_active"] == num_decode
-+    # Note (david): the extend kernel's request window starts at the first
++    # Note (david): the prefill kernel's request window starts at the first
 +    # prefill request, so its metadata is the tail of the step's and its cu
 +    # values stay absolute offsets into q.
-+    assert seen["extend_active"] == batch.num_reqs - num_decode
-+    assert seen["extend_causal"]
-+    slots = batch.kv_lens.size
-+    np.testing.assert_array_equal(seen["cu_q_lens"][:slots + 1 - num_decode],
-+                                  batch.cu_q_lens[num_decode:])
-+    np.testing.assert_array_equal(seen["kv_lens"][:slots - num_decode],
++    assert seen["varlen_num_active"] == batch.num_reqs - num_decode
++    assert seen["varlen_causal"]
++    num_slots = batch.kv_lens.size
++    np.testing.assert_array_equal(
++        seen["cu_q_lens"][:num_slots + 1 - num_decode],
++        batch.cu_q_lens[num_decode:])
++    np.testing.assert_array_equal(seen["kv_lens"][:num_slots - num_decode],
 +                                  batch.kv_lens[num_decode:])
 +    np.testing.assert_array_equal(
-+        seen["block_table"].reshape(slots,
-+                                    -1)[:slots - num_decode, :PAGES_PER_SEQ],
++        seen["block_table"].reshape(
++            num_slots, -1)[:num_slots - num_decode, :PAGES_PER_SEQ],
 +        batch.block_table[num_decode:])
++    assert seen["block_table"].shape == (num_slots, PAGES_PER_SEQ)
++    assert seen["max_seqlens"] == (batch.q.shape[0], PAGES_PER_SEQ * PAGE_SIZE)
 +    out = np.asarray(out)
 +    np.testing.assert_array_equal(out[:num_decode], 7)
 +    # Note (david): rows at or past num_decode are decode-kernel padding; here
-+    # they are the chunk's own first tokens and stay with the extend kernel.
++    # they are the chunk's own first tokens and stay with the prefill kernel.
 +    assert seen["rows"] > num_decode
 +    np.testing.assert_array_equal(out[num_decode:], 3)
 +
@@ -4479,11 +4401,12 @@ index 000000000..0a37a0411
 +HEAD_DIMS = (64, 96, 128, 129, 192, 255, 256)
 +# Note (david): decode and extend run the decode kernel, which rejects the
 +# padded head_dims (test_decode_rejects_padded_head_dim).
-+PADDED_HEAD_DIM_CASES = [(mode, head_dim)
-+                         for mode in ("dense", "ragged", "decode", "extend")
-+                         for head_dim in HEAD_DIMS
-+                         if mode in ("dense", "ragged")
-+                         or head_dim in fa.DECODE_HEAD_DIMS]
++PADDED_HEAD_DIM_CASES = [
++    (mode, head_dim)
++    for mode in ("dense", "ragged", "decode", "extend")
++    for head_dim in HEAD_DIMS
++    if mode in ("dense", "ragged") or head_dim in fa.DECODE_HEAD_DIMS
++]
 +
 +
 +@pytest.mark.parametrize("phase", [fa.DECODE_PHASE, fa.EXTEND_PHASE])
@@ -6653,10 +6576,10 @@ index 939769d47..7c55785c3 100644
  
 diff --git a/tpu_inference/distributed/flywheel_kv_transfer.py b/tpu_inference/distributed/flywheel_kv_transfer.py
 new file mode 100644
-index 000000000..039e01389
+index 000000000..8d9341517
 --- /dev/null
 +++ b/tpu_inference/distributed/flywheel_kv_transfer.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,54 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from typing import TYPE_CHECKING, Any
@@ -6665,16 +6588,19 @@ index 000000000..039e01389
 +    from vllm.config import VllmConfig
 +
 +
-+def get_flywheel_kv_transfer_config(config: "VllmConfig") -> dict[str, Any]:
++def get_flywheel_kv_transfer_config(
++        config: "VllmConfig") -> dict[str, str | int]:
 +    sharding = config.sharding_config
 +    model_dtype = str(config.model_config.dtype).removeprefix("torch.")
-+    cache_dtype = config.cache_config.cache_dtype
-+    if cache_dtype == "auto":
++    if config.cache_config.cache_dtype == "auto":
 +        cache_dtype = model_dtype
-+    # Use the resolved sharding, not parallel_config: the scheduler PCP shim
-+    # temporarily folds PCP into DCP while constructing the connector.
++    else:
++        cache_dtype = config.cache_config.cache_dtype
++    # Note (david): use the resolved sharding, not parallel_config: the
++    # scheduler PCP shim temporarily folds PCP into DCP while constructing the
++    # connector.
 +    return {
-+        "layout": "flywheel_merged_kv_v1",
++        "layout": "flywheel_merged_kv_v2",
 +        "tp_size": sharding.tp_size,
 +        "pcp_size": sharding.prefill_cp_size,
 +        "dcp_size": sharding.decode_cp_size,
@@ -6870,10 +6796,10 @@ index 9623a8864..d02f614e1 100644
      p_id_to_r_base = (query_start_loc[p_id_to_s_idx] +
                        p_id_to_t_id * cfg.chunk_size)
 diff --git a/tpu_inference/kernels/ragged_paged_attention/v2/ragged_kv_cache_update.py b/tpu_inference/kernels/ragged_paged_attention/v2/ragged_kv_cache_update.py
-index f03d7539e..305b13527 100644
+index f03d7539e..396c7b82e 100644
 --- a/tpu_inference/kernels/ragged_paged_attention/v2/ragged_kv_cache_update.py
 +++ b/tpu_inference/kernels/ragged_paged_attention/v2/ragged_kv_cache_update.py
-@@ -28,13 +28,20 @@ def _kv_cache_update_kernel(
+@@ -28,12 +28,13 @@ def _kv_cache_update_kernel(
      kv_cache_hbm_ref,  # [total_num_pages * page_size, num_combined_kv_heads,
      # head_dim]
      # Output
@@ -6883,19 +6809,12 @@ index f03d7539e..305b13527 100644
      scratch,  # [num_slices_per_block, page_size, num_combined_kv_heads,
      # head_dim]
      sem,
-+    *,
-+    kv_head_start: int | None,
  ):
 +    del kv_cache_hbm_ref
      async_copies = []
-+    if kv_head_start is None:
-+        cache_heads = (Ellipsis, )
-+    else:
-+        cache_heads = (pl.ds(kv_head_start, scratch.shape[2]), slice(None))
      block_idx = pl.program_id(0)
      num_slices_per_block = scratch.shape[0]
- 
-@@ -56,7 +63,7 @@ def _kv_cache_update_kernel(
+@@ -56,7 +57,7 @@ def _kv_cache_update_kernel(
      for async_copy in async_copies:
          async_copy.wait()
  
@@ -6904,86 +6823,15 @@ index f03d7539e..305b13527 100644
      async_copies.clear()
      for i in range(num_slices_per_block):
          offset_i = i + block_idx * num_slices_per_block
-@@ -66,7 +73,8 @@ def _kv_cache_update_kernel(
+@@ -66,7 +67,7 @@ def _kv_cache_update_kernel(
                                  slices_ref[2, offset_i], 0)
          async_copy = pltpu.make_async_copy(
              scratch.at[i, pl.ds(0, length), ...],
 -            kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
-+            updated_kv_cache_hbm_ref.at[(pl.ds(kv_cache_start, length),
-+                                         *cache_heads)],
++            updated_kv_cache_hbm_ref.at[pl.ds(kv_cache_start, length), ...],
              sem,
          )
          async_copy.start()
-@@ -144,9 +152,14 @@ def _kv_cache_update(
-     num_slices_per_block: int,
-     dynamic_validate_inputs: bool,
-     vmem_limit_bytes: int = 40 * 1024 * 1024,
-+    kv_head_start: int | None = None,
- ):
-     new_token_num, num_combined_kv_heads, head_dim = new_kv.shape
--    assert kv_cache.shape[1] == num_combined_kv_heads
-+    if kv_head_start is None:
-+        assert kv_cache.shape[1] == num_combined_kv_heads
-+    else:
-+        assert (0 <= kv_head_start
-+                and kv_head_start + num_combined_kv_heads <= kv_cache.shape[1])
-     assert kv_cache.shape[2] == head_dim
-     assert head_dim % 128 == 0
-     if dynamic_validate_inputs is True:
-@@ -173,7 +186,8 @@ def _kv_cache_update(
-     ]
- 
-     kernel = pl.pallas_call(
--        _kv_cache_update_kernel,
-+        functools.partial(_kv_cache_update_kernel,
-+                          kv_head_start=kv_head_start),
-         grid_spec=pltpu.PrefetchScalarGridSpec(
-             num_scalar_prefetch=len(scalar_prefetches),
-             in_specs=in_specs,
-@@ -231,7 +245,8 @@ def _get_num_slices_per_kv_cache_update_block(page_size_bytes: int,
- 
- @jax.jit(
-     static_argnames=[
--        "page_size", "num_slices_per_block", "mesh", "kv_cache_pspec"
-+        "page_size", "num_slices_per_block", "mesh", "kv_cache_pspec",
-+        "kv_head_start"
-     ],
-     donate_argnames="kv_cache",
- )
-@@ -250,6 +265,10 @@ def kv_cache_update(
-     | None = None,  # Only sharding along head_dim is supported
-     dynamic_validate_inputs: bool = False,
-     vmem_limit_bytes: int = 40 * 1024 * 1024,
-+    # None writes whole cache rows, which must then have new_kv's head count;
-+    # an int writes new_kv's heads into the cache heads [kv_head_start,
-+    # kv_head_start + num_combined_kv_heads) of each row and leaves the rest.
-+    kv_head_start: int | None = None,
- ):
-     if num_slices_per_block is None:
-         _, num_combined_kv_heads, head_dim = new_kv.shape
-@@ -260,9 +279,19 @@ def kv_cache_update(
-             page_size_bytes, vmem_limit_bytes)
- 
-     if mesh is None:
--        return _kv_cache_update(new_kv, slices, kv_cache, num_slices,
--                                page_size, num_slices_per_block,
--                                dynamic_validate_inputs)
-+        return _kv_cache_update(new_kv,
-+                                slices,
-+                                kv_cache,
-+                                num_slices,
-+                                page_size,
-+                                num_slices_per_block,
-+                                dynamic_validate_inputs,
-+                                kv_head_start=kv_head_start)
-+
-+    if kv_head_start is not None:
-+        raise ValueError(
-+            "kv_head_start indexes one shard's heads; call kv_cache_update "
-+            "inside the caller's own shard_map instead of passing mesh")
- 
-     if kv_cache_pspec is None:
-         raise ValueError(
 diff --git a/tpu_inference/layers/common/attention_interface.py b/tpu_inference/layers/common/attention_interface.py
 index fee282e5f..e9cc89e2b 100644
 --- a/tpu_inference/layers/common/attention_interface.py
@@ -7625,14 +7473,13 @@ index 000000000..c41c23333
 +                         write_slices, write_counts)
 diff --git a/tpu_inference/layers/common/flywheel_tpu_attention.py b/tpu_inference/layers/common/flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..ec3e8048f
+index 000000000..ba93df62e
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_tpu_attention.py
-@@ -0,0 +1,1089 @@
+@@ -0,0 +1,1063 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Dense FlyWheel TPU attention backend (USE_FLYWHEEL_TPU_KERNEL=1)."""
 +
-+import functools
 +import math
 +from collections.abc import Sequence
 +
@@ -7648,23 +7495,19 @@ index 000000000..ec3e8048f
 +from flywheel_tpu import \
 +    flash_attn_varlen_func as _flash_attn_varlen_func
 +from flywheel_tpu import flash_attn_with_kvcache
-+from tpu_inference.kernels.ragged_paged_attention.v2.ragged_kv_cache_update import (
-+    _get_num_slices_per_kv_cache_update_block, _get_page_size_bytes,
-+    kv_cache_update)
++from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
 +from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 +from tpu_inference.layers.common.sharding import ShardingAxisName
 +from tpu_inference.utils import align_to, get_mesh_shape_product
 +
-+# Note (david): flash_attn_with_kvcache (decode and extend) and
-+# kv_cache_update carry their own jax.jit, so every layer of a backbone calls
-+# one shared traced kernel. flash_attn_varlen_func and the bare extend kernel
-+# did not, and each layer traced and lowered its own inlined copy: a 36-layer
-+# Qwen3-4B attention stack at the 4096-token bucket on v6e-1 lowered to 64 MB
-+# of StableHLO in 22 s for a span-2048 prefill and to 46 MB in 56 s for extend,
-+# Python time a warm persistent compile cache cannot skip. Shared, the same
-+# stacks lower to 2.3 MB in 1.0 s and to 1.9 MB in 1.7 s, and their cold
-+# compile drops from 71 s to 34 s and from 131 s to 40 s, at an unchanged step
-+# time (30.3 ms ragged prefill and 127.6 ms extend, either way).
++# Note (david): flash_attn_with_kvcache and the KV writer carry their own
++# jax.jit, so every layer of a backbone calls one shared traced kernel.
++# flash_attn_varlen_func did not, and each layer traced and lowered its own
++# inlined copy: a 36-layer Qwen3-4B attention stack at the 4096-token bucket
++# on v6e-1 lowered to 64 MB of StableHLO in 22 s for a span-2048 prefill,
++# Python time a warm persistent compile cache cannot skip. Shared, it lowers
++# to 2.3 MB in 1.0 s, and its cold compile drops from 71 s to 34 s, at an
++# unchanged step time (30.3 ms ragged prefill).
 +flash_attn_varlen_func = jax.jit(
 +    _flash_attn_varlen_func,
 +    static_argnames=("max_seqlen_q", "max_seqlen_k", "softmax_scale", "causal",
@@ -7672,15 +7515,13 @@ index 000000000..ec3e8048f
 +)
 +
 +# Note (david): one KV cache layout, the merged (num_pages, page_size,
-+# 2 * kv_heads, head_dim): every token row holds the shard's K heads, then its
-+# V heads. It has no singleton axis at one KV head per chip (a stacked
-+# (2, ..., 1, head_dim) one did, which XLA laid out so that every written
-+# layer paid two whole-cache copies), and its leading axis is the page axis.
-+# With more heads per chip it matched the stacked layout it replaced on
-+# Qwen3-4B (8 KV heads, v6e-1): the decode kernel within 0.5% at 12 sampled
-+# (batch, length) points, the extend kernel within 0.1% on five chunked
-+# prefill mixes, and all 27 cells of the prefill sweep (1K-32K tokens x
-+# batch 1-64) within 0.5% end to end.
++# 2 * kv_heads, head_dim) whose token rows interleave each KV head's K row and
++# V row, [k0, v0, k1, v1, ...] (RPA v3's head order). It has no singleton axis
++# at one KV head per chip (a stacked (2, ..., 1, head_dim) one did, which XLA
++# laid out so that every written layer paid two whole-cache copies), and its
++# leading axis is the page axis. One head's (K, V) row pair is a 2-row window
++# of the head axis, so the paged prefill kernel stages only the KV head each
++# q head reads.
 +
 +
 +def _padded_head_dim(head_dim: int) -> int:
@@ -7714,13 +7555,12 @@ index 000000000..ec3e8048f
 +    """Shape of one shard's merged K/V page pool for actual_num_kv_heads KV
 +    heads. bf16 only, so kv_dtype does not size it."""
 +    head_dim = _padded_head_dim(actual_head_dim)
-+    # Note (david): the kernels load two bf16 heads per u32 lane, so a shard
-+    # holds one KV head (staged as a K/V pair) or an even number of them.
-+    if actual_num_kv_heads < 1 or (actual_num_kv_heads > 1
-+                                   and actual_num_kv_heads % 2):
-+        raise NotImplementedError(
-+            "USE_FLYWHEEL_TPU_KERNEL needs one or an even number of KV "
-+            f"heads per chip; got {actual_num_kv_heads}.")
++    # Note (david): the kernels read a KV head's (K, V) row pair as one u32
++    # word per lane, so any KV head count per chip works.
++    if actual_num_kv_heads < 1:
++        raise ValueError(
++            "USE_FLYWHEEL_TPU_KERNEL needs at least one KV head per chip; "
++            f"got {actual_num_kv_heads}.")
 +    return (total_num_pages, page_size, 2 * actual_num_kv_heads, head_dim)
 +
 +
@@ -7788,11 +7628,6 @@ index 000000000..ec3e8048f
 +    out[2, :total] = hi - lo
 +    return total
 +
-+
-+# Note (david): has to stay the vmem_limit_bytes kv_cache_update defaults to.
-+# write_kv_cache pads the slice table to the writer's block size, so it has to
-+# derive that block size with the same budget before the call.
-+KV_WRITE_VMEM_LIMIT_BYTES = 40 * 1024 * 1024
 +
 +# Note (david): these kernels tile the KV token axis in 128-token blocks, so a
 +# page that is not a whole number of blocks cannot be indexed.
@@ -7867,27 +7702,29 @@ index 000000000..ec3e8048f
 +    phase = phase_from_request_counts(num_decode, kv_lens.size)
 +    if kv_lens.size == 0:
 +        return PREFILL_PHASE
-+    if phase == DECODE_PHASE:
-+        if np.any(q_lens != 1):
-+            raise ValueError("Decode requires exactly one query per request.")
++    elif phase == DECODE_PHASE and np.any(q_lens != 1):
++        raise ValueError("Decode requires exactly one query per request.")
++    elif phase == DECODE_PHASE:
 +        return DECODE_PHASE
-+    # Note (david): a mixed step hands the leading num_decode requests to the
-+    # one-token-per-row decode kernel, so a regression in the runner's
-+    # reordering has to fail here instead of silently attending wrong rows.
-+    if np.any(q_lens[:num_decode] != 1):
++    elif np.any(q_lens[:num_decode] != 1):
++        # Note (david): a mixed step hands the leading num_decode requests to
++        # the one-token-per-row decode kernel, so a regression in the runner's
++        # reordering has to fail here instead of silently attending wrong
++        # rows.
 +        raise ValueError(
 +            "A mixed batch must put its decode requests first, one query "
 +            f"each; got q_lens {q_lens[:num_decode].tolist()} for the "
 +            f"leading {num_decode}.")
-+    # Note (david): a mixed step is EXTEND even when its prefill requests are
-+    # fresh. The ragged kernel served it by merging the decode rows into its
-+    # own [T, N, D] output, a read and a write of one buffer that XLA cannot
-+    # do in place: the second copy per layer made its memory-space assignment
-+    # drop the MLP weight prefetch into VMEM on 56 of 64 layers, +176.8 ms of
-+    # a 3311.7 ms step with Qwen3.8-27B at TP 8 on v6e-8. The price is the
-+    # extend kernel on every serving prefill step, which took a 320-prompt
-+    # benchmark on v6e-1 with Qwen3-4B from 113.80 s to 146.74 s.
-+    if phase == EXTEND_PHASE or np.any(kv_lens != q_lens):
++    elif phase == EXTEND_PHASE or np.any(kv_lens != q_lens):
++        # Note (david): a mixed step is EXTEND even when its prefill requests
++        # are fresh. The ragged kernel served it by merging the decode rows
++        # into its own [T, N, D] output, a read and a write of one buffer that
++        # XLA cannot do in place: the second copy per layer made its
++        # memory-space assignment drop the MLP weight prefetch into VMEM on 56
++        # of 64 layers, +176.8 ms of a 3311.7 ms step with Qwen3.8-27B at TP 8
++        # on v6e-8. The price is the paged cache kernel on every serving
++        # prefill step (with the extend kernel it replaced, a 320-prompt
++        # benchmark on v6e-1 with Qwen3-4B went from 113.80 s to 146.74 s).
 +        return EXTEND_PHASE
 +    else:
 +        return PREFILL_PHASE
@@ -8093,54 +7930,25 @@ index 000000000..ec3e8048f
 +
 +
 +def write_kv_cache(
-+        k: jax.Array,  # [T, H, D]
-+        v: jax.Array,  # [T, H, D]
-+        kv_cache: jax.Array,  # [P, S, 2H, D]
-+        kv_write_slices: jax.Array,  # i32[3, bound]
-+        kv_write_num_slices: jax.Array,  # i32[1]
++        k: jax.Array,
++        v: jax.Array,
++        kv_cache: jax.Array,
++        kv_write_slices: jax.Array,
++        kv_write_num_slices: jax.Array,
 +) -> jax.Array:
-+    """Copy this step's K/V rows into their pages; return the same buffer.
++    """Copy this step's K/V rows into their pages as interleaved
++    [k0, v0, k1, v1, ...] cache rows; return the same buffer.
 +
-+    The cache is viewed as token rows by a leading-axis reshape that leaves
-+    the (heads, head_dim) tiling untouched, so XLA emits no copy.
++    k and v are (T, H, D), kv_cache (P, S, 2H, D); kv_write_slices is
++    i32[3, bound] and kv_write_num_slices i32[1].
 +    """
-+    _, num_kv_heads, head_dim = k.shape
-+    num_pages, page_size = kv_cache.shape[:2]
-+    # Note (david): heads per writer run. One run carries the K and V of a
-+    # one-head shard; more heads write K and V in a run each.
-+    concatenates_kv = num_kv_heads == 1
-+    written_heads = 2 * num_kv_heads if concatenates_kv else num_kv_heads
-+    # Note (david): the writer kernel statically indexes every slice of its
-+    # last block, so the table is padded with empty pieces to a multiple of
-+    # the block size the writer picks for these pages.
-+    page_bytes = _get_page_size_bytes(page_size, written_heads, head_dim,
-+                                      kv_cache.dtype)
-+    slices_per_block = _get_num_slices_per_kv_cache_update_block(
-+        page_bytes, KV_WRITE_VMEM_LIMIT_BYTES)
-+    padded_num_slices = align_to(kv_write_slices.shape[1], slices_per_block)
-+    slices = jnp.pad(kv_write_slices,
-+                     ((0, 0),
-+                      (0, padded_num_slices - kv_write_slices.shape[1])))
-+    write = functools.partial(kv_cache_update,
-+                              num_slices=kv_write_num_slices,
-+                              page_size=page_size,
-+                              num_slices_per_block=slices_per_block)
-+    flat = kv_cache.reshape(num_pages * page_size, 2 * num_kv_heads, head_dim)
-+    if concatenates_kv:
-+        # Note (david): the two heads of a one-head row are its K and V, so
-+        # one run writes both once they are concatenated into that order. A
-+        # run per part is impossible: Mosaic tiles that axis by 2 and a size-1
-+        # slice of it does not compile.
-+        flat = write(jnp.concatenate([k, v], axis=1), slices, flat)
-+    else:
-+        # Note (david): with more heads, K and V go straight from their own
-+        # buffers into their head windows of each row. Concatenating them into
-+        # one [T, 2H, D] run instead made XLA copy all of V once more per
-+        # layer: +6.25 ms of a 65536-token Qwen3-4B prefill step on v6e-1
-+        # (29.11 ms of K/V writing against 22.86 ms for two separate runs).
-+        flat = write(k, slices, flat, kv_head_start=0)
-+        flat = write(v, slices, flat, kv_head_start=num_kv_heads)
-+    return flat.reshape(kv_cache.shape)
++    # Note (david): the fused writer interleaves K and V in VMEM because an
++    # XLA stack before a one-run write costs two extra HBM passes over them:
++    # +16 to +94% of the write on v6e (h32 k32 d256, 1024 tokens: 0.173
++    # against 0.090 ms per layer), while the fused writer measured 6 to 57%
++    # below the blocked layout's two runs.
++    return write_kv_cache_pages(k, v, kv_cache, kv_write_slices,
++                                kv_write_num_slices)
 +
 +
 +def is_q_rope_fused(attention_metadata: AttentionMetadata) -> bool:
@@ -8424,25 +8232,26 @@ index 000000000..ec3e8048f
 +    prefix; the phase for a prefill request whose keys are partly in the pages.
 +
 +    A mixed step splits over the same written cache: its leading num_decode
-+    one-token rows go to the decode kernel, the prefill requests to the extend
-+    kernel over a request window slid past them.
++    one-token rows go to the decode kernel, the prefill requests to the paged
++    varlen kernel, over a request window slid past them.
 +    """
 +    cache = write_kv_cache(k, v, kv_cache, kv_write_slices,
 +                           kv_write_num_slices)
-+    # Note (david): the extend kernel walks requests serially at a per-request
-+    # cost that does not shrink with the query length, so 21 decode rows at
-+    # kv_len 7800 cost 1.378 ms per Qwen3-4B layer on v6e against 0.448 ms
-+    # batched here. The cache is threaded writer -> decode kernel -> extend
-+    # kernel so the one donated buffer aliases the whole chain.
-+    # Note (david): KNOWN ISSUE, TP 4. With 2 KV heads per chip (Qwen3-4B at
-+    # TP 4 on v6e-8) the decode rows of a mixed step come out wrong: six
-+    # concurrent requests under 2048-token chunked prefill leave TP 1's greedy
-+    # tokens at the first token decoded in a mixed step. TP 1, 2 and 8 match.
-+    # The rows are right when this kernel reads a materialized copy of the
-+    # written cache (cache * a runtime one behind an optimization barrier) or
-+    # when the extend kernel serves them too; a barrier alone, a one-run
-+    # writer or the extend kernel going first does not help. Root cause open;
-+    # do not serve several requests at 2 KV heads per chip until it is fixed.
++    # Note (david): the decode rows are batched in the decode kernel; a
++    # kernel that walks requests serially costs the same per request whatever
++    # its query length (21 decode rows at kv_len 7800: 1.378 ms per Qwen3-4B
++    # layer on v6e against 0.448 ms batched). The cache is threaded writer ->
++    # decode kernel so the one donated buffer aliases the chain; the varlen
++    # kernel only reads it.
++    # Note (david): KNOWN ISSUE, TP 4, seen on the blocked [K heads, V heads]
++    # cache layout this interleaved one replaced. With 2 KV heads per chip
++    # (Qwen3-4B at TP 4 on v6e-8) the decode rows of a mixed step came out
++    # wrong: six concurrent requests under 2048-token chunked prefill left TP
++    # 1's greedy tokens at the first token decoded in a mixed step. TP 1, 2
++    # and 8 matched. The rows were right when this kernel read a materialized
++    # copy of the written cache (cache * a runtime one behind an optimization
++    # barrier); a barrier alone or a one-run writer did not help. Root cause
++    # open; recheck before serving several requests at 2 KV heads per chip.
 +    decode_out, cache = paged_cache_decode(q,
 +                                           None,
 +                                           None,
@@ -8452,45 +8261,61 @@ index 000000000..ec3e8048f
 +                                           num_decode,
 +                                           sm_scale=sm_scale)
 +    page_size = cache.shape[1]
-+    batch = kv_lens.shape[0]
-+    table = page_indices.reshape(batch, -1)
-+    padded_pages = decode_block_table_pages(table.shape[1], page_size)
-+    table = jnp.pad(table, ((0, 0), (0, padded_pages - table.shape[1])))
++    max_num_seqs = kv_lens.shape[0]
++    block_table = page_indices.reshape(max_num_seqs, -1)
++    pages_per_seq = block_table.shape[1]
 +    # Note (david): the window has to MOVE past the decode requests. Leaving
 +    # them in place with their query ranges clamped to zero tokens still cost
 +    # 0.042 ms per request against 0.003 ms for the slid window. dynamic_slice
 +    # needs its start in range, so each array is padded by its own length; the
 +    # padding is never read, because the kernel only touches the first
 +    # num_active - num_decode slots plus cu_q_lens[num_reqs].
-+    output, cache = flash_attn_with_kvcache(
-+        q,
++    cu_q_window = lax.dynamic_slice(jnp.pad(cu_q_lens, (0, max_num_seqs)),
++                                    (num_decode, ), (max_num_seqs + 1, ))
++    kv_lens_window = lax.dynamic_slice(jnp.pad(kv_lens, (0, max_num_seqs)),
++                                       (num_decode, ), (max_num_seqs, ))
++    block_table_window = lax.dynamic_slice(
++        jnp.pad(block_table, ((0, max_num_seqs), (0, 0))), (num_decode, 0),
++        (max_num_seqs, pages_per_seq))
++    # Note (david): max_seqlen_q/k are static block-size bounds, not lengths
++    # (the token bucket and the table's capacity), so one executable serves
++    # every kv_len of a bucket. The kernel clamps page indices into each
++    # sequence's own pages, so its table needs none of the decode kernel's
++    # capacity padding.
++    output = flash_attn_varlen_func(
++        q.transpose(1, 0, 2),
 +        cache,
 +        None,
-+        cache_seqlens=lax.dynamic_slice(jnp.pad(kv_lens, (0, batch)),
-+                                        (num_decode, ), (batch, )),
-+        block_table=lax.dynamic_slice(jnp.pad(table, ((0, batch), (0, 0))),
-+                                      (num_decode, 0), (batch, padded_pages)),
-+        num_active=num_active - num_decode,
-+        cu_seqlens_q=lax.dynamic_slice(jnp.pad(cu_q_lens, (0, batch)),
-+                                       (num_decode, ), (batch + 1, )),
++        cu_q_window,
++        None,
++        max_seqlen_q=q.shape[0],
++        max_seqlen_k=pages_per_seq * page_size,
 +        softmax_scale=sm_scale,
-+        causal=True)
-+    # Note (david): the extend kernel writes from the 8-aligned tile of its
-+    # own first request, which is the first PREFILL one, and zero-fills from
-+    # the 8-aligned tile past the step's last token; a DP rank whose whole
-+    # batch is decode leaves it no request at all. So rebuild that leading
-+    # window: decode rows from the decode kernel, scheduled rows from the
-+    # extend kernel, zeros for the bucket padding.
-+    rows = min(align_to(decode_out.shape[0], 8), q.shape[0])
-+    if decode_out.shape[0] < rows:
++        causal=True,
++        token_major=False,
++        block_table=block_table_window,
++        seqused_k=kv_lens_window,
++        num_active=num_active - num_decode,
++    ).transpose(1, 0, 2)
++    # Note (david): the varlen kernel does not own the rows below its first
++    # request (row num_decode): its first q block may start anywhere below it,
++    # and a decode-only DP rank leaves it no request. num_decode never exceeds
++    # num_leading_rows, so rebuilding the leading rows covers all of them.
++    num_leading_rows = min(align_to(decode_out.shape[0], 8), q.shape[0])
++    if decode_out.shape[0] < num_leading_rows:
 +        # Note (david): shape padding only; num_decode cannot reach these rows.
-+        decode_out = jnp.pad(decode_out,
-+                             ((0, rows - decode_out.shape[0]), (0, 0), (0, 0)))
-+    index = jnp.arange(rows)[:, None, None]
-+    scheduled = cu_q_lens[num_active]
-+    head = jnp.where(index < num_decode, decode_out,
-+                     jnp.where(index < scheduled, output[:rows], 0))
-+    return output.at[:rows].set(head), cache
++        padded_decode_out = jnp.pad(
++            decode_out,
++            ((0, num_leading_rows - decode_out.shape[0]), (0, 0), (0, 0)))
++    else:
++        padded_decode_out = decode_out
++    row_index = jnp.arange(num_leading_rows)[:, None, None]
++    num_scheduled_tokens = cu_q_lens[num_active]
++    leading_output = jnp.where(
++        row_index < num_decode, padded_decode_out,
++        jnp.where(row_index < num_scheduled_tokens, output[:num_leading_rows],
++                  0))
++    return output.at[:num_leading_rows].set(leading_output), cache
 +
 +
 +def flywheel_tpu_attention(
@@ -8517,7 +8342,7 @@ index 000000000..ec3e8048f
 +
 +    distribution is this rank's request_distribution: its last entry bounds
 +    the decode kernel's active rows and its first splits a mixed batch
-+    between the decode kernel and the extend kernel.
++    between the decode kernel and the paged varlen kernel.
 +    """
 +    # Note (david): the phase is static, so each step traces only its selected
 +    # kernel and the in-place cache update sits in the entry computation,
@@ -8539,45 +8364,49 @@ index 000000000..ec3e8048f
 +    if k.shape[-1] != head_dim or v.shape != k.shape:
 +        raise ValueError(
 +            "Q/K/V must share head_dim and K/V shapes must match.")
-+    if padded_head_dim != head_dim:
-+        if fused_q_rope_theta is not None:
-+            raise ValueError(
-+                "fused_q_rope_theta requires an unpadded head_dim; rotate Q "
-+                "in the model before padding.")
-+        # Keep the cache padded permanently; only pad this step's activations.
-+        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
-+        q, k, v = (jnp.pad(x, padding) for x in (q, k, v))
++    if padded_head_dim != head_dim and fused_q_rope_theta is not None:
++        raise ValueError(
++            "fused_q_rope_theta requires an unpadded head_dim; rotate Q "
++            "in the model before padding.")
 +    num_kv_heads = k.shape[1]
 +    if kv_cache.ndim != 4:
 +        raise ValueError(
 +            "flywheel_tpu expects a (pages, page_size, 2 * kv_heads, "
 +            f"head_dim) cache; got {kv_cache.shape}.")
-+    page_size, cache_heads = kv_cache.shape[1], kv_cache.shape[2:]
-+    expected_heads = (2 * num_kv_heads, padded_head_dim)
-+    if cache_heads != expected_heads:
++    page_size, cache_head_shape = kv_cache.shape[1], kv_cache.shape[2:]
++    expected_head_shape = (2 * num_kv_heads, padded_head_dim)
++    if cache_head_shape != expected_head_shape:
 +        raise ValueError(
-+            f"cache heads/head_dim {cache_heads} do not match k/v "
-+            f"{expected_heads}.")
++            f"cache heads/head_dim {cache_head_shape} do not match k/v "
++            f"{expected_head_shape}.")
 +    if page_size % PAGE_SIZE_MULTIPLE:
 +        raise ValueError(f"page_size must be a multiple of "
 +                         f"{PAGE_SIZE_MULTIPLE}; got {page_size}.")
++    if padded_head_dim == head_dim:
++        padded_q, padded_k, padded_v = q, k, v
++    else:
++        # Note (david): get_kv_cache_shape allocates the cache at the padded
++        # head_dim once, so only this step's activations need padding.
++        padding = ((0, 0), (0, 0), (0, padded_head_dim - head_dim))
++        padded_q, padded_k, padded_v = (jnp.pad(activation, padding)
++                                        for activation in (q, k, v))
 +    # Note (david): per-rank metadata is sharded as flat arrays, so the
 +    # writer's (3, bound) table arrives flattened.
 +    kv_write_slices = kv_write_slices.reshape(3, -1)
 +
 +    if phase == DECODE_PHASE:
-+        output, kv_cache = flywheel_tpu_decode(q,
-+                                                 k,
-+                                                 v,
++        output, kv_cache = flywheel_tpu_decode(padded_q,
++                                                 padded_k,
++                                                 padded_v,
 +                                                 kv_cache,
 +                                                 kv_lens,
 +                                                 page_indices,
 +                                                 distribution[2],
 +                                                 sm_scale=sm_scale)
 +    elif phase == EXTEND_PHASE:
-+        output, kv_cache = flywheel_tpu_extend(q,
-+                                                 k,
-+                                                 v,
++        output, kv_cache = flywheel_tpu_extend(padded_q,
++                                                 padded_k,
++                                                 padded_v,
 +                                                 kv_cache,
 +                                                 kv_lens,
 +                                                 page_indices,
@@ -8589,9 +8418,9 @@ index 000000000..ec3e8048f
 +                                                 sm_scale=sm_scale)
 +    else:
 +        output, kv_cache = flywheel_tpu_varlen_prefill(
-+            q,
-+            k,
-+            v,
++            padded_q,
++            padded_k,
++            padded_v,
 +            kv_cache,
 +            cu_q_lens,
 +            kv_write_slices,
@@ -8627,32 +8456,25 @@ index 000000000..ec3e8048f
 +    """Shards along KV heads, mirroring sharded_ragged_paged_attention."""
 +    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
 +    num_kv_heads = k.shape[1]
++    if (tp_size > 1 and num_kv_heads < tp_size
++            and tp_size % num_kv_heads != 0):
++        raise ValueError(
++            f"For GQA/MQA, tp_size {tp_size} must be divisible by "
++            f"num_kv_heads {num_kv_heads}")
 +    if tp_size > 1 and num_kv_heads < tp_size:
-+        if tp_size % num_kv_heads != 0:
-+            raise ValueError(
-+                f"For GQA/MQA, tp_size {tp_size} must be divisible by "
-+                f"num_kv_heads {num_kv_heads}")
-+        factor = tp_size // num_kv_heads
-+        k = jnp.repeat(k, factor, axis=1)
-+        v = jnp.repeat(v, factor, axis=1)
++        kv_head_repeats = tp_size // num_kv_heads
++        sharded_k = jnp.repeat(k, kv_head_repeats, axis=1)
++        sharded_v = jnp.repeat(v, kv_head_repeats, axis=1)
++    else:
++        sharded_k, sharded_v = k, v
 +
 +    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-+    # Note (david): the cache's head axis splits into each shard's K block,
-+    # then its V block.
++    # Note (david): the cache's head axis splits into each shard's
++    # contiguous run of interleaved (K, V) row pairs.
 +    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
 +                      ShardingAxisName.ATTN_HEAD, None)
-+    in_specs = (
-+        qkv_spec,  # q
-+        qkv_spec,  # k
-+        qkv_spec,  # v
-+        kv_cache_spec,  # kv cache
-+        P(ShardingAxisName.ATTN_DATA),  # kv_lens
-+        P(ShardingAxisName.ATTN_DATA),  # page_indices
-+        P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
-+        P(ShardingAxisName.ATTN_DATA),  # kv_write_slices
-+        P(ShardingAxisName.ATTN_DATA),  # kv_write_num_slices
-+        P(ShardingAxisName.ATTN_DATA),  # distribution
-+    )
++    in_specs = ((qkv_spec, qkv_spec, qkv_spec, kv_cache_spec) +
++                (P(ShardingAxisName.ATTN_DATA), ) * 6)
 +    out_specs = (qkv_spec, kv_cache_spec)
 +
 +    def _attention(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -8670,8 +8492,8 @@ index 000000000..ec3e8048f
 +        in_specs=in_specs,
 +        out_specs=out_specs,
 +        check_vma=False,
-+    )(q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, kv_write_slices,
-+      kv_write_num_slices, distribution)
++    )(q, sharded_k, sharded_v, kv_cache, kv_lens, page_indices, cu_q_lens,
++      kv_write_slices, kv_write_num_slices, distribution)
 +
 +
 +def check_supported(
@@ -10334,7 +10156,7 @@ index 37db5ff6f..78e635edf 100644
  
          if self.runner.speculative_config:
 diff --git a/tpu_inference/runner/kv_cache.py b/tpu_inference/runner/kv_cache.py
-index 3561f7ca7..91a272492 100644
+index 3561f7ca7..176bb9f8e 100644
 --- a/tpu_inference/runner/kv_cache.py
 +++ b/tpu_inference/runner/kv_cache.py
 @@ -31,6 +31,7 @@ else:
@@ -10365,8 +10187,8 @@ index 3561f7ca7..91a272492 100644
  
 +    With USE_FLYWHEEL_TPU_KERNEL it is the merged
 +    (num_blocks, block_size, 2 * num_kv_heads, head_size) layout, sharded on
-+    its head axis like the default one: every shard holds its K heads, then
-+    its V heads.
++    its head axis like the default one: every token row interleaves each KV
++    head's K row and V row, so every shard holds its heads' (K, V) pairs.
 +
      Args:
          num_blocks: The number of blocks in the KV cache.

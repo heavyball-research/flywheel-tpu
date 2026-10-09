@@ -6,8 +6,12 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo
+
+MIN_BLOCK_KV = 128
+BF16_BITS = 16
 
 
 def advance(
@@ -184,3 +188,106 @@ def fold_row(
     return ref.at[:, pl.ds(fold_idx * lane_width, lane_width)]
   else:
     return ref.at[fold_idx]
+
+
+def load_kv_fragment(
+    kv_stage: jax.Array,
+    slot: jax.Array,
+    head_group: int,
+    kv_compute_index: int,
+    *,
+    block_kv_compute: int,
+    kv_heads_per_fragment: int,
+    is_cache_head_major: bool,
+    is_bitcast_load: bool,
+) -> jax.Array:
+  """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 rows of one head
+  group, read from a slot of kv_stage: keys from the K staging buffer, values
+  from the V staging buffer."""
+  head_dim = kv_stage.shape[-1]
+  compute_start = pl.multiple_of(
+      kv_compute_index * block_kv_compute, MIN_BLOCK_KV
+  )
+  if is_cache_head_major:
+    return kv_stage[
+        slot,
+        pl.ds(head_group, 1),
+        pl.ds(compute_start, block_kv_compute),
+        :,
+    ].reshape(block_kv_compute, head_dim)
+  elif not is_bitcast_load:
+    return kv_stage[
+        slot,
+        pl.ds(compute_start, block_kv_compute),
+        pl.ds(head_group, 1),
+        :,
+    ].reshape(block_kv_compute, head_dim)
+  else:
+    word_stride = kv_stage.shape[2]
+    words_ref = staged_words(kv_stage, slot)
+    pair_index = (
+        head_group if kv_heads_per_fragment == 2 else head_group // 2
+    )
+    word_start = compute_start * word_stride + pair_index
+    words = load_staged_words(
+        words_ref, word_start, block_kv_compute, word_stride)
+    if kv_heads_per_fragment == 2:
+      return pltpu.bitcast(words, jnp.bfloat16)
+    else:
+      return bf16_half(words, head_group % 2)
+
+
+def bank_safe_word_stride(head_pairs: int) -> int:
+  """u32 word rows a pair-packed staging slot gives each token: its
+  head_pairs, plus one unused pad row when head_pairs is even."""
+  # Note (david): a strided word load reads its 8 sublanes from rows stride
+  # apart, and an even stride lands several of them in one VMEM bank, which
+  # splits the load into one per bank collision joined with vor. An odd
+  # stride keeps the 8 rows in distinct banks (RPA v3's has_bank_conflicts
+  # pad). v7x merged decode, block-loop bundles: 32 KV heads of 256 (one
+  # load per sublane unpadded) 22753 against 7149 per 512 tokens, 4 KV heads
+  # (a 2-way split) 2450 against 1758 per 1024 tokens.
+  return head_pairs + 1 if head_pairs % 2 == 0 else head_pairs
+
+
+def staged_words(kv_stage: jax.Array, slot: jax.Array) -> jax.Array:
+  """A (block_kv * word_stride, head_dim) u32 view of one pair-packed staging
+  slot of (stages, block_kv, word_stride, 2, head_dim) bf16; word row
+  token * word_stride + pair holds that pair's two heads."""
+  _, block_kv, word_stride, _, head_dim = kv_stage.shape
+  return kv_stage.bitcast(jnp.uint32).at[slot].reshape(
+      block_kv * word_stride, head_dim)
+
+
+def load_staged_words(
+    words_ref: jax.Array,
+    word_start: jax.Array | int,
+    num_rows: int,
+    stride: int,
+) -> jax.Array:
+  """(num_rows, head_dim) u32 words at rows word_start + i * stride."""
+  num_word_rows, head_dim = words_ref.shape
+  folds = head_dim // NUM_LANES
+  if head_dim <= NUM_LANES:
+    return words_ref[pl.ds(word_start, num_rows, stride)]
+  else:
+    # Note (david): a wide head loads each 128-lane half with its own strided
+    # load and joins the halves along lanes. Loading (rows, halves, 128) and
+    # reshaping instead interleaves sublanes; on v7x decode at 32 heads of 256
+    # that was 40K rotate/combine ops per 4096-token block, 8.55 against 5.22
+    # ms a step at 4 KV heads (flywheel-tpu PR #7).
+    lanes_ref = words_ref.reshape(num_word_rows * folds, NUM_LANES)
+    return jnp.concatenate(
+        [
+            lanes_ref[pl.ds(word_start * folds + fold, num_rows,
+                            stride * folds)]
+            for fold in range(folds)
+        ],
+        axis=1,
+    )
+
+
+def bf16_half(words: jax.Array, lane: jax.Array | int) -> jax.Array:
+  """The bf16 head in a u32 word's low (lane 0) or high (lane 1) half."""
+  lane_bits = words >> jnp.uint32(lane * BF16_BITS)
+  return pltpu.bitcast(lane_bits.astype(jnp.uint16), jnp.bfloat16)

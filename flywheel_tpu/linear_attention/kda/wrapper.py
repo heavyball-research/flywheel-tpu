@@ -71,14 +71,17 @@ def store_out_rows(out_slot_ref: jax.Array, out: jax.Array,
     block-grid rows; BATCHED packs each sequence's real rows back to back from
     stage row delta.
     """
-    align = config.SUBLANE_ALIGN
     out_dtype = out_slot_ref.dtype
     if cfg.mode == config.KDAMode.PER_SEQ:
         compute_chunk = cfg.compute_chunk_size
         if isinstance(chunk_idx, int):
             row_offset = chunk_idx * compute_chunk
         else:
-            row_offset = pl.multiple_of(chunk_idx * compute_chunk, align)
+            # Note (david): out_window_rows makes the stage a multiple of
+            # STAGE_TILE_ROWS, which v7x tiles 16 rows deep, so an 8-row hint
+            # cannot prove this store aligned (E2003). The chunk grid can.
+            row_offset = pl.multiple_of(chunk_idx * compute_chunk,
+                                        compute_chunk)
         out_slot_ref[pl.ds(row_offset, compute_chunk)] = out[0].astype(
             out_dtype)
     else:
@@ -345,6 +348,9 @@ def outer_kernel(
     del aliased_out_ref, conv_state_out_ref, recurrent_state_out_ref
 
     align = config.SUBLANE_ALIGN
+    stage_tile = config.STAGE_TILE_ROWS
+    # Note (david): the head blend picks one SUBLANE_ALIGN half of a stage tile.
+    assert stage_tile == 2 * align, (stage_tile, align)
     num_tiles = metadata_ref.num_tiles[...]
     first_window_base, _, _, _ = memory_ref.out_window(0, metadata_ref, cfg)
     profile_scope = compute_kda.profile_scope
@@ -374,13 +380,13 @@ def outer_kernel(
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_qkv_in(qkv_buf.at[slot],
+            memory_ref.wait_qkv_in(qkv_ref, qkv_buf.at[slot],
                                    sems.at[config.STREAM_QKV, slot],
                                    *tile_args)
             memory_ref.wait_compact_in(b_buf.at[slot],
                                        sems.at[config.STREAM_B, slot],
                                        *tile_args)
-            memory_ref.wait_qkv_in(g_buf.at[slot],
+            memory_ref.wait_qkv_in(g_ref, g_buf.at[slot],
                                    sems.at[config.STREAM_G, slot], *tile_args)
             memory_ref.wait_state_in(conv_in_buf.at[slot],
                                      sems.at[config.STREAM_CONV_IN, slot],
@@ -405,7 +411,7 @@ def outer_kernel(
     def _wait_out(p_id, slot):
         with profile_scope("wait_out"):
             tile_args = (p_id, metadata_ref, cfg)
-            memory_ref.wait_out(out_buf.at[slot],
+            memory_ref.wait_out(out_ref, out_buf.at[slot],
                                 sems.at[config.STREAM_OUT, slot], *tile_args)
             memory_ref.wait_state_out(conv_out_buf.at[slot],
                                       sems.at[config.STREAM_CONV_OUT, slot],
@@ -464,33 +470,45 @@ def outer_kernel(
         with profile_scope("out_fixup"):
             # Note (david): rows past the tile's last real one hold stale stage
             # data (a chunk the tail path skipped, or the rotate's zero pad).
-            # Only the slab holding used_rows can still fall inside the DMA
-            # window; the next tile's window overwrites it, and the last tile's
-            # lands in the padded tail, which the zero fill below expects zero.
+            # Only the stage tile holding used_rows can still fall inside the
+            # DMA window; the next tile's window overwrites it, and the last
+            # tile's lands in the padded tail, which the zero fill below
+            # expects zero.
             stage_ref = out_buf.at[slot]
             tail_slab_start = pl.multiple_of(
-                used_rows - (used_rows & (align - 1)), align)
+                used_rows - (used_rows & (stage_tile - 1)), stage_tile)
             tail_slab_rows = tail_slab_start + lax.broadcasted_iota(
-                jnp.int32, (align, cfg.v_dim_size), 0)
-            stage_ref[pl.ds(tail_slab_start, align)] = jnp.where(
+                jnp.int32, (stage_tile, cfg.v_dim_size), 0)
+            stage_ref[pl.ds(tail_slab_start, stage_tile)] = jnp.where(
                 tail_slab_rows < used_rows,
-                stage_ref[pl.ds(tail_slab_start, align)], 0)
+                stage_ref[pl.ds(tail_slab_start, stage_tile)], 0)
 
             # Note (david): the window's head rows belong to the previous tile,
             # whose stage is still resident since only its outbound DMA reads
-            # it. Both windows sit on the SUBLANE_ALIGN grid, so the copy is
-            # slab to slab and the previous window always covers row
-            # window_base + delta - 1.
+            # it. Both windows sit on the SUBLANE_ALIGN grid, so the previous
+            # stage holds them from row prev_stage_row, a multiple of 8 that
+            # may sit mid stage tile, and the previous window always covers
+            # row window_base + delta - 1. Both stage tiles are read whole and
+            # the previous one's half is picked in f32, where 8 rows are one
+            # whole (8, 128) tile.
             @pl.when(delta > 0)
             def _blend_head_rows():
-                prev_stage_row = pl.multiple_of(window_base - prev_window_base,
-                                                align)
+                prev_stage_row = window_base - prev_window_base
+                prev_slab_start = pl.multiple_of(
+                    prev_stage_row - (prev_stage_row & (stage_tile - 1)),
+                    stage_tile)
+                prev_slab = out_buf.at[other_slot][
+                    pl.ds(prev_slab_start, stage_tile)].astype(jnp.float32)
+                own_slab = stage_ref[pl.ds(0, stage_tile)].astype(jnp.float32)
                 head_rows = lax.broadcasted_iota(
                     jnp.int32, (align, cfg.v_dim_size), 0)
-                stage_ref[pl.ds(0, align)] = jnp.where(
-                    head_rows < delta,
-                    out_buf.at[other_slot][pl.ds(prev_stage_row, align)],
-                    stage_ref[pl.ds(0, align)])
+                prev_head = jnp.where(
+                    head_rows + (prev_stage_row - prev_slab_start) < align,
+                    prev_slab[:align], prev_slab[align:])
+                own_head = jnp.where(head_rows < delta, prev_head,
+                                     own_slab[:align])
+                stage_ref[pl.ds(0, stage_tile)] = jnp.concatenate(
+                    [own_head, own_slab[align:]]).astype(stage_ref.dtype)
 
         _start_out(tile_idx, slot)
 
@@ -758,6 +776,18 @@ def fused_conv1d_kda(
                 spec_tile_budget // bytes_per_seq))
     else:
         decode_tile_size = min(decode_tile_size, batch_size)
+        # Note (david): every state ring slot holds each sequence's initial
+        # state and its one checkpoint. Where the rings cannot fit the scoped
+        # VMEM limit (v7x has half of v6e's VMEM: 4 sequences of 48 value heads
+        # at head_dim 128), the tile shrinks until they do, with one more state
+        # per sequence left for the compiler's temporaries.
+        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
+        ring_bytes_per_seq = config.NUM_BUFFERS * 2 * (
+            state_bytes + (kernel_size - 1) * dim * F32_BYTES)
+        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+        if decode_tile_size * ring_bytes_per_seq > vmem_limit:
+            decode_tile_size = max(
+                1, vmem_limit // (ring_bytes_per_seq + state_bytes))
 
     # Note (david): b keeps the compact [batch, 1, heads] layout: it is tiny,
     # and its untiled leading token axis keeps ragged DMAs offset-free. g is as

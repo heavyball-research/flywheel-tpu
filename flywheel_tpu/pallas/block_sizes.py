@@ -44,6 +44,11 @@ MIN_NUM_STAGES = 2
 # for stages >= 2).
 STAGES = (2, 3, 4)
 DEFAULT_BLOCK_Q_COMPUTE = 256
+# Note (david): descending, since pick_tile takes the first candidate that
+# divides the axis.
+FWD_BLOCKS = (2048, 1024, 512, 256, 128)
+FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
+FWD_Q_COMPUTE_BLOCKS = (256, 128)
 
 # Note (david): exp(x) == exp2(x * log2(e)). Folding log2(e) into the score
 # scale and the loaded lse lets the softmax use exp2, dropping the per-element
@@ -125,6 +130,23 @@ class TokenMajorInfo:
   num_kv_heads: int
   head_dim_qk: int
   head_dim_v: int
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class PagedKVInfo:
+  """Static addressing facts for a paged KV cache; None means packed K/V.
+
+  The cache is one merged (num_pages, page_size, 2 * num_kv_heads, head_dim)
+  operand whose token rows interleave each head's K and V rows, [k0, v0, k1,
+  v1, ...], so one head's (K, V) row pair is one 2-row window of the head
+  axis. is_bitcast_load reads a staged pair as one u32 word per lane (K in the
+  low half, V in the high half), which only the TPU build supports; the
+  Pallas interpreter indexes the two rows instead.
+  """
+  num_kv_heads: int
+  page_size: int
+  pages_per_seq: int
+  is_bitcast_load: bool
 
 
 @dataclasses.dataclass(frozen=True, slots=True)

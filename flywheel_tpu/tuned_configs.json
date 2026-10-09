@@ -2111,6 +2111,21 @@
       1,
       "head_dim_minor",
       false
+    ],
+    "kvcache|bfloat16|h32|k32|b128|s16384|d256|a1|w-|l0": [
+      512,
+      512,
+      2
+    ],
+    "kvcache|bfloat16|h32|k4|b128|s16384|d256|a1|w-|l0": [
+      4096,
+      1024,
+      2
+    ],
+    "kvcache|bfloat16|h32|k4|b256|s16384|d256|a1|w-|l0": [
+      4096,
+      1024,
+      2
     ]
   }
 }
