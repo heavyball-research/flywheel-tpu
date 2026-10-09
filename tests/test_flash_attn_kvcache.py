@@ -336,6 +336,40 @@ def test_flash_attn_with_kvcache_block_table_matches_contiguous_kernel():
   np.testing.assert_array_equal(lse_paged, lse_dense)
 
 
+@pytest.mark.parametrize(("num_query_heads", "num_kv_heads", "head_dim"),
+                         [(8, 1, 128), (6, 1, 256), (8, 2, 128)])
+def test_flash_attn_with_kvcache_appends_step_after_step(
+    num_query_heads, num_kv_heads, head_dim):
+  # Note (david): one executable serves every position, and each step's
+  # append must land on the cache the previous step returned: the positions
+  # cross the 8-row and 16-row cache tiles (one KV head stages head-major,
+  # whose token axis v7x tiles 16 deep) and end at the last slot.
+  batch, capacity = 2, 256
+  positions = [*range(0, 40), *range(capacity - 20, capacity)]
+  q, k_cache, v_cache, _, _ = random_decode_inputs(
+      17, batch, batch, capacity, num_query_heads, num_kv_heads, head_dim)
+  k_cache = k_cache.at[:, positions].set(0.0)
+  v_cache = v_cache.at[:, positions].set(0.0)
+  expected_k, expected_v = k_cache, v_cache
+  updated_k, updated_v = jnp.copy(k_cache), jnp.copy(v_cache)
+  rows = jnp.arange(batch, dtype=jnp.int32)
+  new_shape = (batch, 1, num_kv_heads, head_dim)
+  for step, position in enumerate(positions):
+    keys = jax.random.split(jax.random.PRNGKey(100 + step), 2)
+    k = jax.random.normal(keys[0], new_shape, jnp.bfloat16)
+    v = jax.random.normal(keys[1], new_shape, jnp.bfloat16)
+    cache_seqlens = jnp.full((batch,), position, jnp.int32)
+    out, lse, updated_k, updated_v = flash_attn_with_kvcache(
+        q, updated_k, updated_v, k, v, cache_seqlens=cache_seqlens,
+        return_softmax_lse=True, interpret=INTERPRET)
+    expected_k = expected_k.at[rows, position].set(k[:, 0])
+    expected_v = expected_v.at[rows, position].set(v[:, 0])
+    np.testing.assert_array_equal(updated_k, expected_k)
+    np.testing.assert_array_equal(updated_v, expected_v)
+    assert_decode_matches(out, lse, q, expected_k, expected_v,
+                          cache_seqlens + 1, rows)
+
+
 def test_flash_attn_with_kvcache_block_table_changes_under_one_executable():
   # Note (david): the table and the lengths are runtime operands, so one
   # executable must serve both page layouts, each append landing where its

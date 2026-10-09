@@ -256,15 +256,25 @@ def kvcache_kernel(
         is_bitcast_load=is_bitcast_load,
     )
 
+  # Note (david): every cache DMA on the token axis moves whole cache_tile_rows
+  # tiles. A head-major stage puts tokens on its bf16 sublane axis, which v7x
+  # tiles 16 rows deep (BF16_TILE_ROWS; v6e 8), and Mosaic sizes a DMA and its
+  # wait between the 8-row HBM tiles and that stage in whole 16-row tiles, so
+  # an 8-row remainder was dropped from the copy and the wait returned before
+  # the DMA landed (v7x read stale tokens; the leftover semaphore count then
+  # released later waits early). A token-major stage puts tokens on a leading
+  # axis, where each token is whole tiles and the 8-row granule is exact.
+  cache_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
+
   def _cache_copy_size(cache_len, block_index):
     copy_limit = (
-        (cache_len + int(has_new) + (NUM_SUBLANES - 1))
-        // NUM_SUBLANES * NUM_SUBLANES
+        (cache_len + int(has_new) + (cache_tile_rows - 1))
+        // cache_tile_rows * cache_tile_rows
     )
     copy_size = jnp.clip(
         copy_limit - block_index * block_kv, 0, block_kv
     )
-    return pl.multiple_of(copy_size, NUM_SUBLANES)
+    return pl.multiple_of(copy_size, cache_tile_rows)
 
   def _cache_tile(ref, hbm_row, token_start, num_tokens):
     if is_cache_head_major:
@@ -320,7 +330,7 @@ def kvcache_kernel(
               0,
               pl.multiple_of(
                   jnp.clip(load_size - page * page_size, 0, page_size),
-                  NUM_SUBLANES,
+                  cache_tile_rows,
               ),
               page * page_size,
           )
@@ -359,17 +369,18 @@ def kvcache_kernel(
     if page_size is None:
       hbm_row = cache_row
       tile_start = pl.multiple_of(
-          cache_len // NUM_SUBLANES * NUM_SUBLANES, NUM_SUBLANES
+          cache_len // cache_tile_rows * cache_tile_rows, cache_tile_rows
       )
     else:
-      # Note (david): page_size is a multiple of 128, so an 8-token tile at an
-      # 8-aligned offset never straddles a page and the paged append stays a
-      # single write.
+      # Note (david): page_size is a multiple of 128, so a write tile at a
+      # tile-aligned offset never straddles a page and the paged append stays
+      # a single write.
       hbm_row = block_table_ref[
           cache_row * pages_per_seq + cache_len // page_size
       ]
       tile_start = pl.multiple_of(
-          cache_len % page_size // NUM_SUBLANES * NUM_SUBLANES, NUM_SUBLANES
+          cache_len % page_size // cache_tile_rows * cache_tile_rows,
+          cache_tile_rows,
       )
     if is_cache_head_major:
       # Note (david): one copy per head, since the head axis of a cache row is
@@ -380,7 +391,7 @@ def kvcache_kernel(
               out_ref_hbm.at[
                   hbm_row,
                   pl.ds(head_offset, 1),
-                  pl.ds(tile_start, NUM_SUBLANES),
+                  pl.ds(tile_start, cache_tile_rows),
                   :,
               ],
               sems.at[sem_index, slot, head_offset],
@@ -391,10 +402,12 @@ def kvcache_kernel(
     else:
       return [
           pltpu.make_async_copy(
-              buffers.at[slot].reshape(NUM_SUBLANES, staged_kv_heads, head_dim)
+              buffers.at[slot].reshape(
+                  cache_tile_rows, staged_kv_heads, head_dim
+              )
               if is_bitcast_load
               else buffers.at[slot],
-              out_ref_hbm.at[hbm_row, pl.ds(tile_start, NUM_SUBLANES), :, :],
+              out_ref_hbm.at[hbm_row, pl.ds(tile_start, cache_tile_rows), :, :],
               sems.at[sem_index, slot, 0],
           )
           for buffers, out_ref_hbm, sem_index in write_parts
@@ -617,22 +630,17 @@ def kvcache_kernel(
 
         @pl.when(block_index == append_block)
         def _append():
-          # Note (david): a head-major stage puts tokens on its bf16 sublane
-          # axis, which v7x tiles 16 rows deep (BF16_TILE_ROWS), so the append
-          # reads and writes the stage in a whole 16-row tile (E2003 at an
-          # 8-row one). A token-major stage puts tokens on a leading axis,
-          # where an 8-row tile is aligned already.
-          staged_tile_rows = (
-              BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
-          )
+          # Note (david): the append reads, updates and writes back the whole
+          # cache tile holding the new token, cache_tile_rows tokens at a
+          # tile-aligned offset, which the block load has staged in full.
           local_index = cache_len - block_index * block_kv
           local_tile_start = pl.multiple_of(
-              local_index // staged_tile_rows * staged_tile_rows,
-              staged_tile_rows,
+              local_index // cache_tile_rows * cache_tile_rows,
+              cache_tile_rows,
           )
           new_row = local_index - local_tile_start
-          token_row = jnp.arange(staged_tile_rows, dtype=jnp.int32)
-          tile_tokens = pl.ds(local_tile_start, staged_tile_rows)
+          token_row = jnp.arange(cache_tile_rows, dtype=jnp.int32)
+          tile_tokens = pl.ds(local_tile_start, cache_tile_rows)
           if is_cache_head_major:
             tile_index = (slot, slice(None), tile_tokens, slice(None))
             token_rows = token_row[None, :, None]
@@ -660,16 +668,6 @@ def kvcache_kernel(
             staged_tile = buffers[tile_index]
             updated_tile = jnp.where(is_new_row, expand(new_token), staged_tile)
             buffers[tile_index] = updated_tile
-            if is_cache_head_major:
-              # Note (david): the write-back stays on the 8-row HBM grid, so it
-              # takes the 16-row tile's half that holds the new token, picked
-              # in f32, where 8 rows are one whole (8, 128) tile.
-              rows = updated_tile.astype(jnp.float32)
-              updated_tile = jnp.where(
-                  new_row < NUM_SUBLANES,
-                  rows[:, :NUM_SUBLANES, :],
-                  rows[:, NUM_SUBLANES:, :],
-              ).astype(updated_tile.dtype)
             updated_tiles.append(updated_tile)
 
           write_slot = lax.rem(local_batch_index, num_kv_stages)
@@ -865,10 +863,10 @@ def validate_kvcache_config(
         f"num_kv_stages must be one of {STAGES}; got {num_kv_stages}."
     )
   # Note (david): this must mirror the scratch shapes below; the extra
-  # NUM_SUBLANES rows per stage are the cache write tile, and the two extra
-  # heads per token bound a staged block's bank pad word row.
+  # BF16_TILE_ROWS rows per stage bound the cache write tile, and the two
+  # extra heads per token bound a staged block's bank pad word row.
   kv_staging_bytes = (
-      2 * num_kv_stages * (block_kv + NUM_SUBLANES) * (num_kv_heads + 2)
+      2 * num_kv_stages * (block_kv + BF16_TILE_ROWS) * (num_kv_heads + 2)
       * head_dim * BF16_BYTES)
   q_o_buffer_bytes = 2 * 2 * num_query_heads * head_dim * BF16_BYTES
   row_state_bytes = 2 * num_query_heads * NUM_LANES * F32_BYTES
@@ -1056,11 +1054,14 @@ def flash_attn_kvcache_pallas(
 
   # Note (david): only the staged blocks are read with strided word loads,
   # so only they take the bank pad; the write tiles stay dense for their
-  # one-DMA write-back.
+  # one-DMA write-back. A write tile is one cache tile of tokens: 16 on the
+  # head-major token axis (the bf16 sublane tile v7x uses), 8 token-major
+  # (see cache_tile_rows in the kernel).
   head_pairs = staged_kv_heads // 2
   cache_buffer_shape = _staging_shape(
       block_kv, bank_safe_word_stride(head_pairs))
-  write_buffer_shape = _staging_shape(NUM_SUBLANES, head_pairs)
+  write_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
+  write_buffer_shape = _staging_shape(write_tile_rows, head_pairs)
   # Note (david): a merged build never touches the V staging, so it shrinks to
   # the write-tile size instead of a whole KV block.
   value_buffer_shape = (
