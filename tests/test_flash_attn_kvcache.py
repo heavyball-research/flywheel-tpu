@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache
+from flywheel_tpu.flash_attn_interface import fused_q_scale
 from flywheel_tpu.pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -23,7 +24,16 @@ def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
   values = v_cache[cache_batch_idx].astype(jnp.float32)
   group = q.shape[2] // keys.shape[2]
   keys, values = (jnp.repeat(cache, group, axis=2) for cache in (keys, values))
-  scores = jnp.einsum("bqhd,bkhd->bhqk", q.astype(jnp.float32) * scale, keys)
+  # The decode wrapper folds softmax_scale * log2(e) into q and rounds it to
+  # bf16 before the kernel, so the reference scores start from that same
+  # rounded q. Scaling the unrounded q instead is off by the rounding: with
+  # one visible key the lse is a single dot product, the error has a std of
+  # 1.6e-3 at head_dim 128 or 256, and it passes the lse tolerance below for
+  # 1-2% of the elements, whatever the kernel does.
+  q_scaled = (
+      q.astype(jnp.float32) * fused_q_scale(scale, 0.0)).astype(q.dtype)
+  scores = math.log(2.0) * jnp.einsum(
+      "bqhd,bkhd->bhqk", q_scaled.astype(jnp.float32), keys)
   key_positions = jnp.arange(k_cache.shape[1])[None, :]
   query_positions = (cache_seqlens - 1)[:, None]
   left, right = window_size
