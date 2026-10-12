@@ -14,12 +14,6 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
-# Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
-# of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
-# load or store must start on that tile. Dynamic row accesses into bf16 stages
-# therefore step in whole 16-row tiles, which is legal under either tiling;
-# HBM DMA windows sit on the hbm_bf16_tile_rows() grid.
-BF16_TILE_ROWS = 2 * NUM_SUBLANES
 # Note (david): d64 is the one sub-tile head_dim token-major supports; a
 # 64-wide head fills half a lane tile, so heads are DMA'd and folded in pairs.
 PAIRED_HEAD_DIM = NUM_LANES // 2

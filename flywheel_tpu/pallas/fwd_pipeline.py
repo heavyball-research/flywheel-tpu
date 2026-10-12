@@ -11,7 +11,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import (
-  BF16_TILE_ROWS,
   DEFAULT_MASK_VALUE,
   NN_DIM_NUMBERS,
   NT_DIM_NUMBERS,
@@ -47,6 +46,13 @@ SEM_LSE = 4
 NUM_SEMS = 5
 SEM_ROTARY_Q = NUM_SEMS
 SEM_ROTARY_K = NUM_SEMS + 1
+# Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
+# of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
+# load or store must start on that tile. Dynamic row accesses into bf16 stages
+# therefore step in whole 16-row tiles, which is legal under either tiling;
+# HBM DMAs stay on the hbm_bf16_tile_rows() grid.
+BF16_TILE_ROWS = 2 * NUM_SUBLANES
+
 # Note (david): the guard keeps score <= e^T, row_sum <= kv_seq_len * e^T and
 # |o| <= row_sum * max|v| under the f32 max (e^88.7), assuming |v| <= 2^12 and
 # keeping a 2-nat margin. Below a 20-nat threshold the static anchor cannot be
