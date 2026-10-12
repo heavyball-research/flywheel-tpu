@@ -7,6 +7,7 @@ import math
 from collections.abc import Sequence
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
@@ -48,20 +49,20 @@ def vmem_limit_bytes() -> int:
 def hbm_bf16_tile_rows() -> int:
   """Rows a traced window into a bf16 HBM operand has to be aligned to.
 
-  The rule is TpuInfo.get_sublane_tiling's. Before v7x XLA tiles a bf16 HBM
-  buffer (8, 128), unless xla_tpu_enable_large_2nd_minor_layout_for_x16 is
-  set. From v7x on it may tile one whose row count is a multiple of 16 as
-  (16, 128): it does when the buffer is a value of the surrounding program,
-  which a kernel output is as soon as another op reads it, and it does not
-  for a program output. A kernel cannot tell which it gets, so there the
-  windows sit on 16 rows, legal under either tiling.
+  It is TpuInfo.get_sublane_tiling for bf16. Before v7x that is 8: XLA tiles
+  a bf16 HBM buffer (8, 128), unless
+  xla_tpu_enable_large_2nd_minor_layout_for_x16 is set. On v7x it is 16: XLA
+  may tile a buffer whose row count is a multiple of 16 as (16, 128). It does
+  when the buffer is a value of the surrounding program, which a kernel
+  output is as soon as another op reads it, and it does not for a program
+  output; 16 rows are legal under either tiling.
 
-  Asked on first use, like vmem_limit_bytes(); off TPU there is no tiling and
-  builds keep the v6e grid.
+  Asked on first use, like vmem_limit_bytes(). Off TPU get_tpu_info() has no
+  chip to describe, and builds keep the v6e grid.
   """
-  if jax.default_backend() != "tpu" or pltpu.get_tpu_info().generation < 7:
+  if jax.default_backend() != "tpu":
     return NUM_SUBLANES
-  return BF16_TILE_ROWS
+  return pltpu.get_tpu_info().get_sublane_tiling(jnp.bfloat16)
 
 MIN_NUM_STAGES = 2
 # Note (david): the KV-cache kernel issues the next block's DMA into slot
