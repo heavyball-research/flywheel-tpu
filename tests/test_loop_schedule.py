@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from flywheel_tpu.pallas.block_sizes import BF16_TILE_ROWS
 from flywheel_tpu.pallas.loop_schedule import (
     PerSeqIntervals,
     dense_bwd_params,
@@ -140,9 +141,9 @@ def replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, window):
     lo, hi, ctx = sched.row_interval(jnp.int32(si))
     # Note (david): ctx only carries the start clamped to the padded end, so
     # the unclamped one is rebuilt from the layout: sequence r's i-th block
-    # starts at align8(cu_q[r]) + i * bq.
+    # starts at align16(cu_q[r]) + i * bq.
     seq = int(np.searchsorted(np.asarray(cu_qblk), si, side="right")) - 1
-    aligned_q_start = (cu_q[seq] // 8 * 8
+    aligned_q_start = (cu_q[seq] // BF16_TILE_ROWS * BF16_TILE_ROWS
                        + (si - int(cu_qblk[seq])) * bq)
     blocks = []
     for kv in range(int(lo), int(hi) + 1):
@@ -199,13 +200,16 @@ def test_per_seq_fwd_schedule_windows_and_masks(case, window):
   _, rows = replay_per_seq_fwd(cu_q, cu_k, q_pad, kv_pad, bq, bkv, window)
   mask = packed_mask(cu_q, cu_k, q_pad, kv_pad, *window)
 
-  # Note (david): Mosaic DMAs need every token offset on the 8-row tile,
-  # aligned cu_seqlens or not.
+  # Note (david): Mosaic DMAs need every token offset on a tile, aligned
+  # cu_seqlens or not. The tile is the 16-row bf16 one: v7x lays bf16 HBM
+  # operands out in it when they are values of the surrounding program.
   for row in rows:
-    assert row.aligned_q_start % 8 == 0 and row.staged_q_start % 8 == 0, row.si
+    assert row.aligned_q_start % BF16_TILE_ROWS == 0, row.si
+    assert row.staged_q_start % BF16_TILE_ROWS == 0, row.si
     for kv, k_tok, _ in row.blocks:
-      assert (int(row.ctx.kv_window_base) + kv * bkv) % 8 == 0, k_tok
-      assert k_tok % 8 == 0, k_tok
+      assert (int(row.ctx.kv_window_base) + kv * bkv) % BF16_TILE_ROWS == 0, (
+          k_tok)
+      assert k_tok % BF16_TILE_ROWS == 0, k_tok
 
   # Note (david): the owned ranges must partition [0, cu_q[-1]) in si order,
   # so every token is computed exactly once however the staged windows
@@ -288,7 +292,7 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
   # Note (david): host replay of fwd_body's packed-direct write: blocks write
   # their whole staged window in si order after blending rows [staged start,
   # q_start) from the previous block's stage and zeroing rows past cu_q[-1],
-  # then the fill writes zeros from the next 8-row tile on. Every packed row
+  # then the fill writes zeros from the next 16-row tile on. Every packed row
   # must end up with its owning block's value, and every padding row with the
   # zero marker. The blend fixes the write, not the mask, so it does not
   # depend on the window.
@@ -312,17 +316,17 @@ def test_per_seq_packed_write_blend_covers_every_row(case):
                      owner[packed % q_pad], -1)
     blend_width = max(0, q_start - row.staged_q_start)
     src_offset = row.staged_q_start - prev_start
-    # Note (david): the in-kernel copy moves whole 8-row tiles and must stay
+    # Note (david): the in-kernel copy moves whole 16-row tiles and must stay
     # inside the previous stage.
     assert blend_width == 0 or (
-        src_offset >= 0 and src_offset % 8 == 0
-        and src_offset + -(-blend_width // 8) * 8 <= bq), (
-            row.si, src_offset, blend_width)
+        src_offset >= 0 and src_offset % BF16_TILE_ROWS == 0
+        and (src_offset + -(-blend_width // BF16_TILE_ROWS) * BF16_TILE_ROWS
+             <= bq)), (row.si, src_offset, blend_width)
     stage[:blend_width] = prev_stage[src_offset:src_offset + blend_width]
     stage[packed >= packed_q_end] = zero_marker
     out[row.staged_q_start:row.staged_q_start + bq] = stage
     prev_stage, prev_start = stage, row.staged_q_start
-  out[-(-packed_q_end // 8) * 8:] = zero_marker
+  out[-(-packed_q_end // BF16_TILE_ROWS) * BF16_TILE_ROWS:] = zero_marker
   np.testing.assert_array_equal(out, owner)
 
 
@@ -351,7 +355,8 @@ def replay_paged_fwd(cu_q, seqused_k, q_pad, bq, bkv, page_size,
     lo, hi, ctx = sched.row_interval(jnp.int32(si))
     seq = int(np.searchsorted(np.asarray(cu_qblk), si, side="right")) - 1
     assert int(ctx.seq_idx) == seq, si
-    aligned_q_start = cu_q[seq] // 8 * 8 + (si - int(cu_qblk[seq])) * bq
+    aligned_q_start = (cu_q[seq] // BF16_TILE_ROWS * BF16_TILE_ROWS
+                       + (si - int(cu_qblk[seq])) * bq)
     blocks = []
     for kv in range(int(lo), int(hi) + 1):
       _, needs_bounds = sched.block_flags(jnp.int32(si), jnp.int32(kv), ctx)
@@ -376,7 +381,7 @@ PAGED_CASES = [
     # Note (david): the last kv block of every sequence runs past its 14-page
     # table row, whose missing pages must clamp into the row.
     ([0, 300, 364, 1000], [590, 233, 1700], 1024, 256, 512, 128, 14),
-    # Note (david): boundaries off the 8-row grid, a one-token request and an
+    # Note (david): boundaries off the 16-row grid, a one-token request and an
     # empty request in the middle.
     ([0, 13, 14, 14, 75], [100, 40, 0, 300], 128, 128, 256, 128, 3),
     # Note (david): the last block clamps from 288 to 256 at the padded end,
@@ -415,7 +420,7 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal):
     assert row.staged_q_start <= start and end <= row.staged_q_start + bq, (
         row.si, row.owned_rows)
     cursor = end
-    assert row.staged_q_start % 8 == 0, row.si
+    assert row.staged_q_start % BF16_TILE_ROWS == 0, row.si
     assert int(row.ctx.kv_start) == 0 and int(row.ctx.kv_window_base) == 0
 
     valid_rows = kept_rows(row, bq)

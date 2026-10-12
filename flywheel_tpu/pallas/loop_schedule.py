@@ -13,7 +13,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .block_sizes import NUM_SUBLANES
+from .block_sizes import BF16_TILE_ROWS
 
 
 class PerSeqIntervals(NamedTuple):
@@ -267,15 +267,17 @@ def seq_index_at(pos: jax.Array, cu_src_ref: jax.Array) -> jax.Array:
   return seq_idx
 
 
-def align_to_sublane_tile(token: jax.Array) -> jax.Array:
-  """Snap a token offset down to the sublane tile the token axis is tiled in.
+def align_to_bf16_tile(token: jax.Array) -> jax.Array:
+  """Snap a token offset down to the tile the token axis can be tiled in.
 
   Mosaic rejects a dynamic second-minor offset it cannot prove tile-aligned,
   and it can prove nothing about a cu_seqlens scalar read from SMEM, so the
   per-seq schedule puts every window base on this grid and asserts it with
-  pl.multiple_of.
+  pl.multiple_of. The grid is the 16-row bf16 tile, not the 8-row one: on v7x
+  XLA lays a bf16 HBM operand out in (16, 128) tiles when it is a value of the
+  surrounding program, as every operand of a model layer is.
   """
-  return (token // NUM_SUBLANES) * NUM_SUBLANES
+  return (token // BF16_TILE_ROWS) * BF16_TILE_ROWS
 
 
 def per_seq_qblk_prefix(cu_seqlens_q: jax.Array, bq: int) -> jax.Array:
@@ -289,7 +291,7 @@ def per_seq_qblk_prefix(cu_seqlens_q: jax.Array, bq: int) -> jax.Array:
   cu_q = jnp.asarray(cu_seqlens_q, jnp.int32)
   num_blocks_per_seq = jnp.where(
       jnp.diff(cu_q) > 0,
-      -(-(cu_q[1:] - align_to_sublane_tile(cu_q[:-1])) // bq), 0)
+      -(-(cu_q[1:] - align_to_bf16_tile(cu_q[:-1])) // bq), 0)
   return jnp.concatenate(
       [jnp.zeros((1,), jnp.int32),
        jnp.cumsum(num_blocks_per_seq).astype(jnp.int32)])
@@ -322,7 +324,7 @@ def make_per_seq_fwd_schedule(
   offset = cu_k[r + 1] - cu_q[r + 1]. None is unbounded, and causal is
   (None, 0). Empty sequences own no si.
 
-  Aligning a base down drags up to 7 rows of the previous sequence into the
+  Aligning a base down drags up to 15 rows of earlier sequences into the
   first block, and the last block runs past q_end. Those q rows are garbage:
   fwd_body blends rows [q_token, blend_start) from the previous block's stage
   before the packed write, and tail rows are overwritten by the next block or,
@@ -334,11 +336,11 @@ def make_per_seq_fwd_schedule(
   # corrupts data silently instead of failing the verifier. A base of
   # align(cu) + i * bq is tile-aligned only while bq and bkv are, and the
   # clamped bases (padded_total - block) need the padded totals aligned too.
-  if (bq % NUM_SUBLANES or bkv % NUM_SUBLANES
-      or padded_total_q % NUM_SUBLANES or padded_total_k % NUM_SUBLANES):
+  if (bq % BF16_TILE_ROWS or bkv % BF16_TILE_ROWS
+      or padded_total_q % BF16_TILE_ROWS or padded_total_k % BF16_TILE_ROWS):
     raise ValueError(
         f"{bq=}, {bkv=}, {padded_total_q=} and {padded_total_k=} must be"
-        f" multiples of {NUM_SUBLANES}."
+        f" multiples of {BF16_TILE_ROWS}."
     )
   num_kv_blocks = padded_total_k // bkv
 
@@ -347,8 +349,8 @@ def make_per_seq_fwd_schedule(
     block_in_seq = si - cu_qblk_ref[seq_idx]
     q_start, q_end = cu_q_ref[seq_idx], cu_q_ref[seq_idx + 1]
     kv_start, kv_end = cu_k_ref[seq_idx], cu_k_ref[seq_idx + 1]
-    kv_window_base = align_to_sublane_tile(kv_start)
-    q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
+    kv_window_base = align_to_bf16_tile(kv_start)
+    q_block_start = align_to_bf16_tile(q_start) + block_in_seq * bq
     q_window_start = jnp.minimum(q_block_start, padded_total_q - bq)
     bottom_right_offset = kv_end - q_end
     if right is None:
@@ -376,12 +378,12 @@ def make_per_seq_fwd_schedule(
     return lo, hi, ctx
 
   def _q_token(ctx):
-    return pl.multiple_of(ctx.q_window_start, NUM_SUBLANES)
+    return pl.multiple_of(ctx.q_window_start, BF16_TILE_ROWS)
 
   def _kv_token(kv, ctx):
     return pl.multiple_of(
         jnp.minimum(ctx.kv_window_base + kv * bkv, padded_total_k - bkv),
-        NUM_SUBLANES)
+        BF16_TILE_ROWS)
 
   def _block_flags(_, kv, ctx):
     k_first = ctx.kv_window_base + kv * bkv
@@ -490,7 +492,7 @@ def make_paged_fwd_schedule(
     block_in_seq = si - cu_qblk_ref[seq_idx]
     q_start, q_end = cu_q_ref[seq_idx], cu_q_ref[seq_idx + 1]
     kv_start, kv_used_end = jnp.int32(0), seqused_k_ref[seq_idx]
-    q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
+    q_block_start = align_to_bf16_tile(q_start) + block_in_seq * bq
     q_window_start = jnp.minimum(q_block_start, padded_total_q - bq)
     bottom_right_offset = kv_used_end - q_end
     # Note (david): the block loads and owns keys only up to its own causal

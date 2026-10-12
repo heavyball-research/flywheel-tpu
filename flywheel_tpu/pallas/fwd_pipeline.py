@@ -11,6 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import (
+  BF16_TILE_ROWS,
   DEFAULT_MASK_VALUE,
   NN_DIM_NUMBERS,
   NT_DIM_NUMBERS,
@@ -45,13 +46,6 @@ SEM_LSE = 4
 NUM_SEMS = 5
 SEM_ROTARY_Q = NUM_SEMS
 SEM_ROTARY_K = NUM_SEMS + 1
-# Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
-# of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
-# load or store must start on that tile. Dynamic row accesses into bf16 stages
-# therefore step in whole 16-row tiles, which is legal under either tiling;
-# HBM DMAs stay on the NUM_SUBLANES grid.
-BF16_TILE_ROWS = 2 * NUM_SUBLANES
-
 # Note (david): the guard keeps score <= e^T, row_sum <= kv_seq_len * e^T and
 # |o| <= row_sum * max|v| under the f32 max (e^88.7), assuming |v| <= 2^12 and
 # keeping a 2-nat margin. Below a 20-nat threshold the static anchor cannot be
@@ -1048,22 +1042,18 @@ def fwd_body(
         _finalize_head(g)
 
     if is_per_seq:
-      # Note (david): a per-seq window sits on the 8-row grid and may reach
+      # Note (david): a per-seq window sits on the 16-row grid and may reach
       # below blend_start into rows the previous output block computed
       # correctly. That stage is still resident (num_stages >= 2 and only its
-      # outbound DMA reads it), so the rows are copied over from it. The bf16
-      # stage is accessed in whole 16-row tiles, but the two windows are only
-      # 8-aligned apart, so each own tile reads the two source tiles it
-      # straddles and picks their 8-row halves in f32, where 8 rows are one
-      # whole (8, 128) tile.
+      # outbound DMA reads it), so the rows are copied over from it. The two
+      # windows are whole 16-row tiles apart, so each own tile of the bf16
+      # stage has one source tile.
       num_blend_rows = schedule.blend_start(ctx) - q_tok
 
       @pl.when(jnp.logical_and(is_last, num_blend_rows > 0))
       def _blend_head_rows():
         prev_slot = (num_out_copies - 1) % num_stages
         src_row_offset = q_tok - prev_out_tok
-        src_offset_in_tile = src_row_offset & (BF16_TILE_ROWS - 1)
-        half_rows = BF16_TILE_ROWS // 2
 
         def _tile_index(stage_ref, slot, row_start):
           return (slot,) + (slice(None),) * (len(stage_ref.shape) - 3) + (
@@ -1072,36 +1062,19 @@ def fwd_body(
 
         def _blend_stage(stage_ref, tile):
           own_index = _tile_index(stage_ref, out_slot, tile * BF16_TILE_ROWS)
-          own_rows = stage_ref[own_index].astype(jnp.float32)
-          src_lower_start = (
-              src_row_offset - src_offset_in_tile + tile * BF16_TILE_ROWS)
-          # Note (david): the upper source tile is used only when
-          # src_offset_in_tile is 8 and this tile's upper half blends, and then
-          # it lies inside the source stage; the clamp keeps the unused read in
-          # bounds otherwise.
-          src_upper_start = jnp.minimum(src_lower_start + BF16_TILE_ROWS,
-                                        stage_ref.shape[-2] - BF16_TILE_ROWS)
-          src_lower = stage_ref[
-              _tile_index(stage_ref, prev_slot, src_lower_start)].astype(
-                  jnp.float32)
-          src_upper = stage_ref[
-              _tile_index(stage_ref, prev_slot, src_upper_start)].astype(
-                  jnp.float32)
-          half_ids = lax.broadcasted_iota(
-              jnp.int32, src_lower[..., :half_rows, :].shape,
-              src_lower.ndim - 2)
-          is_src_on_tile = half_ids + src_offset_in_tile < half_rows
-          prev_rows = jnp.concatenate([
-              jnp.where(is_src_on_tile, src_lower[..., :half_rows, :],
-                        src_lower[..., half_rows:, :]),
-              jnp.where(is_src_on_tile, src_lower[..., half_rows:, :],
-                        src_upper[..., :half_rows, :]),
-          ], axis=-2)
+          own_rows = stage_ref[own_index]
+          # The source tile lies inside the previous stage whenever there is
+          # one. The first block of a batch whose cu_seqlens_q[0] is not 0 has
+          # none: its leading rows belong to no sequence, and the clamp keeps
+          # that read in bounds.
+          src_start = jnp.minimum(
+              src_row_offset + tile * BF16_TILE_ROWS,
+              stage_ref.shape[-2] - BF16_TILE_ROWS)
+          prev_rows = stage_ref[_tile_index(stage_ref, prev_slot, src_start)]
           row_ids = tile * BF16_TILE_ROWS + lax.broadcasted_iota(
               jnp.int32, own_rows.shape, own_rows.ndim - 2)
           stage_ref[own_index] = jnp.where(
-              row_ids < num_blend_rows, prev_rows, own_rows).astype(
-                  stage_ref.dtype)
+              row_ids < num_blend_rows, prev_rows, own_rows)
 
         def _blend_tile(tile, carry):
           _blend_stage(o_stage, tile)
@@ -1237,12 +1210,12 @@ def fwd_body(
     # Note (david): packed padding rows own no q block, so once every output
     # DMA has landed they are written from a cleared stage. The last block
     # already zeroed its window's padding rows, so the fill starts at the next
-    # 8-row tile; with no block at all, cu_seqlens_q is all 0 and so is that
+    # 16-row tile; with no block at all, cu_seqlens_q is all 0 and so is that
     # tile.
     packed_q_end = schedule.packed_q_end
     padded_total_q = o_hbm.shape[-2]
     fill_start = (
-        (packed_q_end + NUM_SUBLANES - 1) // NUM_SUBLANES * NUM_SUBLANES)
+        (packed_q_end + BF16_TILE_ROWS - 1) // BF16_TILE_ROWS * BF16_TILE_ROWS)
     num_fills = pl.cdiv(jnp.maximum(padded_total_q - fill_start, 0), bq)
 
     @pl.when(num_fills > 0)
@@ -1252,9 +1225,9 @@ def fwd_body(
         lse_stage[0] = jnp.full(lse_stage.shape[1:], -jnp.inf, jnp.float32)
 
     def _fill_rows(fill_index, carry):
-      row_start = pl.multiple_of(fill_start + fill_index * bq, NUM_SUBLANES)
+      row_start = pl.multiple_of(fill_start + fill_index * bq, BF16_TILE_ROWS)
       num_fill_rows = pl.multiple_of(
-          jnp.minimum(padded_total_q - row_start, bq), NUM_SUBLANES)
+          jnp.minimum(padded_total_q - row_start, bq), BF16_TILE_ROWS)
       fill_rows = pl.ds(0, num_fill_rows)
       # Note (david): only a head-major fold stages a leading fold axis; a
       # token-major fold rides the lanes.

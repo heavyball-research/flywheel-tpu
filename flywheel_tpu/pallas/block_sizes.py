@@ -13,6 +13,13 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
+# On v7x a bf16 buffer whose row count is a multiple of 16 can be tiled
+# (16, 128) instead of (8, 128). A VMEM scratch always is. An HBM operand is
+# when XLA lays it out so: a kernel output that feeds further ops of the same
+# program does, a program output does not. A dynamic row window has to start
+# on a tile and span whole ones, so dynamic rows into bf16 buffers step in 16,
+# which is legal under either tiling.
+BF16_TILE_ROWS = 2 * NUM_SUBLANES
 # Note (david): d64 is the one sub-tile head_dim token-major supports; a
 # 64-wide head fills half a lane tile, so heads are DMA'd and folded in pairs.
 PAIRED_HEAD_DIM = NUM_LANES // 2

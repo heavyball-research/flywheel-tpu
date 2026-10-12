@@ -419,10 +419,40 @@ def test_flash_attn_varlen_func(seqlens_q, seqlens_kv, block_sizes, causal):
 
 
 @pytest.mark.parametrize(
+    "seqlens",
+    [
+        pytest.param([50, 78], id="one_block"),
+        pytest.param([37, 53, 22, 100, 300], id="several_blocks"),
+    ],
+)
+def test_flash_attn_varlen_func_feeds_the_program(seqlens):
+    # On v7x XLA lays a bf16 kernel output out in 16-row tiles when further ops
+    # of the same program read it, as a model layer's do, and in 8-row tiles
+    # when it is the program's output, as in every other test here. The
+    # program has to compile and hand on what the kernel alone returns.
+    q, k, v, _ = packed_qkv(seqlens, 4, 2, 128)
+    cu = cu_seqlens_of(seqlens)
+
+    def attend(q, k, v, cu):
+        return flash_attn_varlen_func(
+            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True,
+            interpret=INTERPRET)
+
+    @jax.jit
+    def layer(q, k, v, cu):
+        merged = attend(q, k, v, cu).reshape(q.shape[0], -1)
+        return merged @ jnp.eye(merged.shape[1], dtype=merged.dtype)
+
+    expected = attend(q, k, v, cu)
+    assert jnp.array_equal(
+        layer(q, k, v, cu).reshape(expected.shape), expected)
+
+
+@pytest.mark.parametrize(
     "seqlens,nheads_k,block_sizes",
     [
         pytest.param([37, 53, 22], 2, None, id="gqa"),
-        # Note (david): starts off the 8-token grid make every first q block
+        # Note (david): starts off the 16-token grid make every first q block
         # reach back into its predecessor, so lse goes through the boundary
         # blend exactly as O does.
         pytest.param([37, 53, 22, 100], 4, None, id="unaligned"),
