@@ -452,7 +452,7 @@ def test_flash_attn_varlen_func_feeds_the_program(seqlens):
     "seqlens,nheads_k,block_sizes",
     [
         pytest.param([37, 53, 22], 2, None, id="gqa"),
-        # Note (david): starts off the 16-token grid make every first q block
+        # Note (david): starts off the 8-token grid make every first q block
         # reach back into its predecessor, so lse goes through the boundary
         # blend exactly as O does.
         pytest.param([37, 53, 22, 100], 4, None, id="unaligned"),

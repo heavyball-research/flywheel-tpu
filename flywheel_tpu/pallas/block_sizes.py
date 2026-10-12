@@ -13,12 +13,11 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
 NUM_SUBLANES = 8
-# On v7x a bf16 buffer whose row count is a multiple of 16 can be tiled
-# (16, 128) instead of (8, 128). A VMEM scratch always is. An HBM operand is
-# when XLA lays it out so: a kernel output that feeds further ops of the same
-# program does, a program output does not. A dynamic row window has to start
-# on a tile and span whole ones, so dynamic rows into bf16 buffers step in 16,
-# which is legal under either tiling.
+# Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
+# of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
+# load or store must start on that tile. Dynamic row accesses into bf16 stages
+# therefore step in whole 16-row tiles, which is legal under either tiling;
+# HBM DMA windows sit on the hbm_bf16_tile_rows() grid.
 BF16_TILE_ROWS = 2 * NUM_SUBLANES
 # Note (david): d64 is the one sub-tile head_dim token-major supports; a
 # 64-wide head fills half a lane tile, so heads are DMA'd and folded in pairs.
@@ -43,6 +42,26 @@ def vmem_limit_bytes() -> int:
   if jax.default_backend() != "tpu":
     return MAX_VMEM_LIMIT_BYTES
   return min(MAX_VMEM_LIMIT_BYTES, pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
+@functools.cache
+def hbm_bf16_tile_rows() -> int:
+  """Rows a traced window into a bf16 HBM operand has to be aligned to.
+
+  The rule is TpuInfo.get_sublane_tiling's. Before v7x XLA tiles a bf16 HBM
+  buffer (8, 128), unless xla_tpu_enable_large_2nd_minor_layout_for_x16 is
+  set. From v7x on it may tile one whose row count is a multiple of 16 as
+  (16, 128): it does when the buffer is a value of the surrounding program,
+  which a kernel output is as soon as another op reads it, and it does not
+  for a program output. A kernel cannot tell which it gets, so there the
+  windows sit on 16 rows, legal under either tiling.
+
+  Asked on first use, like vmem_limit_bytes(); off TPU there is no tiling and
+  builds keep the v6e grid.
+  """
+  if jax.default_backend() != "tpu" or pltpu.get_tpu_info().generation < 7:
+    return NUM_SUBLANES
+  return BF16_TILE_ROWS
 
 MIN_NUM_STAGES = 2
 # Note (david): the KV-cache kernel issues the next block's DMA into slot
