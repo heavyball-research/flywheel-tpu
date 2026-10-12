@@ -1,8 +1,9 @@
 # FlyWheel on TPU v7x
 
 The benchmarks in the [README](README.md) were measured on v6e. This page has
-the softmax and linear attention benchmarks on v7x, measured the same way and
-on the same stack, `jax[tpu]==0.11.0` and `libtpu==0.0.44`.
+the softmax and linear attention benchmarks and the end-to-end evaluation on
+v7x, measured the same way and on the same stack, `jax[tpu]==0.11.0` and
+`libtpu==0.0.44`.
 
 ## Softmax attention
 
@@ -143,36 +144,40 @@ RPA v3 runs with the request distribution vLLM's TPU runner sends (mixed for
 chunked prefill, decode for decode) and its own default blocks. At 32:32 those
 run out of VMEM, so it runs `[128, 256, 128, 256]`, the one config that fit its
 sweep; a decode call compiles RPA's mixed kernel as well, so that config is set
-there too. flywheel runs its defaults, sized to the core's VMEM by
-`vmem_limit_bytes()`.
+there too. flywheel runs its defaults for chunked prefill, sized to the core's
+VMEM by `vmem_limit_bytes()`, and for decode the configs tuned on v7x in the
+`"TPU v7"` section of [`tuned_configs.json`](flywheel_tpu/tuned_configs.json).
 
 Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count),
 and our speedup over RPA v3:
 
 | | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4 | 11.86 (371) | 8.96 (491) | 1.32x |
-| 32:32 | 26.02 (169) | 30.07 (146) | 0.87x |
+| 32:4 | 11.86 (371) | 9.66 (455) | 1.23x |
+| 32:32 | 26.02 (169) | 11.21 (392) | 2.32x |
 
 Decode, 15K cached tokens then 1024 steps, ms per step (cached K/V read per
 step, TB/s):
 
 | | RPA v3 | flywheel | vs RPA v3 |
 |---|---|---|---|
-| 32:4, 256 sequences | 5.148 (3.23) | 5.217 (3.19) | 0.99x |
-| 32:4, 128 sequences | 2.574 (3.23) | 2.606 (3.19) | 0.99x |
-| 32:32, 128 sequences | 22.426 (2.97) | 29.317 (2.27) | 0.76x |
+| 32:4, 256 sequences | 5.148 (3.23) | 5.023 (3.31) | 1.02x |
+| 32:4, 128 sequences | 2.574 (3.23) | 2.519 (3.30) | 1.02x |
+| 32:4, 32 sequences | 0.660 (3.15) | 0.649 (3.20) | 1.02x |
+| 32:32, 128 sequences | 22.426 (2.97) | 19.875 (3.35) | 1.13x |
+| 32:32, 32 sequences | 5.645 (2.95) | 4.950 (3.36) | 1.14x |
 
 32:32 at 256 sequences needs 128 GiB of cache, more than a v7x core's
 94.7 GiB of HBM. A core's HBM peak is 3.7 TB/s.
 
-flywheel leads on chunked prefill at 32:4 and matches RPA v3 on decode at
-32:4; at 32:32 RPA v3 is ahead in both scenarios.
+flywheel leads in both scenarios, by the most at 32:32. Its decode reads the
+cache at 3.2 to 3.4 TB/s, close to the core's HBM peak.
 
 To reproduce, sequentially on a v7x VM:
 
 ```bash
-benchmarks/softmax_attention/kvcache_scenarios.sh results/benchmark/kvcache_scenarios
+DECODE_BATCHES="256 128 32" \
+    benchmarks/softmax_attention/kvcache_scenarios.sh results/benchmark/kvcache_scenarios
 ```
 
 ## Linear attention
@@ -246,11 +251,58 @@ PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench
     --impl baseline --output results/kda_fwd_baseline.json
 ```
 
-## Not on v7x yet
+## End-to-end evaluation
 
-`flash_attn_varlen_func` has not been run on v7x since its fix. Before it,
-Mosaic stopped at `E2003: CompileTimeMosaicUnprovenMemoryAccessAlignment:
-cannot statically prove that index in dimension 1 is a multiple of 16`: on v7x
-its bf16 VMEM stage is tiled 16 rows deep, and the per-seq head blend read it
-in 8-row slabs at a row it could only prove to be a multiple of 8. The blend
-now reads and writes whole 16-row tiles, which is not verified on v7x yet.
+The [README](README.md#end-to-end-evaluation)'s vLLM backend with its RULER
+and BABILong sweeps, on one v7x host. The host has four chips, so eight
+TensorCores, and `--tp-size 8` gives each tensor-parallel rank one core. The
+model is Qwen3.8-27B in bf16: 64 layers, 48 of them GDN linear attention and
+16 full attention at 24:4 heads of head_dim 256. The engine serves one
+sequence at a time, with chunked prefill and prefix caching off.
+
+`flywheel` sets `USE_FLYWHEEL_TPU_KERNEL=1` and
+`USE_FLYWHEEL_TPU_LINEAR_KERNEL=1`. `baseline` is the same backend with both
+off: RPA v3 with the mixed block sizes of
+[`eval/configs`](eval/configs/qwen38_27b_tp8_rpa_mixed_blocks.json), and
+`gdn_v3`. Those block sizes were tuned on v6e; they compile on a v7x core at
+every length here and were not tuned again.
+
+Tokens/s is prompt tokens over the time of the generation calls, so it
+includes the answer's decode steps: up to 128 tokens on RULER and 20 on
+BABILong. Every point ran 20 samples per task; the README's sweeps run 500 on
+RULER and 100 on BABILong.
+
+RULER, 13 tasks and 260 prompts per point; the score is the mean over the
+tasks, in %:
+
+| context | baseline, tokens/s | flywheel, tokens/s | speedup | baseline score | flywheel score |
+|---|---|---|---|---|---|
+| 4K | 9,078 | 8,925 | 0.98x | 95.9 | 95.5 |
+| 32K | 25,522 | 26,686 | 1.05x | 95.4 | 95.1 |
+| 131K | 26,388 | 30,065 | 1.14x | 94.8 | 95.2 |
+
+BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
+
+| length | baseline, tokens/s | flywheel, tokens/s | speedup | baseline accuracy | flywheel accuracy |
+|---|---|---|---|---|---|
+| 128k | 26,999 | 30,786 | 1.14x | 66.0 | 66.0 |
+| 256k | 22,872 | 27,788 | 1.21x | 56.0 | 56.0 |
+
+The two backends answer alike. On BABILong the accuracy of every task is the
+same at both lengths, and the RULER scores differ by one `ruler_qa_hotpot`
+sample at each length, in either direction. flywheel's lead grows with the
+context, from none at 4K to 1.21x at 256k.
+
+Video-MME ran as a smoke test only: `videomme_long_reasoning` at 1024 frames,
+about 118K prompt tokens, on 8 questions. Both backends give the same eight
+answers, 5 of them correct. The LLM prefill takes 3.53 s on flywheel against
+4.07 s (1.15x), and the time to the first token 7.00 s against 7.61 s.
+
+To reproduce, on a v7x host with the venv of the README's vLLM backend
+section:
+
+```bash
+eval/ruler/run_ruler_sweep.sh --seqlens "4096 32768 131072" --limit 20
+eval/babilong/run_babilong_sweep.sh --lengths "128k 256k" --limit 20
+eval/videomme/run_videomme_sweep.sh --frames 1024 --limit 8
+```
