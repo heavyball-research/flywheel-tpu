@@ -45,14 +45,14 @@ def hbm_bf16_tile_rows() -> int:
 
   It is TpuInfo.get_sublane_tiling for bf16. Before v7x that is 8: XLA tiles
   a bf16 HBM buffer (8, 128), unless
-  xla_tpu_enable_large_2nd_minor_layout_for_x16 is set. On v7x it is 16: XLA
-  may tile a buffer whose row count is a multiple of 16 as (16, 128). It does
-  when the buffer is a value of the surrounding program, which a kernel
-  output is as soon as another op reads it, and it does not for a program
-  output; 16 rows are legal under either tiling.
-
-  Asked on first use, like vmem_limit_bytes(). Off TPU get_tpu_info() has no
-  chip to describe, and builds keep the v6e grid.
+  xla_tpu_enable_large_2nd_minor_layout_for_x16 is set. On v7x it is 16: There
+  XLA lays out a bf16 HBM buffer whose row count is a multiple of 16 in one of
+  two ways:
+  - (16, 128) tiles when another op of the jitted program reads the buffer,
+    as with a kernel's output inside a model;
+  - (8, 128) tiles when the jitted program returns the buffer, as when a
+    test calls the kernel alone.
+  A window that starts on a multiple of 16 rows is aligned under both.
   """
   if jax.default_backend() != "tpu":
     return NUM_SUBLANES

@@ -289,13 +289,17 @@ BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
 | 256k | 22,872 | 27,788 | 1.21x | 56.0 | 56.0 |
 | 512k | 17,815 | 24,140 | 1.35x | 47.0 | 46.0 |
 
-The 512k row is not the README's 512k point. The README runs 512k on several
-hosts, at TP 8 with prefill context parallelism 2, so each rank prefills half
-of a prompt. This row is TP 8 on the one host, the README's command without
-`--cp-size 2 --multihost`, and every rank prefills the whole prompt. It keeps
-`--enable-sp` and `--yarn-factor 2`: the prompts run to 508K tokens, past the
-model's 262,144 native positions. The baseline takes the 256k cell of the
-block-size table, the longest it has.
+NOTE: The 512k row is not the README's 512k point. The README runs 512k on
+several hosts (due to the smaller HBM size on v6e), at TP 8 with prefill
+context parallelism 2, so each rank prefills half of a prompt. This row is
+TP 8 on a single host (see below for the exact command), and every rank
+prefills the whole prompt. As in the README's 512k command, `--enable-sp` is
+on, and `--yarn-factor 2` stretches the model's RoPE from its 262,144
+positions to 524,288, because the prompts run to 508K tokens. The baseline's
+RPA v3 block sizes are tuned per prefill length, and the table in
+`eval/configs` ends at 262,144 tokens. The sweep script gives a longer
+prefill that last entry, so here the baseline runs with the block sizes of
+half the length.
 
 The two backends answer alike. On BABILong the accuracy of every task is the
 same at 128k and 256k; at 512k three of the 100 answers differ, one in
