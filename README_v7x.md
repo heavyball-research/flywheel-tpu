@@ -287,11 +287,21 @@ BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
 |---|---|---|---|---|---|
 | 128k | 26,999 | 30,786 | 1.14x | 66.0 | 66.0 |
 | 256k | 22,872 | 27,788 | 1.21x | 56.0 | 56.0 |
+| 512k | 17,815 | 24,140 | 1.35x | 47.0 | 46.0 |
+
+The 512k row is not the README's 512k point. The README runs 512k on several
+hosts, at TP 8 with prefill context parallelism 2, so each rank prefills half
+of a prompt. This row is TP 8 on the one host, the README's command without
+`--cp-size 2 --multihost`, and every rank prefills the whole prompt. It keeps
+`--enable-sp` and `--yarn-factor 2`: the prompts run to 508K tokens, past the
+model's 262,144 native positions. The baseline takes the 256k cell of the
+block-size table, the longest it has.
 
 The two backends answer alike. On BABILong the accuracy of every task is the
-same at both lengths, and the RULER scores differ by one `ruler_qa_hotpot`
-sample at each length, in either direction. flywheel's lead grows with the
-context, from none at 4K to 1.21x at 256k.
+same at 128k and 256k; at 512k three of the 100 answers differ, one in
+flywheel's favor and two in the baseline's. The RULER scores differ by one
+`ruler_qa_hotpot` sample at each length, in either direction. flywheel's lead
+grows with the context, from none at 4K to 1.21x at 256k and 1.35x at 512k.
 
 Video-MME ran as a smoke test only: `videomme_long_reasoning` at 1024 frames,
 about 118K prompt tokens, on 8 questions. Both backends give the same eight
@@ -304,5 +314,7 @@ section:
 ```bash
 eval/ruler/run_ruler_sweep.sh --seqlens "4096 32768 131072" --limit 20
 eval/babilong/run_babilong_sweep.sh --lengths "128k 256k" --limit 20
+eval/babilong/run_babilong_sweep.sh --lengths 512k --enable-sp \
+    --yarn-factor 2 --limit 20
 eval/videomme/run_videomme_sweep.sh --frames 1024 --limit 8
 ```
