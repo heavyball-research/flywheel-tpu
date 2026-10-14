@@ -280,6 +280,8 @@ tasks, in %:
 | 4K | 9,078 | 8,925 | 0.98x | 95.9 | 95.5 |
 | 32K | 25,522 | 26,686 | 1.05x | 95.4 | 95.1 |
 | 131K | 26,388 | 30,065 | 1.14x | 94.8 | 95.2 |
+| 262K | 22,623 | 27,719 | 1.23x | 94.9 | 94.9 |
+| 524K | 17,703 | 23,960 | 1.35x | 90.3 | 89.5 |
 
 BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
 
@@ -289,36 +291,52 @@ BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
 | 256k | 22,872 | 27,788 | 1.21x | 56.0 | 56.0 |
 | 512k | 17,815 | 24,140 | 1.35x | 47.0 | 46.0 |
 
-NOTE: The 512k row is not the README's 512k point. The README runs 512k on
-several hosts (due to the smaller HBM size on v6e), at TP 8 with prefill
-context parallelism 2, so each rank prefills half of a prompt. This row is
-TP 8 on a single host (see below for the exact command), and every rank
-prefills the whole prompt. As in the README's 512k command, `--enable-sp` is
-on, and `--yarn-factor 2` stretches the model's RoPE from its 262,144
-positions to 524,288, because the prompts run to 508K tokens. The baseline's
-RPA v3 block sizes are tuned per prefill length, and the table in
-`eval/configs` ends at 262,144 tokens. The sweep script gives a longer
-prefill that last entry, so here the baseline runs with the block sizes of
+NOTE: The RULER 524K and BABILong 512k rows are not the README's 512k
+points. The README runs 512k on several hosts (due to the smaller HBM size on
+v6e), at TP 8 with prefill context parallelism 2, so each rank prefills half
+of a prompt. These rows are TP 8 on a single host (see below for the exact
+commands), and every rank prefills the whole prompt. As in the README's 512k
+commands, `--enable-sp` is on, and `--yarn-factor 2` stretches the model's
+RoPE from its 262,144 positions to 524,288, because the prompts run to 524K
+tokens on RULER and 508K on BABILong. RULER 262K runs with `--yarn-factor 2`
+too, because the eval sizes the engine at the length plus 1,024 tokens, past
+the 262,144 positions; the prompts themselves run to 262,036 tokens. The
+baseline's RPA v3 block sizes are tuned per prefill length, and the table in
+`eval/configs` ends at 262,144 tokens. The sweep scripts give a longer
+prefill that last entry, so at 512k the baseline runs with the block sizes of
 half the length.
 
-The two backends answer alike. On BABILong the accuracy of every task is the
-same at 128k and 256k; at 512k three of the 100 answers differ, one in
-flywheel's favor and two in the baseline's. The RULER scores differ by one
-`ruler_qa_hotpot` sample at each length, in either direction. flywheel's lead
-grows with the context, from none at 4K to 1.21x at 256k and 1.35x at 512k.
+The two backends answer nearly alike. On BABILong the accuracy of every task
+is the same at 128k and 256k; at 512k three of the 100 answers differ, one in
+flywheel's favor and two in the baseline's. On RULER the scores differ by one
+`ruler_qa_hotpot` sample at each length up to 131K, in either direction, and
+every task scores the same at 262K. At 524K the baseline is ahead by two of
+the 20 `ruler_niah_multikey_3` samples and by one of the 80 values of
+`ruler_niah_multivalue`. flywheel's lead grows with the context and is the
+same on both evals: none at 4K, 1.14x at 128k, 1.21x to 1.23x at 256k and
+1.35x at 512k (RULER's 131K, 262K and 524K).
 
-Video-MME ran as a smoke test only: `videomme_long_reasoning` at 1024 frames,
-about 118K prompt tokens, on 8 questions. Both backends give the same eight
-answers, 5 of them correct. The LLM prefill takes 3.53 s on flywheel against
-4.07 s (1.15x), and the time to the first token 7.00 s against 7.61 s.
+Video-MME ran as a smoke test only: `videomme_long_reasoning` on 8 questions,
+at 1024 frames (about 118K prompt tokens) and 2048 frames (about 236K). At
+each, both backends give the same eight answers, 5 of them correct at 1024
+frames and 4 at 2048. The LLM prefill takes 3.53 s on flywheel against
+4.07 s (1.15x) at 1024 frames and 7.88 s against 9.77 s (1.24x) at 2048. The
+time to the first token, which adds the vision encoder, is 7.00 s against
+7.61 s and 14.44 s against 16.51 s. The 2048-frame times are from a second
+pass: in the first, the vision encoder's time varied between 5 and 11 s per
+request, and flywheel's time to the first token came out at 18.66 s against
+17.95 s with the same prefill times.
 
 To reproduce, on a v7x host with the venv of the README's vLLM backend
 section:
 
 ```bash
 eval/ruler/run_ruler_sweep.sh --seqlens "4096 32768 131072" --limit 20
+eval/ruler/run_ruler_sweep.sh --seqlens 262144 --yarn-factor 2 --limit 20
+eval/ruler/run_ruler_sweep.sh --seqlens 524288 --enable-sp \
+    --yarn-factor 2 --limit 20
 eval/babilong/run_babilong_sweep.sh --lengths "128k 256k" --limit 20
 eval/babilong/run_babilong_sweep.sh --lengths 512k --enable-sp \
     --yarn-factor 2 --limit 20
-eval/videomme/run_videomme_sweep.sh --frames 1024 --limit 8
+eval/videomme/run_videomme_sweep.sh --frames "1024 2048" --limit 8
 ```
