@@ -68,6 +68,8 @@ class Cell:
     batch: int
     decode_tokens: int
     page_size: int
+    # Keys each query attends, its own included; None is full causal.
+    sliding_window: int | None = None
     # q, k, v and cache dtype. flash_attn_with_kvcache takes bf16 caches only;
     # every byte count below follows itemsize, so another dtype only needs a
     # kernel that takes it.
@@ -77,6 +79,8 @@ class Cell:
     def key(self):
         shape = (f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
                  f"-d{self.head_dim}-s{self.seq}-p{self.page_size}")
+        if self.sliding_window is not None:
+            shape = f"{shape}-w{self.sliding_window}"
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
         return f"{shape}-b{self.batch}-n{self.decode_tokens}"
@@ -122,11 +126,16 @@ class Cell:
 def attention_pairs(cell):
     """(query, key) pairs the whole scenario attends."""
     if cell.scenario == "chunked_prefill":
-        c = cell.chunk
-        return sum(c * i * c + c * (c + 1) // 2 for i in range(cell.num_calls))
-    first = cell.context + 1
-    last = cell.context + cell.decode_tokens
-    return cell.batch * (first + last) * cell.decode_tokens // 2
+        first_query, num_queries = 0, cell.seq
+    else:
+        first_query, num_queries = cell.context, cell.decode_tokens
+    causal_keys = np.arange(first_query + 1, first_query + num_queries + 1,
+                            dtype=np.int64)
+    if cell.sliding_window is None:
+        visible_keys = causal_keys
+    else:
+        visible_keys = np.minimum(causal_keys, cell.sliding_window)
+    return cell.num_seqs * int(visible_keys.sum())
 
 
 def draw(generator, dtype, *shape):
@@ -197,6 +206,10 @@ def build_flywheel(cell, inputs, args):
     # interleaves each kv head's K row and V row.
     shape = (cell.num_seqs * block_table.shape[1], cell.page_size,
              2 * cell.heads_k, cell.head_dim)
+    if cell.sliding_window is None:
+        window_size = (-1, -1)
+    else:
+        window_size = (cell.sliding_window - 1, 0)
 
     def call(cache, q, k, v, start):
         if cell.scenario == "chunked_prefill":
@@ -205,7 +218,7 @@ def build_flywheel(cell, inputs, args):
             q, k, v = q[:, None], k[:, None], v[:, None]
         out, cache = flash_attn_with_kvcache(
             q, cache, None, k, v, cache_seqlens=start,
-            block_table=block_table, causal=True)
+            block_table=block_table, causal=True, window_size=window_size)
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -258,7 +271,7 @@ def build_rpa(cell, inputs, args):
         out, cache = kernel_fn(
             q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
             distribution, use_causal_mask=True, sm_scale=scale,
-            **block_kwargs)
+            sliding_window=cell.sliding_window, **block_kwargs)
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -315,9 +328,15 @@ def run(cell, args):
     # Every call reads each sequence's whole visible cache once.
     if cell.scenario == "decode":
         kv_tokens_read = pairs
-    else:
+    elif cell.sliding_window is None:
         kv_tokens_read = sum(
             (i + 1) * cell.chunk for i in range(cell.num_calls))
+    else:
+        # The first query of call i reaches back sliding_window - 1 keys.
+        kv_tokens_read = sum(
+            (i + 1) * cell.chunk
+            - max(0, i * cell.chunk - cell.sliding_window + 1)
+            for i in range(cell.num_calls))
     kv_bytes_read = kv_tokens_read * cell.kv_token_bytes
     record = {"key": cell.key, "cell": dataclasses.asdict(cell),
               "num_calls": cell.num_calls, "attention_pairs": pairs,
@@ -367,7 +386,7 @@ def main(argv=None):
     args = parse_args(argv)
     cell = Cell(args.impl, args.scenario, args.heads, args.heads_k,
                 args.head_dim, args.seq, args.chunk, args.batch,
-                args.decode_tokens, args.page_size)
+                args.decode_tokens, args.page_size, args.sliding_window)
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
     if args.output and not args.trace and recorded(args.output, cell.key):
@@ -398,6 +417,10 @@ def parse_args(argv=None):
     parser.add_argument("--decode-tokens", type=int, default=1024,
                         help="decode: steps, the last tokens of --seq")
     parser.add_argument("--page-size", type=int, default=128)
+    parser.add_argument("--sliding-window", type=int,
+                        help="keys each query attends, its own included "
+                             "(RPA's sliding_window; flywheel's window_size "
+                             "is (W - 1, 0)); default: full causal")
     parser.add_argument("--rpa-blocks",
                         help="bq_sz,bkv_sz,bq_csz,bkv_csz for RPA's case; "
                              "default: RPA's own formula")
