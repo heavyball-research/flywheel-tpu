@@ -511,6 +511,27 @@ def check_common_kwargs(
   return window_size
 
 
+def paged_window(
+    causal: bool, window_size: tuple[int, int]) -> tuple[bool, int | None]:
+  """(is_right_bounded, window_left) for the paged varlen kernel.
+
+  Its schedule bounds a row's keys on the right only at the causal diagonal,
+  so the right bound must be 0 or unbounded; causal forces 0, as in
+  flash_attn_func.
+  """
+  if causal or window_size[1] == 0:
+    is_right_bounded = True
+  elif window_size[1] == -1:
+    is_right_bounded = False
+  else:
+    raise NotImplementedError(
+        "a paged KV cache takes a window right bound of -1 (unbounded) or 0"
+        f" (causal) only; got window_size={window_size}."
+    )
+  window_left = None if window_size[0] == -1 else window_size[0]
+  return is_right_bounded, window_left
+
+
 def flash_attn_func(
     q: jax.Array,
     k: jax.Array,
@@ -857,11 +878,7 @@ def paged_varlen_attn(
         "head_dim is only meaningful for token-major inputs; a paged call"
         " takes head-major q."
     )
-  if window_size != (-1, -1):
-    raise NotImplementedError(
-        "window_size is not supported with a paged KV cache.")
-  if softcap != 0.0:
-    raise NotImplementedError("softcap is not supported with a paged KV cache.")
+  is_right_bounded, window_left = paged_window(causal, window_size)
   if cu_seqlens_k is not None:
     raise ValueError(
         "with block_table, pass cu_seqlens_k=None: seqused_k gives each"
@@ -970,8 +987,10 @@ def paged_varlen_attn(
       flash_attn_varlen_paged,
       max_seqlen_q=int(max_seqlen_q),
       max_seqlen_k=int(max_seqlen_k),
-      causal=bool(causal),
-      q_scale=float(fused_q_scale(softmax_scale, 0.0)),
+      causal=is_right_bounded,
+      window_left=window_left,
+      softcap=float(softcap),
+      q_scale=float(fused_q_scale(softmax_scale, softcap)),
       return_lse=bool(return_softmax_lse),
       interpret=bool(interpret),
       block_sizes=paged_block_sizes,
@@ -1051,10 +1070,10 @@ def flash_attn_varlen_func(
   past a sequence's own pages. cu_seqlens_k must be None and seqused_k
   ((batch,) int) is each sequence's kv length, its new tokens included,
   which the cache must already hold; max_seqlen_k bounds it. q / out stay
-  head-major; token_major, window_size, softcap and rotary_k=True raise, and
-  RoPE rotates Q only, at positions seqused_k - len_q + t. cu_seqlens_q[0]
-  must be 0; a concrete one is checked, a traced one is the caller's
-  contract. A one-token sequence is an ordinary sequence. num_active (int
+  head-major; token_major, rotary_k=True and a window right bound other than
+  -1 or 0 raise, and RoPE rotates Q only, at positions seqused_k - len_q + t.
+  window_size and softcap act as on packed K/V. cu_seqlens_q[0] must be 0; a
+  concrete one is checked, a traced one is the caller's contract. A one-token sequence is an ordinary sequence. num_active (int
   or int32 scalar, possibly traced) keeps only the first num_active
   sequences; rows past the last kept one return out = 0 and lse = -inf. A
   concrete num_active outside [0, batch] raises; a traced one must lie in
@@ -1206,8 +1225,8 @@ def flash_attn_varlen_func(
 @functools.partial(
     jax.jit,
     static_argnames=(
-        "softmax_scale", "causal", "window_size", "return_softmax_lse",
-        "interpret",
+        "softmax_scale", "causal", "window_size", "softcap",
+        "return_softmax_lse", "interpret",
     ),
     donate_argnames=("k_cache", "v_cache"),
 )
@@ -1226,6 +1245,7 @@ def flash_attn_with_kvcache(
     softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple[int, int] = (-1, -1),
+    softcap: float = 0.0,
     return_softmax_lse: bool = False,
     interpret: bool = False,
 ) -> tuple[jax.Array, ...]:
@@ -1263,11 +1283,12 @@ def flash_attn_with_kvcache(
   multi-token and packed calls but unspecified on single-token decode. All of
   these may be tracers.
 
-  causal is bottom-right aligned per request. window_size works only for
-  single-token decode. A decode row with nothing to attend returns out = 0
-  and lse = -inf; on multi-token and packed calls, as in
-  flash_attn_varlen_func, a row with no visible key is unspecified.
-  Forward-only.
+  causal and window_size are bottom-right aligned per request; multi-token and
+  packed calls take a window right bound of -1 or 0 only (causal forces 0).
+  softcap > 0 applies tanh(s / softcap) * softcap to the scaled scores. A
+  decode row with nothing to attend returns out = 0 and lse = -inf; on
+  multi-token and packed calls, as in flash_attn_varlen_func, a row with no
+  visible key is unspecified. Forward-only.
 
   Returns (out, k_cache, v_cache) for the contiguous pair and (out, kv_cache)
   for the paged merged cache, with lse after out when return_softmax_lse:
@@ -1275,7 +1296,7 @@ def flash_attn_with_kvcache(
   donated and updated in place, so rebind them; under an outer jax.jit,
   donate them on that jit instead.
   """
-  window_size = check_common_kwargs(window_size)
+  window_size = check_common_kwargs(window_size, softcap=softcap)
   is_ragged = cu_seqlens_q is not None
   if is_ragged:
     cu_seqlens_q = jnp.asarray(cu_seqlens_q)
@@ -1301,11 +1322,6 @@ def flash_attn_with_kvcache(
     if batch <= 0 or seqlen_q <= 0:
       raise ValueError("batch and seqlen_q must be positive.")
   is_extend = is_ragged or seqlen_q != 1
-  if is_extend and window_size != (-1, -1):
-    raise NotImplementedError(
-        "Ragged/multi-token KV-cache attention does not yet support"
-        " window_size."
-    )
   # Note (david): a paged cache is always the merged one, a contiguous cache
   # always the K/V pair.
   is_paged = block_table is not None
@@ -1424,19 +1440,23 @@ def flash_attn_with_kvcache(
       packed_v = v.reshape(-1, nheads_k, head_dim)
     else:
       packed_k = packed_v = None
+    is_right_bounded, window_left = paged_window(causal, window_size)
     kernel_outputs = flash_attn_kvcache_varlen(
         packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
         row_cache_seqlens, flat_block_table, num_active,
-        q_scale=float(fused_q_scale(softmax_scale, 0.0)), causal=bool(causal),
-        return_lse=bool(return_softmax_lse), interpret=bool(interpret),
+        q_scale=float(fused_q_scale(softmax_scale, softcap)),
+        causal=is_right_bounded, window_left=window_left,
+        softcap=float(softcap), return_lse=bool(return_softmax_lse),
+        interpret=bool(interpret),
     )
   else:
     # Note (david): the decode kernel runs its softmax in log2 units straight
-    # off q @ k^T, so softmax_scale * log2(e) is folded into Q here, with the
-    # same bf16 rounding the dense kernels apply per staged Q tile.
+    # off q @ k^T, so softmax_scale * log2(e) (softmax_scale / softcap with a
+    # softcap) is folded into Q here, with the same bf16 rounding the dense
+    # kernels apply per staged Q tile.
     q_scaled = (
         q.reshape(batch, nheads, head_dim).astype(jnp.float32)
-        * fused_q_scale(softmax_scale, 0.0)
+        * fused_q_scale(softmax_scale, softcap)
     ).astype(q.dtype)
     new_token_shape = (batch, nheads_k, head_dim)
     if has_new:
@@ -1462,6 +1482,7 @@ def flash_attn_with_kvcache(
         block_table=flat_block_table,
         num_active=num_active,
         merged_cache=is_paged,
+        softcap=float(softcap),
     )
   out = kernel_outputs[0].reshape(q.shape)
   caches_out = kernel_outputs[1:1 + len(cache_operands)]

@@ -14,6 +14,7 @@ from ..tuned_block_sizes import KVCacheConfig, get_tuned_kvcache_config
 from .block_sizes import (
   BF16_BYTES,
   F32_BYTES,
+  LOG2E,
   NUM_LANES,
   NUM_SUBLANES,
   STAGES,
@@ -180,6 +181,7 @@ def kvcache_kernel(
     return_lse: bool,
     has_new: bool,
     left: int | None,
+    log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
     pages_per_seq: int | None,
@@ -577,7 +579,14 @@ def kvcache_kernel(
         key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
         values = None
         scores = jnp.dot(query, key.T, preferred_element_type=jnp.float32)
-      scores = jnp.where(is_valid, scores, -jnp.inf)
+      # Note (david): Q carries softmax_scale / softcap, so log2(e) rides in the
+      # tanh output scale. The cap runs before the mask, since tanh would lift
+      # a masked -inf to -softcap.
+      if log2_softcap:
+        capped_scores = jnp.tanh(scores) * log2_softcap
+      else:
+        capped_scores = scores
+      scores = jnp.where(is_valid, capped_scores, -jnp.inf)
 
       # Note (david): the running state is read as whole (rows, 128) tiles
       # with every lane holding its row's value, so every broadcast against
@@ -970,10 +979,13 @@ def flash_attn_kvcache_pallas(
     block_table: jax.Array | None = None,
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
+    softcap: float = 0.0,
 ) -> tuple[jax.Array, ...]:
   """One-token cache append and decode attention for every row in one call.
 
-  q: (batch, num_query_heads, head_dim), already scaled into log2 units.
+  q: (batch, num_query_heads, head_dim), already scaled into log2 units, or
+  by softmax_scale / softcap when softcap > 0, which applies Gemma-2's
+  tanh(s / softcap) * softcap to the scaled scores.
   k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim), or head-major
   (rows, num_kv_heads, capacity, head_dim) with cache_head_major. With
   block_table, the flat (batch * pages_per_seq,) int32 page table, the caches
@@ -1051,6 +1063,8 @@ def flash_attn_kvcache_pallas(
     raise ValueError(
         f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
     )
+  # Note (david): softcap stays out of the tuned key because decode is bound by
+  # the cache read; the tanh did not move the v6e step time.
   tuned_config = get_tuned_kvcache_config(
       dtype=q.dtype,
       num_query_heads=num_query_heads,
@@ -1195,6 +1209,7 @@ def flash_attn_kvcache_pallas(
       return_lse=return_lse,
       has_new=has_new,
       left=left,
+      log2_softcap=softcap * LOG2E,
       guard_threshold=guard_threshold,
       page_size=page_size,
       pages_per_seq=pages_per_seq,

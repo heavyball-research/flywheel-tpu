@@ -18,6 +18,7 @@ from .block_sizes import (
   F32_BYTES,
   FWD_BLOCKS,
   FWD_KV_COMPUTE_BLOCKS,
+  LOG2E,
   NUM_LANES,
   NUM_SUBLANES,
   BlockSizes,
@@ -75,6 +76,7 @@ def flash_fwd_varlen_paged_kernel(
     *refs: jax.Array,
     paged: PagedKVInfo,
     causal: bool,
+    window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
     bq: int,
@@ -88,7 +90,8 @@ def flash_fwd_varlen_paged_kernel(
       padded_total_q=q_hbm.shape[1],
       bq=bq, bkv=bkv,
       page_size=paged.page_size, pages_per_seq=paged.pages_per_seq,
-      causal=causal, num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
+      causal=causal, left=window_left,
+      num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
   # Note (david): K and V share the one merged cache operand.
   fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
@@ -279,6 +282,8 @@ def flash_attn_varlen_paged(
     block_sizes: BlockSizes | None = None,
     rotary: tuple[jax.Array, None] | None = None,
     rotary_interleaved: bool = True,
+    window_left: int | None = None,
+    softcap: float = 0.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Packed head-major attention over a paged KV cache, read-only.
 
@@ -288,7 +293,10 @@ def flash_attn_varlen_paged(
   [k0, v0, k1, v1, ...]. seqused_k is each sequence's kv length with its new
   tokens, which the cache must already hold; block_table entries past those
   tokens' pages are never dereferenced. Causal rows align to the end of their
-  sequence's keys, and q_scale is softmax_scale * log2(e). Rows past
+  sequence's keys; window_left (None unbounded) also hides the keys more than
+  window_left positions before that diagonal. softcap > 0 applies Gemma-2's
+  tanh(s / softcap) * softcap to the scaled scores. q_scale is softmax_scale *
+  log2(e), or softmax_scale / softcap with a softcap. Rows past
   cu_seqlens_q[-1] are out = 0, lse = -inf. max_seqlen_q and max_seqlen_k
   only pick the tiles, so an underestimate is slow, not wrong.
   rotary is prepare_rotary's (q coefficients, None) pair.
@@ -410,6 +418,7 @@ def flash_attn_varlen_paged(
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
       causal=causal,
+      window_left=window_left,
       num_head_groups=num_kv_heads,
       q_heads_per_kv_head=gqa_fold,
   )
@@ -431,7 +440,9 @@ def flash_attn_varlen_paged(
       guard_threshold=overflow_guard_threshold(capacity),
       window=(None, None),
       causal_offset=0,
-      softcap=0.0,
+      # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
+      # softcap, so log2(e) rides in the tanh output scale.
+      softcap=softcap * LOG2E,
       q_scale=q_scale,
   )
   if return_lse:

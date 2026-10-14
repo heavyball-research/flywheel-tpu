@@ -459,6 +459,7 @@ def make_paged_fwd_schedule(
     page_size: int,
     pages_per_seq: int,
     causal: bool,
+    left: int | None,
     num_rows: jax.Array,
 ) -> FwdSchedule:
   """Per-sequence q blocks attending a paged KV cache.
@@ -466,7 +467,9 @@ def make_paged_fwd_schedule(
   The q side is make_per_seq_fwd_schedule's. Sequence r's kv axis is its own
   [0, seqused_k[r]), read through its row of the flat (batch * pages_per_seq,)
   block_table_ref. Rows past cu_q[-1] get no q block; fwd_body zero-fills them
-  from packed_q_end.
+  from packed_q_end. left bounds the window below each sequence's own
+  bottom-right diagonal as on the per-seq schedule (None is unbounded); the
+  right edge is causal's 0 or unbounded.
   """
   num_kv_blocks = -(-(pages_per_seq * page_size) // bkv)
   pages_per_block = bkv // page_size
@@ -478,7 +481,7 @@ def make_paged_fwd_schedule(
       q_heads_per_kv_head=q_heads_per_kv_head,
       padded_total_q=padded_total_q,
       padded_total_k=num_kv_blocks * bkv,
-      bq=bq, bkv=bkv, left=None, right=0 if causal else None,
+      bq=bq, bkv=bkv, left=left, right=0 if causal else None,
       num_rows=num_rows,
   )
 
@@ -505,10 +508,20 @@ def make_paged_fwd_schedule(
     # Note (david): kv_len == 0 still gets one kv block, as on the per-seq
     # schedule; its page DMAs clip to zero tokens.
     hi = jnp.clip((kv_end - 1) // bkv, 0, num_kv_blocks - 1)
+    if left is None:
+      lo = jnp.int32(0)
+    else:
+      # Note (david): as on the per-seq schedule, the left edge starts from the
+      # clamped window's first own row, whose output the packed write keeps;
+      # the paged kv grid starts at token 0.
+      first_kept_q = jnp.maximum(q_start, q_window_start)
+      kv_lo_token = jnp.maximum(
+          kv_start, first_kept_q + bottom_right_offset - left)
+      lo = jnp.clip(kv_lo_token // bkv, 0, hi)
     ctx = PerSeqIntervals(
         q_start, q_end, kv_start, kv_end, bottom_right_offset,
         q_window_start, kv_start, seq_idx, kv_used_end)
-    return jnp.int32(0), hi, ctx
+    return lo, hi, ctx
 
   def _kv_page(seq_idx, kv, page):
     # Note (david): a lookup past the row's last page clamps into the row; its

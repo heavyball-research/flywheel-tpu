@@ -17,8 +17,11 @@ INTERPRET = jax.default_backend() != "tpu"
 
 
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
-                     window_size=(-1, -1)):
-  """(out, lse) of one decode step over the mapped contiguous cache rows."""
+                     window_size=(-1, -1), softcap=0.0):
+  """(out, lse) of one decode step over the mapped contiguous cache rows.
+
+  softcap > 0 caps the scaled scores at tanh(s / softcap) * softcap.
+  """
   scale = 1.0 / math.sqrt(q.shape[-1])
   keys = k_cache[cache_batch_idx].astype(jnp.float32)
   values = v_cache[cache_batch_idx].astype(jnp.float32)
@@ -30,10 +33,16 @@ def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
   # one visible key the lse is a single dot product, the error has a std of
   # 1.6e-3 at head_dim 128 or 256, and it passes the lse tolerance below for
   # 1-2% of the elements, whatever the kernel does.
+  # With a softcap the folded scale is softmax_scale / softcap, so the raw dot
+  # product is already s / softcap.
   q_scaled = (
-      q.astype(jnp.float32) * fused_q_scale(scale, 0.0)).astype(q.dtype)
-  scores = math.log(2.0) * jnp.einsum(
+      q.astype(jnp.float32) * fused_q_scale(scale, softcap)).astype(q.dtype)
+  raw_scores = jnp.einsum(
       "bqhd,bkhd->bhqk", q_scaled.astype(jnp.float32), keys)
+  if softcap:
+    scores = jnp.tanh(raw_scores) * softcap
+  else:
+    scores = math.log(2.0) * raw_scores
   key_positions = jnp.arange(k_cache.shape[1])[None, :]
   query_positions = (cache_seqlens - 1)[:, None]
   left, right = window_size
@@ -53,9 +62,10 @@ def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
 
 def assert_decode_matches(out, lse, q, k_cache, v_cache, total_seqlens,
                           cache_batch_idx, window_size=(-1, -1),
-                          out_tol=(2e-2, 3e-2)):
+                          out_tol=(2e-2, 3e-2), softcap=0.0):
   out_ref, lse_ref = decode_reference(
-      q, k_cache, v_cache, total_seqlens, cache_batch_idx, window_size)
+      q, k_cache, v_cache, total_seqlens, cache_batch_idx, window_size,
+      softcap)
   np.testing.assert_allclose(
       out.astype(jnp.float32), out_ref.astype(jnp.float32),
       rtol=out_tol[0], atol=out_tol[1])
@@ -212,6 +222,80 @@ def test_flash_attn_with_kvcache_matches_reference(
   np.testing.assert_array_equal(updated_v, expected_v)
   assert_decode_matches(out, lse, q, expected_k, expected_v, total_seqlens,
                         cache_batch_idx, window_size)
+
+
+def assert_softcap_changes_reference(q, k_cache, v_cache, total_seqlens,
+                                     rows, window_size, softcap):
+  """Fail unless the cap moves the reference lse by SOFTCAP_MIN_LSE_SHIFT."""
+  _, capped_lse = decode_reference(
+      q, k_cache, v_cache, total_seqlens, rows, window_size, softcap)
+  _, uncapped_lse = decode_reference(
+      q, k_cache, v_cache, total_seqlens, rows, window_size)
+  finite = jnp.isfinite(capped_lse)
+  assert (float(jnp.max(jnp.abs(capped_lse - uncapped_lse)[finite]))
+          > SOFTCAP_MIN_LSE_SHIFT)
+
+
+# Note (david): random bf16 q and k give scaled scores of std 1, which a cap of
+# 30 or 50 barely bends, so the softcap tests lift q by SOFTCAP_Q_GAIN (exact
+# in bf16) to put the scores in the cap's curved range.
+SOFTCAP_Q_GAIN = 8.0
+# Note (david): 30x the lse atol, so a kernel that drops the cap fails by far
+# more than rounding.
+SOFTCAP_MIN_LSE_SHIFT = 0.1
+
+
+@pytest.mark.parametrize(
+    ("head_dim", "num_query_heads", "num_kv_heads", "append", "window_size",
+     "softcap"),
+    [
+        # Note (david): two KV heads with at most 4 query heads each score a
+        # bitcast head pair per fragment under the parity mask.
+        (128, 2, 2, True, (-1, -1), 30.0),
+        (128, 8, 2, True, (-1, -1), 50.0),
+        (64, 4, 2, False, (-1, -1), 5.0),
+        # Note (david): 8 query heads per KV head unpack one head per fragment.
+        (256, 16, 2, True, (3, 0), 5.0),
+        (128, 16, 2, False, (300, 0), 30.0),
+        # Note (david): one KV head stages head-major.
+        (128, 8, 1, True, (-1, -1), 50.0),
+        (64, 4, 1, False, (40, 0), 5.0),
+        (256, 8, 8, True, (-1, -1), 30.0),
+    ],
+)
+def test_flash_attn_with_kvcache_softcap_matches_reference(
+    head_dim, num_query_heads, num_kv_heads, append, window_size, softcap):
+  # Note (david): a 2048-token row spans two 1024-token blocks, so the cap
+  # also runs through the cross-block softmax state.
+  capacity = 2048
+  q, k_cache, v_cache, k, v = random_decode_inputs(
+      head_dim + num_query_heads + int(softcap), 3, 3, capacity,
+      num_query_heads, num_kv_heads, head_dim)
+  q = q * SOFTCAP_Q_GAIN
+  cache_batch_idx = jnp.array([2, 0, 1], jnp.int32)
+  kwargs = dict(cache_batch_idx=cache_batch_idx, window_size=window_size,
+                softcap=softcap, return_softmax_lse=True,
+                interpret=INTERPRET)
+  if append:
+    cache_seqlens = jnp.array([5, 1100, capacity - 1], jnp.int32)
+    out, lse, updated_k, updated_v = decode_with_cache_copies(
+        q, k_cache, v_cache, k, v, cache_seqlens=cache_seqlens, **kwargs)
+    expected_k = k_cache.at[cache_batch_idx, cache_seqlens].set(k[:, 0])
+    expected_v = v_cache.at[cache_batch_idx, cache_seqlens].set(v[:, 0])
+    total_seqlens = cache_seqlens + 1
+  else:
+    cache_seqlens = jnp.array([0, 1100, capacity], jnp.int32)
+    out, lse, updated_k, updated_v = decode_with_cache_copies(
+        q, k_cache, v_cache, cache_seqlens=cache_seqlens, **kwargs)
+    expected_k, expected_v = k_cache, v_cache
+    total_seqlens = cache_seqlens
+  np.testing.assert_array_equal(updated_k, expected_k)
+  np.testing.assert_array_equal(updated_v, expected_v)
+  assert_softcap_changes_reference(
+      q, expected_k, expected_v, total_seqlens, cache_batch_idx, window_size,
+      softcap)
+  assert_decode_matches(out, lse, q, expected_k, expected_v, total_seqlens,
+                        cache_batch_idx, window_size, softcap=softcap)
 
 
 def test_flash_attn_with_kvcache_recovers_when_later_block_changes_anchor():

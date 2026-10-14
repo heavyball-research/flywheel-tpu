@@ -8,6 +8,8 @@ import pytest
 from flywheel_tpu import flash_attn_with_kvcache
 from tests.test_flash_attn_kvcache import (
     INTERPRET,
+    SOFTCAP_Q_GAIN,
+    assert_softcap_changes_reference,
     decode_reference,
     gather_pages,
     interleave_kv,
@@ -19,11 +21,11 @@ PAGE_SIZE = 128
 
 
 def assert_matches_reference(out, lse, q, k_cache, v_cache, total_seqlens,
-                             rows, window_size=(-1, -1)):
+                             rows, window_size=(-1, -1), softcap=0.0):
   # Note (david): the wrapper rounds the scaled q to bf16, so a one-key row's
   # lse, a raw score, can be off by a few 1e-3 in absolute terms.
   out_ref, lse_ref = decode_reference(
-      q, k_cache, v_cache, total_seqlens, rows, window_size)
+      q, k_cache, v_cache, total_seqlens, rows, window_size, softcap)
   np.testing.assert_allclose(out.astype(jnp.float32),
                              out_ref.astype(jnp.float32), rtol=2e-2, atol=3e-2)
   if lse is not None:
@@ -35,13 +37,14 @@ def assert_matches_reference(out, lse, q, k_cache, v_cache, total_seqlens,
 
 def run_interleaved_decode(num_query_heads, num_kv_heads, head_dim, capacity,
                            append, return_lse, window_size=(-1, -1),
-                           num_active=None, seed=0):
+                           num_active=None, seed=0, softcap=0.0, q_gain=1.0):
   """Decode once on the interleaved pool; returns (out, lse, updated pool,
   expected pool, q, gathered expected K, gathered expected V, total lengths,
   active rows)."""
   q, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
       seed, BATCH, capacity, PAGE_SIZE, num_query_heads, num_kv_heads,
       head_dim)
+  q = q * q_gain
   # Note (david): a mid-page row, a page boundary, an empty row, the last
   # slot, a block-crossing row and a long row.
   cache_seqlens = jnp.array(
@@ -63,7 +66,7 @@ def run_interleaved_decode(num_query_heads, num_kv_heads, head_dim, capacity,
   pointer = pool.unsafe_buffer_pointer()
   outputs = flash_attn_with_kvcache(
       q, pool, None, k, v, cache_seqlens=cache_seqlens,
-      block_table=block_table, window_size=window_size,
+      block_table=block_table, window_size=window_size, softcap=softcap,
       num_active=None if num_active is None else jnp.int32(num_active),
       return_softmax_lse=return_lse, interpret=INTERPRET)
   if return_lse:
@@ -139,3 +142,35 @@ def test_interleaved_decode_window_and_padding_rows(
   np.testing.assert_array_equal(updated, expected_pool)
   assert_matches_reference(out, lse, q, expected_k, expected_v, total_seqlens,
                            rows, window_size)
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "head_dim", "capacity", "append",
+     "return_lse", "window_size", "num_active", "softcap"),
+    [
+        (32, 8, 128, 512, True, True, (-1, -1), None, 30.0),
+        # Note (david): two blocks of whole pages, as above.
+        (32, 8, 256, 2048, True, True, (-1, -1), None, 50.0),
+        (16, 4, 128, 2048, False, True, (300, 0), None, 5.0),
+        # Note (david): 4 query heads per KV head group two KV heads into one
+        # 8-row tile, whose per-head scores are merged before the cap.
+        (8, 2, 64, 512, True, True, (-1, -1), 4, 5.0),
+        (32, 32, 128, 512, True, False, (5, 0), None, 30.0),
+        (8, 1, 128, 512, True, True, (-1, -1), 2, 50.0),
+        (12, 3, 256, 512, False, True, (200, 0), None, 30.0),
+    ],
+)
+def test_interleaved_decode_softcap_matches_reference(
+    num_query_heads, num_kv_heads, head_dim, capacity, append, return_lse,
+    window_size, num_active, softcap):
+  (out, lse, updated, expected_pool, q, expected_k, expected_v, total_seqlens,
+   rows) = run_interleaved_decode(
+       num_query_heads, num_kv_heads, head_dim, capacity, append, return_lse,
+       window_size=window_size, num_active=num_active,
+       seed=num_query_heads + head_dim + int(softcap), softcap=softcap,
+       q_gain=SOFTCAP_Q_GAIN)
+  np.testing.assert_array_equal(updated, expected_pool)
+  assert_softcap_changes_reference(
+      q, expected_k, expected_v, total_seqlens, rows, window_size, softcap)
+  assert_matches_reference(out, lse, q, expected_k, expected_v, total_seqlens,
+                           rows, window_size, softcap)
