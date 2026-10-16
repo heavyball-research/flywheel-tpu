@@ -160,29 +160,63 @@ def test_flash_attn_window_size(seqlen, causal, window_size):
 
 
 def test_flash_attn_window_size_crosses_kv_compute_tiles():
-    # Note (david): one 768-token block split into two kv compute tiles, and a
-    # right bound reaching across them takes the fragment-skip path that a
-    # causal diagonal never reaches. The window block cap never builds this
-    # tiling, so the blocks are pinned.
+    # Note (david): seqlen 768 splits kv into two compute tiles, and a right
+    # bound reaching across them ends each q tile's band past the diagonal,
+    # where a causal plan never ends one.
     q, k, v = random_qkv(0, 1, 768, 2, 2, 64, jnp.bfloat16)
-    kernel = make_flash_attn_mha(
-        2, 768, 768, causal=False, window=(0, 400),
-        block_sizes=BlockSizes(block_q=768, block_kv=768, block_kv_compute=384,
-                               block_q_compute=256),
-        num_kv_heads=2, interpret=INTERPRET)
-    out = run_head_major_kernel(kernel, q, k, v)
-    assert_close_to_reference(out, q, k, v, causal=False, window_size=(0, 400),
-                              softmax_scale=1.0)
+    out = flash_attn_func(
+        q, k, v, causal=False, window_size=(0, 400), interpret=INTERPRET)
+    assert_close_to_reference(out, q, k, v, causal=False, window_size=(0, 400))
 
 
-@pytest.mark.parametrize("seqlens,expected", [
-    ((16384, 16384), (512, 512, 256, 512)),
-    ((768, 768), (256, 256, 128, 256)),
-    ((384, 384), (384, 384, 128, 384)),
-    ((16384, 16384, 4096, 100), (128, 512, 64, 512)),
+@pytest.mark.parametrize("block_sizes", [
+    (256, 256, 128, 128), (512, 256, 128, 128), (512, 512, 256, 128)])
+@pytest.mark.parametrize("seqlen_q,causal,window_size", [
+    (1024, True, (100, 0)),
+    (1024, True, (700, 0)),
+    (1024, False, (300, -1)),
+    (1024, False, (300, 50)),
+    (512, True, (300, 0)),
 ])
-def test_window_caps_default_blocks(seqlens, expected):
-    blocks = flash_attn_interface.default_block_sizes(*seqlens, has_window=True)
+def test_flash_attn_window_band_copies(block_sizes, seqlen_q, causal,
+                                       window_size):
+    # Note (david): pinned blocks with bq % bkv == 0 run the static band copies
+    # over several block offsets: a window narrower and one wider than a block,
+    # left-only and two-sided bands, and a bottom-right offset.
+    seqlen_kv = 1024
+    left, right = window_size
+    if causal:
+        window = (left, 0)
+    elif right == -1:
+        window = (left, None)
+    else:
+        window = (left, right)
+    q, k, v = random_qkv(0, 1, seqlen_q, 2, 1, 128, jnp.bfloat16,
+                         seqlen_kv=seqlen_kv)
+    block_q, block_kv, block_q_compute, block_kv_compute = block_sizes
+    kernel = make_flash_attn_mha(
+        2, seqlen_q, seqlen_kv, causal=causal,
+        causal_offset=seqlen_kv - seqlen_q, window=window,
+        block_sizes=BlockSizes(block_q=block_q, block_kv=block_kv,
+                               block_q_compute=block_q_compute,
+                               block_kv_compute=block_kv_compute),
+        num_kv_heads=1, interpret=INTERPRET)
+    out = run_head_major_kernel(kernel, q, k, v)
+    assert_close_to_reference(out, q, k, v, causal=causal,
+                              window_size=window_size, softmax_scale=1.0)
+
+
+@pytest.mark.parametrize("seqlens,window_size,head_dim,expected", [
+    ((16384, 16384), (1023, 0), 256, (2048, 2048, 256, 256)),
+    ((16384, 16384), (4095, 0), 256, (2048, 2048, 256, 512)),
+    ((16384, 16384), (4095, 0), 128, (2048, 2048, 256, 256)),
+    ((768, 768), (100, 0), 128, (768, 768, 256, 256)),
+    ((16384, 16384), (-1, 50), 128, (1024, 1024, 256, 512)),
+    ((16384, 16384, 4096, 100), (1023, 0), 128, (128, 1024, 64, 512)),
+])
+def test_window_default_blocks(seqlens, window_size, head_dim, expected):
+    blocks = flash_attn_interface.default_block_sizes(
+        *seqlens, window_size=window_size, head_dim=head_dim)
     assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
             blocks.block_kv_compute) == expected
 

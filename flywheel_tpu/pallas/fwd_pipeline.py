@@ -34,7 +34,7 @@ from .copy_utils import (
   load_staged_words,
   staged_words,
 )
-from .loop_schedule import FwdSchedule
+from .loop_schedule import FwdSchedule, window_fragment_plans
 from .mask import apply_packed_bounds_mask
 from .rotary import ROTARY_DIM_MULTIPLE, rotate_tile
 
@@ -194,14 +194,22 @@ def fwd_body(
   group_bq = gqa_fold * bq
   frag_rows = gqa_fold * bq_compute
   token_tile_shape = (bq_compute, bkv_compute)
-  # Note (david): fragment skipping assumes the diagonal sits at qi == kv with
-  # bq == bkv (zero-offset square causal, or no mask). Any other window masks
-  # every fragment of a partial block, which costs compute, never correctness.
-  # A runtime causal_offset is a traced scalar, so the isinstance keeps it off.
-  can_skip_fragments = (
-      window[0] is None and window[1] in (0, None)
-      and isinstance(causal_offset, int) and causal_offset == 0 and bq == bkv
-  )
+  # Note (david): a partial block of a dense window (causal included) masks
+  # every fragment of the generic copy, about as many VPU ops as the softmax.
+  # Under bq % bkv == 0 and a static offset its fragment flags are static per
+  # block offset, so each offset runs its own branch-free copy over the band
+  # alone; runtime fragment flags measured 2x slower than masking everything,
+  # since a branch per fragment breaks the QK/PV overlap. Any other build
+  # masks every fragment of a partial block, which costs compute, never
+  # correctness. A runtime causal_offset is a traced scalar, so the isinstance
+  # keeps it off.
+  if (has_static_mask and not is_per_seq
+      and isinstance(causal_offset, int) and bq % bkv == 0):
+    window_plans = window_fragment_plans(
+        bq=bq, bkv=bkv, bq_compute=bq_compute, bkv_compute=bkv_compute,
+        left=window[0], right=window[1], causal_offset=causal_offset)
+  else:
+    window_plans = None
   # Note (david): a paged q block's frontier is a runtime scalar, so its masked
   # blocks skip each kv compute tile past the frontier of the q tile's last row.
   # Unmasked blocks lie below every row's frontier and skip nothing.
@@ -700,8 +708,10 @@ def fwd_body(
 
     def _online_softmax(
         g, kv_compute_index, q_compute_index, logits, needs_mask,
-        guard_recovery, apply_bounds,
+        guard_recovery, apply_bounds, window_fragment=None,
     ):
+      """window_fragment is the fragment's static plan entry on a window
+      block copy, None on the generic copies."""
       head_rows = pl.ds(g * group_bq, group_bq)
       new_parity, old_parity = _head_parities(g)
       row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
@@ -717,7 +727,13 @@ def fwd_body(
       state_shape = row_max_scratch_g[slice_q, :].shape
       frag_row_max = lax.broadcast_in_dim(
           scores.max(axis=-1), state_shape, (0,))
-      is_row_start = jnp.logical_and(is_first, kv_compute_index == 0)
+      if window_fragment is None:
+        is_row_start = jnp.logical_and(is_first, kv_compute_index == 0)
+      else:
+        # Note (david): a band clipped at kv 0 starts at the row's first block.
+        is_row_start = jnp.logical_or(
+            window_fragment.starts_band,
+            jnp.logical_and(is_first, kv_compute_index == 0))
       row_max_prev = row_max_scratch_g[slice_q, :]
       if defers_row_start:
         # Note (david): a row whose fragments so far all lay before its window
@@ -785,6 +801,8 @@ def fwd_body(
               is_block_last_tile,
               jnp.logical_not(
                   _is_kv_tile_live(kv_compute_index + 1, q_compute_index)))
+        elif window_fragment is not None:
+          is_last_kv_tile = window_fragment.checks_guard
         else:
           is_last_kv_tile = is_block_last_tile
         has_overflow_risk = jnp.any(
@@ -853,11 +871,30 @@ def fwd_body(
         )[..., :o_scratch.shape[-1]] * o_read
       o_new_ref[tile_index] = jnp.where(is_row_start, o_curr, o_prev + o_curr)
 
-    def _run_schedule(is_causal, guard_recovery, static_g, apply_bounds):
+    def _run_schedule(is_causal, guard_recovery, static_g, apply_bounds,
+                      window_fragments=None):
       # Note (david): static_g None is the fast path, one distance-1 pipeline
       # across every folded head so head g + 1's first QK overlaps head g's
       # last PV. An int static_g is the rare per-head overflow replay, kept
       # simple on purpose.
+      if window_fragments is not None:
+        heads = range(head_fold) if static_g is None else (static_g,)
+        pending_pv = None
+        for g in heads:
+          for fragment in window_fragments:
+            logits = _qk(g, fragment.kv_tile, fragment.q_tile)
+            probs, is_row_start, rescale = _online_softmax(
+                g, fragment.kv_tile, fragment.q_tile, logits,
+                fragment.needs_mask, guard_recovery=guard_recovery,
+                apply_bounds=False, window_fragment=fragment,
+            )
+            if pending_pv is not None:
+              _pv(*pending_pv)
+            pending_pv = (g, fragment.kv_tile, fragment.q_tile, probs,
+                          is_row_start, rescale)
+        _pv(*pending_pv)
+        return
+
       if static_g is None:
         num_fragments = head_fold * num_compute_tiles
 
@@ -892,24 +929,13 @@ def fwd_body(
         current_g, current_k, current_q = _fragment_coords(frag_idx)
         if skips_past_frontier and apply_bounds:
           is_active = _is_kv_tile_live(current_k, current_q)
-        elif not can_skip_fragments:
-          is_active = True
         else:
-          is_below_diagonal = (
-              (current_q + 1) * bq_compute > current_k * bkv_compute)
-          is_active = jnp.logical_or(not is_causal, is_below_diagonal)
+          is_active = True
 
         def _process_active(_):
-          if can_skip_fragments:
-            needs_mask = jnp.logical_and(
-                is_causal,
-                current_q * bq_compute < (current_k + 1) * bkv_compute,
-            )
-          else:
-            needs_mask = is_causal
           logits = _qk(_resolve_g(current_g), current_k, current_q)
           probs_curr, is_row_start_curr, rescale_curr = _online_softmax(
-              _resolve_g(current_g), current_k, current_q, logits, needs_mask,
+              _resolve_g(current_g), current_k, current_q, logits, is_causal,
               guard_recovery=guard_recovery, apply_bounds=apply_bounds,
           )
           _pv(
@@ -935,7 +961,7 @@ def fwd_body(
           rescale_last,
       )
 
-    def _run_group(is_causal, apply_bounds):
+    def _run_group(is_causal, apply_bounds, window_fragments=None):
       if is_lane_paired:
         # Note (david): one static-g pipeline per head, since the fused
         # pipeline's loop-carried g would make the 64-lane window offsets
@@ -943,12 +969,12 @@ def fwd_body(
         for g in range(head_fold):
           _run_schedule(
               is_causal, guard_recovery=False, static_g=g,
-              apply_bounds=apply_bounds,
+              apply_bounds=apply_bounds, window_fragments=window_fragments,
           )
       else:
         _run_schedule(
             is_causal, guard_recovery=False, static_g=None,
-            apply_bounds=apply_bounds,
+            apply_bounds=apply_bounds, window_fragments=window_fragments,
         )
 
       for g in range(head_fold):
@@ -956,16 +982,17 @@ def fwd_body(
         def _recover(g=g):
           _run_schedule(
               is_causal, guard_recovery=True, static_g=g,
-              apply_bounds=apply_bounds,
+              apply_bounds=apply_bounds, window_fragments=window_fragments,
           )
 
-    # Note (david): two static copies of the fragment pipeline, one mask-free
-    # and one applying every mask the build has, because the masks cost about
-    # as many VPU ops as the softmax itself. One copy per (causal, bounds) pair
-    # measured 2.6x slower at block 2048. A build carries either the static
-    # window (dense) or the per-seq bounds (varlen), never both, and
-    # has_static_mask still gates the former so a full-attention build never
-    # loses its upper triangle.
+    # Note (david): a mask-free copy of the fragment pipeline and masked ones,
+    # because the masks cost about as many VPU ops as the softmax itself: one
+    # per partial-block offset under window_plans, else one applying every
+    # mask the build has. One copy per (causal, bounds) pair measured 2.6x
+    # slower at block 2048. A build carries either the static window (dense)
+    # or the per-seq bounds (varlen), never both, and has_static_mask still
+    # gates the former so a full-attention build never loses its upper
+    # triangle.
     if is_per_seq:
       needs_any_mask = jnp.logical_or(is_partial, needs_bounds)
     else:
@@ -974,22 +1001,29 @@ def fwd_body(
       is_selected = (
           needs_any_mask if is_masked else jnp.logical_not(needs_any_mask))
 
-      @pl.when(is_selected)
-      def _run_block(is_masked=is_masked):
-        if is_masked and is_per_seq:
-          # Note (david): synthesize the bounds rows once for the whole (1, bkv)
-          # kv window; evaluated per fragment they spilled vector registers the
-          # MXU then waited on (+13.4% on a 2048/256 prefill).
-          staged_bounds = bounds_buf.at[0]
-          k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
-          q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
-          staged_bounds[0:1, :] = q_lower
-          if schedule.has_q_span:
-            staged_bounds[1:2, :] = q_span
-        _run_group(
-            is_causal=is_masked and has_static_mask,
-            apply_bounds=is_masked and is_per_seq,
-        )
+      if is_masked and window_plans is not None:
+        for block_offset, fragments in window_plans.items():
+          @pl.when(jnp.logical_and(is_selected, kv_tok - q_tok == block_offset))
+          def _run_window_block(fragments=fragments):
+            _run_group(
+                is_causal=True, apply_bounds=False, window_fragments=fragments)
+      else:
+        @pl.when(is_selected)
+        def _run_block(is_masked=is_masked):
+          if is_masked and is_per_seq:
+            # Note (david): synthesize the bounds rows once for the whole
+            # (1, bkv) kv window; evaluated per fragment they spilled vector
+            # registers the MXU then waited on (+13.4% on a 2048/256 prefill).
+            staged_bounds = bounds_buf.at[0]
+            k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
+            q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
+            staged_bounds[0:1, :] = q_lower
+            if schedule.has_q_span:
+              staged_bounds[1:2, :] = q_span
+          _run_group(
+              is_causal=is_masked and has_static_mask,
+              apply_bounds=is_masked and is_per_seq,
+          )
 
     def _stage_gqa_folded_lse(row_sum_ref):
       # Note (david): lse is row_max + log2(row_sum) as below. Every lane of a

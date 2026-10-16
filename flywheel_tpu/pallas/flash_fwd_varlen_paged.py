@@ -21,7 +21,6 @@ from .block_sizes import (
   LOG2E,
   NUM_LANES,
   NUM_SUBLANES,
-  WINDOW_BLOCK,
   BlockSizes,
   PagedKVInfo,
   next_pow2,
@@ -65,6 +64,11 @@ MAX_FRAGMENT_ROWS = 1024
 # 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
 # 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
+# Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
+# dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
+# by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
+# 4096 but cost 13% at W 1024, so the cap stays at 512.
+PAGED_WINDOW_BLOCK = 512
 
 
 def flash_fwd_varlen_paged_kernel(
@@ -203,13 +207,13 @@ def resolve_paged_tiles(
   one that streams the longest sequence's kv prefix the fewest times, then the
   smaller q block, then the larger kv block. The q compute tile keeps a
   fragment within MAX_FRAGMENT_ROWS rows. has_window caps both blocks at
-  WINDOW_BLOCK tokens, and block_kv at no less than one page. A pinned
+  PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page. A pinned
   block_sizes is only checked against the budget.
   """
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
   else:
-    block_cap = WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
+    block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
     # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
     # five or three pages (1920 tokens), where no power-of-two block ends on a
     # page edge; smaller kv blocks halve the page count.

@@ -22,6 +22,7 @@ from flywheel_tpu.pallas.loop_schedule import (
     make_paged_fwd_schedule,
     make_per_seq_fwd_schedule,
     per_seq_qblk_prefix,
+    window_fragment_plans,
 )
 
 # The per-seq windows sit on the bf16 HBM tile of the chip the tests run on: 8
@@ -118,6 +119,70 @@ def test_dense_fwd_schedule_matches_the_mask(case):
       seqlen_q=seq_q, seqlen_kv=seq_kv, bq=bq, bkv=bkv,
       left=left, right=right, offset=offset)
   assert replay_dense_fwd(params, fold) == expected
+
+
+FRAGMENT_PLAN_CASES = [
+    # (seq_q, seq_kv, bq, bkv, bq_compute, bkv_compute, left, right, offset)
+    (2048, 2048, 512, 512, 256, 128, None, 0, 0),
+    (2048, 2048, 1024, 512, 256, 256, None, 0, 0),
+    (1024, 2048, 512, 512, 128, 256, None, 0, 1024),
+    (1536, 2048, 512, 512, 128, 128, None, 0, 512),
+    (2048, 2048, 512, 512, 128, 128, 300, 0, 0),
+    (2048, 2048, 512, 256, 128, 128, 700, 0, 0),
+    (2048, 2048, 512, 512, 256, 256, 1500, 0, 0),
+    (2048, 2048, 512, 512, 128, 128, 300, None, 0),
+    (2048, 2048, 512, 512, 128, 128, None, 100, 0),
+    (2048, 2048, 512, 512, 128, 128, 200, 50, 0),
+]
+
+
+@pytest.mark.parametrize("case", FRAGMENT_PLAN_CASES)
+def test_window_fragment_plans_cover_the_dense_schedule(case):
+  # Note (david): fwd_body runs a partial block only through the plan of its
+  # offset, so a missing offset or fragment would drop work silently, and a
+  # q tile must keep its tile 0 in every block after its row starts to carry
+  # the row state across the parity flip.
+  seq_q, seq_kv, bq, bkv, bq_compute, bkv_compute, left, right, offset = case
+  num_q_tiles, num_kv_tiles = bq // bq_compute, bkv // bkv_compute
+  mask = static_mask(seq_q, seq_kv, left, right, offset)
+  plans = window_fragment_plans(
+      bq=bq, bkv=bkv, bq_compute=bq_compute, bkv_compute=bkv_compute,
+      left=left, right=right, causal_offset=offset)
+  params = dense_fwd_params(
+      num_q_heads=1, head_fold=1, q_heads_per_kv_head=1, seqlen_q=seq_q,
+      seqlen_kv=seq_kv, bq=bq, bkv=bkv, left=left, right=right, offset=offset)
+  sched = make_dense_fwd_schedule(params)
+  for si in range(sched.num_rows):
+    lo, hi, ctx = sched.row_interval(np.int32(si))
+    qi = sched.first_row + si
+    started = set()
+    for kv in range(int(lo), int(hi) + 1):
+      tiles = mask[qi * bq:(qi + 1) * bq, kv * bkv:(kv + 1) * bkv].reshape(
+          num_q_tiles, bq_compute, num_kv_tiles, bkv_compute)
+      is_visible = tiles.any(axis=(1, 3))
+      is_full = tiles.all(axis=(1, 3))
+      is_partial, _ = sched.block_flags(np.int32(si), np.int32(kv), ctx)
+      if is_partial:
+        plan = plans[kv * bkv - qi * bq]
+        fragments = {(f.q_tile, f.kv_tile): f for f in plan}
+        for q_tile in range(num_q_tiles):
+          tile_fragments = [f for f in plan if f.q_tile == q_tile]
+          if q_tile in started:
+            assert (q_tile, 0) in fragments, (qi, kv, q_tile)
+          for kv_tile in range(num_kv_tiles):
+            fragment = fragments.get((q_tile, kv_tile))
+            if is_visible[q_tile, kv_tile]:
+              assert fragment.needs_mask == (not is_full[q_tile, kv_tile])
+              if q_tile not in started:
+                assert fragment.starts_band or (kv == lo and kv_tile == 0)
+                started.add(q_tile)
+            else:
+              assert fragment is None or q_tile in started, (qi, kv, q_tile)
+          if tile_fragments:
+            assert tile_fragments[-1].checks_guard, (qi, kv, q_tile)
+      else:
+        assert is_full.all(), (qi, kv)
+        started.update(range(num_q_tiles))
 
 
 class PerSeqRow(NamedTuple):

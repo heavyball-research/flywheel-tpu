@@ -18,7 +18,6 @@ from .pallas.block_sizes import (
   LOG2E,
   NUM_LANES,
   PAIRED_HEAD_DIM,
-  WINDOW_BLOCK,
   BlockSizes,
   QKVLayout,
   TokenMajorInfo,
@@ -38,6 +37,22 @@ from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # decode kernel descriptor-bound.
 PAGE_SIZE_MULTIPLE = 128
+# Note (david): a packed (or right-only) window caps both physical forward
+# blocks. A q block row loads the window plus bq + bkv keys of partial blocks,
+# all through the masked fragment pipeline, so large blocks waste about
+# (bq + bkv) / W, and small ones pay a pipeline step per few fragments. On v6e
+# varlen 16K prefill (2 x 8K, 16:8 heads of 256, 32:8 of 128, W 1024 and
+# 4096), 1024 beat 512 by 1.25-1.64x and 2048 by up to 1.44x, except at W 4096,
+# where 2048 was 2-7% faster.
+WINDOW_BLOCK = 1024
+# Note (david): a dense window with a left bound runs fwd_pipeline's static
+# band copies, which skip and mask per compute tile, so its blocks stay at the
+# full-attention size. On v6e dense 16K causal prefill (16:8 heads of 256,
+# 32:8 of 128, W 128-4096), 2048 blocks with 256-key kv tiles beat 512-key ones
+# by 7-26%, while 128-key tiles fell off a code-size cliff (5.5-12.7 ms at
+# W 512). A d256 window wider than a block pair runs the 64-fragment mask-free
+# copy, which ran 9.63 ms at 256-key tiles (W 4096) against 1.98 at 512.
+BAND_KV_COMPUTE_BLOCKS = (256, 128)
 # Note (david): seq is axis 1 of the token-major dense layout (batch, seq,
 # heads * head_dim) and axis 2 of both head-major ones, (batch, heads, seq,
 # head_dim) and heads-outer (heads, batch, seq, head_dim); tokens are axis 0 of
@@ -64,7 +79,8 @@ def default_block_sizes(
     max_seqlen: int | None = None,
     max_seqlen_q: int | None = None,
     *,
-    has_window: bool = False,
+    window_size: tuple[int, int] = (-1, -1),
+    head_dim: int = NUM_LANES,
 ) -> BlockSizes:
   # Note (david): the kernel masks in absolute coordinates, so block_q and
   # block_kv come from their own axes. Chunked-prefill q chunks are far shorter
@@ -72,24 +88,35 @@ def default_block_sizes(
   # sequences and leaves the block-diagonal schedule little to skip, so
   # max_seqlen_q caps the q axis on its own.
   seq_q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
-  if has_window:
-    q_cap = WINDOW_BLOCK if seq_q_cap is None else min(seq_q_cap, WINDOW_BLOCK)
-    kv_cap = (WINDOW_BLOCK if max_seqlen is None
-              else min(max_seqlen, WINDOW_BLOCK))
+  is_dense_band = max_seqlen is None and window_size[0] != -1
+  if is_dense_band:
+    # Note (david): the band copies need bq % bkv == 0.
+    block_q = default_block(q_seqlen, FWD_BLOCKS)
+    block_kv = default_block(kv_seqlen, FWD_BLOCKS, block_q)
+  elif window_size != (-1, -1):
+    block_q = default_block(
+        q_seqlen, FWD_BLOCKS,
+        WINDOW_BLOCK if seq_q_cap is None else min(seq_q_cap, WINDOW_BLOCK))
+    block_kv = default_block(
+        kv_seqlen, FWD_BLOCKS,
+        WINDOW_BLOCK if max_seqlen is None else min(max_seqlen, WINDOW_BLOCK))
   else:
-    q_cap = seq_q_cap
-    kv_cap = max_seqlen
-  block_q = default_block(q_seqlen, FWD_BLOCKS, q_cap)
-  block_kv = default_block(kv_seqlen, FWD_BLOCKS, kv_cap)
+    block_q = default_block(q_seqlen, FWD_BLOCKS, seq_q_cap)
+    block_kv = default_block(kv_seqlen, FWD_BLOCKS, max_seqlen)
   q_compute_tile = pick_tile(FWD_Q_COMPUTE_BLOCKS, block_q)
   if block_q // q_compute_tile < MIN_Q_TILES_PER_BLOCK:
     block_q_compute = q_compute_tile // MIN_Q_TILES_PER_BLOCK
   else:
     block_q_compute = q_compute_tile
+  if is_dense_band and (head_dim <= NUM_LANES
+                        or window_size[0] < block_q + block_kv - 1):
+    kv_compute_blocks = BAND_KV_COMPUTE_BLOCKS
+  else:
+    kv_compute_blocks = FWD_KV_COMPUTE_BLOCKS
   return BlockSizes(
       block_q=block_q,
       block_kv=block_kv,
-      block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
+      block_kv_compute=pick_tile(kv_compute_blocks, block_kv),
       block_q_compute=block_q_compute,
   )
 
@@ -180,7 +207,7 @@ def get_kernel(
     if blocks_override is None:
       block_sizes = default_block_sizes(
           seqlen_q, seqlen_kv, varlen_max_seqlen_kv, varlen_max_seqlen_q,
-          has_window=has_window,
+          window_size=window_size, head_dim=head_dim,
       )
     else:
       # Note (david): the caller already padded both axes to multiples of these
