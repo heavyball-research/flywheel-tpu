@@ -98,6 +98,7 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.KDAConfig,
+    shadow_slot_ref: jax.Ref | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Pick each sequence's starting conv and recurrent state.
 
@@ -110,8 +111,9 @@ def load_and_select_states(
     [seq_tile_size, prev_kernel_size, dim_size] and the recurrent state
     [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
 
-    A replay tile reads each checkpoint straight from its ring slot, so for it
-    the slot of a sequence without an initial state is zeroed in place and
+    A replay tile reads each checkpoint straight from its ring slots (the f32
+    one in recurrent_slot_ref, its bf16 shadow in shadow_slot_ref), so for it
+    both slots of a sequence without an initial state are zeroed in place and
     None is returned for the recurrent state.
     """
     real_size_list = []
@@ -138,12 +140,13 @@ def load_and_select_states(
         real_size_list.append(r_size)
         conv_state_list.append(conv_state)
         if cfg.is_replay:
-            checkpoint_ref = recurrent_slot_ref.at[idx, 0]
+            checkpoint_refs = (recurrent_slot_ref.at[idx, 0],
+                               shadow_slot_ref.at[idx, 0])
 
             @pl.when(jnp.logical_not(has_initial_state))
-            def _zero_checkpoint():
-                checkpoint_ref[...] = jnp.zeros(checkpoint_ref.shape,
-                                                checkpoint_ref.dtype)
+            def _zero_checkpoint(checkpoint_refs=checkpoint_refs):
+                for ref in checkpoint_refs:
+                    ref[...] = jnp.zeros(ref.shape, ref.dtype)
 
             continue
 

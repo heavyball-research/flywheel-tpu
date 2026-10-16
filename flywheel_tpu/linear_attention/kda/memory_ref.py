@@ -343,17 +343,32 @@ def wait_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).wait()
 
 
+def reads_state(record: PackedPIdRecord, metadata_ref: MetadataRef,
+                only_flushing: bool) -> jax.Array:
+    """Whether the record's sequence fetches its initial state: on its first
+    tile, if it has one, and with only_flushing only if it flushes."""
+    s_idx = record.s_idx
+    should_read = jnp.logical_and(record.is_first_tile,
+                                  metadata_ref.s_idx_has_initial_state[s_idx])
+    if only_flushing:
+        should_read = jnp.logical_and(should_read,
+                                      metadata_ref.s_idx_to_flush[s_idx] != 0)
+    return should_read
+
+
 def start_state_in(hbm_ref: jax.Ref,
                    buf_ref: jax.Ref,
                    sem: jax.Ref,
                    p_id: int | jax.Array,
                    metadata_ref: MetadataRef,
                    cfg: config.KDAConfig,
-                   apply_read_offset: bool = True) -> None:
+                   apply_read_offset: bool = True,
+                   only_flushing: bool = False) -> None:
     """Fetch each sequence's initial checkpoint into window position 0.
 
     Only a sequence's first tile reads, and only if it has an initial state.
-    A replay checkpoint has a single slot, so it ignores the read offset.
+    A replay checkpoint has a single slot, so it ignores the read offset; its
+    f32 copy is read only by flushing sequences (only_flushing).
     """
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
@@ -361,9 +376,8 @@ def start_state_in(hbm_ref: jax.Ref,
         read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
         if apply_read_offset:
             read_slot += metadata_ref.s_idx_to_read_offset[s_idx]
-        has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
-        should_read = jnp.logical_and(record.is_first_tile, has_initial_state)
-        num_states = jnp.where(should_read, 1, 0)
+        num_states = jnp.where(
+            reads_state(record, metadata_ref, only_flushing), 1, 0)
         pltpu.make_async_copy(
             hbm_ref.at[pl.ds(read_slot, num_states)],
             buf_ref.at[idx, pl.ds(0, num_states)],
@@ -371,14 +385,17 @@ def start_state_in(hbm_ref: jax.Ref,
         ).start()
 
 
-def wait_state_in(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                  metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
+def wait_state_in(buf_ref: jax.Ref,
+                  sem: jax.Ref,
+                  p_id: int | jax.Array,
+                  metadata_ref: MetadataRef,
+                  cfg: config.KDAConfig,
+                  only_flushing: bool = False) -> None:
     num_states = 0
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
-        has_initial_state = metadata_ref.s_idx_has_initial_state[record.s_idx]
-        should_read = jnp.logical_and(record.is_first_tile, has_initial_state)
-        num_states += jnp.where(should_read, 1, 0)
+        num_states += jnp.where(
+            reads_state(record, metadata_ref, only_flushing), 1, 0)
     wait_row_dma(buf_ref, num_states, sem)
 
 

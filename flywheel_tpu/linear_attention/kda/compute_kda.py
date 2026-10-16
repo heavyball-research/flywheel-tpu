@@ -1081,6 +1081,7 @@ def replay_kda(
     num_records: jax.Array,
     records: jax.Array,
     checkpoint_ref: jax.Ref,
+    shadow_ref: jax.Ref,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.KDAConfig,
@@ -1092,8 +1093,9 @@ def replay_kda(
     [num_v_heads, window, kq_head_dim], b_rows [1, window, gate_lanes], and
     a_log and dt_bias [num_v_heads, 1, kq_head_dim]; rows from num_tokens on
     are padding. records is the [replay_window, record_dim] buffer whose first
-    num_records rows are committed, and checkpoint_ref the [num_v_heads,
-    kq_head_dim, v_head_dim] state before them. With G the per-key-channel
+    num_records rows are committed, checkpoint_ref the f32 [num_v_heads,
+    kq_head_dim, v_head_dim] state before them (read only by the flush thunk)
+    and shadow_ref its bf16 copy (read by the step). With G the per-key-channel
     cumulative log decay over the records and then the new tokens, the decayed
     state token t reads is
 
@@ -1166,8 +1168,12 @@ def replay_kda(
                                  axis=1)
 
     with profile_scope("replay_ckpt_read"):
-        ckpt_reads = batched_matmul(kq_decayed * jnp.exp(g_records_total),
-                                    checkpoint_ref[...].astype(compute))
+        # Note (david): a default-precision f32 dot rounds both operands to
+        # bf16 (round to nearest), so this dot on the bf16 shadow is bitwise
+        # the one on the f32 checkpoint (v6e).
+        ckpt_reads = batched_matmul(
+            (kq_decayed * jnp.exp(g_records_total)).astype(jnp.bfloat16),
+            shadow_ref[...])
 
     with profile_scope("replay_record_read"):
         record_coeffs = jax.lax.dot_general(

@@ -115,6 +115,7 @@ def main() -> None:
     results = {}
     for mode in MODES:
         conv, rec = conv0.copy(), rec0.copy()
+        shadow = rec0.astype(jnp.bfloat16)
         replay_lens = jnp.zeros((num_seqs, ), jnp.int32)
         record_dtype = jnp.bfloat16 if mode == "replay_bf16" else jnp.float32
         replay = jnp.zeros((num_slots, args.replay_window, record_dim),
@@ -131,8 +132,9 @@ def main() -> None:
                                                    recurrent_state=rec,
                                                    **common)
             else:
-                (conv, rec, replay), out = replay_fn(
-                    conv_state=conv, recurrent_state=rec, replay_state=replay,
+                (conv, rec, shadow, replay), out = replay_fn(
+                    conv_state=conv, recurrent_state=rec,
+                    recurrent_shadow=shadow, replay_state=replay,
                     replay_lens=replay_lens, replay_window=args.replay_window,
                     **common)
                 replay_lens = wrapper.next_replay_lens(

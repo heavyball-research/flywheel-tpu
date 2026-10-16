@@ -49,7 +49,9 @@ STREAM_CONV_OUT = 6
 STREAM_REC_OUT = 7
 STREAM_REPLAY_IN = 8
 STREAM_REPLAY_OUT = 9
-NUM_STREAMS = 10
+STREAM_SHADOW_IN = 10
+STREAM_SHADOW_OUT = 11
+NUM_STREAMS = 12
 
 
 class KDAMode(enum.StrEnum):
@@ -110,6 +112,16 @@ class KDAConfig:
     # checkpoint plus up to replay_window records of recent tokens and writes
     # the checkpoint only when the records would overflow. 0 turns it off.
     replay_window: int = 0
+    # Note (david): replay calls keep a bf16 shadow of the f32 recurrent
+    # checkpoint, bf16(checkpoint) in every slot. A replay decode reads only
+    # the shadow, the operand its default-precision dot rounds S to anyway,
+    # and the f32 checkpoint only to flush; whatever writes a checkpoint (a
+    # flush, a PER_SEQ sequence's last tile) writes its shadow too.
+    has_shadow: bool = False
+
+    def __post_init__(self):
+        assert self.has_shadow or not self.is_replay, (
+            "a replay decode reads the checkpoint through its shadow")
 
     @property
     def is_replay(self) -> bool:
@@ -233,6 +245,20 @@ class KDAConfig:
             replay_in_buf = None
             replay_out_buf = None
 
+        # Note (david): only a replay decode reads the shadow; a PER_SEQ tile
+        # starts from the f32 checkpoint and writes both.
+        if self.is_replay:
+            shadow_in_buf = pltpu.VMEM((slots, tile_seqs, 1, *rec_state_shape),
+                                       jnp.bfloat16)
+        else:
+            shadow_in_buf = None
+        if self.has_shadow:
+            shadow_out_buf = pltpu.VMEM(
+                (slots, tile_seqs, num_rec_out, *rec_state_shape),
+                jnp.bfloat16)
+        else:
+            shadow_out_buf = None
+
         return {
             "qkv_buf": pltpu.VMEM(
                 (slots, tile_seqs, self.qkv_block_rows, self.dim_size),
@@ -256,6 +282,8 @@ class KDAConfig:
                 self.dtypes.recurrent_state),
             "replay_in_buf": replay_in_buf,
             "replay_out_buf": replay_out_buf,
+            "shadow_in_buf": shadow_in_buf,
+            "shadow_out_buf": shadow_out_buf,
             "out_buf": pltpu.VMEM(
                 (slots, self.out_window_rows, self.v_dim_size),
                 self.dtypes.act_out),

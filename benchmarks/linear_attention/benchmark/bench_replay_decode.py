@@ -144,23 +144,25 @@ def main() -> None:
             # Note (david): one jit with the states donated, so the commit's
             # few ops add no eager dispatches and the kernel's in-place
             # aliasing survives the outer call.
-            @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3))
-            def _replay(conv, rec, replay, lens, inputs=inputs,
+            @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4))
+            def _replay(conv, rec, shadow, replay, lens, inputs=inputs,
                         read_offsets=read_offsets, num_spec=num_spec,
                         num_accepted=num_accepted):
-                (conv, rec, replay), out = replay_fn(
+                (conv, rec, shadow, replay), out = replay_fn(
                     conv_state=conv, recurrent_state=rec,
-                    replay_state=replay, replay_lens=lens, **inputs,
-                    read_offsets=read_offsets, num_spec_tokens=num_spec,
-                    replay_window=replay_window, **model_dims)
+                    recurrent_shadow=shadow, replay_state=replay,
+                    replay_lens=lens, **inputs, read_offsets=read_offsets,
+                    num_spec_tokens=num_spec, replay_window=replay_window,
+                    **model_dims)
                 lens = wrapper.next_replay_lens(
                     lens, inputs["query_start_loc"], inputs["seq_lens"],
                     inputs["state_indices"], inputs["read_state_indices"],
                     inputs["distribution"], num_accepted, replay_window)
-                return (conv, rec, replay, lens), out
+                return (conv, rec, shadow, replay, lens), out
 
             replay_ms, _ = time_stateful(
-                _replay, (conv_state, recurrent_state, replay_state,
+                _replay, (conv_state, recurrent_state,
+                          recurrent_state.astype(jnp.bfloat16), replay_state,
                           replay_lens), args.warmup, args.iters, args.repeats)
 
             row = dict(kernel=args.kernel, batch=num_seqs, window=window,
