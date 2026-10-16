@@ -1,700 +1,607 @@
-"""Head-major flash_attn_func / flash_attn_varlen_func against a naive reference."""
+"""flash_attn_func / flash_attn_varlen_func / flash_attn_with_kvcache against a naive
+reference.
 
-import functools
+The tests hold (batch, seqlen, nheads, headdim) arrays; flash_attn_func and
+flash_attn_varlen_func take head-major operands, so each call transposes in and
+out. A kernel passes when its error from the f32 reference is at most rtol times the
+error of the same math run in bf16 with reordered ops, plus the rounding of any
+arithmetic on the reference.
+"""
+
 import itertools
 import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
-from flywheel_tpu import flash_attn_interface, tuned_block_sizes
-from flywheel_tpu.pallas.block_sizes import BlockSizes
-from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
-from tests.reference import (
+from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+from tests.padding import pad_input, unpad_input
+from tests.test_util import (
     attention_ref,
-    head_major_flash_attn,
-    head_major_varlen_flash_attn,
-    random_qkv,
-    rel_err,
+    generate_qkv,
+    generate_random_padding_mask,
+    randn,
 )
 
-# Note (david): token-major has its own suite in test_token_major.py. The
-# dense cases keep the reference's (batch, seqlen, nheads, headdim) arrays and
-# the packed ones its (total, nheads, headdim) arrays, and reach the head-major
-# APIs through head_major_flash_attn / head_major_varlen_flash_attn.
-flash_attn_func = head_major_flash_attn
-flash_attn_varlen_func = head_major_varlen_flash_attn
-
-ON_TPU = jax.default_backend() == "tpu"
-INTERPRET = not ON_TPU
-# Note (david): interpret mode emulates the kernel on CPU and only affords
-# short sequences.
-SEQLENS = [128, 256, 1024, 2048] if ON_TPU else [128, 256]
-# Note (david): the boundaries sit off every block edge, so blocks straddle
-# sequences and each q block reaches a different number of kv blocks.
-PACKED_MANY = (100, 128, 52, 90, 128, 76, 110, 128, 84, 128)
+INTERPRET = jax.default_backend() != "tpu"
+# Note (david): interpret mode emulates the kernels on CPU and only affords short
+# sequences.
+MAX_INTERPRET_SEQLEN = 256
+COMPILED_HDIMS = [64, 96, 128, 192, 256]
+# Note (david): kernel tiles are 128 tokens wide, so the dense kernel and every KV
+# cache layout need seqlen_k or the page size to be a multiple of 128.
+TILE = 128
 
 
-def assert_close_to_reference(out, q, k, v, rows=slice(None), **mask_kwargs):
-    # Note (david): flash-attention's rule: the kernel may drift at most twice
-    # as far from the f32 reference as the same math run in bf16.
-    out_ref = attention_ref(q, k, v, upcast=True, **mask_kwargs)
-    out_lp = attention_ref(q, k, v, upcast=False, **mask_kwargs)
-    assert out.shape == out_ref.shape and out.dtype == q.dtype
-    # Note (david): an empty packed sequence reduces over zero rows.
-    err = jnp.abs(out[:, rows].astype(jnp.float32)
-                  - out_ref[:, rows].astype(jnp.float32)).max(initial=0.0)
-    err_lp = jnp.abs(out_lp[:, rows].astype(jnp.float32)
-                     - out_ref[:, rows].astype(jnp.float32)).max(initial=0.0)
-    assert err <= 2 * err_lp + 1e-5, (err, err_lp)
+def on_backend(seqlens):
+    """The (seqlen_q, seqlen_k, ...) cases the backend affords."""
+    return [case for case in seqlens if not INTERPRET or max(case[:2]) <= MAX_INTERPRET_SEQLEN]
 
 
-def assert_lse_close(lse, q, k, v, **mask_kwargs):
-    _, lse_ref = attention_ref(q, k, v, return_lse=True, **mask_kwargs)
-    finite = jnp.isfinite(lse_ref)
-    assert lse.dtype == jnp.float32
-    assert jnp.array_equal(jnp.isfinite(lse), finite)
-    err = jnp.abs(jnp.where(finite, lse - lse_ref, 0.0)).max(initial=0.0)
-    assert err <= 1e-2, err
-
-
-def input_grads(fn, q, k, v, dout):
-    return jax.grad(
-        lambda *qkv: (fn(*qkv) * dout).sum(), argnums=(0, 1, 2))(q, k, v)
-
-
-def assert_grads_close_to_reference(q, k, v, causal):
-    dout = jax.random.normal(jax.random.PRNGKey(7), q.shape, dtype=q.dtype)
-    grads = input_grads(
-        functools.partial(flash_attn_func, causal=causal, interpret=INTERPRET),
-        q, k, v, dout)
-    grads_ref = input_grads(
-        functools.partial(attention_ref, causal=causal), q, k, v, dout)
-    for name, grad, grad_ref in zip("qkv", grads, grads_ref):
-        assert grad.shape == grad_ref.shape and grad.dtype == q.dtype, name
-        assert rel_err(grad, grad_ref) < 3e-2, (name, rel_err(grad, grad_ref))
-
-
-def cu_seqlens_of(seqlens):
-    return jnp.array([0, *itertools.accumulate(seqlens)], jnp.int32)
-
-
-def packed_qkv(seqlens_q, nheads, nheads_k, headdim, seqlens_kv=None):
-    """Sequences packed end to end, plus each one as its own batch-1 input."""
-    seqlens_kv = seqlens_q if seqlens_kv is None else seqlens_kv
-    segments = [
-        random_qkv(index, 1, len_q, nheads, nheads_k, headdim, jnp.bfloat16,
-                   seqlen_kv=len_kv)
-        for index, (len_q, len_kv) in enumerate(zip(seqlens_q, seqlens_kv))
-    ]
-    q, k, v = (
-        jnp.concatenate([segment[axis][0] for segment in segments])
-        for axis in range(3)
+def dense_cases(seqlens):
+    """(seqlen_q, seqlen_k, causal) flash_attn_func supports: the dense kernel needs
+    seqlen_k % 128 == 0 unless causal keeps every row off the padded kv tail."""
+    return on_backend(
+        [
+            (seqlen_q, seqlen_k, causal)
+            for seqlen_q, seqlen_k in seqlens
+            for causal in (False, True)
+            if causal or seqlen_k % TILE == 0
+        ]
     )
-    return q, k, v, segments
 
 
-def run_head_major_kernel(kernel, q, k, v, *cu_seqlens):
-    # Note (david): make_flash_attn_mha works in exp2, so q is pre-scaled by
-    # log2(e) and the reference runs with softmax_scale 1.
-    q_scaled = (q.astype(jnp.float32) * math.log2(math.e)).astype(q.dtype)
-    out = kernel(
-        *(x[0].transpose(1, 0, 2) for x in (q_scaled, k, v)), *cu_seqlens)
-    return out.transpose(1, 0, 2)[None]
+def to_head_major(x):
+    """(batch, seqlen, nheads, d) -> flash_attn_func's (batch, nheads, seqlen, d), or
+    packed (total, nheads, d) -> flash_attn_varlen_func's (nheads, total, d); the map
+    is its own inverse."""
+    return jnp.swapaxes(x, -3, -2)
 
 
+def max_abs(x):
+    return jnp.abs(x.astype(jnp.float32)).max(initial=0.0).item()
+
+
+def mean_abs(x):
+    return jnp.abs(x.astype(jnp.float32)).mean().item()
+
+
+def arithmetic_atol(ref):
+    """Numerical error if we just do any arithmetic on ref."""
+    return 2 * max_abs(ref + 0.3 - 0.3 - ref)
+
+
+def assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol):
+    """lse matches on the valid rows.
+
+    Note (david): the kernels round the scaled q to bf16 once per row, an error every
+    score of the row shares, while the bf16 reference rounds each score on its own
+    and averages that away over a long row, so lse gets the out rule plus a fixed
+    1e-2.
+    """
+    err = max_abs(jnp.where(valid, lse - lse_ref, 0.0))
+    err_bf16 = max_abs(jnp.where(valid, lse_bf16 - lse_ref, 0.0))
+    print(f"LSE max diff: {err}, bf16 reference LSE max diff: {err_bf16}")
+    assert err <= rtol * err_bf16 + 1e-2
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,causal",
+    dense_cases([
+        (1, 1),
+        (64, 128),
+        (128, 192),
+        (256, 256),
+        (239, 1),
+        (799, 3),
+        (113, 203),
+        (113, 128),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (4096, 4096),
+        (4224, 4224),
+    ]),
+)
+def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_type, dtype):
+    rng = np.random.default_rng(0)
+    batch_size = 9 if seqlen_k <= 2048 else 2
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    for dv in dv_vals:
+        print(f"{dv = }")
+        q = randn(rng, (batch_size, seqlen_q, nheads, d), dtype)
+        if softcap > 0.0:
+            # Note (david): lifting q puts the scores in the range the cap bends.
+            q = q * softcap / 4
+        k = randn(rng, (batch_size, seqlen_k, nheads_kv, d), dtype)
+        v = randn(rng, (batch_size, seqlen_k, nheads_kv, dv), dtype)
+        window_size = (-1, -1) if not local else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        out_ref, lse_ref = attention_ref(
+            q, k, v, causal=causal, window_size=window_size, softcap=softcap
+        )
+        out_bf16, lse_bf16 = attention_ref(
+            q,
+            k,
+            v,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+        )
+        print(f"bf16 reference max diff: {max_abs(out_bf16 - out_ref)}")
+        print(f"bf16 reference mean diff: {mean_abs(out_bf16 - out_ref)}")
+        fwd_atol = arithmetic_atol(out_ref)
+        rtol = 2 if softcap == 0.0 else 3
+
+        out, lse = flash_attn_func(
+            *map(to_head_major, (q, k, v)),
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=True,
+            interpret=INTERPRET,
+        )
+        out = to_head_major(out)
+        print(f"Output max diff: {max_abs(out - out_ref)}")
+        print(f"Output mean diff: {mean_abs(out - out_ref)}")
+        assert max_abs(out - out_ref) <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        # Note (david): rows with no visible key are exact zeros with lse -inf.
+        assert jnp.array_equal(jnp.isneginf(lse), jnp.isneginf(lse_ref))
+        assert_lse_close(lse, lse_ref, lse_bf16, jnp.isfinite(lse_ref), rtol)
+
+        # Note (david): flash_attn_func's backward covers causal and full masks only;
+        # window_size and softcap are forward-only.
+        if not local and softcap == 0.0:
+            g = randn(rng, out.shape, dtype)
+
+            def attn(q, k, v):
+                out = flash_attn_func(
+                    *map(to_head_major, (q, k, v)), causal=causal, interpret=INTERPRET
+                )
+                return to_head_major(out)
+
+            def attn_ref(q, k, v, **kwargs):
+                return attention_ref(q, k, v, causal=causal, **kwargs)[0]
+
+            dq, dk, dv_ = jax.vjp(attn, q, k, v)[1](g)
+            dq_ref, dk_ref, dv_ref = jax.vjp(attn_ref, q, k, v)[1](g)
+            dq_bf16, dk_bf16, dv_bf16 = jax.vjp(
+                lambda q, k, v: attn_ref(q, k, v, upcast=False, reorder_ops=True), q, k, v
+            )[1](g)
+            for name, grad, grad_ref, grad_bf16 in (
+                ("dQ", dq, dq_ref, dq_bf16),
+                ("dK", dk, dk_ref, dk_bf16),
+                ("dV", dv_, dv_ref, dv_bf16),
+            ):
+                print(f"{name} max diff: {max_abs(grad - grad_ref)}")
+                print(f"{name} mean diff: {mean_abs(grad - grad_ref)}")
+                print(f"{name} bf16 reference max diff: {max_abs(grad_bf16 - grad_ref)}")
+                print(f"{name} bf16 reference mean diff: {mean_abs(grad_bf16 - grad_ref)}")
+                # Note (david): a row with one visible key has a dQ of exactly 0 in
+                # both references, while the kernel's D = rowsum(dO * O) and dP sum
+                # in different orders, so the floor keeps an all-zero reference
+                # from demanding a bit-exact 0.
+                atol = arithmetic_atol(grad_ref) + 1e-4
+                assert max_abs(grad - grad_ref) <= rtol * max_abs(grad_bf16 - grad_ref) + atol, name
+
+
+@pytest.mark.parametrize("dtype", [jnp.bfloat16])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+@pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("nheads,nheads_k", [(4, 4), (4, 2), (4, 1)])
-@pytest.mark.parametrize("headdim", [64, 128, 256])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_output(seqlen, headdim, nheads, nheads_k, causal):
-    q, k, v = random_qkv(0, 2, seqlen, nheads, nheads_k, headdim, jnp.bfloat16)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    on_backend([
+        (1, 1),
+        (1, 3),
+        (2, 1),
+        (511, 1),
+        (3, 513),
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (307, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+        (4096, 4096),
+    ]),
+)
+def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_type, dtype):
+    rng = np.random.default_rng(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
+    batch_size = 9 if seqlen_q <= 2048 else 2
+    nheads = 6
+    nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    for dv in dv_vals:
+        print(f"{dv = }")
+        q = randn(rng, (batch_size, seqlen_q, nheads, d), dtype)
+        if softcap > 0.0:
+            # Note (david): lifting q puts the scores in the range the cap bends.
+            q = q * softcap / 4
+        k = randn(rng, (batch_size, seqlen_k, nheads_kv, d), dtype)
+        v = randn(rng, (batch_size, seqlen_k, nheads_kv, dv), dtype)
+        window_size = (-1, -1) if not local else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q, batch_size, rng
+        )
+        key_padding_mask = generate_random_padding_mask(
+            seqlen_k, batch_size, rng
+        )
+        # Note (david): flash_attn_varlen_func leaves a row with no visible key
+        # unspecified, so no sequence has one: every key length is positive, and
+        # under a right bound r each query length stays within its key length + r.
+        right = 0 if causal else window_size[1]
+        if right >= 0:
+            query_padding_mask = query_padding_mask & (
+                jnp.arange(seqlen_q)[None, :] < key_padding_mask.sum(-1, keepdims=True) + right
+            )
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            output_pad_fn,
+        ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
+        out_ref, lse_ref = attention_ref(
+            q,
+            k,
+            v,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+        )
+        out_bf16, lse_bf16 = attention_ref(
+            q,
+            k,
+            v,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+        )
+        print(f"bf16 reference max diff: {max_abs(out_bf16 - out_ref)}")
+        print(f"bf16 reference mean diff: {mean_abs(out_bf16 - out_ref)}")
+        fwd_atol = arithmetic_atol(out_ref)
+        rtol = 2 if softcap == 0.0 else 3
+
+        valid = jnp.broadcast_to(query_padding_mask[:, None, :], lse_ref.shape)
+        assert jnp.isfinite(jnp.where(valid, lse_ref, 0.0)).all()
+
+        out_unpad, lse_unpad = flash_attn_varlen_func(
+            *map(to_head_major, (q_unpad, k_unpad, v_unpad)),
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            return_softmax_lse=True,
+            interpret=INTERPRET,
+        )
+        out = output_pad_fn(to_head_major(out_unpad))
+        lse = jnp.swapaxes(output_pad_fn(lse_unpad.T), 1, 2)
+        print(f"Output max diff: {max_abs(out - out_ref)}")
+        print(f"Output mean diff: {mean_abs(out - out_ref)}")
+        assert max_abs(out - out_ref) <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol)
 
 
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_overflow_guard_recovery(causal):
-    # Note (david): scaled keys in the last quarter push late row maxima far past
-    # the guard threshold anchored on the first kv block, so the recovery
-    # replay runs, while early causal rows never see them and stay on the fast
-    # path.
-    seqlen = 1024 if ON_TPU else 256
-    q, k, v = random_qkv(0, 2, seqlen, 4, 4, 64, jnp.bfloat16)
-    k = k.at[:, 3 * seqlen // 4:].multiply(40.0)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
+def generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, rng, dtype):
+    num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
+    k_cache_paged = randn(rng, (num_blocks, page_size, nheads_k, d), dtype)
+    v_cache_paged = randn(rng, (num_blocks, page_size, nheads_k, dv), dtype)
+    page_table = jnp.asarray(rng.permutation(num_blocks), jnp.int32).reshape(batch_size, -1)
+    k_cache = gather_paged_cache(k_cache_paged, page_table)[:, :seqlen_k]
+    v_cache = gather_paged_cache(v_cache_paged, page_table)[:, :seqlen_k]
+    return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("nheads,nheads_k", [(4, 4), (4, 2), (4, 1)])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_softmax_lse(seqlen, nheads, nheads_k, causal):
-    q, k, v = random_qkv(0, 2, seqlen, nheads, nheads_k, 64, jnp.bfloat16)
-    out, lse = flash_attn_func(
-        q, k, v, causal=causal, return_softmax_lse=True, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-    assert_lse_close(lse, q, k, v, causal=causal)
+def gather_paged_cache(cache_paged, page_table):
+    """(num_blocks, page_size, ...) pages -> each row's (nblocks * page_size, ...) view."""
+    batch_size, nblocks = page_table.shape
+    return cache_paged[page_table.reshape(-1)].reshape(
+        batch_size, nblocks * cache_paged.shape[1], *cache_paged.shape[2:]
+    )
 
 
-@pytest.mark.parametrize("headdim,headdim_v", [(128, 64), (64, 128)])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_head_dim_v(seqlen, causal, headdim, headdim_v):
-    q, k, v = random_qkv(
-        0, 2, seqlen, 4, 2, headdim, jnp.bfloat16, headdim_v=headdim_v)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
+def interleave_kv(k_cache_paged, v_cache_paged):
+    """The paged cache flash_attn_with_kvcache takes: one merged (num_blocks, page_size,
+    2 * nheads_k, d) pool whose token rows hold each KV head's K then its V."""
+    *leading, nheads_k, d = k_cache_paged.shape
+    return jnp.stack([k_cache_paged, v_cache_paged], axis=-2).reshape(*leading, 2 * nheads_k, d)
 
 
-@pytest.mark.parametrize("window_size", [(16, 0), (0, 16), (16, 16), (16, -1)])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_window_size(seqlen, causal, window_size):
-    q, k, v = random_qkv(0, 2, seqlen, 4, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(
-        q, k, v, causal=causal, window_size=window_size, interpret=INTERPRET)
-    assert_close_to_reference(
-        out, q, k, v, causal=causal, window_size=window_size)
+def kvcache_cases(seqlens):
+    """(seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type) the TPU caches
+    support.
+
+    The contiguous cache (page_size None) serves single-token decode only and packs two
+    bf16 KV heads per u32 lane, so gqa's 3 KV heads need the paged cache; a paged
+    cache's block_table maps the rows, so cache_batch_idx is contiguous-only.
+    """
+    cases = []
+    for (seqlen_q, seqlen_k), page_size, has_batch_idx, varlen_q, mha_type in itertools.product(
+        seqlens, [None, 128, 256], [False, True], [False, True], ["mha", "mqa", "gqa"]
+    ):
+        if page_size is None:
+            supported = seqlen_q == 1 and not varlen_q and mha_type != "gqa"
+        else:
+            supported = seqlen_k % page_size == 0 and not has_batch_idx
+        if supported:
+            cases.append((seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type))
+    return on_backend(cases)
 
 
-def test_flash_attn_window_size_crosses_kv_compute_tiles():
-    # Note (david): seqlen 768 splits kv into two compute tiles, and a right
-    # bound reaching across them ends each q tile's band past the diagonal,
-    # where a causal plan never ends one.
-    q, k, v = random_qkv(0, 1, 768, 2, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(
-        q, k, v, causal=False, window_size=(0, 400), interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=False, window_size=(0, 400))
-
-
-@pytest.mark.parametrize("block_sizes", [
-    (256, 256, 128, 128), (512, 256, 128, 128), (512, 512, 256, 128)])
-@pytest.mark.parametrize("seqlen_q,causal,window_size", [
-    (1024, True, (100, 0)),
-    (1024, True, (700, 0)),
-    (1024, False, (300, -1)),
-    (1024, False, (300, 50)),
-    (512, True, (300, 0)),
-])
-def test_flash_attn_window_band_copies(block_sizes, seqlen_q, causal,
-                                       window_size):
-    # Note (david): pinned blocks with bq % bkv == 0 run the static band copies
-    # over several block offsets: a window narrower and one wider than a block,
-    # left-only and two-sided bands, and a bottom-right offset.
-    seqlen_kv = 1024
-    left, right = window_size
-    if causal:
-        window = (left, 0)
-    elif right == -1:
-        window = (left, None)
+@pytest.mark.parametrize("dtype", [jnp.bfloat16])
+@pytest.mark.parametrize("new_kv", [False, True])
+@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+@pytest.mark.parametrize("d", [128])
+# Note (david): every cache layout holds whole 128-token tiles, so the capacities
+# are multiples of 128; cache_seqlens draws unaligned lengths.
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,page_size,has_batch_idx,varlen_q,mha_type",
+    kvcache_cases([
+        (1, 128),
+        (3, 1024),
+        (64, 256),
+        (64, 2048),
+        (128, 128),
+        (256, 512),  # an append spanning more than one page
+    ]),
+)
+def test_flash_attn_kvcache(
+    seqlen_q,
+    seqlen_k,
+    d,
+    varlen_q,
+    has_batch_idx,
+    page_size,
+    softcap,
+    causal,
+    local,
+    new_kv,
+    mha_type,
+    dtype,
+):
+    rng = np.random.default_rng(0)
+    batch_size = 5
+    batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
+    nheads = 6
+    nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
+    assert nheads % nheads_k == 0
+    dv = d
+    q = randn(rng, (batch_size, seqlen_q, nheads, d), dtype)
+    if softcap > 0.0:
+        # Note (david): lifting q puts the scores in the range the cap bends.
+        q = q * softcap / 4
+    if varlen_q:
+        query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, rng)
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
+        output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_q, batch_size, seqlen_q)
     else:
-        window = (left, right)
-    q, k, v = random_qkv(0, 1, seqlen_q, 2, 1, 128, jnp.bfloat16,
-                         seqlen_kv=seqlen_kv)
-    block_q, block_kv, block_q_compute, block_kv_compute = block_sizes
-    kernel = make_flash_attn_mha(
-        2, seqlen_q, seqlen_kv, causal=causal,
-        causal_offset=seqlen_kv - seqlen_q, window=window,
-        block_sizes=BlockSizes(block_q=block_q, block_kv=block_kv,
-                               block_q_compute=block_q_compute,
-                               block_kv_compute=block_kv_compute),
-        num_kv_heads=1, interpret=INTERPRET)
-    out = run_head_major_kernel(kernel, q, k, v)
-    assert_close_to_reference(out, q, k, v, causal=causal,
-                              window_size=window_size, softmax_scale=1.0)
+        query_padding_mask = None
+        q_unpad = q
+        cu_seqlens_q, max_seqlen_q = None, None
+    # Note (david): the paged kernel bounds a row's keys on the right only at the
+    # causal diagonal, so a local window here is left-only.
+    window_size = (-1, -1) if not local else (int(rng.integers(0, seqlen_k)), -1)
+
+    # Note (david): appended k / v share q's token layout, so seqlen_new is seqlen_q
+    # and varlen k / v follow q's packing.
+    seqlen_new = seqlen_q
+    if new_kv:
+        k = randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype)
+        v = randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype)
+        if varlen_q:
+            key_new_padding_mask = query_padding_mask
+            k_unpad, indices_k, *rest = unpad_input(k, key_new_padding_mask)
+            v_unpad, *rest = unpad_input(v, key_new_padding_mask)
+        else:
+            k_unpad, v_unpad = k, v
+    else:
+        k, v, k_unpad, v_unpad = None, None, None, None
+    if page_size is None:
+        k_cache = randn(rng, (batch_size_cache, seqlen_k, nheads_k, d), dtype)
+        v_cache = randn(rng, (batch_size_cache, seqlen_k, nheads_k, dv), dtype)
+        page_table = None
+    else:
+        (
+            k_cache,
+            v_cache,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = generate_block_kvcache(seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, rng, dtype)
+    # Note (david): a multi-token row with no visible key is unspecified, so a causal
+    # read-only call keeps every query at or past position 0: cache_seqlens >= seqlen_q.
+    cache_seqlens = jnp.asarray(
+        rng.integers(
+            0 if new_kv else (seqlen_q if causal else 1),
+            (seqlen_k - seqlen_new + 1) if new_kv else (seqlen_k + 1),
+            (batch_size,),
+        ),
+        jnp.int32,
+    )
+    if has_batch_idx:
+        cache_batch_idx = jnp.asarray(rng.permutation(batch_size_cache)[:batch_size], jnp.int32)
+    else:
+        cache_batch_idx = None
+    arange = jnp.arange(seqlen_k)[None, :]
+    cache_seqlens_expanded = cache_seqlens[:, None]
+    if not new_kv:
+        key_padding_mask = arange < cache_seqlens_expanded
+    else:
+        k_new_seqlens = key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
+    k_cache_ref = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
+    v_cache_ref = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
+    if new_kv:
+        update_mask = (cache_seqlens_expanded <= arange) & (
+            arange < cache_seqlens_expanded + k_new_seqlens
+        )
+        k_to_update = k.reshape(-1, nheads_k, d)
+        v_to_update = v.reshape(-1, nheads_k, dv)
+        if varlen_q:
+            k_to_update = k_to_update[indices_k]
+            v_to_update = v_to_update[indices_k]
+        update_index = jnp.nonzero(update_mask)
+        k_cache_ref = k_cache_ref.at[update_index].set(k_to_update)
+        v_cache_ref = v_cache_ref.at[update_index].set(v_to_update)
+    out_ref, lse_ref = attention_ref(
+        q,
+        k_cache_ref,
+        v_cache_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+    )
+    out_bf16, lse_bf16 = attention_ref(
+        q,
+        k_cache_ref,
+        v_cache_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        upcast=False,
+        reorder_ops=True,
+    )
+    # Note (david): the caches are donated, so every call gets a fresh copy.
+    if page_size is None:
+        caches = (jnp.copy(k_cache), jnp.copy(v_cache))
+    else:
+        caches = (interleave_kv(k_cache_paged, v_cache_paged), None)
+    out, lse, *caches_out = flash_attn_with_kvcache(
+        q if not varlen_q else q_unpad,
+        *caches,
+        k if not new_kv or not varlen_q else k_unpad,
+        v if not new_kv or not varlen_q else v_unpad,
+        cache_seqlens=cache_seqlens,
+        cache_batch_idx=cache_batch_idx,
+        block_table=page_table,
+        cu_seqlens_q=cu_seqlens_q,
+        causal=causal,
+        window_size=window_size,
+        softcap=softcap,
+        return_softmax_lse=True,
+        interpret=INTERPRET,
+    )
+    if varlen_q:
+        out = output_pad_fn(out)
+        lse = jnp.swapaxes(output_pad_fn(lse.T), 1, 2)
+    if query_padding_mask is None:
+        valid = jnp.ones(lse_ref.shape, bool)
+    else:
+        valid = jnp.broadcast_to(query_padding_mask[:, None, :], lse_ref.shape)
+    assert jnp.isfinite(jnp.where(valid, lse_ref, 0.0)).all()
+    print(f"Output max diff: {max_abs(out - out_ref)}")
+    print(f"Output mean diff: {mean_abs(out - out_ref)}")
+    print(f"bf16 reference max diff: {max_abs(out_bf16 - out_ref)}")
+    print(f"bf16 reference mean diff: {mean_abs(out_bf16 - out_ref)}")
+
+    if new_kv:
+        if page_size is None:
+            k_cache_out, v_cache_out = caches_out
+            k_cache_select = k_cache_out if not has_batch_idx else k_cache_out[cache_batch_idx]
+            v_cache_select = v_cache_out if not has_batch_idx else v_cache_out[cache_batch_idx]
+        else:
+            (kv_cache_out,) = caches_out
+            k_cache_select = gather_paged_cache(kv_cache_out[:, :, 0::2], page_table)[:, :seqlen_k]
+            v_cache_select = gather_paged_cache(kv_cache_out[:, :, 1::2], page_table)[:, :seqlen_k]
+        assert jnp.array_equal(v_cache_select, v_cache_ref)
+        assert jnp.array_equal(k_cache_select, k_cache_ref)
+    rtol = 2 if softcap == 0.0 else 3
+    assert max_abs(out - out_ref) <= rtol * max_abs(out_bf16 - out_ref) + 1e-5
+    mult_mean = 1.5
+    assert mean_abs(out - out_ref) <= mult_mean * mean_abs(out_bf16 - out_ref)
+    assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol)
 
 
-@pytest.mark.parametrize("seqlens,window_size,head_dim,expected", [
-    ((16384, 16384), (1023, 0), 256, (2048, 2048, 256, 256)),
-    ((16384, 16384), (4095, 0), 256, (2048, 2048, 256, 512)),
-    ((16384, 16384), (4095, 0), 128, (2048, 2048, 256, 256)),
-    ((768, 768), (100, 0), 128, (768, 768, 256, 256)),
-    ((16384, 16384), (-1, 50), 128, (1024, 1024, 256, 512)),
-    ((16384, 16384, 4096, 100), (1023, 0), 128, (128, 1024, 64, 512)),
-])
-def test_window_default_blocks(seqlens, window_size, head_dim, expected):
-    blocks = flash_attn_interface.default_block_sizes(
-        *seqlens, window_size=window_size, head_dim=head_dim)
-    assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
-            blocks.block_kv_compute) == expected
-
-
-def test_flash_attn_head_major_layout():
-    # Note (david): the API itself, without the test adapter: (batch, nheads,
-    # seqlen, headdim) in and out.
-    q, k, v = random_qkv(0, 2, 200, 4, 2, 128, jnp.bfloat16)
-    q_bhsd, k_bhsd, v_bhsd = (x.transpose(0, 2, 1, 3) for x in (q, k, v))
-    out, lse = flash_attn_interface.flash_attn_func(
-        q_bhsd, k_bhsd, v_bhsd, causal=True, return_softmax_lse=True,
-        token_major=False, interpret=INTERPRET)
-    assert out.shape == q_bhsd.shape and lse.shape == (2, 4, 200)
-    assert_close_to_reference(out.transpose(0, 2, 1, 3), q, k, v, causal=True)
-    assert_lse_close(lse, q, k, v, causal=True)
-
-
-def test_flash_attn_attention_chunk_unsupported():
-    q, k, v = random_qkv(0, 1, 256, 2, 2, 128, jnp.bfloat16)
-    with pytest.raises(NotImplementedError, match="attention_chunk"):
-        flash_attn_func(q, k, v, causal=True, attention_chunk=128,
-                        interpret=INTERPRET)
-
-
-@pytest.mark.parametrize("softcap", [30.0, 50.0])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_softcap(seqlen, causal, softcap):
-    q, k, v = random_qkv(0, 2, seqlen, 4, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(
-        q, k, v, causal=causal, softcap=softcap, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal, softcap=softcap)
-
-
-@pytest.mark.parametrize("seqlen", [120, 300, 1000])
-def test_flash_attn_unaligned_seqlen(seqlen):
-    # Note (david): only a right bound of 0 keeps real queries off the padded kv
-    # tail, so unaligned dense attention is causal-only.
-    q, k, v = random_qkv(0, 2, seqlen, 4, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(q, k, v, causal=True, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=True)
-
-
+@pytest.mark.skipif(INTERPRET, reason="a race needs the compiled kernels")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16])
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv,causal",
-    [
-        (256, 128, False),
-        (256, 128, True),
-        (128, 384, False),
-        (128, 384, True),
-        (200, 120, True),
-        (120, 333, True),
-    ],
+    "seqlen_q,seqlen_k,causal",
+    dense_cases([
+        (1, 239),
+        (239, 1),
+        (3, 799),
+        (799, 3),
+        (1024, 128),
+        (97, 97),
+        (128, 128),
+        (200, 200),
+        (256, 256),
+        (257, 257),
+        (384, 384),
+        (512, 512),
+        (768, 768),
+        (1024, 1024),
+        (2048, 2048),
+    ]),
 )
-def test_flash_attn_rect(seqlen_q, seqlen_kv, causal):
-    q, k, v = random_qkv(
-        0, 2, seqlen_q, 4, 2, 64, jnp.bfloat16, seqlen_kv=seqlen_kv)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-
-
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv,causal,window_size",
-    [
-        (256, 128, False, (-1, -1)),
-        (256, 128, True, (-1, -1)),
-        (128, 384, False, (-1, -1)),
-        (128, 384, True, (-1, -1)),
-        (200, 120, True, (-1, -1)),
-        (256, 128, False, (32, 32)),
-    ],
-)
-def test_flash_attn_rect_softmax_lse(seqlen_q, seqlen_kv, causal, window_size):
-    q, k, v = random_qkv(
-        0, 2, seqlen_q, 4, 2, 64, jnp.bfloat16, seqlen_kv=seqlen_kv)
-    out, lse = flash_attn_func(
-        q, k, v, causal=causal, window_size=window_size,
-        return_softmax_lse=True, interpret=INTERPRET)
-    assert_close_to_reference(
-        out, q, k, v, causal=causal, window_size=window_size)
-    assert_lse_close(lse, q, k, v, causal=causal, window_size=window_size)
-    # Note (david): rows with no visible key are defined as exact zeros.
-    right = 0 if causal else window_size[1]
-    num_empty_rows = 0 if right == -1 else max(0, seqlen_q - seqlen_kv - right)
-    assert jnp.all(out[:, :num_empty_rows] == 0)
-
-
-@pytest.mark.parametrize("causal,window_size", [(True, (64, 0)), (False, (32, 32))])
-@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(256, 128), (128, 384)])
-def test_flash_attn_rect_window_size(seqlen_q, seqlen_kv, causal, window_size):
-    q, k, v = random_qkv(
-        0, 2, seqlen_q, 4, 2, 64, jnp.bfloat16, seqlen_kv=seqlen_kv)
-    out = flash_attn_func(
-        q, k, v, causal=causal, window_size=window_size, interpret=INTERPRET)
-    assert_close_to_reference(
-        out, q, k, v, causal=causal, window_size=window_size)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("nheads,nheads_k", [(4, 4), (4, 2), (4, 1)])
-def test_flash_attn_rect_gqa(nheads, nheads_k, causal):
-    q, k, v = random_qkv(
-        0, 2, 256, nheads, nheads_k, 64, jnp.bfloat16, seqlen_kv=128)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-
-
-@pytest.mark.parametrize("headdim,headdim_v", [(128, 64), (64, 128)])
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_rect_head_dim_v(causal, headdim, headdim_v):
-    q, k, v = random_qkv(
-        0, 2, 256, 4, 2, headdim, jnp.bfloat16, headdim_v=headdim_v,
-        seqlen_kv=128)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-
-
-def test_flash_attn_seqlen_above_2048():
-    # Note (david): 3072 is not a multiple of 2048, so the default block drops
-    # to 1024 and the sequence spans several physical blocks.
-    q, k, v = random_qkv(0, 1, 3072, 2, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(q, k, v, causal=True, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=True)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_rect_short_q_long_kv(causal):
-    # Note (david): the static-anchor softmax needs two q compute tiles, which
-    # a 128-row q only gets if the default blocks halve the q axis alone.
-    q, k, v = random_qkv(0, 2, 128, 4, 2, 64, jnp.bfloat16, seqlen_kv=1024)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-
-
-def test_flash_attn_rect_fully_masked_q_block():
-    # Note (david): q 4096 against kv 128 leaves the whole first q block without
-    # a visible key, so the schedule must skip that block row.
-    q, k, v = random_qkv(0, 1, 4096, 2, 2, 64, jnp.bfloat16, seqlen_kv=128)
-    out = flash_attn_func(q, k, v, causal=True, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=True)
-    assert jnp.all(out[:, :4096 - 128] == 0)
-
-
-def test_flash_attn_causal_unequal_physical_blocks():
-    # Note (david): fragment skipping assumes block_q == block_kv, so an
-    # explicit block_q != block_kv must mask every fragment of a partial block.
-    q, k, v = random_qkv(0, 1, 256, 2, 2, 64, jnp.bfloat16)
-    kernel = make_flash_attn_mha(
-        2, 256, 256, causal=True,
-        block_sizes=BlockSizes(block_q=256, block_kv=128, block_kv_compute=128,
-                               block_q_compute=128),
-        num_kv_heads=2, interpret=INTERPRET)
-    out = run_head_major_kernel(kernel, q, k, v)
-    assert_close_to_reference(out, q, k, v, causal=True, softmax_scale=1.0)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("batch,seqlen", [(1, 1024), (2, 256), (4, 512)])
-@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (8, 8), (4, 1)])
-def test_flash_attn_heads_outer_fold(batch, seqlen, nheads, nheads_k, causal):
-    # Note (david): the fold only renumbers the kernel's leading axis, so the
-    # result must be bitwise the batch-outer one.
-    q, k, v = random_qkv(104, batch, seqlen, nheads, nheads_k, 128,
-                         jnp.bfloat16)
-    expected = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    actual = flash_attn_func(
-        q, k, v, causal=causal, heads_outer_fold=True, interpret=INTERPRET)
-    assert jnp.array_equal(actual, expected)
-
-
-@pytest.mark.parametrize("seqlen,causal", [(512, False), (512, True), (1000, True)])
-def test_flash_attn_tuned_head_fold(monkeypatch, seqlen, causal):
-    # Note (david): the tuned key carries the flat head count and the TPU v6
-    # table has no d256 entry for 4 heads, so the lookup misses and the analytic
-    # defaults run; seqlen 1000 looks up its padded length 1024.
-    monkeypatch.setattr(tuned_block_sizes, "get_device_name", lambda: "TPU v6")
-    flash_attn_interface.get_kernel.cache_clear()
-    q, k, v = random_qkv(0, 2, seqlen, 2, 2, 256, jnp.bfloat16)
-    out = flash_attn_func(q, k, v, causal=causal, interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=causal)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("headdim", [64, 128])
-@pytest.mark.parametrize("seqlen", SEQLENS)
-def test_flash_attn_backward(seqlen, headdim, causal):
-    q, k, v = random_qkv(0, 2, seqlen, 4, 4, headdim, jnp.bfloat16)
-    assert_grads_close_to_reference(q, k, v, causal)
-
-
-@pytest.mark.parametrize("seqlen", [192, 1000] if ON_TPU else [192])
-def test_flash_attn_backward_unaligned(seqlen):
-    q, k, v = random_qkv(0, 2, seqlen, 4, 4, 64, jnp.bfloat16)
-    assert_grads_close_to_reference(q, k, v, causal=True)
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("nheads_k", [2, 1])
-def test_flash_attn_backward_gqa(causal, nheads_k):
-    q, k, v = random_qkv(0, 2, 256, 4, nheads_k, 64, jnp.bfloat16)
-    assert_grads_close_to_reference(q, k, v, causal)
-
-
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv,causal",
-    [
-        (256, 128, False),
-        (256, 128, True),
-        (128, 384, False),
-        (128, 384, True),
-        (100, 150, True),
-        # Note (david): only q pads here, so non-causal stays dense; the padded q
-        # rows are harmless only because the output slice hands them a zero
-        # cotangent.
-        (100, 128, False),
-        (100, 128, True),
-    ],
-)
-def test_flash_attn_rect_backward(seqlen_q, seqlen_kv, causal):
-    q, k, v = random_qkv(
-        0, 2, seqlen_q, 4, 4, 64, jnp.bfloat16, seqlen_kv=seqlen_kv)
-    assert_grads_close_to_reference(q, k, v, causal)
-
-
-@pytest.mark.parametrize(
-    "seqlens_q,seqlens_kv,block_sizes",
-    [
-        pytest.param([37, 53, 22], [37, 53, 22], None, id="unaligned"),
-        pytest.param([37, 53, 22], [37, 53, 22], (256, 256, 128, 128),
-                     id="wide_blocks"),
-        # Note (david): 64-wide q compute tiles keep the two tiles per block the
-        # fragment pipeline needs at 128-wide blocks.
-        pytest.param([128, 0, 37, 256], [128, 0, 37, 256], (128, 128, 64, 128),
-                     id="empty_and_block_multiple"),
-        pytest.param([37, 5, 64, 22], [90, 64, 64, 130], None,
-                     id="chunked_prefill"),
-    ],
-)
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_varlen_func(seqlens_q, seqlens_kv, block_sizes, causal):
-    # Note (david): each packed sequence must match itself run alone, which
-    # catches any leak across a sequence boundary.
-    q, k, v, segments = packed_qkv(seqlens_q, 4, 2, 64, seqlens_kv)
-    cu_q = cu_seqlens_of(seqlens_q)
-    out = flash_attn_varlen_func(
-        q, k, v, cu_q, cu_seqlens_of(seqlens_kv), max(seqlens_q),
-        max(seqlens_kv), causal=causal, interpret=INTERPRET,
-        block_sizes=block_sizes)
-    for index, segment in enumerate(segments):
-        rows = slice(int(cu_q[index]), int(cu_q[index + 1]))
-        assert_close_to_reference(out[rows][None], *segment, causal=causal)
-
-
-@pytest.mark.parametrize(
-    "seqlens",
-    [
-        pytest.param([50, 78], id="one_block"),
-        pytest.param([37, 53, 22, 100, 300], id="several_blocks"),
-    ],
-)
-def test_flash_attn_varlen_func_feeds_the_program(seqlens):
-    # On v7x XLA lays a bf16 kernel output out in 16-row tiles when further ops
-    # of the same program read it, as a model layer's do, and in 8-row tiles
-    # when it is the program's output, as in every other test here. The
-    # program has to compile and hand on what the kernel alone returns.
-    q, k, v, _ = packed_qkv(seqlens, 4, 2, 128)
-    cu = cu_seqlens_of(seqlens)
-
-    def attend(q, k, v, cu):
-        return flash_attn_varlen_func(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True,
-            interpret=INTERPRET)
+def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
+    rng = np.random.default_rng(0)
+    batch_size = 60
+    nheads = 4
+    q = randn(rng, (batch_size, nheads, seqlen_q, d), dtype)
+    k = randn(rng, (batch_size, nheads, seqlen_k, d), dtype)
+    v = randn(rng, (batch_size, nheads, seqlen_k, d), dtype)
 
     @jax.jit
-    def layer(q, k, v, cu):
-        merged = attend(q, k, v, cu).reshape(q.shape[0], -1)
-        return merged @ jnp.eye(merged.shape[1], dtype=merged.dtype)
+    def fwd_bwd(q, k, v, g):
+        out, vjp = jax.vjp(lambda q, k, v: flash_attn_func(q, k, v, causal=causal), q, k, v)
+        return out, *vjp(g)
 
-    expected = attend(q, k, v, cu)
-    assert jnp.array_equal(
-        layer(q, k, v, cu).reshape(expected.shape), expected)
-
-
-@pytest.mark.parametrize(
-    "seqlens,nheads_k,block_sizes",
-    [
-        pytest.param([37, 53, 22], 2, None, id="gqa"),
-        # Note (david): starts off the 8-token grid make every first q block
-        # reach back into its predecessor, so lse goes through the boundary
-        # blend exactly as O does.
-        pytest.param([37, 53, 22, 100], 4, None, id="unaligned"),
-        # Note (david): an empty sequence owns no q block, so the next block
-        # blends from two sequences back.
-        pytest.param([45, 0, 61, 0, 30], 4, None, id="empty_sequence"),
-        # Note (david): the last short sequence clamps its q window to the padded
-        # end, the widest blend the per-seq schedule can need.
-        pytest.param([384, 96, 32], 4, (256, 256, 128, 256), id="clamped_tail"),
-        # Note (david): cu_q on the block grid starts every sequence on its own
-        # block, so no staged window carries rows of the previous sequence and
-        # the boundary blend never runs.
-        pytest.param([128, 256, 128], 2, (128, 128, 64, 128),
-                     id="block_aligned"),
-    ],
-)
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_varlen_softmax_lse(seqlens, nheads_k, block_sizes, causal):
-    q, k, v, _ = packed_qkv(seqlens, 4, nheads_k, 64)
-    cu = cu_seqlens_of(seqlens)
-    out, lse = flash_attn_varlen_func(
-        q, k, v, cu, cu, max(seqlens), max(seqlens), causal=causal,
-        return_softmax_lse=True, interpret=INTERPRET, block_sizes=block_sizes)
-    assert_close_to_reference(
-        out[None], q[None], k[None], v[None], causal=causal,
-        cu_seqlens=(cu, cu))
-    assert_lse_close(
-        lse[None], q[None], k[None], v[None], causal=causal,
-        cu_seqlens=(cu, cu))
-
-
-@pytest.mark.parametrize(
-    "seqlens_q,seqlens_kv",
-    [
-        # Note (david): the q and kv totals pad to different 128-multiples, in
-        # both directions, and a q pad longer than the kv pad leaves pad rows
-        # with no reachable key.
-        ([17, 32, 5], [40, 32, 60]),
-        ([0, 12, 1], [24, 30, 100]),
-    ],
-)
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_varlen_unequal_totals(seqlens_q, seqlens_kv, causal):
-    q, k, v, segments = packed_qkv(seqlens_q, 4, 2, 64, seqlens_kv)
-    cu_q = cu_seqlens_of(seqlens_q)
-    out, lse = flash_attn_varlen_func(
-        q, k, v, cu_q, cu_seqlens_of(seqlens_kv), max(seqlens_q),
-        max(seqlens_kv), causal=causal, return_softmax_lse=True,
-        interpret=INTERPRET)
-    for index, segment in enumerate(segments):
-        rows = slice(int(cu_q[index]), int(cu_q[index + 1]))
-        assert_close_to_reference(out[rows][None], *segment, causal=causal)
-        assert_lse_close(lse[None, :, rows], *segment, causal=causal)
-
-
-@pytest.mark.parametrize("seqlens_q,num_pad", [
-    ([17, 1, 0, 40], 23),
-    ([5], 600),
-    ([0, 0], 9),
-])
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
-    # Note (david): buffer rows past cu_seqlens[-1] own no q block, so they
-    # come back out = 0 and lse = -inf even when their queries are NaN. A
-    # 600-row pad takes several fill windows, and an all-empty batch runs no
-    # block at all.
-    q, k, v, segments = packed_qkv(seqlens_q, 4, 2, 128)
-    pad_q, pad_k, pad_v = random_qkv(99, 1, num_pad, 4, 2, 128, jnp.bfloat16)
-    q = jnp.concatenate([q, jnp.full_like(pad_q[0], jnp.nan)])
-    k = jnp.concatenate([k, pad_k[0]])
-    v = jnp.concatenate([v, pad_v[0]])
-    cu = cu_seqlens_of(seqlens_q)
-    max_seqlen = max(max(seqlens_q), 1)
-    out, lse = flash_attn_varlen_func(
-        q, k, v, cu, cu, max_seqlen, max_seqlen, causal=causal,
-        return_softmax_lse=True, interpret=INTERPRET)
-    packed_q_end = int(cu[-1])
-    assert jnp.array_equal(out[packed_q_end:],
-                           jnp.zeros_like(out[packed_q_end:]))
-    assert jnp.all(lse[:, packed_q_end:] == -jnp.inf)
-    for index, segment in enumerate(segments):
-        rows = slice(int(cu[index]), int(cu[index + 1]))
-        assert_close_to_reference(out[rows][None], *segment, causal=causal)
-        assert_lse_close(lse[None, :, rows], *segment, causal=causal)
-
-
-def test_flash_attn_varlen_differing_q_kv_splits():
-    # Note (david): equal totals but cu_q != cu_k make the packed mask a general
-    # block-diagonal; non-causal because sequence 0 has more queries than keys.
-    q, k, v = (x[0] for x in random_qkv(0, 1, 128, 2, 2, 64, jnp.bfloat16))
-    cu_q = jnp.array([0, 64, 128], jnp.int32)
-    cu_k = jnp.array([0, 32, 128], jnp.int32)
-    out = flash_attn_varlen_func(q, k, v, cu_q, cu_k, 64, 96, interpret=INTERPRET)
-    assert_close_to_reference(
-        out[None], q[None], k[None], v[None], cu_seqlens=(cu_q, cu_k))
-
-
-@pytest.mark.parametrize(
-    "seqlens_q,seqlens_kv,block_sizes",
-    [
-        pytest.param([37, 53, 22], [37, 53, 22], None, id="unaligned"),
-        pytest.param([37, 5, 64, 22], [90, 64, 64, 130], None,
-                     id="chunked_prefill"),
-        # Note (david): 128-wide blocks under 300-token sequences put a left
-        # edge several kv blocks past each sequence's first block.
-        pytest.param([300, 45, 200], [300, 60, 330], (128, 128, 64, 128),
-                     id="left_edge_skips_blocks"),
-    ],
-)
-@pytest.mark.parametrize(
-    "causal,window_size",
-    [(True, (16, 0)), (True, (160, 0)), (False, (8, 8)), (False, (24, -1)),
-     (False, (-1, 4)), (False, (0, 0))],
-)
-def test_flash_attn_varlen_window(
-        seqlens_q, seqlens_kv, block_sizes, causal, window_size):
-    # Note (david): the window is bottom-right aligned per sequence, so each
-    # packed sequence must match itself run alone under the same window.
-    q, k, v, segments = packed_qkv(seqlens_q, 4, 2, 64, seqlens_kv)
-    cu_q = cu_seqlens_of(seqlens_q)
-    out, lse = flash_attn_varlen_func(
-        q, k, v, cu_q, cu_seqlens_of(seqlens_kv), max(seqlens_q),
-        max(seqlens_kv), causal=causal, window_size=window_size,
-        return_softmax_lse=True, interpret=INTERPRET, block_sizes=block_sizes)
-    for index, segment in enumerate(segments):
-        rows = slice(int(cu_q[index]), int(cu_q[index + 1]))
-        assert_close_to_reference(
-            out[rows][None], *segment, causal=causal, window_size=window_size)
-        assert_lse_close(
-            lse[None, :, rows], *segment, causal=causal,
-            window_size=window_size)
-
-
-def test_flash_attn_varlen_is_forward_only():
-    seqlens = [37, 53, 22]
-    cu = cu_seqlens_of(seqlens)
-    q, k, v, _ = packed_qkv(seqlens, 2, 2, 64)
-
-    def loss(q):
-        return flash_attn_varlen_func(
-            q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True,
-            interpret=INTERPRET).astype(jnp.float32).sum()
-
-    with pytest.raises(NotImplementedError, match="flash_attn_varlen_func"):
-        jax.grad(loss)(q)
-
-
-def test_flash_attn_varlen_folded_softmax_lse(monkeypatch):
-    monkeypatch.setattr(
-        flash_attn_interface, "get_varlen_head_fold",
-        lambda key, num_heads, head_dim, head_dim_v: 4)
-    flash_attn_interface.get_kernel.cache_clear()
-    q, k, v = random_qkv(19, 1, 512, 8, 8, 128, jnp.bfloat16)
-    cu = jnp.array([0, 256, 512], jnp.int32)
-    out, lse = flash_attn_varlen_func(
-        q[0], k[0], v[0], cu, cu, 256, 256, return_softmax_lse=True,
-        interpret=INTERPRET)
-    assert_close_to_reference(out[None], q, k, v, cu_seqlens=(cu, cu))
-    assert_lse_close(lse[None], q, k, v, cu_seqlens=(cu, cu))
-
-
-@pytest.mark.parametrize("causal", [False, True])
-def test_flash_attn_varlen_many_blocks(causal):
-    blocks = BlockSizes(block_q=128, block_kv=128, block_kv_compute=128,
-                        block_q_compute=64, num_stages=3)
-    total = sum(PACKED_MANY)
-    cu = cu_seqlens_of(PACKED_MANY)
-    q, k, v = random_qkv(0, 1, total, 2, 2, 64, jnp.bfloat16)
-    kernel = make_flash_attn_mha(
-        2, total, total, causal=causal, block_sizes=blocks, num_kv_heads=2,
-        interpret=INTERPRET, varlen_max_seqlen_kv=max(PACKED_MANY))
-    out = run_head_major_kernel(kernel, q, k, v, cu, cu)
-    assert_close_to_reference(
-        out, q, k, v, causal=causal, cu_seqlens=(cu, cu), softmax_scale=1.0)
-
-
-def test_flash_attn_varlen_causal_below_diagonal_packed_block():
-    # Note (david): one 500-token sequence in a 512 buffer puts q block 1 across
-    # the real/pad boundary while strictly below the diagonal from kv block 0;
-    # the masked pipeline copy must not apply the diagonal's fragment skip
-    # there. The skip only fires with more than one kv compute tile per block.
-    real = 500
-    cu = jnp.array([0, real], jnp.int32)
-    q, k, v = random_qkv(3, 1, 512, 2, 2, 64, jnp.bfloat16)
-    kernel = make_flash_attn_mha(
-        2, 512, 512, causal=True,
-        block_sizes=BlockSizes(block_q=256, block_kv=256, block_kv_compute=128,
-                               block_q_compute=128),
-        num_kv_heads=2, interpret=INTERPRET, varlen_max_seqlen_kv=512)
-    out = run_head_major_kernel(kernel, q, k, v, cu, cu)
-    assert_close_to_reference(
-        out, q, k, v, rows=slice(0, real), causal=True, cu_seqlens=(cu, cu),
-        softmax_scale=1.0)
+    g = randn(rng, (batch_size, nheads, seqlen_q, d), dtype)
+    out0, dq0, dk0, dv0 = fwd_bwd(q, k, v, g)
+    # Note (david): the kernels accumulate in a fixed order, so every repeat on the
+    # same inputs must match bitwise; a DMA read before its wait breaks that.
+    for _ in range(100):
+        out, dq, dk, dv = fwd_bwd(q, k, v, g)
+        assert jnp.array_equal(out, out0)
+        assert jnp.array_equal(dq, dq0)
+        assert jnp.array_equal(dk, dk0)
+        assert jnp.array_equal(dv, dv0)
