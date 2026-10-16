@@ -209,7 +209,6 @@ def conv_state_on_grid(qkv_view_ref: jax.Ref, halo: jax.Array,
 
 
 def causal_conv1d(
-    real_sizes: jax.Array,
     chunk_tokens: jax.Array,
     prev_conv: jax.Array,
     conv_weight: jax.Array,
@@ -218,14 +217,15 @@ def causal_conv1d(
 ) -> tuple[jax.Array, jax.Array]:
     """Causal conv1d of one compute chunk and its conv state checkpoints.
 
-    real_sizes is [seq], chunk_tokens the chunk's raw tokens [seq, chunk,
-    dim_size], prev_conv the [seq, prev_kernel_size, dim_size] tokens before
-    them, conv_weight [kernel_size, dim_size] and conv_bias [dim_size]. Returns
-    the [seq, compute_chunk_size, dim_size] output and the [seq, window_size,
+    chunk_tokens is the chunk's raw tokens [seq, chunk, dim_size], prev_conv
+    the [seq, prev_kernel_size, dim_size] tokens before them, conv_weight
+    [kernel_size, dim_size] and conv_bias [dim_size]. Returns the [seq,
+    compute_chunk_size, dim_size] output and the [seq, window_size,
     prev_kernel_size, dim_size] states: checkpoint w holds the last
     prev_kernel_size inputs ending at token compute_chunk_size - window_size +
-    w, clamped to the last real token, i.e. the state a sequence resuming right
-    after that token starts from.
+    w, the state a sequence resuming right after that token starts from.
+    Checkpoints past a sequence's last real token hold its pad rows; the state
+    write-back skips them.
     """
     assert cfg.mode == config.KDAMode.BATCHED
     assert chunk_tokens.ndim == 3 and prev_conv.ndim == 3
@@ -243,24 +243,16 @@ def causal_conv1d(
     else:
         biased_out = conv_out + conv_bias.reshape(1, 1, -1)
 
-    # Note (david): decode and speculative windows keep chunk_size tiny
-    # (== window_size), so a masking loop of a few selects beats the roll.
-    real_sizes_col = real_sizes.reshape(-1, 1, 1)
+    # Note (david): start_conv_out writes back only the window positions
+    # before a sequence's real size, whose checkpoints end at a real token, so
+    # no checkpoint is clamped to the last real token. The clamp selects cost
+    # 1.4 us of a 2.4 us verify-4 tile (v6e, 4 sequences, dim 8192) and only
+    # ever touched positions that are dropped.
     conv_ckpts = []
     for w_idx in range(cfg.window_size):
         last_row = 1 + cfg.compute_chunk_size - cfg.window_size + w_idx
-        # Note (david): this is the checkpoint of sequences whose last real
-        # token is at or past this window position; the selects below pick the
-        # shorter ones.
-        conv_ckpt = token_rows(prev_conv, chunk_tokens, last_row,
-                               cfg.prev_kernel_size)
-        for c_idx in range(1, last_row):
-            conv_ckpt = jnp.where(
-                c_idx == real_sizes_col,
-                token_rows(prev_conv, chunk_tokens, c_idx,
-                           cfg.prev_kernel_size),
-                conv_ckpt,
-            )
-        conv_ckpts.append(conv_ckpt)
+        conv_ckpts.append(
+            token_rows(prev_conv, chunk_tokens, last_row,
+                       cfg.prev_kernel_size))
 
     return biased_out, jnp.stack(conv_ckpts, axis=1)

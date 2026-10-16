@@ -166,9 +166,8 @@ def inner_kernel(
                 qkv_slot_ref=qkv_slot_ref, cfg=cfg)
         with profile_scope("conv1d"):
             qkv_out, conv_ckpt = compute_conv1d.causal_conv1d(
-                real_sizes=real_sizes, chunk_tokens=qkv_in,
-                prev_conv=prev_conv, conv_weight=conv_weight,
-                conv_bias=conv_bias, cfg=cfg)
+                chunk_tokens=qkv_in, prev_conv=prev_conv,
+                conv_weight=conv_weight, conv_bias=conv_bias, cfg=cfg)
         with profile_scope("silu"):
             qkv_out = compute_gdn.silu(qkv_out)
         q, k, v, b, a = vmem_ldst.load_activation_as_chunked(
@@ -237,9 +236,8 @@ def inner_kernel(
                 qkv_slot_ref=qkv_slot_ref, cfg=cfg)
         with profile_scope("conv1d"):
             qkv_out, conv_ckpt = compute_conv1d.causal_conv1d(
-                real_sizes=real_sizes, chunk_tokens=qkv_in,
-                prev_conv=prev_conv, conv_weight=conv_weight,
-                conv_bias=conv_bias, cfg=cfg)
+                chunk_tokens=qkv_in, prev_conv=prev_conv,
+                conv_weight=conv_weight, conv_bias=conv_bias, cfg=cfg)
         with profile_scope("silu"):
             qkv_out = compute_gdn.silu(qkv_out)
         q, k, v, b, a = vmem_ldst.load_activation_as_token(
