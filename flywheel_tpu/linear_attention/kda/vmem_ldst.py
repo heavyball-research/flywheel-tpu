@@ -15,6 +15,7 @@
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from . import config, memory_ref
@@ -97,7 +98,7 @@ def load_and_select_states(
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.KDAConfig,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Pick each sequence's starting conv and recurrent state.
 
     A sequence's first tile starts from the state DMA'd from HBM, or zeros
@@ -108,6 +109,10 @@ def load_and_select_states(
     BATCHED mode. Returns real_sizes [seq_tile_size], the f32 conv state
     [seq_tile_size, prev_kernel_size, dim_size] and the recurrent state
     [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
+
+    A replay tile reads each checkpoint straight from its ring slot, so for it
+    the slot of a sequence without an initial state is zeroed in place and
+    None is returned for the recurrent state.
     """
     real_size_list = []
     conv_state_list = []
@@ -130,6 +135,18 @@ def load_and_select_states(
             conv_state = jnp.where(is_first_tile, initial_conv_state,
                                    carry_conv_scratch_ref[idx])
 
+        real_size_list.append(r_size)
+        conv_state_list.append(conv_state)
+        if cfg.is_replay:
+            checkpoint_ref = recurrent_slot_ref.at[idx, 0]
+
+            @pl.when(jnp.logical_not(has_initial_state))
+            def _zero_checkpoint():
+                checkpoint_ref[...] = jnp.zeros(checkpoint_ref.shape,
+                                                checkpoint_ref.dtype)
+
+            continue
+
         initial_recurrent_state = jnp.where(has_initial_state,
                                             recurrent_slot_ref[idx, 0], 0)
         if carry_recurrent_scratch_ref is None:
@@ -137,14 +154,14 @@ def load_and_select_states(
         else:
             recurrent_state = jnp.where(is_first_tile, initial_recurrent_state,
                                         carry_recurrent_scratch_ref[idx])
-
-        real_size_list.append(r_size)
-        conv_state_list.append(conv_state)
         recurrent_state_list.append(recurrent_state)
 
+    if recurrent_state_list:
+        recurrent_states = jnp.stack(recurrent_state_list, axis=0)
+    else:
+        recurrent_states = None
     return (jnp.stack(real_size_list, axis=0),
-            jnp.stack(conv_state_list, axis=0),
-            jnp.stack(recurrent_state_list, axis=0))
+            jnp.stack(conv_state_list, axis=0), recurrent_states)
 
 
 def load_activation_as_token(

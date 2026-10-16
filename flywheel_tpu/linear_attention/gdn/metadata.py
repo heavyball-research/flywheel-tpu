@@ -28,6 +28,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
+    replay_lens: jax.Array | None = None,
 ) -> memory_ref.MetadataRef:
     """Metadata for tiles holding several sequences, one record per sequence.
 
@@ -35,6 +36,10 @@ def compute_batched_seq_metadata(
     speculative verify window of up to cfg.window_size tokens. The initial
     state is read from read_indices[s] + read_offsets[s] and window position t
     checkpoints to state_indices[s] + t.
+
+    With cfg.replay_window, the recurrent checkpoint is read from
+    read_indices[s] alone, replay_lens[s] committed records come with it, and
+    the flush rule of replay_flush decides whether it is rewritten.
     """
     all_seqs = jnp.arange(seq_lens.size)
 
@@ -43,6 +48,17 @@ def compute_batched_seq_metadata(
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
     is_valid_seq = all_seqs < end_seq
     valid_seq_ids = jnp.where(is_valid_seq, all_seqs, 0)
+    has_initial_state = (seq_lens - query_lens) > 0
+
+    if cfg.replay_window:
+        assert replay_lens is not None
+        replay_len, is_flush = replay_flush(replay_lens, query_lens,
+                                            has_initial_state, read_indices,
+                                            state_indices, cfg.replay_window)
+        replay_kwargs = dict(s_idx_to_replay_len=replay_len,
+                             s_idx_to_flush=is_flush.astype(jnp.int32))
+    else:
+        replay_kwargs = {}
 
     return memory_ref.MetadataRef.create(
         cfg=cfg,
@@ -52,11 +68,34 @@ def compute_batched_seq_metadata(
         p_id_to_r_size=jnp.where(is_valid_seq, query_lens, 0),
         p_id_is_first_tile=is_valid_seq,
         p_id_is_last_tile=is_valid_seq,
-        s_idx_has_initial_state=(seq_lens - query_lens) > 0,
+        s_idx_has_initial_state=has_initial_state,
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_read_indices=read_indices,
+        **replay_kwargs,
     )
+
+
+def replay_flush(
+    replay_lens: jax.Array,
+    query_lens: jax.Array,
+    has_initial_state: jax.Array,
+    read_indices: jax.Array,
+    state_indices: jax.Array,
+    replay_window: int,
+) -> tuple[jax.Array, jax.Array]:
+    """(committed records read, flush) of each replay sequence.
+
+    A sequence flushes when its new records would not fit behind the
+    committed ones, when it has no initial state (its slot must receive a
+    zero checkpoint) and when it reads and writes different slots (the write
+    slot must receive the whole state).
+    """
+    replay_len = jnp.where(has_initial_state, replay_lens, 0).astype(jnp.int32)
+    is_flush = ((replay_len + query_lens > replay_window)
+                | jnp.logical_not(has_initial_state)
+                | (read_indices != state_indices))
+    return replay_len, is_flush
 
 
 def compute_per_seq_metadata(

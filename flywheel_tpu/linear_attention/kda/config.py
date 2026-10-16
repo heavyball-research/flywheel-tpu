@@ -47,7 +47,9 @@ STREAM_REC_IN = 4
 STREAM_OUT = 5
 STREAM_CONV_OUT = 6
 STREAM_REC_OUT = 7
-NUM_STREAMS = 8
+STREAM_REPLAY_IN = 8
+STREAM_REPLAY_OUT = 9
+NUM_STREAMS = 10
 
 
 class KDAMode(enum.StrEnum):
@@ -70,6 +72,9 @@ class Dtypes:
     compute: jnp.dtype
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
+    # Note (david): the replay record buffer's storage dtype, f32 or bf16; the
+    # records are computed and merged in f32 either way.
+    replay_record: jnp.dtype = jnp.float32
 
 
 @jax.tree_util.register_dataclass
@@ -101,6 +106,14 @@ class KDAConfig:
     window_size: int = 1
     lower_bound: float | None = None
     beta_is_activated: bool = False
+    # Note (david): ReplaySSM decode keeps each sequence's recurrent state as a
+    # checkpoint plus up to replay_window records of recent tokens and writes
+    # the checkpoint only when the records would overflow. 0 turns it off.
+    replay_window: int = 0
+
+    @property
+    def is_replay(self) -> bool:
+        return self.mode == KDAMode.BATCHED and self.replay_window > 0
 
     @property
     def chunk_size(self) -> int:
@@ -160,6 +173,24 @@ class KDAConfig:
         num_lanes = pltpu.get_tpu_info().num_lanes
         return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
 
+    @property
+    def record_k_offset(self) -> int:
+        return self.v_dim_size
+
+    @property
+    def record_g_offset(self) -> int:
+        return self.v_dim_size + self.num_kq_heads * self.kq_head_dim
+
+    @property
+    def record_dim(self) -> int:
+        """Lanes of one replay record [u | k | g].
+
+        u is the token's delta-rule correction per value head, k its
+        normalized key per kq head and g its per-key-channel log decay per
+        value head.
+        """
+        return self.record_g_offset + self.num_v_heads * self.kq_head_dim
+
     def get_scratch_shape_dict(self) -> dict[str, pl.MemoryRef | None]:
         """VMEM rings, inter-tile carries and DMA semaphores of the pipeline.
 
@@ -174,6 +205,9 @@ class KDAConfig:
         g_dim_size = self.num_v_heads * self.kq_head_dim
         conv_state_shape = (self.prev_kernel_size, self.dim_size)
         rec_state_shape = (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
+        # Note (david): a replay tile writes at most one checkpoint per
+        # sequence, the flushed one, whatever its window.
+        num_rec_out = 1 if self.is_replay else self.window_size
 
         # Note (david): a BATCHED tile holds whole sequences, so only PER_SEQ
         # carries state from one tile to the next.
@@ -185,6 +219,19 @@ class KDAConfig:
         else:
             carry_conv_scratch = None
             carry_recurrent_scratch = None
+
+        if self.is_replay:
+            # Note (david): the record axis is the tiled row axis, so the
+            # buffer moves in whole SUBLANE_ALIGN-row windows: the in ring holds
+            # the committed prefix, the out ring the merged rows written back.
+            replay_shape = (slots, tile_seqs, self.replay_window,
+                            self.record_dim)
+            replay_in_buf = pltpu.VMEM(replay_shape, self.dtypes.replay_record)
+            replay_out_buf = pltpu.VMEM(replay_shape,
+                                        self.dtypes.replay_record)
+        else:
+            replay_in_buf = None
+            replay_out_buf = None
 
         return {
             "qkv_buf": pltpu.VMEM(
@@ -205,8 +252,10 @@ class KDAConfig:
                 (slots, tile_seqs, self.window_size, *conv_state_shape),
                 self.dtypes.conv_state),
             "rec_out_buf": pltpu.VMEM(
-                (slots, tile_seqs, self.window_size, *rec_state_shape),
+                (slots, tile_seqs, num_rec_out, *rec_state_shape),
                 self.dtypes.recurrent_state),
+            "replay_in_buf": replay_in_buf,
+            "replay_out_buf": replay_out_buf,
             "out_buf": pltpu.VMEM(
                 (slots, self.out_window_rows, self.v_dim_size),
                 self.dtypes.act_out),
