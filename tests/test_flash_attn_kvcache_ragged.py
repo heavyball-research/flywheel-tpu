@@ -28,6 +28,14 @@ from flywheel_tpu.pallas.flash_fwd_varlen_paged import (
 INTERPRET = jax.default_backend() != "tpu"
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)
 LSE_TOL = dict(rtol=2e-3, atol=4e-3)
+# Note (david): random q and k give scaled scores of std 1, which a softcap of 5
+# barely bends; a softmax_scale of SOFTCAP_SCORE_GAIN / sqrt(head_dim) spreads
+# them into the cap's curved range.
+SOFTCAP_SCORE_GAIN = 4.0
+
+
+def bf16(array):
+  return jnp.asarray(array, jnp.bfloat16)
 
 
 def random_ragged_case(lengths=(3, 0, 5), prefixes=(127, 0, 251), heads=4,
@@ -277,7 +285,7 @@ def test_ragged_cache_rotary_q_matches_reference(interleaved, causal, append,
     second = reference_q[start:end, :, second_lanes]
     reference_q[start:end, :, first_lanes] = first * cosine - second * sine
     reference_q[start:end, :, second_lanes] = first * sine + second * cosine
-  scale = softcap_test_scale(head_dim, softcap)
+  scale = SOFTCAP_SCORE_GAIN / math.sqrt(head_dim) if softcap else None
   expected = ragged_reference(
       reference_q, kc, vc, k, v, cu, lengths, table,
       causal=causal or window_size[1] == 0, softmax_scale=scale,
@@ -307,12 +315,6 @@ def test_ragged_cache_multiple_query_blocks_and_pages(head_dim, heads,
   assert_extend_matches(actual, expected, case[5], case[6], 2)
 
 
-def softcap_test_scale(head_dim, softcap):
-  """softmax_scale for a softcap case: 4 / sqrt(head_dim) spreads the random
-  scores to where a softcap of 5 bends them; None keeps the default."""
-  return 4 / math.sqrt(head_dim) if softcap else None
-
-
 # Note (david): the narrowest window keeps 6 keys, because a one-key row's lse
 # is a single bf16-rounded dot product, whose error passes the lse tolerance.
 PAGED_WINDOW_SOFTCAP_CASES = [
@@ -338,7 +340,7 @@ def test_paged_window_and_softcap_match_reference(
       lengths=(131, 17), prefixes=(400, 255), heads=heads, kv_heads=kv_heads,
       capacity=640, padding=3)
   k, v = (k, v) if append else (None, None)
-  scale = softcap_test_scale(q.shape[-1], softcap)
+  scale = SOFTCAP_SCORE_GAIN / math.sqrt(q.shape[-1]) if softcap else None
   expected = ragged_reference(
       q, kc, vc, k, v, cu, lengths, table,
       causal=causal or window_size[1] == 0, softmax_scale=scale,
@@ -672,13 +674,13 @@ def test_multitoken_rejects_window_right_bound():
 
 
 def paged_tiles(max_seqlen_q_bucket, max_seqlen_k_bucket, *, head_dim=128,
-                page_size=128, gqa_fold=1, block_sizes=None):
+                page_size=128, gqa_fold=1, has_window=False, block_sizes=None):
   """resolve_paged_tiles with no lse or rotary."""
   return resolve_paged_tiles(
       max_seqlen_q_bucket=max_seqlen_q_bucket,
       max_seqlen_k_bucket=max_seqlen_k_bucket, page_size=page_size,
       head_dim=head_dim, return_lse=False, rotary_dtype=None,
-      gqa_fold=gqa_fold, block_sizes=block_sizes)
+      gqa_fold=gqa_fold, has_window=has_window, block_sizes=block_sizes)
 
 
 @pytest.mark.parametrize("shape,dtype,expected_bytes", [
@@ -810,6 +812,22 @@ def test_paged_tiles_fold_q_heads_into_fragment_rows(
       gqa_fold=gqa_fold) <= vmem_limit_bytes()
 
 
+@pytest.mark.parametrize(
+    "max_seqlen_q_bucket,page_size,gqa_fold,head_dim,expected", [
+        (1024, 128, 1, 128, (512, 512, 256, 512)),
+        (1024, 128, 8, 256, (512, 512, 128, 512)),
+        (1024, 256, 1, 128, (512, 512, 256, 512)),
+        (64, 128, 1, 128, (128, 512, 64, 512)),
+        (1024, 384, 1, 128, (512, 384, 256, 384)),
+    ])
+def test_paged_tiles_cap_window_blocks(max_seqlen_q_bucket, page_size, gqa_fold,
+                                       head_dim, expected):
+  blocks = paged_tiles(max_seqlen_q_bucket, 16384, head_dim=head_dim,
+                       page_size=page_size, gqa_fold=gqa_fold, has_window=True)
+  assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
+          blocks.block_kv_compute) == expected
+
+
 def test_paged_tiles_reject_pinned_vmem_overflow():
   # Note (david): a pinned build past the budget raises; nothing shrinks
   # behind the pin. A 65536-token kv block stages ~200 MiB at d256.
@@ -925,21 +943,20 @@ def probe_case(lengths, prefixes, *, heads=4, kv_heads=2, head_dim=128,
                           edges[rng.integers(0, count)],
                           rng.integers(0, last + 1))
         second = np.full(length, -1)
-      if window_left is not None:
+      if window_left is None:
+        aimed_target, aimed_second = target, second
+      else:
         # Note (david): a missed left edge splits the attention of an edge row
         # onto the hidden key it also aims at.
         first_visible = np.maximum(rows - window_left, 0)
         at_edge = rng.random(length) < 0.5
-        target = np.where(at_edge, first_visible,
-                          np.maximum(target, first_visible))
-        second = np.where(at_edge & (first_visible > 0), first_visible - 1,
-                          second)
-      direction = codes[seq][target, group[head]] + np.where(
-          second[:, None] >= 0, codes[seq][second, group[head]], 0)
+        aimed_target = np.where(at_edge, first_visible,
+                                np.maximum(target, first_visible))
+        aimed_second = np.where(at_edge & (first_visible > 0),
+                                first_visible - 1, second)
+      direction = codes[seq][aimed_target, group[head]] + np.where(
+          aimed_second[:, None] >= 0, codes[seq][aimed_second, group[head]], 0)
       q[start:start + length, head] = logit / scale * direction
-
-  def bf16(array):
-    return jnp.asarray(array, jnp.bfloat16)
 
   return (bf16(q), bf16(kc), bf16(vc), bf16(k), bf16(v),
           jnp.asarray(cu, jnp.int32), jnp.asarray(cache_seqlens, jnp.int32),
@@ -1106,13 +1123,39 @@ def test_paged_overflow_guard_checks_last_live_kv_tile():
       (length, kv_heads, head_dim))
   pages = np.zeros((num_pages, page_size, kv_heads, head_dim))
 
-  def bf16(array):
-    return jnp.asarray(array, jnp.bfloat16)
-
   case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
           jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
           jnp.arange(num_pages, dtype=jnp.int32)[None])
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size)
   assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+  assert_extend_matches(actual, expected, case[5], case[6], 1)
+
+
+def test_paged_replay_rescale_survives_skipped_fragment():
+  # Note (david): keys [0, 256) score 0 and keys [256, 1024) ~200 nats, so
+  # every row past 256 overflows its first-tile anchor and the block replays.
+  # With 512-row q tiles and 256-key kv tiles, q tile 0's frontier skips kv
+  # tiles 2 and 3, so q tile 1's fragments at kv tiles 1 and 2 run back to
+  # back in the replay. The rebase at kv tile 1 must still scale away the
+  # first tile's state, whatever kv tile 2's softmax computes next.
+  length, heads, head_dim = 1024, 1, 128
+  num_pages, page_size = 8, 128
+  scale = 1 / math.sqrt(head_dim)
+  direction = np.zeros(head_dim)
+  direction[0] = 1.0
+  magnitude = math.sqrt(200.0 / scale)
+  q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+  k = np.zeros((length, heads, head_dim))
+  k[256:] = magnitude * direction
+  v = np.where(np.arange(length)[:, None, None] < 256, 1.0, 3.0) * np.ones(
+      (length, heads, head_dim))
+  pages = np.zeros((num_pages, page_size, heads, head_dim))
+
+  case = (bf16(q), bf16(pages), bf16(pages), bf16(k), bf16(v),
+          jnp.array([0, length], jnp.int32), jnp.array([0], jnp.int32),
+          jnp.arange(num_pages, dtype=jnp.int32)[None])
+  expected = ragged_reference(*case, causal=True)
+  actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size,
+                     block_sizes=(1024, 1024, 512, 256))
   assert_extend_matches(actual, expected, case[5], case[6], 1)

@@ -160,13 +160,31 @@ def test_flash_attn_window_size(seqlen, causal, window_size):
 
 
 def test_flash_attn_window_size_crosses_kv_compute_tiles():
-    # Note (david): seqlen 768 splits kv into two compute tiles, and a right
-    # bound reaching across them takes the fragment-skip path that a causal
-    # diagonal never reaches.
+    # Note (david): one 768-token block split into two kv compute tiles, and a
+    # right bound reaching across them takes the fragment-skip path that a
+    # causal diagonal never reaches. The window block cap never builds this
+    # tiling, so the blocks are pinned.
     q, k, v = random_qkv(0, 1, 768, 2, 2, 64, jnp.bfloat16)
-    out = flash_attn_func(
-        q, k, v, causal=False, window_size=(0, 400), interpret=INTERPRET)
-    assert_close_to_reference(out, q, k, v, causal=False, window_size=(0, 400))
+    kernel = make_flash_attn_mha(
+        2, 768, 768, causal=False, window=(0, 400),
+        block_sizes=BlockSizes(block_q=768, block_kv=768, block_kv_compute=384,
+                               block_q_compute=256),
+        num_kv_heads=2, interpret=INTERPRET)
+    out = run_head_major_kernel(kernel, q, k, v)
+    assert_close_to_reference(out, q, k, v, causal=False, window_size=(0, 400),
+                              softmax_scale=1.0)
+
+
+@pytest.mark.parametrize("seqlens,expected", [
+    ((16384, 16384), (512, 512, 256, 512)),
+    ((768, 768), (256, 256, 128, 256)),
+    ((384, 384), (384, 384, 128, 384)),
+    ((16384, 16384, 4096, 100), (128, 512, 64, 512)),
+])
+def test_window_caps_default_blocks(seqlens, expected):
+    blocks = flash_attn_interface.default_block_sizes(*seqlens, has_window=True)
+    assert (blocks.block_q, blocks.block_kv, blocks.block_q_compute,
+            blocks.block_kv_compute) == expected
 
 
 def test_flash_attn_head_major_layout():

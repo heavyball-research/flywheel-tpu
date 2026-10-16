@@ -70,6 +70,12 @@ DEFAULT_BLOCK_Q_COMPUTE = 256
 FWD_BLOCKS = (2048, 1024, 512, 256, 128)
 FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
 FWD_Q_COMPUTE_BLOCKS = (256, 128)
+# Note (david): a sliding window caps both physical forward blocks. A q block
+# row loads the window plus bq + bkv keys of partial blocks, all through the
+# masked fragment pipeline, so large blocks waste about (bq + bkv) / W. On v6e
+# paged chunked prefill (d256, W 1024 and 4096), 512 beat 256 by 1.4-2.7x and
+# uncapped blocks by up to 1.55x, losing to them by at most 3%.
+WINDOW_BLOCK = 512
 
 # Note (david): exp(x) == exp2(x * log2(e)). Folding log2(e) into the score
 # scale and the loaded lse lets the softmax use exp2, dropping the per-element
@@ -97,10 +103,11 @@ def default_block(
   """Analytic physical block for a sequence axis, shared by fwd and bwd.
 
   seqlen <= candidates[0] is one whole-axis block; a longer axis takes the
-  largest candidate dividing it. max_seqlen (packed schedules only) caps the
-  block at max(candidates[-1], next_pow2(max_seqlen)), relaxed to the largest
-  candidate under the cap that divides the axis, since a block spanning several
-  sequences leaves the block-diagonal schedule nothing to skip.
+  largest candidate dividing it. max_seqlen (packed schedules, or a window's
+  WINDOW_BLOCK) caps the block at max(candidates[-1], next_pow2(max_seqlen)),
+  relaxed to the largest candidate under the cap that divides the axis, since
+  a block spanning several sequences leaves the block-diagonal schedule
+  nothing to skip.
   """
   if seqlen <= candidates[0]:
     block = seqlen

@@ -62,6 +62,13 @@ V_ABS_MAX_LOG2 = 12
 GUARD_MARGIN_NATS = 2.0
 MIN_GUARD_THRESHOLD_NATS = 20.0
 
+# Note (david): a masked score is exactly DEFAULT_MASK_VALUE and real logits
+# sit far inside half of it, so these bounds never mistake one for the other;
+# exp2(score - UNANCHORED_ROW_MAX) is exactly 0 for every score.
+MASKED_ROW_BOUND = 0.5 * DEFAULT_MASK_VALUE
+UNANCHORED_ROW_MAX = -DEFAULT_MASK_VALUE
+UNANCHORED_ROW_BOUND = -MASKED_ROW_BOUND
+
 
 def overflow_guard_threshold(kv_seq_len: int) -> float:
   """Static-anchor overflow-guard threshold in log2 units."""
@@ -159,8 +166,8 @@ def fwd_body(
     pipeline_refs, lse_stage = remaining_refs, None
   # Note (david): the exact unpack pins this variable-arity tail against
   # forward_common's scratch list; a silent mismatch would shift every ref.
-  (o_stage, row_max_scratch, row_sum_scratch, o_scratch, rescale_scratch,
-   guard_smem, parity_smem, sems) = pipeline_refs
+  (o_stage, row_max_scratch, row_sum_scratch, o_scratch, guard_smem,
+   parity_smem, sems) = pipeline_refs
   if return_lse and is_per_seq:
     lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
@@ -199,6 +206,10 @@ def fwd_body(
   # blocks skip each kv compute tile past the frontier of the q tile's last row.
   # Unmasked blocks lie below every row's frontier and skip nothing.
   skips_past_frontier = schedule.kv_frontier is not None
+  # Note (david): only a left window can mask a row's whole first fragment
+  # while later keys stay visible; anchoring on that masked score would push
+  # the row's first visible key past the guard into a replay.
+  defers_row_start = window[0] is not None or schedule.has_q_span
 
   if token_major is None:
     width_qk = width_v = q_heads_per_row = kv_heads_per_row = None
@@ -695,7 +706,6 @@ def fwd_body(
       new_parity, old_parity = _head_parities(g)
       row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
       row_max_scratch_g = row_max_scratch.at[head_rows]
-      rescale_scratch_g = rescale_scratch.at[head_rows]
 
       slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
       scores = _masked_scores(kv_compute_index, q_compute_index, logits,
@@ -709,14 +719,26 @@ def fwd_body(
           scores.max(axis=-1), state_shape, (0,))
       is_row_start = jnp.logical_and(is_first, kv_compute_index == 0)
       row_max_prev = row_max_scratch_g[slice_q, :]
+      if defers_row_start:
+        # Note (david): a row whose fragments so far all lay before its window
+        # holds UNANCHORED_ROW_MAX, which zeroes every probability it scores,
+        # so its row_sum and o stay exactly 0 until its first visible key
+        # anchors it, and no rescale is due then.
+        was_unanchored = row_max_prev >= UNANCHORED_ROW_BOUND
+        takes_frag_anchor = jnp.logical_or(is_row_start, was_unanchored)
+        frag_anchor = jnp.where(
+            frag_row_max > MASKED_ROW_BOUND, frag_row_max, UNANCHORED_ROW_MAX)
+      else:
+        takes_frag_anchor = is_row_start
+        frag_anchor = frag_row_max
       if guard_recovery:
         # Note (david): the recovery replay rebases the anchor onto the
         # overflowing fragment; the ordinary pass keeps the anchor it first
         # picked.
         should_rebase = frag_row_max - row_max_prev > guard_threshold
         row_max = jnp.where(
-            is_row_start,
-            frag_row_max,
+            takes_frag_anchor,
+            frag_anchor,
             jnp.where(
                 should_rebase,
                 jnp.maximum(row_max_prev, frag_row_max),
@@ -724,23 +746,34 @@ def fwd_body(
             ),
         )
       else:
-        row_max = jnp.where(is_row_start, frag_row_max, row_max_prev)
+        row_max = jnp.where(takes_frag_anchor, frag_anchor, row_max_prev)
       # Note (david): logits are in log2 units, so exp2 drops the per-element
       # multiply jnp.exp lowers to on TPU.
       probs = jnp.exp2(scores - jnp.tile(row_max, (1, bkv_repeats)))
       frag_row_sum = lax.broadcast_in_dim(
           probs.sum(axis=-1), state_shape, (0,))
-      if guard_recovery:
+      if guard_recovery and defers_row_start:
+        # Note (david): an unanchored row's state is exactly 0, but
+        # exp2(UNANCHORED_ROW_MAX - anchor) is inf, and inf * 0 is NaN.
+        rescale = jnp.where(
+            was_unanchored, 0.0, jnp.exp2(row_max_prev - row_max))
+        row_sum_prev = rescale * row_sum_read_ref[slice_q, :]
+      elif guard_recovery:
         rescale = jnp.exp2(row_max_prev - row_max)
         row_sum_prev = rescale * row_sum_read_ref[slice_q, :]
       else:
+        rescale = None
         row_sum_prev = row_sum_read_ref[slice_q, :]
       row_sum_new = jnp.where(
           is_row_start, frag_row_sum, row_sum_prev + frag_row_sum)
       row_sum_new_ref[slice_q, :] = row_sum_new
       row_max_scratch_g[slice_q, :] = row_max
       if guard_recovery:
-        rescale_scratch_g[slice_q, :] = jnp.where(is_row_start, 1.0, rescale)
+        # Note (david): the rescale rides the pipeline carry to this fragment's
+        # PV. A per-q-tile scratch would race: once skipped fragments make two
+        # fragments of one q tile adjacent, the later softmax overwrites it
+        # before the earlier fragment's PV reads it.
+        rescale = jnp.where(is_row_start, 1.0, rescale)
       else:
         # Note (david): row_sum upper-bounds every single score of the row, so
         # this detector may request a needless replay but never misses a score
@@ -760,15 +793,15 @@ def fwd_body(
             guard_smem[g],
             jnp.where(is_last_kv_tile, has_overflow_risk.astype(jnp.int32), 0),
         )
-      return probs, is_row_start
+      return probs, is_row_start, rescale
 
     def _pv(
-        g, kv_compute_index, q_compute_index, probs, is_row_start,
-        guard_recovery,
+        g, kv_compute_index, q_compute_index, probs, is_row_start, rescale,
     ):
+      """rescale is the fragment's recovery rescale, None on the ordinary
+      pass."""
       head_rows = pl.ds(g * group_bq, group_bq)
       new_parity, old_parity = _head_parities(g)
-      rescale_scratch_g = rescale_scratch.at[head_rows]
 
       if is_paged:
         o_curr = lax.dot_general(
@@ -807,16 +840,16 @@ def fwd_body(
         o_read_ref = o_scratch.at[read_parity, head_rows]
         tile_index = (slice_q, slice(None))
       o_read = o_read_ref[tile_index]
-      if not guard_recovery:
+      if rescale is None:
         o_prev = o_read
       elif transposed_pv:
-        # Note (david): every lane of the rescale scratch holds the row value,
-        # so lane 0 transposed to (1, bq_compute) broadcasts over the head_dim_v
+        # Note (david): every lane of the rescale holds the row value, so lane
+        # 0 transposed to (1, bq_compute) broadcasts over the head_dim_v
         # sublanes without any lane tiling.
-        o_prev = rescale_scratch_g[slice_q, 0:1].T * o_read
+        o_prev = rescale[:, 0:1].T * o_read
       else:
         o_prev = jnp.tile(
-            rescale_scratch_g[slice_q, :], (1, head_dim_v_repeats)
+            rescale, (1, head_dim_v_repeats)
         )[..., :o_scratch.shape[-1]] * o_read
       o_new_ref[tile_index] = jnp.where(is_row_start, o_curr, o_prev + o_curr)
 
@@ -848,13 +881,14 @@ def fwd_body(
       first_g, first_k, first_q = (
           jnp.int32(coord) for coord in _fragment_coords(0))
       logits = _qk(_resolve_g(first_g), first_k, first_q)
-      probs_first, is_row_start_first = _online_softmax(
+      probs_first, is_row_start_first, rescale_first = _online_softmax(
           _resolve_g(first_g), first_k, first_q, logits, needs_mask=is_causal,
           guard_recovery=guard_recovery, apply_bounds=apply_bounds,
       )
 
       def _pipeline_step(frag_idx, carry):
-        probs_prev, is_row_start_prev, prev_g, prev_k, prev_q = carry
+        (probs_prev, is_row_start_prev, rescale_prev, prev_g, prev_k,
+         prev_q) = carry
         current_g, current_k, current_q = _fragment_coords(frag_idx)
         if skips_past_frontier and apply_bounds:
           is_active = _is_kv_tile_live(current_k, current_q)
@@ -874,29 +908,31 @@ def fwd_body(
           else:
             needs_mask = is_causal
           logits = _qk(_resolve_g(current_g), current_k, current_q)
-          probs_curr, is_row_start_curr = _online_softmax(
+          probs_curr, is_row_start_curr, rescale_curr = _online_softmax(
               _resolve_g(current_g), current_k, current_q, logits, needs_mask,
               guard_recovery=guard_recovery, apply_bounds=apply_bounds,
           )
           _pv(
               _resolve_g(prev_g), prev_k, prev_q, probs_prev,
-              is_row_start_prev, guard_recovery=guard_recovery,
+              is_row_start_prev, rescale_prev,
           )
-          return (probs_curr, is_row_start_curr, current_g, current_k,
-                  current_q)
+          return (probs_curr, is_row_start_curr, rescale_curr, current_g,
+                  current_k, current_q)
 
         return lax.cond(is_active, _process_active, lambda _: carry, operand=None)
 
-      probs_last, is_row_start_last, last_g, last_k, last_q = lax.fori_loop(
+      (probs_last, is_row_start_last, rescale_last, last_g, last_k,
+       last_q) = lax.fori_loop(
           1,
           num_fragments,
           _pipeline_step,
-          (probs_first, is_row_start_first, first_g, first_k, first_q),
+          (probs_first, is_row_start_first, rescale_first, first_g, first_k,
+           first_q),
           unroll=True,
       )
       _pv(
           _resolve_g(last_g), last_k, last_q, probs_last, is_row_start_last,
-          guard_recovery=guard_recovery,
+          rescale_last,
       )
 
     def _run_group(is_causal, apply_bounds):
@@ -1564,12 +1600,11 @@ def forward_common(
   row_sum_scratch = vmem((2, folded_bq, NUM_LANES), jnp.float32)
   o_scratch = vmem(
       (2, *from_head_minor((folded_bq, head_dim_v), o_layout)), jnp.float32)
-  rescale_scratch = vmem((folded_bq, NUM_LANES), jnp.float32)
   guard_smem = pltpu.SMEM((head_fold,), jnp.int32)
   parity_smem = pltpu.SMEM((head_fold,), jnp.int32)
   sems = pltpu.SemaphoreType.DMA((NUM_SEMS + num_rotary_streams, num_stages))
   scratch_shapes += [o_stage, row_max_scratch, row_sum_scratch, o_scratch,
-                     rescale_scratch, guard_smem, parity_smem, sems]
+                     guard_smem, parity_smem, sems]
   if return_lse and is_per_seq:
     scratch_shapes.append(vmem((num_stages, bq, NUM_LANES), jnp.float32))
   elif return_lse:

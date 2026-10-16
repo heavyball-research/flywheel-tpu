@@ -466,13 +466,14 @@ def test_paged_fwd_schedule_matches_the_mask(case, causal, left):
         lower, span = sched.q_bounds(row.ctx, jnp.int32(kv), k_abs)
         assert (span is not None) == sched.has_q_span
         lower = np.asarray(lower)[0]
-        actual = valid_rows[:, None] >= lower[None, :]
-        if span is not None:
+        if span is None:
+          actual = valid_rows[:, None] >= lower[None, :]
+        else:
           # Note (david): the kernel's one unsigned comparison, where a row
           # below lower wraps past any span.
           relative_ids = (valid_rows[:, None] - lower[None, :]).astype(
               np.uint32)
-          actual &= relative_ids < np.asarray(span)[0].astype(np.uint32)
+          actual = relative_ids < np.asarray(span)[0].astype(np.uint32)
         np.testing.assert_array_equal(actual, block_mask,
                                       err_msg=str((row.si, kv)))
       else:

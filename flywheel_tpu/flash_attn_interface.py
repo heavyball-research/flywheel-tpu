@@ -18,6 +18,7 @@ from .pallas.block_sizes import (
   LOG2E,
   NUM_LANES,
   PAIRED_HEAD_DIM,
+  WINDOW_BLOCK,
   BlockSizes,
   QKVLayout,
   TokenMajorInfo,
@@ -62,15 +63,24 @@ def default_block_sizes(
     kv_seqlen: int,
     max_seqlen: int | None = None,
     max_seqlen_q: int | None = None,
+    *,
+    has_window: bool = False,
 ) -> BlockSizes:
   # Note (david): the kernel masks in absolute coordinates, so block_q and
   # block_kv come from their own axes. Chunked-prefill q chunks are far shorter
   # than their kv contexts, and a q block sized to the kv cap straddles several
   # sequences and leaves the block-diagonal schedule little to skip, so
   # max_seqlen_q caps the q axis on its own.
-  q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
+  seq_q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
+  if has_window:
+    q_cap = WINDOW_BLOCK if seq_q_cap is None else min(seq_q_cap, WINDOW_BLOCK)
+    kv_cap = (WINDOW_BLOCK if max_seqlen is None
+              else min(max_seqlen, WINDOW_BLOCK))
+  else:
+    q_cap = seq_q_cap
+    kv_cap = max_seqlen
   block_q = default_block(q_seqlen, FWD_BLOCKS, q_cap)
-  block_kv = default_block(kv_seqlen, FWD_BLOCKS, max_seqlen)
+  block_kv = default_block(kv_seqlen, FWD_BLOCKS, kv_cap)
   q_compute_tile = pick_tile(FWD_Q_COMPUTE_BLOCKS, block_q)
   if block_q // q_compute_tile < MIN_Q_TILES_PER_BLOCK:
     block_q_compute = q_compute_tile // MIN_Q_TILES_PER_BLOCK
@@ -169,7 +179,8 @@ def get_kernel(
     transposed_pv = False
     if blocks_override is None:
       block_sizes = default_block_sizes(
-          seqlen_q, seqlen_kv, varlen_max_seqlen_kv, varlen_max_seqlen_q
+          seqlen_q, seqlen_kv, varlen_max_seqlen_kv, varlen_max_seqlen_q,
+          has_window=has_window,
       )
     else:
       # Note (david): the caller already padded both axes to multiples of these
@@ -1073,11 +1084,11 @@ def flash_attn_varlen_func(
   head-major; token_major, rotary_k=True and a window right bound other than
   -1 or 0 raise, and RoPE rotates Q only, at positions seqused_k - len_q + t.
   window_size and softcap act as on packed K/V. cu_seqlens_q[0] must be 0; a
-  concrete one is checked, a traced one is the caller's contract. A one-token sequence is an ordinary sequence. num_active (int
-  or int32 scalar, possibly traced) keeps only the first num_active
-  sequences; rows past the last kept one return out = 0 and lse = -inf. A
-  concrete num_active outside [0, batch] raises; a traced one must lie in
-  that range, which is not checked on device.
+  concrete one is checked, a traced one is the caller's contract. A one-token
+  sequence is an ordinary sequence. num_active (int or int32 scalar, possibly
+  traced) keeps only the first num_active sequences; rows past the last kept
+  one return out = 0 and lse = -inf. A concrete num_active outside [0, batch]
+  raises; a traced one must lie in that range, which is not checked on device.
   """
   window_size = check_common_kwargs(
       window_size, dropout_p=dropout_p, softcap=softcap,

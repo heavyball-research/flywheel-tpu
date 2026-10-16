@@ -68,7 +68,6 @@ class Cell:
     batch: int
     decode_tokens: int
     page_size: int
-    # Keys each query attends, its own included; None is full causal.
     sliding_window: int | None = None
     # q, k, v and cache dtype. flash_attn_with_kvcache takes bf16 caches only;
     # every byte count below follows itemsize, so another dtype only needs a
@@ -77,10 +76,12 @@ class Cell:
 
     @property
     def key(self):
+        if self.sliding_window is None:
+            window_tag = ""
+        else:
+            window_tag = f"-w{self.sliding_window}"
         shape = (f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
-                 f"-d{self.head_dim}-s{self.seq}-p{self.page_size}")
-        if self.sliding_window is not None:
-            shape = f"{shape}-w{self.sliding_window}"
+                 f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}")
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
         return f"{shape}-b{self.batch}-n{self.decode_tokens}"
@@ -332,7 +333,8 @@ def run(cell, args):
         kv_tokens_read = sum(
             (i + 1) * cell.chunk for i in range(cell.num_calls))
     else:
-        # The first query of call i reaches back sliding_window - 1 keys.
+        # Note (david): call i reads from its first query's window edge,
+        # sliding_window - 1 keys back, not from token 0.
         kv_tokens_read = sum(
             (i + 1) * cell.chunk
             - max(0, i * cell.chunk - cell.sliding_window + 1)

@@ -224,6 +224,15 @@ def test_flash_attn_with_kvcache_matches_reference(
                         cache_batch_idx, window_size)
 
 
+# Note (david): random bf16 q and k give scaled scores of std 1, which a cap of
+# 30 or 50 barely bends, so the softcap tests lift q by SOFTCAP_Q_GAIN (exact
+# in bf16) to put the scores in the cap's curved range.
+SOFTCAP_Q_GAIN = 8.0
+# Note (david): 30x the lse atol, so a kernel that drops the cap fails by far
+# more than rounding.
+SOFTCAP_MIN_LSE_SHIFT = 0.1
+
+
 def assert_softcap_changes_reference(q, k_cache, v_cache, total_seqlens,
                                      rows, window_size, softcap):
   """Fail unless the cap moves the reference lse by SOFTCAP_MIN_LSE_SHIFT."""
@@ -234,15 +243,6 @@ def assert_softcap_changes_reference(q, k_cache, v_cache, total_seqlens,
   finite = jnp.isfinite(capped_lse)
   assert (float(jnp.max(jnp.abs(capped_lse - uncapped_lse)[finite]))
           > SOFTCAP_MIN_LSE_SHIFT)
-
-
-# Note (david): random bf16 q and k give scaled scores of std 1, which a cap of
-# 30 or 50 barely bends, so the softcap tests lift q by SOFTCAP_Q_GAIN (exact
-# in bf16) to put the scores in the cap's curved range.
-SOFTCAP_Q_GAIN = 8.0
-# Note (david): 30x the lse atol, so a kernel that drops the cap fails by far
-# more than rounding.
-SOFTCAP_MIN_LSE_SHIFT = 0.1
 
 
 @pytest.mark.parametrize(
