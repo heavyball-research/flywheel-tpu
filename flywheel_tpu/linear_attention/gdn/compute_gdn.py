@@ -963,15 +963,13 @@ def recurrent_gdn(
 def replay_record_parts(
         records: jax.Array, num_records: jax.Array,
         cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """The committed rows of a [replay_window, record_dim] record buffer:
-    u [num_v_heads, rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim]
-    and the log decays g [1, rows, gate_lanes]; rows from num_records on are
-    zero."""
+    """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
+    rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim] and g [1, rows,
+    gate_lanes]; rows from num_records on are zero."""
     d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
     gate_lanes = cfg.aligned_num_v_heads
-    # Note (david): rows past num_records hold stale or uninitialized VMEM, so
-    # they are selected away rather than scaled: 0 * NaN is NaN. Zero records
-    # are inert like a step's pad rows.
+    # Note (david): rows past num_records may hold NaN from stale VMEM, so they
+    # are selected away, not scaled: 0 * NaN is NaN.
     record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
     records = jnp.where(record_row < num_records, records, 0)
     u_records = jnp.stack([
@@ -1013,24 +1011,17 @@ def replay_gdn(
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[jax.Array, jax.Array]:
-    """One ReplaySSM step of one sequence: outputs and records, no state.
+    """One ReplaySSM step of one sequence: outputs and new records, no state.
 
-    q_chunked and k_chunked are [num_kq_heads, window, kq_head_dim], v_chunked
-    [num_v_heads, window, v_head_dim], b_rows and a_rows [1, window,
-    gate_lanes], and a_log and dt_bias [1, 1, gate_lanes]; rows from
-    num_tokens on are padding. records is the [replay_window, record_dim]
-    buffer whose first num_records rows are committed and shadow_ref the bf16
-    [num_v_heads, kq_head_dim, v_head_dim] state before them, rounded from the
-    f32 checkpoint. With G the cumulative log decay over the records and then
-    the new tokens, the decayed state token t reads is
+    With G the cumulative log decay over the committed records and then the
+    new tokens, token t reads the state
 
         exp(G_t) S + sum_{j < t} exp(G_t - G_j) k_j^T u_j,
 
-    so the new tokens' corrections u and outputs need S only through
-    [k; q] @ S, one weight push per head, and the records only through dots
-    with their k and u. Returns the packed output [window, num_v_heads *
-    v_head_dim] and the new tokens' records [window, record_dim];
-    replay_flush folds the committed records into the checkpoint.
+    so S, the bf16 shadow in shadow_ref, enters only through [k; q] @ S and
+    the records only through dots with their k and u. Rows from num_tokens on
+    are padding. Returns the packed output [window, num_v_heads * v_head_dim]
+    and the new records [window, record_dim].
     """
     window = cfg.window_size
     num_v_heads = cfg.num_v_heads
@@ -1056,19 +1047,17 @@ def replay_gdn(
     q = l2_norm(q) * d_k**-0.5
     k = l2_norm(k)
 
-    _to_column = functools.partial(gate_column, num_v_heads=num_v_heads)
-    _to_row = functools.partial(gate_row, num_v_heads=num_v_heads)
-
-    # Note (david): every factor below is exp of a non-positive log decay, so
-    # none can overflow: the records' decay to their end, the new tokens'
-    # decay from the records' end, and the checkpoint's decay to each token.
+    # Note (david): every decay below is exp of a non-positive log decay, so
+    # none can overflow.
     g_records_cumsum = cumsum_rows(g_records)
     g_records_total = g_records_cumsum[:, -1:]
     g_new_cumsum = cumsum_rows(g)
-    decay_records_to_end = _to_row(jnp.exp(g_records_total - g_records_cumsum))
-    decay_new_col = _to_column(jnp.exp(g_new_cumsum))
-    decay_ckpt_col = _to_column(jnp.exp(g_records_total + g_new_cumsum))
-    beta_col = _to_column(beta)
+    decay_records_to_end = gate_row(
+        jnp.exp(g_records_total - g_records_cumsum), num_v_heads)
+    decay_new_col = gate_column(jnp.exp(g_new_cumsum), num_v_heads)
+    decay_ckpt_col = gate_column(jnp.exp(g_records_total + g_new_cumsum),
+                                 num_v_heads)
+    beta_col = gate_column(beta, num_v_heads)
 
     k_repeat = jnp.repeat(k, cfg.v_per_kq_head, axis=0)
     q_repeat = jnp.repeat(q, cfg.v_per_kq_head, axis=0)
@@ -1104,9 +1093,9 @@ def replay_gdn(
             q_dot_k = jnp.sum(q_repeat * k_repeat, axis=-1, keepdims=True)
             out = q_reads + q_dot_k * u
         else:
-            # Note (david): the window's own tokens interact through a unit
-            # lower triangular system; at window <= 8 its forward substitution
-            # is a few VPU broadcasts per row.
+            # Note (david): at window <= 8, forward substitution of the
+            # window's unit lower triangular system is a few VPU broadcasts
+            # per row.
             kq_dot_k = jax.lax.dot_general(
                 kq, k, (((2, ), (2, )), ((0, ), (0, ))),
                 preferred_element_type=jnp.float32)
@@ -1117,7 +1106,8 @@ def replay_gdn(
             is_lower = row >= col
             log_decay_pair = jnp.where(
                 is_lower,
-                _to_column(g_new_cumsum) - _to_row(g_new_cumsum), 0)
+                gate_column(g_new_cumsum, num_v_heads) -
+                gate_row(g_new_cumsum, num_v_heads), 0)
             decay_pair = jnp.where(is_lower, jnp.exp(log_decay_pair), 0)
             akk = jnp.where(row > col,
                             beta_col * kq_dot_k[:, :window] * decay_pair, 0)
@@ -1149,19 +1139,17 @@ def replay_flush(
     wait_checkpoint: Callable[[], None],
     cfg: config.GDNConfig,
 ) -> jax.Array:
-    """The state after one sequence's committed records, the checkpoint a
-    flush writes.
+    """Fold one sequence's first num_records records into its f32 checkpoint
+    and return the new checkpoint.
 
-    records is the [replay_window, record_dim] buffer whose first num_records
-    rows are committed and checkpoint_ref the f32 [num_v_heads, kq_head_dim,
-    v_head_dim] state before them. wait_checkpoint runs right before
-    checkpoint_ref is read, so the caller can wait for its DMA there.
+    wait_checkpoint runs right before checkpoint_ref is read, so the caller
+    can wait for its DMA there.
     """
     num_v_heads = cfg.num_v_heads
     u_records, k_records, g_records = replay_record_parts(
         records, num_records, cfg)
-    # Note (david): the fold is the only place record error can enter the
-    # recurrence, so it runs at f32 precision; it runs once per flush.
+    # Note (david): the fold is the only place record error enters the
+    # recurrence, and it runs once per flush, so it pays for f32 precision.
     with profile_scope("replay_flush"):
         g_records_cumsum = cumsum_rows(g_records)
         g_records_total = g_records_cumsum[:, -1:]

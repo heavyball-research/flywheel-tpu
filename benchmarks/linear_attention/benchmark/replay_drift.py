@@ -19,6 +19,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from flywheel_tpu.linear_attention.gdn import wrapper as gdn_wrapper
+from flywheel_tpu.linear_attention.kda import wrapper as kda_wrapper
 from tests.linear_attention import test_gdn_replay, test_kda_replay
 
 MODES = ("conventional", "replay_f32", "replay_bf16")
@@ -38,19 +40,27 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.kernel == "gdn":
-        from flywheel_tpu.linear_attention.gdn import wrapper
+        wrapper = gdn_wrapper
+        conventional_fn = gdn_wrapper.fused_conv1d_gdn
+        replay_fn = gdn_wrapper.fused_conv1d_gdn_replay
         helpers = test_gdn_replay
         n_kq, n_v = helpers.N_KQ, helpers.N_V
         d_k, d_v = helpers.KQ_HEAD_DIM, helpers.V_HEAD_DIM
         dim = helpers.CONV_DIM
         model_dims = helpers.MODEL_DIMS
+        ref_kwargs = model_dims
+        gate_name = "a"
     else:
-        from flywheel_tpu.linear_attention.kda import wrapper
+        wrapper = kda_wrapper
+        conventional_fn = kda_wrapper.fused_conv1d_kda
+        replay_fn = kda_wrapper.fused_conv1d_kda_replay
         helpers = test_kda_replay
         n_kq, n_v, d_k, d_v = (helpers.N_KQ, helpers.N_V, helpers.D_K,
                                helpers.D_V)
         dim = helpers.DIM
         model_dims = helpers.MODEL_DIMS
+        ref_kwargs = dict(lower_bound=None)
+        gate_name = "g"
     kernel_size = model_dims["kernel_size"]
 
     num_seqs, num_steps = args.num_seqs, args.num_steps
@@ -92,26 +102,16 @@ def main() -> None:
                     args.gate_scale + args.gate_scale).astype(jnp.bfloat16)
         tokens.append((qkv, b, gate))
 
-    # Reference outputs per sequence over the whole run.
     ref_outs = []
     for seq in range(num_seqs):
         slot = int(state_indices[seq])
         seq_tokens = [jnp.stack([t[i][seq] for t in tokens]).astype(
             jnp.float32) for i in range(3)]
-        if args.kernel == "gdn":
-            _, _, out = helpers.sequence_ref(*seq_tokens, conv0[slot],
-                                             rec0[slot], **params,
-                                             **model_dims)
-        else:
-            _, out = helpers.sequence_ref(*seq_tokens, conv0[slot],
-                                          rec0[slot], **params,
-                                          lower_bound=None)
+        _, _, out = helpers.sequence_ref(*seq_tokens, conv0[slot], rec0[slot],
+                                         **params, **ref_kwargs)
         ref_outs.append(np.asarray(out, np.float32))
     ref_outs = np.stack(ref_outs, axis=1)
 
-    gate_name = "a" if args.kernel == "gdn" else "g"
-    conventional_fn = getattr(wrapper, f"fused_conv1d_{args.kernel}")
-    replay_fn = getattr(wrapper, f"fused_conv1d_{args.kernel}_replay")
     results = {}
     for mode in MODES:
         conv, rec = conv0.copy(), rec0.copy()

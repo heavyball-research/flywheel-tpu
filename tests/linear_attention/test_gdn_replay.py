@@ -33,12 +33,12 @@ pytestmark = TPU_ONLY
 CONTEXT_LEN = 100
 
 
-def _sequence_ref(*args, **kwargs):
+@jax.jit(static_argnames=STATIC)
+def sequence_ref(
+    *args: jax.Array, **kwargs: jax.Array | int
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     with jax.default_matmul_precision("highest"):
         return gdn_sequence_ref(*args, **kwargs)
-
-
-sequence_ref = jax.jit(_sequence_ref, static_argnames=STATIC)
 
 
 def materialize_state(checkpoint: np.ndarray, records: np.ndarray,
@@ -97,7 +97,9 @@ def run_replay(
     history = [[] for _ in range(num_seqs)]
     max_len = prefill_len + (num_steps + 1) * window
 
-    def _reference(seq: int, seq_tokens: list) -> tuple[jax.Array, jax.Array]:
+    def _reference(
+        seq: int, seq_tokens: list[tuple[np.ndarray, np.ndarray, np.ndarray]]
+    ) -> tuple[jax.Array, jax.Array]:
         """Per-token states and outputs of seq_tokens from seq's initial
         state; zero tokens pad it to max_len so one compile serves all."""
         num_pad = max_len - len(seq_tokens)

@@ -112,9 +112,6 @@ class MetadataRef:
     # (align mode) resumes a sequence from the cached state block of the
     # previous block boundary while it checkpoints into a new block.
     s_idx_to_read_indices: jax.Array
-    # Note (david): replay decode only, None otherwise. replay_len is the
-    # number of committed records the sequence reads (0 without an initial
-    # state) and flush whether it folds them into its checkpoint this step.
     s_idx_to_replay_len: jax.Array | None
     s_idx_to_flush: jax.Array | None
     records_per_tile: int = dataclasses.field(metadata={"static": True})
@@ -351,9 +348,10 @@ def reads_state(record: PackedPIdRecord, metadata_ref: MetadataRef,
     should_read = jnp.logical_and(record.is_first_tile,
                                   metadata_ref.s_idx_has_initial_state[s_idx])
     if only_flushing:
-        should_read = jnp.logical_and(should_read,
-                                      metadata_ref.s_idx_to_flush[s_idx] != 0)
-    return should_read
+        return jnp.logical_and(should_read,
+                               metadata_ref.s_idx_to_flush[s_idx] != 0)
+    else:
+        return should_read
 
 
 def start_state_in(hbm_ref: jax.Ref,
@@ -373,9 +371,11 @@ def start_state_in(hbm_ref: jax.Ref,
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
         s_idx = record.s_idx
-        read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
         if apply_read_offset:
-            read_slot += metadata_ref.s_idx_to_read_offset[s_idx]
+            read_slot = (metadata_ref.s_idx_to_read_indices[s_idx] +
+                         metadata_ref.s_idx_to_read_offset[s_idx])
+        else:
+            read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
         num_states = jnp.where(
             reads_state(record, metadata_ref, only_flushing), 1, 0)
         pltpu.make_async_copy(
@@ -430,10 +430,9 @@ def wait_state_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
 
 
 # Note (david): the conv state cache arrives as its [prev_kernel_size,
-# num_slots, dim_size] view, whose slot axis is the tiled second-minor one.
-# Mosaic rejects a traced row count on that axis, so every conv checkpoint
-# moves as its own [prev_kernel_size, dim_size] DMA (slot axis squeezed),
-# guarded by pl.when, and is waited on with its own descriptor.
+# num_slots, dim_size] view, whose slot axis is tiled. Mosaic rejects a traced
+# row count there, so each conv checkpoint moves as its own pl.when-guarded
+# DMA, waited on with its own descriptor.
 
 
 def conv_in_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
@@ -591,9 +590,8 @@ def wait_flushed_ckpt_in(buf_ref: jax.Ref, sem: jax.Ref,
     """Wait, before record idx's flush reads its f32 checkpoint, for the
     tile's checkpoint reads (start_state_in with only_flushing)."""
     # Note (david): the reads share one byte-counting semaphore, so a wait
-    # sized to one record's read could return on another record's bytes. The
-    # tile's first reading record waits for all of them instead, before any
-    # checkpoint is read.
+    # sized to one record's read could return on another record's bytes; the
+    # tile's first reading record waits for all of them.
     reads = [
         reads_state(metadata_ref.get_record(p_id, prev), metadata_ref,
                     only_flushing=True) for prev in range(idx + 1)

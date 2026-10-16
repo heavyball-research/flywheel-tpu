@@ -74,9 +74,7 @@ class Dtypes:
     compute: jnp.dtype
     recurrent_state: jnp.dtype
     conv_state: jnp.dtype
-    # Note (david): the replay record buffer's storage dtype, f32 or bf16; the
-    # records are computed and merged in f32 either way.
-    replay_record: jnp.dtype = jnp.float32
+    replay_record: jnp.dtype
 
 
 @jax.tree_util.register_dataclass
@@ -106,18 +104,17 @@ class GDNConfig:
     # without speculative decoding, so shapes and loops size off it
     # unconditionally and the extra axis folds away.
     window_size: int = 1
-    # Note (david): ReplaySSM decode keeps each sequence's recurrent state as a
-    # checkpoint plus up to replay_window records of recent tokens and writes
-    # the checkpoint only when the records would overflow. 0 turns it off.
+    # Note (david): ReplaySSM keeps up to replay_window records of recent
+    # tokens beside the checkpoint, so a decode step writes the state only
+    # when they overflow. 0 turns it off.
     replay_window: int = 0
-    # Note (david): replay calls keep a bf16 shadow of the f32 recurrent
-    # checkpoint, bf16(checkpoint) in every slot. A replay decode reads only
-    # the shadow, the operand its default-precision dot rounds S to anyway,
-    # and the f32 checkpoint only to flush; whatever writes a checkpoint (a
-    # flush, a PER_SEQ sequence's last tile) writes its shadow too.
+    # Note (david): a replay decode reads S only through a default-precision
+    # dot, which rounds it to bf16 anyway, so it reads a bf16 shadow of the
+    # f32 checkpoint at half the bytes; every checkpoint write also writes the
+    # shadow.
     has_shadow: bool = False
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         assert self.has_shadow or not self.is_replay, (
             "a replay decode reads the checkpoint through its shadow")
 
@@ -229,26 +226,23 @@ class GDNConfig:
             carry_conv_scratch = None
             carry_recurrent_scratch = None
 
+        # Note (david): the record axis is tiled, so record DMAs move whole
+        # SUBLANE_ALIGN-row windows and a slot holds the full buffer. Only a
+        # replay decode reads the shadow; a PER_SEQ tile starts from the f32
+        # checkpoint.
         if self.is_replay:
-            # Note (david): the record axis is the tiled row axis, so the
-            # buffer moves in whole SUBLANE_ALIGN-row windows: the in ring holds
-            # the committed prefix, the out ring the merged rows written back.
             replay_shape = (slots, tile_seqs, self.replay_window,
                             self.record_dim)
             replay_in_buf = pltpu.VMEM(replay_shape, self.dtypes.replay_record)
             replay_out_buf = pltpu.VMEM(replay_shape,
                                         self.dtypes.replay_record)
-        else:
-            replay_in_buf = None
-            replay_out_buf = None
-
-        # Note (david): only a replay decode reads the shadow; a PER_SEQ tile
-        # starts from the f32 checkpoint and writes both.
-        if self.is_replay:
             shadow_in_buf = pltpu.VMEM((slots, tile_seqs, 1, *rec_state_shape),
                                        jnp.bfloat16)
         else:
+            replay_in_buf = None
+            replay_out_buf = None
             shadow_in_buf = None
+
         if self.has_shadow:
             shadow_out_buf = pltpu.VMEM(
                 (slots, tile_seqs, num_rec_out, *rec_state_shape),

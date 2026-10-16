@@ -139,8 +139,8 @@ def inner_kernel(
             recurrent_slot_ref=recurrent_in_ref,
             carry_conv_scratch_ref=carry_conv_scratch_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-            cfg=cfg,
             shadow_slot_ref=shadow_in_ref,
+            cfg=cfg,
         )
 
     conv_weight = weights_ref.conv.weight[...].astype(jnp.float32)
@@ -206,14 +206,10 @@ def inner_kernel(
                         shadow_out_ref.dtype)
                     start_flush_out(idx)
 
-        # Note (david): a flush moves 2 MiB in and 3 MiB out (n_v=32, d=128)
-        # on top of its tile's traffic. The tile folds its flushing sequences
-        # halfway through its steps, waits for the f32 read only right before
-        # a fold reads it and starts the writes right after it, so the read
-        # overlaps the compute before the folds and the writes the compute
-        # after them. v6e, B=256, decode, tile 4: 432.8 us with the flush DMAs
-        # at the tile boundaries, 360.9 / 354.3 / 372.4 us folding after 1 /
-        # 2 / 3 steps.
+        # Note (david): folding mid tile overlaps the flush's f32 read with the
+        # steps before it and its writes with the steps after. v6e, B=256,
+        # decode, tile 4: 432.8 us with the flush DMAs at the tile boundaries,
+        # 360.9 / 354.3 / 372.4 us folding after 1 / 2 / 3 steps.
         flush_pass_pos = cfg.seq_tile_size // 2
         seq_outs = []
         for idx in range(cfg.seq_tile_size):
@@ -231,29 +227,25 @@ def inner_kernel(
                 dt_bias=dt_bias.reshape(1, 1, -1), cfg=cfg)
             seq_outs.append(out)
             with profile_scope("replay_merge"):
-                # Note (david): the new records go to rows [base, base +
-                # r_size) of the buffer image written back, the other rows
-                # keep what was read; replay_out_copy writes only the aligned
-                # window around the new rows.
                 base = metadata_ref.replay_base(s_idx)
-                num_pad_rows = cfg.replay_window - cfg.window_size
-                if num_pad_rows:
-                    new_records = jnp.concatenate([
+                if cfg.replay_window == cfg.window_size:
+                    padded_records = new_records
+                else:
+                    padded_records = jnp.concatenate([
                         new_records,
-                        jnp.zeros((num_pad_rows, cfg.record_dim),
-                                  new_records.dtype)
+                        jnp.zeros((cfg.replay_window - cfg.window_size,
+                                   cfg.record_dim), new_records.dtype)
                     ], axis=0)
-                shifted = pltpu.roll(new_records, base, 0)
+                shifted = pltpu.roll(padded_records, base, 0)
                 is_new_row = ((record_rows >= base) &
                               (record_rows < base + record.r_size))
-                # Note (david): the roll and the merge run in f32, whose rows
-                # are unpacked, and only the merged image is cast to the
-                # storage dtype.
+                # Note (david): the aligned window replay_out_copy writes also
+                # covers committed rows, so the image keeps the rows it read.
+                # The roll and the merge run on unpacked f32 rows; only the
+                # merged image is cast to the storage dtype.
                 replay_out_ref[idx] = jnp.where(
                     is_new_row, shifted, records_in).astype(
                         replay_out_ref.dtype)
-        if flush_pass_pos == cfg.seq_tile_size:
-            _flush_pass()
 
         with profile_scope("store_out"):
             store_out_rows(out_slot_ref, jnp.stack(seq_outs, axis=0), 0,
@@ -494,15 +486,18 @@ def outer_kernel(
                 memory_ref.start_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
-            # Note (david): a replay tile reads its f32 checkpoints only in its
-            # flushes, mid tile, so they are issued after the inputs the tile
-            # waits for at its start.
-            memory_ref.start_state_in(recurrent_state_ref,
-                                      rec_in_buf.at[slot],
-                                      sems.at[config.STREAM_REC_IN, slot],
-                                      *tile_args,
-                                      apply_read_offset=not cfg.is_replay,
-                                      only_flushing=cfg.is_replay)
+                # Note (david): only the flushes read the f32 checkpoints, mid
+                # tile, so they queue behind the inputs the tile waits for at
+                # its start.
+                memory_ref.start_state_in(
+                    recurrent_state_ref, rec_in_buf.at[slot],
+                    sems.at[config.STREAM_REC_IN, slot], *tile_args,
+                    apply_read_offset=False, only_flushing=True)
+            else:
+                memory_ref.start_state_in(recurrent_state_ref,
+                                          rec_in_buf.at[slot],
+                                          sems.at[config.STREAM_REC_IN, slot],
+                                          *tile_args)
 
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
@@ -521,10 +516,6 @@ def outer_kernel(
                                     *tile_args)
             # Note (david): a replay tile waits for its f32 checkpoint reads
             # in inner_kernel, right before a flush reads one.
-            if not cfg.is_replay:
-                memory_ref.wait_state_in(rec_in_buf.at[slot],
-                                         sems.at[config.STREAM_REC_IN, slot],
-                                         *tile_args)
             if cfg.is_replay:
                 memory_ref.wait_state_in(
                     shadow_in_buf.at[slot],
@@ -532,6 +523,10 @@ def outer_kernel(
                 memory_ref.wait_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
+            else:
+                memory_ref.wait_state_in(rec_in_buf.at[slot],
+                                         sems.at[config.STREAM_REC_IN, slot],
+                                         *tile_args)
 
     def _start_out(p_id, slot):
         with profile_scope("start_out"):
@@ -858,7 +853,7 @@ def fused_conv1d_gdn(
         (new_conv_state, new_recurrent_state): The updated state caches.
         out: The output [batch_size, n_v * d_v].
     """
-    (conv_state, recurrent_state, _, _), out = _fused_conv1d_gdn(
+    (conv_state, recurrent_state, _, _), out = launch_fused_conv1d_gdn(
         qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
         dt_bias, query_start_loc, state_indices, distribution, seq_lens,
         read_state_indices, read_offsets, None, None, None, n_kq=n_kq, n_v=n_v,
@@ -912,27 +907,21 @@ def fused_conv1d_gdn_replay(
     A decode sequence s keeps its recurrent state as the checkpoint in
     recurrent_state[slot] plus the first replay_lens[s] records of
     replay_state[slot], slot = read_state_indices[s] when read and
-    state_indices[s] when written. A step appends the records of its
-    query_len tokens from row base and computes their outputs from the
-    checkpoint and the records, without materializing a state. Where
-    replay_lens[s] + query_len > replay_window (or the sequence has no initial
-    state, or reads and writes different slots) it flushes: base is 0 and the
-    state after the replay_lens[s] committed records is written as the new
-    checkpoint. Otherwise base is replay_lens[s] and no state is written.
-    next_replay_lens gives the committed count of the next step.
+    state_indices[s] when written. A step appends its tokens' records and
+    computes their outputs without materializing a state. It flushes, folding
+    the committed records into a new checkpoint and appending from row 0, when
+    replay_lens[s] + query_len > replay_window, when it has no initial state
+    or when it reads and writes different slots; next_replay_lens gives the
+    committed count of the next step.
 
-    Speculative windows commit records by moving replay_lens, so the
-    recurrent state needs no per-position checkpoints; the conv state keeps
-    them as in fused_conv1d_gdn, read at read_offsets. Prefill and mixed
-    sequences run as in fused_conv1d_gdn, read and write the whole state, and
-    must have no committed records.
+    Speculative windows commit records by moving replay_lens, so only the conv
+    state keeps per-position checkpoints, read at read_offsets. Prefill and
+    mixed sequences run as in fused_conv1d_gdn and must have no committed
+    records.
 
-    The f32 checkpoint comes with a bf16 shadow, recurrent_shadow[slot] ==
-    recurrent_state[slot].astype(bf16), which a decode step reads instead of
-    the checkpoint; its outputs are bitwise those from the checkpoint, since
-    the step's dot rounds the state to bf16 anyway. Only a flush reads the f32
-    checkpoint, and everything that writes a checkpoint (a flush, a prefill or
-    mixed sequence) writes its shadow too.
+    A decode step reads the bf16 shadow instead of the f32 checkpoint, with
+    bitwise the same outputs since its dot rounds the state to bf16 anyway;
+    every checkpoint write also writes the shadow.
 
     Args:
         recurrent_state: f32 checkpoint cache [num_slots, n_v, d_k, d_v].
@@ -950,19 +939,16 @@ def fused_conv1d_gdn_replay(
         (new_conv_state, new_recurrent_state, new_recurrent_shadow,
         new_replay_state) and out.
     """
-    (conv_state, recurrent_state, replay_state,
-     recurrent_shadow), out = _fused_conv1d_gdn(
+    return launch_fused_conv1d_gdn(
         qkv, b, a, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
         dt_bias, query_start_loc, state_indices, distribution, seq_lens,
         read_state_indices, read_offsets, replay_state, replay_lens,
-        recurrent_shadow, n_kq=n_kq,
-        n_v=n_v, d_k=d_k, d_v=d_v, kernel_size=kernel_size,
-        num_spec_tokens=num_spec_tokens,
+        recurrent_shadow, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+        kernel_size=kernel_size, num_spec_tokens=num_spec_tokens,
         zero_initialize_out=zero_initialize_out,
         compute_precision=compute_precision,
         decode_tile_size=decode_tile_size, mixed_tile_size=mixed_tile_size,
         compute_chunk_size=compute_chunk_size, replay_window=replay_window)
-    return (conv_state, recurrent_state, recurrent_shadow, replay_state), out
 
 
 def next_replay_lens(
@@ -979,7 +965,7 @@ def next_replay_lens(
     step that accepted num_accepted[s] of its tokens (query_len without
     speculation); prefill and mixed sequences restart from 0."""
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    replay_len, is_flush = metadata.replay_flush(
+    replay_len, is_flush = metadata.plan_replay_step(
         replay_lens, query_lens, (seq_lens - query_lens) > 0,
         read_state_indices, state_indices, replay_window)
     base = jnp.where(is_flush, 0, replay_len)
@@ -987,7 +973,7 @@ def next_replay_lens(
     return jnp.where(is_decode, base + num_accepted, 0).astype(jnp.int32)
 
 
-def _fused_conv1d_gdn(
+def launch_fused_conv1d_gdn(
     qkv: jax.Array,
     b: jax.Array,
     a: jax.Array,
@@ -1022,7 +1008,7 @@ def _fused_conv1d_gdn(
 ) -> tuple[tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None],
            jax.Array]:
     """fused_conv1d_gdn, with a ReplaySSM decode segment when
-    replay_window > 0. Returns (conv, recurrent, replay, shadow) states and
+    replay_window > 0. Returns (conv, recurrent, shadow, replay) states and
     out, the last two None without replay."""
     if qkv.dtype != jnp.bfloat16:
         raise TypeError(f"qkv must be bfloat16, got {qkv.dtype}")
@@ -1054,11 +1040,11 @@ def _fused_conv1d_gdn(
     if mixed_tile_size <= 0 or mixed_tile_size % compute_chunk_size:
         raise ValueError(
             "mixed_tile_size must be a positive multiple of compute_chunk_size")
-    if replay_window:
+    if replay_state is not None:
         # Note (david): the record buffer moves in whole sublane tiles, and a
         # flushed window writes its records from row 0.
-        if replay_window % config.SUBLANE_ALIGN:
-            raise ValueError("replay_window must be a multiple of "
+        if replay_window <= 0 or replay_window % config.SUBLANE_ALIGN:
+            raise ValueError("replay_window must be a positive multiple of "
                              f"{config.SUBLANE_ALIGN}")
         if num_spec_tokens + 1 > replay_window:
             raise ValueError("replay_window must hold a verify window of "
@@ -1073,7 +1059,6 @@ def _fused_conv1d_gdn(
                             f"{replay_state.dtype}")
         if replay_lens.shape != state_indices.shape:
             raise ValueError("replay_lens must have one entry per sequence")
-        replay_lens = replay_lens.astype(jnp.int32)
         if recurrent_state.dtype != jnp.float32:
             raise TypeError("a replay checkpoint must be float32, got "
                             f"{recurrent_state.dtype}")
@@ -1093,14 +1078,10 @@ def _fused_conv1d_gdn(
     # of gdn_v3's 1.306 ms forward at T = 8192, dim = 6144.
     b = b.astype(jnp.float32)
     a = a.astype(jnp.float32)
-    # Note (david): the kernels take the conv state as its [kernel_size - 1,
-    # num_slots, dim] view. XLA lays a serving-sized f32 [num_slots,
-    # kernel_size - 1, dim] cache out slot-minor ({2,0,1:T(8,128)}, seen at 257
-    # and 1025 slots) so the short state axis needs no padding; that is this
-    # view's row-major layout, so the swap is a bitcast. A slot-major kernel
-    # operand instead cost a transposing copy of the whole cache before and
-    # after every call (v6e: 67 us at 257 slots, 373 us at 1025). A tiny cache
-    # XLA keeps slot-major pays a small copy here instead.
+    # Note (david): XLA lays a serving-sized f32 conv cache out slot-minor
+    # ({2,0,1:T(8,128)}), so its [kernel_size - 1, num_slots, dim] view is a
+    # bitcast, while a slot-major kernel operand cost a transposing copy of the
+    # whole cache around every call (v6e: 67 us at 257 slots, 373 us at 1025).
     conv_state = jnp.swapaxes(conv_state.astype(jnp.float32), 0, 1)
 
     num_seqs = state_indices.size
@@ -1206,8 +1187,8 @@ def _fused_conv1d_gdn(
         in_recurrent_state: jax.Array,
         aliased_out: jax.Array | None,
         mode: config.GDNMode,
-        in_replay_state: jax.Array | None = None,
-        in_shadow: jax.Array | None = None,
+        in_shadow: jax.Array | None,
+        in_replay_state: jax.Array | None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None,
                jax.Array | None]:
         if mode == config.GDNMode.PER_SEQ:
@@ -1269,7 +1250,7 @@ def _fused_conv1d_gdn(
                 read_offsets=read_offsets,
                 end_seq=distribution[0],
                 read_indices=read_state_indices,
-                replay_lens=replay_lens if cfg.is_replay else None,
+                replay_lens=replay_lens,
             )
         metadata_spec = jax.tree.map(lambda _: smem_spec, seq_metadata)
 
@@ -1289,12 +1270,6 @@ def _fused_conv1d_gdn(
             input_output_aliases = state_aliases | {
                 num_metadata_leaves + ALIASED_OUT_OPERAND: 0
             }
-        if cfg.is_replay:
-            kernel_replay_state = in_replay_state
-            replay_spec = hbm_spec
-        else:
-            kernel_replay_state = None
-            replay_spec = None
 
         # Note (david): the PER_SEQ kernel zero-fills [pad_start, batch_size),
         # the output rows no sequence owns; pad_start = batch_size turns the
@@ -1329,24 +1304,27 @@ def _fused_conv1d_gdn(
             else:
                 kernel_metadata[key] = str(leaf)
 
-        # Note (david): unpinned, XLA may move a small conv state into VMEM
-        # (S(1)), and there the one-slot DMAs through the slot-minor view
-        # read and write the wrong rows (v6e, jax 0.11.2, e.g. 5 slots); in
-        # HBM they are exact at every size tried (5 to 1025 slots).
+        # Note (david): unpinned, XLA may place a small conv state in VMEM,
+        # where the one-slot DMAs through the slot-minor view move the wrong
+        # rows (v6e, jax 0.11.2, 5 slots).
         pinned_conv_state = pltpu.with_memory_space_constraint(
             in_conv_state, pltpu.HBM)
         operands = (seq_metadata, qkv, b, a, pinned_conv_state,
                     in_recurrent_state, aliased_out, weights, pad_start)
+        in_specs = (metadata_spec, hbm_spec, hbm_spec, hbm_spec, hbm_spec,
+                    hbm_spec, aliased_out_spec, weights_spec, pad_spec)
         out_shapes = (out_shape, in_conv_state, in_recurrent_state)
         out_specs = (hbm_spec, hbm_spec, hbm_spec)
-        # Note (david): the replay state and the shadow, when present, follow
-        # every other operand and output, so their flat input index counts the
-        # leaves before them.
-        for extra_state in (kernel_replay_state, in_shadow):
-            if extra_state is not None:
+        # Note (david): the replay state and the shadow follow every other
+        # operand, so their flat input index counts the leaves before them.
+        for extra_state in (in_replay_state, in_shadow):
+            if extra_state is None:
+                in_specs += (None, )
+            else:
                 input_output_aliases = input_output_aliases | {
                     len(jax.tree.leaves(operands)): len(out_shapes)
                 }
+                in_specs += (hbm_spec, )
                 out_shapes += (extra_state, )
                 out_specs += (hbm_spec, )
             operands += (extra_state, )
@@ -1354,19 +1332,7 @@ def _fused_conv1d_gdn(
         results = pl.pallas_call(
             functools.partial(outer_kernel, cfg=cfg),
             out_shape=out_shapes,
-            in_specs=(
-                metadata_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                hbm_spec,
-                aliased_out_spec,
-                weights_spec,
-                pad_spec,
-                replay_spec,
-                None if in_shadow is None else hbm_spec,
-            ),
+            in_specs=in_specs,
             out_specs=out_specs,
             scratch_shapes=cfg.get_scratch_shape_dict(),
             input_output_aliases=input_output_aliases,
@@ -1378,22 +1344,19 @@ def _fused_conv1d_gdn(
             name=f"fused_conv1d_gdn_{mode.value}{kernel_name_suffix}",
             metadata=kernel_metadata,
         )(*operands)
-        out, conv_out, rec_out, *extra_outs = results
-        extra_outs.reverse()
-        replay_out = (None if kernel_replay_state is None else
-                      extra_outs.pop())
-        shadow_out = None if in_shadow is None else extra_outs.pop()
-        assert not extra_outs
-        return out, conv_out, rec_out, replay_out, shadow_out
+        extra_outs = iter(results[3:])
+        replay_out = None if in_replay_state is None else next(extra_outs)
+        shadow_out = None if in_shadow is None else next(extra_outs)
+        return *results[:3], shadow_out, replay_out
 
-    (out, conv_state_out, recurrent_state_out, replay_state_out,
-     shadow_out) = _call_kernel(conv_state, recurrent_state, None,
-                                config.GDNMode.BATCHED, replay_state,
-                                recurrent_shadow)
-    out, conv_state_out, recurrent_state_out, _, shadow_out = _call_kernel(
+    (out, conv_state_out, recurrent_state_out, shadow_out,
+     replay_state_out) = _call_kernel(conv_state, recurrent_state, None,
+                                      config.GDNMode.BATCHED,
+                                      recurrent_shadow, replay_state)
+    out, conv_state_out, recurrent_state_out, shadow_out, _ = _call_kernel(
         conv_state_out, recurrent_state_out, out, config.GDNMode.PER_SEQ,
-        None, shadow_out)
+        shadow_out, None)
 
     return (jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
-            recurrent_state_out.astype(recurrent_out_dtype), replay_state_out,
-            shadow_out), out
+            recurrent_state_out.astype(recurrent_out_dtype), shadow_out,
+            replay_state_out), out

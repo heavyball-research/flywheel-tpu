@@ -86,6 +86,68 @@ def test_qk_kk_operands_match_reference(chunk_size: int, heads: int,
         np.testing.assert_allclose(actual, expected, **OPERAND_TOL)
 
 
+def kda_sequence_ref(
+    qkv: jax.Array,
+    b: jax.Array,
+    g: jax.Array,
+    conv_state: jax.Array,
+    recurrent_state: jax.Array,
+    conv_weight: jax.Array,
+    conv_bias: jax.Array | None,
+    a_log: jax.Array,
+    dt_bias: jax.Array,
+    lower_bound: float | None,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Conv1D + silu + KDA over one sequence, token by token.
+
+    conv_state and recurrent_state are the sequence's initial states. Returns
+    the conv input window [kernel_size - 1 + query_len, dim], the recurrent
+    state after every token [query_len, n_v, d_k, d_v] and the output
+    [query_len, n_v * d_v].
+    """
+    num_tokens = qkv.shape[0]
+    conv_input = jnp.concatenate([conv_state, qkv], axis=0)
+    tap_sum = sum(conv_input[tap:tap + num_tokens] *
+                  conv_weight[:, 0, tap][None] for tap in range(KERNEL_SIZE))
+    if conv_bias is None:
+        conv_out = tap_sum
+    else:
+        conv_out = tap_sum + conv_bias[None]
+    activation = jax.nn.silu(conv_out)
+
+    def _l2_normalize(heads):
+        return heads / jnp.sqrt(
+            jnp.sum(heads * heads, axis=-1, keepdims=True) + L2_NORM_EPS)
+
+    key_dim = N_KQ * D_K
+    v_per_kq_head = N_V // N_KQ
+    q = _l2_normalize(activation[:, :key_dim].reshape(
+        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
+    k = _l2_normalize(activation[:, key_dim:2 * key_dim].reshape(
+        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
+    v = activation[:, 2 * key_dim:].reshape(num_tokens, N_V, D_V)
+    beta = jax.nn.sigmoid(b)
+    shifted_gate = g.reshape(num_tokens, N_V, D_K) + dt_bias.reshape(N_V, D_K)
+    decay_scale = jnp.exp(a_log)[:, None]
+    if lower_bound is None:
+        log_decay = -decay_scale * jax.nn.softplus(shifted_gate)
+    else:
+        log_decay = lower_bound * jax.nn.sigmoid(decay_scale * shifted_gate)
+
+    def _step(state, token_inputs):
+        q_t, k_t, v_t, beta_t, g_t = token_inputs
+        # Note (david): KDA decays the [K, V] state row-wise, one gate per key
+        # channel.
+        decayed = state * jnp.exp(g_t)[:, :, None]
+        v_new = beta_t[:, None] * (v_t - jnp.einsum("hd,hdm->hm", k_t, decayed))
+        state = decayed + jnp.einsum("hd,hm->hdm", k_t, v_new)
+        return state, (jnp.einsum("hd,hdm->hm", q_t, state) * D_K**-0.5, state)
+
+    _, (outs, states) = jax.lax.scan(_step, recurrent_state,
+                                     (q, k, v, beta, log_decay))
+    return conv_input, states, outs.reshape(num_tokens, -1)
+
+
 def kda_reference(
     qkv: jax.Array,
     b: jax.Array,
@@ -113,23 +175,6 @@ def kda_reference(
     new_conv_state = jnp.array(conv_state)
     new_recurrent_state = jnp.array(recurrent_state)
     out = jnp.zeros((qkv.shape[0], N_V * D_V), jnp.float32)
-    decay_scale = jnp.exp(a_log)[:, None]
-    dt_bias = dt_bias.reshape(N_V, D_K)
-    key_dim = N_KQ * D_K
-    v_per_kq_head = N_V // N_KQ
-
-    def _l2_normalize(heads):
-        return heads / jnp.sqrt(
-            jnp.sum(heads * heads, axis=-1, keepdims=True) + L2_NORM_EPS)
-
-    def _step(state, token_inputs):
-        q_t, k_t, v_t, beta_t, g_t = token_inputs
-        # Note (david): KDA decays the [K, V] state row-wise, one gate per key
-        # channel.
-        decayed = state * jnp.exp(g_t)[:, :, None]
-        v_new = beta_t[:, None] * (v_t - jnp.einsum("hd,hdm->hm", k_t, decayed))
-        state = decayed + jnp.einsum("hd,hm->hdm", k_t, v_new)
-        return state, (jnp.einsum("hd,hdm->hm", q_t, state) * D_K**-0.5, state)
 
     for seq_idx in seqs:
         start = int(query_start_loc[seq_idx])
@@ -146,29 +191,11 @@ def kda_reference(
             init_conv_state = jnp.zeros_like(conv_state[0])
             init_recurrent_state = jnp.zeros_like(recurrent_state[0])
 
-        conv_input = jnp.concatenate([init_conv_state, qkv[start:end]], axis=0)
-        tap_sum = sum(conv_input[tap:tap + num_seq_tokens] *
-                      conv_weight[:, 0, tap][None]
-                      for tap in range(KERNEL_SIZE))
-        if conv_bias is None:
-            conv_out = tap_sum
-        else:
-            conv_out = tap_sum + conv_bias[None]
-        activation = jax.nn.silu(conv_out)
-        q = _l2_normalize(activation[:, :key_dim].reshape(
-            num_seq_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-        k = _l2_normalize(activation[:, key_dim:2 * key_dim].reshape(
-            num_seq_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-        v = activation[:, 2 * key_dim:].reshape(num_seq_tokens, N_V, D_V)
-        beta = jax.nn.sigmoid(b[start:end])
-        shifted_gate = g[start:end].reshape(num_seq_tokens, N_V, D_K) + dt_bias
-        if lower_bound is None:
-            log_decay = -decay_scale * jax.nn.softplus(shifted_gate)
-        else:
-            log_decay = lower_bound * jax.nn.sigmoid(decay_scale * shifted_gate)
-        _, (seq_out, seq_states) = jax.lax.scan(
-            _step, init_recurrent_state, (q, k, v, beta, log_decay))
-        out = out.at[start:end].set(seq_out.reshape(num_seq_tokens, -1))
+        conv_input, seq_states, seq_out = kda_sequence_ref(
+            qkv[start:end], b[start:end], g[start:end], init_conv_state,
+            init_recurrent_state, conv_weight, conv_bias, a_log, dt_bias,
+            lower_bound)
+        out = out.at[start:end].set(seq_out)
 
         base_slot = int(state_indices[seq_idx])
         if window == 1:

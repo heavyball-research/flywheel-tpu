@@ -97,8 +97,8 @@ def load_and_select_states(
     recurrent_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
+    shadow_slot_ref: jax.Ref | None,
     cfg: config.GDNConfig,
-    shadow_slot_ref: jax.Ref | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Pick each sequence's starting conv and recurrent state.
 
@@ -111,10 +111,10 @@ def load_and_select_states(
     [seq_tile_size, prev_kernel_size, dim_size] and the recurrent state
     [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
 
-    A replay tile reads each checkpoint straight from its ring slots (the f32
-    one in recurrent_slot_ref, its bf16 shadow in shadow_slot_ref), so for it
-    both slots of a sequence without an initial state are zeroed in place and
-    None is returned for the recurrent state.
+    A replay tile reads its checkpoints straight from the ring slots (f32 in
+    recurrent_slot_ref, the bf16 shadow in shadow_slot_ref), so both slots of
+    a sequence without an initial state are zeroed in place and the returned
+    recurrent state is None.
     """
     real_size_list = []
     conv_state_list = []
@@ -147,22 +147,21 @@ def load_and_select_states(
             def _zero_checkpoint(checkpoint_refs=checkpoint_refs):
                 for ref in checkpoint_refs:
                     ref[...] = jnp.zeros(ref.shape, ref.dtype)
-
-            continue
-
-        initial_recurrent_state = jnp.where(has_initial_state,
-                                            recurrent_slot_ref[idx, 0], 0)
-        if carry_recurrent_scratch_ref is None:
-            recurrent_state = initial_recurrent_state
         else:
-            recurrent_state = jnp.where(is_first_tile, initial_recurrent_state,
-                                        carry_recurrent_scratch_ref[idx])
-        recurrent_state_list.append(recurrent_state)
+            initial_recurrent_state = jnp.where(has_initial_state,
+                                                recurrent_slot_ref[idx, 0], 0)
+            if carry_recurrent_scratch_ref is None:
+                recurrent_state = initial_recurrent_state
+            else:
+                recurrent_state = jnp.where(is_first_tile,
+                                            initial_recurrent_state,
+                                            carry_recurrent_scratch_ref[idx])
+            recurrent_state_list.append(recurrent_state)
 
-    if recurrent_state_list:
-        recurrent_states = jnp.stack(recurrent_state_list, axis=0)
-    else:
+    if cfg.is_replay:
         recurrent_states = None
+    else:
+        recurrent_states = jnp.stack(recurrent_state_list, axis=0)
     return (jnp.stack(real_size_list, axis=0),
             jnp.stack(conv_state_list, axis=0), recurrent_states)
 

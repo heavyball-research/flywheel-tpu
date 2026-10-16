@@ -3,9 +3,8 @@
 Each test runs many decode or speculative-verify steps, so the sequences cross
 several flushes, and checks every step's outputs and, at the end, the state the
 checkpoint and the committed records represent and that the bf16 shadow is
-still the rounded checkpoint. The strong gates decay
-channels by e^-10..e^-30 per token, so the records' cumulative decays span the
-whole f32 exponent range.
+still the rounded checkpoint. The strong gates decay channels by e^-10..e^-30
+per token, so the records' cumulative decays span the whole f32 exponent range.
 """
 
 from collections.abc import Callable
@@ -21,11 +20,11 @@ from tests.linear_attention.test_kda import (
     D_V,
     DIM,
     KERNEL_SIZE,
-    L2_NORM_EPS,
     N_KQ,
     N_V,
     TOL,
     TPU_ONLY,
+    kda_sequence_ref,
 )
 
 pytestmark = TPU_ONLY
@@ -34,65 +33,12 @@ MODEL_DIMS = dict(n_kq=N_KQ, n_v=N_V, d_k=D_K, d_v=D_V,
                   kernel_size=KERNEL_SIZE)
 
 
-def kda_sequence_ref(
-    qkv: jax.Array,
-    b: jax.Array,
-    g: jax.Array,
-    conv_state: jax.Array,
-    recurrent_state: jax.Array,
-    conv_weight: jax.Array,
-    conv_bias: jax.Array,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    lower_bound: float | None,
-) -> tuple[jax.Array, jax.Array]:
-    """Per-token states [tokens, n_v, d_k, d_v] and outputs [tokens, n_v *
-    d_v] of one sequence from its initial conv and recurrent state."""
-    num_tokens = qkv.shape[0]
-    conv_input = jnp.concatenate([conv_state, qkv], axis=0)
-    tap_sum = sum(conv_input[tap:tap + num_tokens] *
-                  conv_weight[:, 0, tap][None] for tap in range(KERNEL_SIZE))
-    activation = jax.nn.silu(tap_sum + conv_bias[None])
-
-    def _l2_normalize(heads):
-        return heads / jnp.sqrt(
-            jnp.sum(heads * heads, axis=-1, keepdims=True) + L2_NORM_EPS)
-
-    key_dim = N_KQ * D_K
-    v_per_kq_head = N_V // N_KQ
-    q = _l2_normalize(activation[:, :key_dim].reshape(
-        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-    k = _l2_normalize(activation[:, key_dim:2 * key_dim].reshape(
-        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-    v = activation[:, 2 * key_dim:].reshape(num_tokens, N_V, D_V)
-    beta = jax.nn.sigmoid(b)
-    shifted_gate = g.reshape(num_tokens, N_V, D_K) + dt_bias.reshape(N_V, D_K)
-    decay_scale = jnp.exp(a_log)[:, None]
-    if lower_bound is None:
-        log_decay = -decay_scale * jax.nn.softplus(shifted_gate)
-    else:
-        log_decay = lower_bound * jax.nn.sigmoid(decay_scale * shifted_gate)
-
-    def _step(state, token_inputs):
-        q_t, k_t, v_t, beta_t, g_t = token_inputs
-        decayed = state * jnp.exp(g_t)[:, :, None]
-        v_new = beta_t[:, None] * (v_t -
-                                   jnp.einsum("hd,hdm->hm", k_t, decayed))
-        state = decayed + jnp.einsum("hd,hm->hdm", k_t, v_new)
-        return state, (jnp.einsum("hd,hdm->hm", q_t, state) * D_K**-0.5,
-                       state)
-
-    _, (outs, states) = jax.lax.scan(_step, recurrent_state,
-                                     (q, k, v, beta, log_decay))
-    return states, outs.reshape(num_tokens, -1)
-
-
-def _sequence_ref(*args, **kwargs):
+@jax.jit(static_argnames=["lower_bound"])
+def sequence_ref(
+    *args: jax.Array, **kwargs: jax.Array | float | None
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     with jax.default_matmul_precision("highest"):
         return kda_sequence_ref(*args, **kwargs)
-
-
-sequence_ref = jax.jit(_sequence_ref, static_argnames=["lower_bound"])
 
 
 def materialize_state(checkpoint: np.ndarray, records: np.ndarray,
@@ -156,7 +102,9 @@ def run_replay(
     history = [[] for _ in range(num_seqs)]
     max_len = prefill_len + (num_steps + 1) * window
 
-    def _reference(seq: int, seq_tokens: list) -> tuple[jax.Array, jax.Array]:
+    def _reference(
+        seq: int, seq_tokens: list[tuple[np.ndarray, np.ndarray, np.ndarray]]
+    ) -> tuple[jax.Array, jax.Array]:
         """Per-token states and outputs of seq_tokens from seq's initial
         state; zero tokens pad it to max_len so one compile serves all."""
         num_pad = max_len - len(seq_tokens)
@@ -164,9 +112,9 @@ def run_replay(
             jnp.pad(jnp.stack([token[i] for token in seq_tokens]),
                     ((0, num_pad), (0, 0))) for i in range(3)
         ]
-        states, outs = sequence_ref(*stacked, initial_conv[seq],
-                                    initial_rec[seq], **params,
-                                    lower_bound=lower_bound)
+        _, states, outs = sequence_ref(*stacked, initial_conv[seq],
+                                       initial_rec[seq], **params,
+                                       lower_bound=lower_bound)
         return states[:len(seq_tokens)], outs[:len(seq_tokens)]
 
     def _step(lengths: list[int], num_rows: int, num_decode: int,

@@ -243,11 +243,9 @@ def causal_conv1d(
     else:
         biased_out = conv_out + conv_bias.reshape(1, 1, -1)
 
-    # Note (david): start_conv_out writes back only the window positions
-    # before a sequence's real size, whose checkpoints end at a real token, so
-    # no checkpoint is clamped to the last real token. The clamp selects cost
-    # 1.4 us of a 2.4 us verify-4 tile (v6e, 4 sequences, dim 8192) and only
-    # ever touched positions that are dropped.
+    # Note (david): no clamp to the last real token: start_conv_out drops the
+    # checkpoints past it, and the clamp cost 1.4 us of a 2.4 us verify-4 tile
+    # (v6e, 4 sequences, dim 8192).
     conv_ckpts = []
     for w_idx in range(cfg.window_size):
         last_row = 1 + cfg.compute_chunk_size - cfg.window_size + w_idx

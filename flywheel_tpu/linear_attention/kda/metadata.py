@@ -28,7 +28,7 @@ def compute_batched_seq_metadata(
     read_offsets: jax.Array,
     end_seq: jax.Array,
     read_indices: jax.Array,
-    replay_lens: jax.Array | None = None,
+    replay_lens: jax.Array | None,
 ) -> memory_ref.MetadataRef:
     """Metadata for tiles holding several sequences, one record per sequence.
 
@@ -37,9 +37,9 @@ def compute_batched_seq_metadata(
     state is read from read_indices[s] + read_offsets[s] and window position t
     checkpoints to state_indices[s] + t.
 
-    With cfg.replay_window, the recurrent checkpoint is read from
-    read_indices[s] alone, replay_lens[s] committed records come with it, and
-    the flush rule of replay_flush decides whether it is rewritten.
+    A replay decode reads the recurrent checkpoint from read_indices[s] alone
+    with replay_lens[s] committed records, and plan_replay_step decides
+    whether it is rewritten.
     """
     all_seqs = jnp.arange(seq_lens.size)
 
@@ -50,15 +50,14 @@ def compute_batched_seq_metadata(
     valid_seq_ids = jnp.where(is_valid_seq, all_seqs, 0)
     has_initial_state = (seq_lens - query_lens) > 0
 
-    if cfg.replay_window:
-        assert replay_lens is not None
-        replay_len, is_flush = replay_flush(replay_lens, query_lens,
-                                            has_initial_state, read_indices,
-                                            state_indices, cfg.replay_window)
-        replay_kwargs = dict(s_idx_to_replay_len=replay_len,
-                             s_idx_to_flush=is_flush.astype(jnp.int32))
+    if cfg.is_replay:
+        replay_len, is_flush = plan_replay_step(replay_lens, query_lens,
+                                                has_initial_state, read_indices,
+                                                state_indices, cfg.replay_window)
+        flush = is_flush.astype(jnp.int32)
     else:
-        replay_kwargs = {}
+        replay_len = None
+        flush = None
 
     return memory_ref.MetadataRef.create(
         cfg=cfg,
@@ -72,11 +71,12 @@ def compute_batched_seq_metadata(
         s_idx_to_state_indices=state_indices,
         s_idx_to_read_offset=read_offsets,
         s_idx_to_read_indices=read_indices,
-        **replay_kwargs,
+        s_idx_to_replay_len=replay_len,
+        s_idx_to_flush=flush,
     )
 
 
-def replay_flush(
+def plan_replay_step(
     replay_lens: jax.Array,
     query_lens: jax.Array,
     has_initial_state: jax.Array,

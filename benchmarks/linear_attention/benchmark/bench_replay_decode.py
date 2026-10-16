@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import functools
-import importlib
 import json
 from pathlib import Path
 
@@ -28,6 +27,8 @@ import jax.numpy as jnp
 
 from benchmarks.common.linear_attention import PARAM_SCALE
 from benchmarks.common.timing import time_stateful
+from flywheel_tpu.linear_attention.gdn import wrapper as gdn_wrapper
+from flywheel_tpu.linear_attention.kda import wrapper as kda_wrapper
 
 F32_BYTES = 4
 CONTEXT_LEN = 1024
@@ -35,7 +36,7 @@ CONTEXT_LEN = 1024
 
 def make_inputs(key: jax.Array, kernel: str, num_seqs: int, window: int,
                 n_kq: int, n_v: int, d_k: int, d_v: int,
-                kernel_size: int) -> dict:
+                kernel_size: int) -> dict[str, jax.Array | None]:
     dim = n_kq * d_k * 2 + n_v * d_v
     num_tokens = num_seqs * window
     keys = iter(jax.random.split(key, 8))
@@ -93,10 +94,14 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
-    wrapper = importlib.import_module(
-        f"flywheel_tpu.linear_attention.{args.kernel}.wrapper")
-    conventional_fn = getattr(wrapper, f"fused_conv1d_{args.kernel}")
-    replay_fn = getattr(wrapper, f"fused_conv1d_{args.kernel}_replay")
+    if args.kernel == "gdn":
+        wrapper = gdn_wrapper
+        conventional_fn = gdn_wrapper.fused_conv1d_gdn
+        replay_fn = gdn_wrapper.fused_conv1d_gdn_replay
+    else:
+        wrapper = kda_wrapper
+        conventional_fn = kda_wrapper.fused_conv1d_kda
+        replay_fn = kda_wrapper.fused_conv1d_kda_replay
     n_kq, n_v = args.kq_heads, args.v_heads
     d_k = d_v = args.head_dim
     replay_window = args.replay_window
@@ -136,7 +141,6 @@ def main() -> None:
             num_slots = recurrent_state.shape[0]
             replay_state = jnp.zeros((num_slots, replay_window, record_dim),
                                      record_dtype)
-            # Note (david): staggered committed counts in [0, window - T].
             replay_lens = (jnp.arange(num_seqs, dtype=jnp.int32) %
                            (replay_window - window + 1))
             num_accepted = jnp.full((num_seqs, ), window, jnp.int32)
