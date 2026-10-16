@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -118,10 +119,17 @@ def inner_kernel(
     replay_out_ref: jax.Array | None,
     shadow_in_ref: jax.Array | None,
     shadow_out_ref: jax.Array | None,
+    wait_flush_in: Callable[[int], None] | None,
+    start_flush_out: Callable[[int], None] | None,
     *,
     cfg: config.GDNConfig,
 ) -> None:
-    """Compute one tile from its VMEM ring slots and stage its outputs."""
+    """Compute one tile from its VMEM ring slots and stage its outputs.
+
+    A replay tile also owns its flushes' DMAs: wait_flush_in(idx) waits for
+    record idx's f32 checkpoint read and start_flush_out(idx) starts its
+    checkpoint and shadow writes.
+    """
     profile_scope = compute_gdn.profile_scope
     with profile_scope("load_states"):
         real_sizes, prev_conv, prev_recurrent = vmem_ldst.load_and_select_states(
@@ -175,18 +183,49 @@ def inner_kernel(
             cfg=cfg)
         record_shape = (cfg.replay_window, cfg.record_dim)
         record_rows = lax.broadcasted_iota(jnp.int32, record_shape, 0)
+
+        def _num_records(record):
+            return jnp.where(record.is_first_tile,
+                             metadata_ref.s_idx_to_replay_len[record.s_idx], 0)
+
+        def _flush_pass():
+            for idx in range(cfg.seq_tile_size):
+                record = metadata_ref.get_record(p_id, idx)
+
+                @pl.when(metadata_ref.s_idx_to_flush[record.s_idx] != 0)
+                def _flush(idx=idx, record=record):
+                    checkpoint = compute_gdn.replay_flush(
+                        records=replay_in_ref[idx].astype(jnp.float32),
+                        num_records=_num_records(record),
+                        checkpoint_ref=recurrent_in_ref.at[idx, 0],
+                        wait_checkpoint=functools.partial(wait_flush_in, idx),
+                        cfg=cfg)
+                    recurrent_out_ref[idx, 0] = checkpoint.astype(
+                        recurrent_out_ref.dtype)
+                    shadow_out_ref[idx, 0] = checkpoint.astype(
+                        shadow_out_ref.dtype)
+                    start_flush_out(idx)
+
+        # Note (david): a flush moves 2 MiB in and 3 MiB out (n_v=32, d=128)
+        # on top of its tile's traffic. The tile folds its flushing sequences
+        # halfway through its steps, waits for the f32 read only right before
+        # a fold reads it and starts the writes right after it, so the read
+        # overlaps the compute before the folds and the writes the compute
+        # after them. v6e, B=256, decode, tile 4: 432.8 us with the flush DMAs
+        # at the tile boundaries, 360.9 / 354.3 / 372.4 us folding after 1 /
+        # 2 / 3 steps.
+        flush_pass_pos = cfg.seq_tile_size // 2
         seq_outs = []
         for idx in range(cfg.seq_tile_size):
+            if idx == flush_pass_pos:
+                _flush_pass()
             record = metadata_ref.get_record(p_id, idx)
             s_idx = record.s_idx
-            num_records = jnp.where(record.is_first_tile,
-                                    metadata_ref.s_idx_to_replay_len[s_idx], 0)
             records_in = replay_in_ref[idx].astype(jnp.float32)
-            out, new_records, flushed_checkpoint = compute_gdn.replay_gdn(
+            out, new_records = compute_gdn.replay_gdn(
                 q_chunked=q[idx], k_chunked=k[idx], v_chunked=v[idx],
                 b_rows=b[idx], a_rows=a[idx], num_tokens=record.r_size,
-                num_records=num_records, records=records_in,
-                checkpoint_ref=recurrent_in_ref.at[idx, 0],
+                num_records=_num_records(record), records=records_in,
                 shadow_ref=shadow_in_ref.at[idx, 0],
                 a_log=a_log.reshape(1, 1, -1),
                 dt_bias=dt_bias.reshape(1, 1, -1), cfg=cfg)
@@ -213,14 +252,8 @@ def inner_kernel(
                 replay_out_ref[idx] = jnp.where(
                     is_new_row, shifted, records_in).astype(
                         replay_out_ref.dtype)
-
-            @pl.when(metadata_ref.s_idx_to_flush[s_idx] != 0)
-            def _flush(idx=idx, flushed_checkpoint=flushed_checkpoint):
-                checkpoint = flushed_checkpoint()
-                recurrent_out_ref[idx, 0] = checkpoint.astype(
-                    recurrent_out_ref.dtype)
-                shadow_out_ref[idx, 0] = checkpoint.astype(
-                    shadow_out_ref.dtype)
+        if flush_pass_pos == cfg.seq_tile_size:
+            _flush_pass()
 
         with profile_scope("store_out"):
             store_out_rows(out_slot_ref, jnp.stack(seq_outs, axis=0), 0,
@@ -419,7 +452,8 @@ def outer_kernel(
     tile t computes and the outputs of tile t - 1 are waited only after tile
     t's outputs start, so both overlap tile t's compute. State inputs and
     outputs use separate rings, so no slot is read by one DMA while another
-    writes it.
+    writes it. A replay tile's flushes wait for their f32 checkpoint reads and
+    start their checkpoint writes inside its compute.
     """
     # Note (david): the tile loop indexes its VMEM rings as t % 2 and 1 - slot.
     assert cfg.num_buffers == config.NUM_BUFFERS, cfg.num_buffers
@@ -452,12 +486,6 @@ def outer_kernel(
             memory_ref.start_conv_in(conv_state_ref, conv_in_buf.at[slot],
                                      sems.at[config.STREAM_CONV_IN, slot],
                                      *tile_args)
-            memory_ref.start_state_in(recurrent_state_ref,
-                                      rec_in_buf.at[slot],
-                                      sems.at[config.STREAM_REC_IN, slot],
-                                      *tile_args,
-                                      apply_read_offset=not cfg.is_replay,
-                                      only_flushing=cfg.is_replay)
             if cfg.is_replay:
                 memory_ref.start_state_in(
                     shadow_state_ref, shadow_in_buf.at[slot],
@@ -466,6 +494,15 @@ def outer_kernel(
                 memory_ref.start_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
+            # Note (david): a replay tile reads its f32 checkpoints only in its
+            # flushes, mid tile, so they are issued after the inputs the tile
+            # waits for at its start.
+            memory_ref.start_state_in(recurrent_state_ref,
+                                      rec_in_buf.at[slot],
+                                      sems.at[config.STREAM_REC_IN, slot],
+                                      *tile_args,
+                                      apply_read_offset=not cfg.is_replay,
+                                      only_flushing=cfg.is_replay)
 
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
@@ -482,10 +519,12 @@ def outer_kernel(
             memory_ref.wait_conv_in(conv_state_ref, conv_in_buf.at[slot],
                                     sems.at[config.STREAM_CONV_IN, slot],
                                     *tile_args)
-            memory_ref.wait_state_in(rec_in_buf.at[slot],
-                                     sems.at[config.STREAM_REC_IN, slot],
-                                     *tile_args,
-                                     only_flushing=cfg.is_replay)
+            # Note (david): a replay tile waits for its f32 checkpoint reads
+            # in inner_kernel, right before a flush reads one.
+            if not cfg.is_replay:
+                memory_ref.wait_state_in(rec_in_buf.at[slot],
+                                         sems.at[config.STREAM_REC_IN, slot],
+                                         *tile_args)
             if cfg.is_replay:
                 memory_ref.wait_state_in(
                     shadow_in_buf.at[slot],
@@ -502,14 +541,9 @@ def outer_kernel(
             memory_ref.start_conv_out(conv_state_ref, conv_out_buf.at[slot],
                                       sems.at[config.STREAM_CONV_OUT, slot],
                                       *tile_args)
+            # Note (david): a replay tile starts its flushed checkpoint writes
+            # in inner_kernel, right after each fold.
             if cfg.is_replay:
-                memory_ref.start_ckpt_out(recurrent_state_ref,
-                                          rec_out_buf.at[slot],
-                                          sems.at[config.STREAM_REC_OUT, slot],
-                                          *tile_args)
-                memory_ref.start_ckpt_out(
-                    shadow_state_ref, shadow_out_buf.at[slot],
-                    sems.at[config.STREAM_SHADOW_OUT, slot], *tile_args)
                 memory_ref.start_replay_out(
                     replay_state_ref, replay_out_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_OUT, slot], *tile_args)
@@ -576,6 +610,21 @@ def outer_kernel(
         def _prefetch_next():
             _start_in(tile_idx + 1, other_slot)
 
+        def _wait_flush_in(idx):
+            memory_ref.wait_flushed_ckpt_in(
+                rec_in_buf.at[slot], sems.at[config.STREAM_REC_IN, slot],
+                tile_idx, idx, metadata_ref, cfg)
+
+        def _start_flush_out(idx):
+            memory_ref.start_flushed_ckpt_out(
+                recurrent_state_ref, rec_out_buf.at[slot],
+                sems.at[config.STREAM_REC_OUT, slot], tile_idx, idx,
+                metadata_ref)
+            memory_ref.start_flushed_ckpt_out(
+                shadow_state_ref, shadow_out_buf.at[slot],
+                sems.at[config.STREAM_SHADOW_OUT, slot], tile_idx, idx,
+                metadata_ref)
+
         _wait_in(tile_idx, slot)
         inner_kernel(
             tile_idx,
@@ -595,6 +644,8 @@ def outer_kernel(
             None if replay_out_buf is None else replay_out_buf.at[slot],
             None if shadow_in_buf is None else shadow_in_buf.at[slot],
             None if shadow_out_buf is None else shadow_out_buf.at[slot],
+            _wait_flush_in if cfg.is_replay else None,
+            _start_flush_out if cfg.is_replay else None,
             cfg=cfg,
         )
         window_base, _, delta, used_rows = memory_ref.out_window(

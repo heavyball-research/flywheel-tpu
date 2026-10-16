@@ -1071,6 +1071,36 @@ def recurrent_kda(
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
 
 
+def replay_record_parts(
+        records: jax.Array, num_records: jax.Array,
+        cfg: config.KDAConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """The committed rows of a [replay_window, record_dim] record buffer:
+    u [num_v_heads, rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim]
+    and the log decays g [num_v_heads, rows, kq_head_dim]; rows from
+    num_records on are zero."""
+    d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
+    # Note (david): rows past num_records hold stale or uninitialized VMEM, so
+    # they are selected away rather than scaled: 0 * NaN is NaN. Zero records
+    # are inert like a step's pad rows.
+    record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
+    records = jnp.where(record_row < num_records, records, 0)
+    u_records = jnp.stack([
+        records[:, head * d_v:(head + 1) * d_v]
+        for head in range(cfg.num_v_heads)
+    ])
+    k_records = jnp.stack([
+        records[:, cfg.record_k_offset + head * d_k:
+                cfg.record_k_offset + (head + 1) * d_k]
+        for head in range(cfg.num_kq_heads)
+    ])
+    g_records = jnp.stack([
+        records[:, cfg.record_g_offset + head * d_k:
+                cfg.record_g_offset + (head + 1) * d_k]
+        for head in range(cfg.num_v_heads)
+    ])
+    return u_records, k_records, g_records
+
+
 def replay_kda(
     q_chunked: jax.Array,
     k_chunked: jax.Array,
@@ -1080,12 +1110,11 @@ def replay_kda(
     num_tokens: jax.Array,
     num_records: jax.Array,
     records: jax.Array,
-    checkpoint_ref: jax.Ref,
     shadow_ref: jax.Ref,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.KDAConfig,
-) -> tuple[jax.Array, jax.Array, Callable[[], jax.Array]]:
+) -> tuple[jax.Array, jax.Array]:
     """One ReplaySSM step of one sequence: outputs and records, no state.
 
     q_chunked and k_chunked are [num_kq_heads, window, kq_head_dim],
@@ -1093,11 +1122,10 @@ def replay_kda(
     [num_v_heads, window, kq_head_dim], b_rows [1, window, gate_lanes], and
     a_log and dt_bias [num_v_heads, 1, kq_head_dim]; rows from num_tokens on
     are padding. records is the [replay_window, record_dim] buffer whose first
-    num_records rows are committed, checkpoint_ref the f32 [num_v_heads,
-    kq_head_dim, v_head_dim] state before them (read only by the flush thunk)
-    and shadow_ref its bf16 copy (read by the step). With G the per-key-channel
-    cumulative log decay over the records and then the new tokens, the decayed
-    state token t reads is
+    num_records rows are committed and shadow_ref the bf16 [num_v_heads,
+    kq_head_dim, v_head_dim] state before them, rounded from the f32
+    checkpoint. With G the per-key-channel cumulative log decay over the
+    records and then the new tokens, the decayed state token t reads is
 
         diag(exp(G_t)) S + sum_{j < t} diag(exp(G_t - G_j)) k_j^T u_j.
 
@@ -1105,13 +1133,13 @@ def replay_kda(
     exp(G_E - G_j), both factors at most 1, folds the decay into the new
     tokens' k / q and the records' k, so S enters only through [k; q] @ S and
     the records through one dot with their decayed k and one with their u.
-    Returns the packed output [window, num_v_heads * v_head_dim], the new
-    tokens' records [window, record_dim] and a thunk computing the state after
-    the committed records, the checkpoint a flush writes.
+    Returns the packed output [window, num_v_heads * v_head_dim] and the new
+    tokens' records [window, record_dim]; replay_flush folds the committed
+    records into the checkpoint.
     """
     window = cfg.window_size
     num_v_heads = cfg.num_v_heads
-    d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
+    d_k = cfg.kq_head_dim
     compute = cfg.dtypes.compute
 
     token_row = jax.lax.broadcasted_iota(jnp.int32, (1, window, 1), 1)
@@ -1129,24 +1157,8 @@ def replay_kda(
         log_decay(g_chunked.astype(compute), a_log.astype(compute),
                   dt_bias.astype(compute), cfg.lower_bound), 0)
 
-    # Note (david): rows past num_records hold stale or uninitialized VMEM, so
-    # they are selected away rather than scaled: 0 * NaN is NaN. Zero records
-    # are inert like the pad rows above.
-    record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
-    records = jnp.where(record_row < num_records, records, 0)
-    u_records = jnp.stack([
-        records[:, head * d_v:(head + 1) * d_v] for head in range(num_v_heads)
-    ])
-    k_records = jnp.stack([
-        records[:, cfg.record_k_offset + head * d_k:
-                cfg.record_k_offset + (head + 1) * d_k]
-        for head in range(cfg.num_kq_heads)
-    ])
-    g_records = jnp.stack([
-        records[:, cfg.record_g_offset + head * d_k:
-                cfg.record_g_offset + (head + 1) * d_k]
-        for head in range(num_v_heads)
-    ])
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
 
     q = l2_norm(q) * d_k**-0.5
     k = l2_norm(k)
@@ -1225,16 +1237,39 @@ def replay_kda(
         [k[head] for head in range(cfg.num_kq_heads)] +
         [g[head] for head in range(num_v_heads)], axis=-1)
 
-    def _flushed_checkpoint() -> jax.Array:
-        # Note (david): the fold is the only place record error can enter the
-        # recurrence, so it runs at f32 precision; it runs once per flush.
-        with profile_scope("replay_flush"):
-            update = batched_matmul(jnp.swapaxes(k_records_decayed, 1, 2),
-                                    u_records,
-                                    precision=jax.lax.Precision.HIGHEST)
-            decay_total = fused_transpose_broadcast(
-                jnp.exp(g_records_total), src_dim=2, dst_dim=1)
-            return (checkpoint_ref[...].astype(compute) * decay_total +
-                    update)
+    return pack_out(out, cfg), new_records
 
-    return pack_out(out, cfg), new_records, _flushed_checkpoint
+
+def replay_flush(
+    records: jax.Array,
+    num_records: jax.Array,
+    checkpoint_ref: jax.Ref,
+    wait_checkpoint: Callable[[], None],
+    cfg: config.KDAConfig,
+) -> jax.Array:
+    """The state after one sequence's committed records, the checkpoint a
+    flush writes.
+
+    records is the [replay_window, record_dim] buffer whose first num_records
+    rows are committed and checkpoint_ref the f32 [num_v_heads, kq_head_dim,
+    v_head_dim] state before them. wait_checkpoint runs right before
+    checkpoint_ref is read, so the caller can wait for its DMA there.
+    """
+    u_records, k_records, g_records = replay_record_parts(
+        records, num_records, cfg)
+    # Note (david): the fold is the only place record error can enter the
+    # recurrence, so it runs at f32 precision; it runs once per flush.
+    with profile_scope("replay_flush"):
+        g_records_cumsum = cumsum_rows(g_records)
+        g_records_total = g_records_cumsum[:, -1:]
+        k_records_decayed = (
+            jnp.repeat(k_records, cfg.v_per_kq_head, axis=0) *
+            jnp.exp(g_records_total - g_records_cumsum))
+        update = batched_matmul(jnp.swapaxes(k_records_decayed, 1, 2),
+                                u_records,
+                                precision=jax.lax.Precision.HIGHEST)
+        decay_total = fused_transpose_broadcast(
+            jnp.exp(g_records_total), src_dim=2, dst_dim=1)
+        wait_checkpoint()
+        return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
+                update)

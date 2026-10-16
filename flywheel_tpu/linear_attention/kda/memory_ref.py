@@ -584,19 +584,44 @@ def num_flushed_ckpts(record: PackedPIdRecord,
     return jnp.where(jnp.logical_and(record.is_last_tile, is_flush), 1, 0)
 
 
-def start_ckpt_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                   p_id: int | jax.Array, metadata_ref: MetadataRef,
-                   cfg: config.KDAConfig) -> None:
-    """Write each flushing sequence's new checkpoint to state_indices[s]."""
-    for idx in range(cfg.seq_tile_size):
-        record = metadata_ref.get_record(p_id, idx)
-        write_slot = metadata_ref.s_idx_to_state_indices[record.s_idx]
-        num_states = num_flushed_ckpts(record, metadata_ref)
-        pltpu.make_async_copy(
-            buf_ref.at[idx, pl.ds(0, num_states)],
-            hbm_ref.at[pl.ds(write_slot, num_states)],
-            sem,
-        ).start()
+def wait_flushed_ckpt_in(buf_ref: jax.Ref, sem: jax.Ref,
+                         p_id: int | jax.Array, idx: int,
+                         metadata_ref: MetadataRef,
+                         cfg: config.KDAConfig) -> None:
+    """Wait, before record idx's flush reads its f32 checkpoint, for the
+    tile's checkpoint reads (start_state_in with only_flushing)."""
+    # Note (david): the reads share one byte-counting semaphore, so a wait
+    # sized to one record's read could return on another record's bytes. The
+    # tile's first reading record waits for all of them instead, before any
+    # checkpoint is read.
+    reads = [
+        reads_state(metadata_ref.get_record(p_id, prev), metadata_ref,
+                    only_flushing=True) for prev in range(idx + 1)
+    ]
+    is_first_read = reads[idx]
+    for prev_reads in reads[:idx]:
+        is_first_read = jnp.logical_and(is_first_read,
+                                        jnp.logical_not(prev_reads))
+
+    @pl.when(is_first_read)
+    def _wait():
+        wait_state_in(buf_ref, sem, p_id, metadata_ref, cfg,
+                      only_flushing=True)
+
+
+def start_flushed_ckpt_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                           p_id: int | jax.Array, idx: int,
+                           metadata_ref: MetadataRef) -> None:
+    """Write record idx's new checkpoint to state_indices[s] if its sequence
+    flushes; none on a padded record."""
+    record = metadata_ref.get_record(p_id, idx)
+    write_slot = metadata_ref.s_idx_to_state_indices[record.s_idx]
+    num_states = num_flushed_ckpts(record, metadata_ref)
+    pltpu.make_async_copy(
+        buf_ref.at[idx, pl.ds(0, num_states)],
+        hbm_ref.at[pl.ds(write_slot, num_states)],
+        sem,
+    ).start()
 
 
 def wait_ckpt_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
