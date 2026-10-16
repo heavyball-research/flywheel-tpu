@@ -272,6 +272,12 @@ def bwd_body(
       def _compute_head(head_idx):
         q_ref, q_half = _fold_lane(q_buf.at[q_slot], head_idx, lane_width_qk)
         q_head_tile = _take_half(q_ref[q_tile_rows, :], q_half, lane_width_qk)
+        # Note (david): the forward rounds q * score_scale to q's dtype before
+        # its scores, and its lse comes from those; recomputing the scores from
+        # the same rounded q keeps p normalized against that lse, e.g. exactly
+        # 1 on a row with one visible key. dq/dk still take the raw q.
+        q_scaled_tile = (
+            q_head_tile.astype(f32) * score_scale).astype(q_head_tile.dtype)
         do_ref, do_half = _fold_lane(do_buf.at[q_slot], head_idx, lane_width_v)
         do_head_tile = _take_half(
             do_ref[q_tile_rows, :], do_half, lane_width_v)
@@ -297,8 +303,8 @@ def bwd_body(
           k_tile = _take_half(k_ref[kv_tile_rows, :], k_half, lane_width_qk)
           v_tile = _take_half(v_ref[kv_tile_rows, :], v_half, lane_width_v)
           qk = lax.dot_general(
-              k_tile, q_head_tile, NT_DIM_NUMBERS,
-              preferred_element_type=f32) * score_scale
+              k_tile, q_scaled_tile, NT_DIM_NUMBERS,
+              preferred_element_type=f32)
           k_start = kv * bkv + kv_tile * bkv_compute
           # Note (david): is_masked selects one of two static copies of this
           # pipeline, so it is a Python bool, never a tracer.

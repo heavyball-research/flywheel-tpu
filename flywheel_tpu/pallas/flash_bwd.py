@@ -241,8 +241,13 @@ def flash_bwd_folded_kernel(
       v_head = v_buf[_head_index(in_slot, head_idx, lane_width_v)]
       lse_row = lse_buf[in_slot, head_idx]
       di_row = di_buf[in_slot, head_idx]
-      qk = score_scale * lax.dot_general(
-          k_head, q_head, NT_DIM_NUMBERS, preferred_element_type=f32)
+      # Note (david): the scores start from the forward's rounded q *
+      # score_scale, so p stays normalized against its lse; dq/dk take the raw
+      # q.
+      q_scaled_head = (
+          q_head.astype(f32) * score_scale).astype(q_head.dtype)
+      qk = lax.dot_general(
+          k_head, q_scaled_head, NT_DIM_NUMBERS, preferred_element_type=f32)
       if causal:
         masked_qk = apply_causal_kv_major(qk, DEFAULT_MASK_VALUE, 0, 0)
       else:
