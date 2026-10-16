@@ -444,9 +444,9 @@ def outer_kernel(
             memory_ref.start_qkv_in(g_ref, g_buf.at[slot],
                                     sems.at[config.STREAM_G, slot],
                                     *tile_args)
-            memory_ref.start_state_in(conv_state_ref, conv_in_buf.at[slot],
-                                      sems.at[config.STREAM_CONV_IN, slot],
-                                      *tile_args)
+            memory_ref.start_conv_in(conv_state_ref, conv_in_buf.at[slot],
+                                     sems.at[config.STREAM_CONV_IN, slot],
+                                     *tile_args)
             memory_ref.start_state_in(recurrent_state_ref,
                                       rec_in_buf.at[slot],
                                       sems.at[config.STREAM_REC_IN, slot],
@@ -468,9 +468,9 @@ def outer_kernel(
                                        *tile_args)
             memory_ref.wait_qkv_in(g_ref, g_buf.at[slot],
                                    sems.at[config.STREAM_G, slot], *tile_args)
-            memory_ref.wait_state_in(conv_in_buf.at[slot],
-                                     sems.at[config.STREAM_CONV_IN, slot],
-                                     *tile_args)
+            memory_ref.wait_conv_in(conv_state_ref, conv_in_buf.at[slot],
+                                    sems.at[config.STREAM_CONV_IN, slot],
+                                    *tile_args)
             memory_ref.wait_state_in(rec_in_buf.at[slot],
                                      sems.at[config.STREAM_REC_IN, slot],
                                      *tile_args)
@@ -484,9 +484,9 @@ def outer_kernel(
             tile_args = (p_id, metadata_ref, cfg)
             memory_ref.start_out(out_ref, out_buf.at[slot],
                                  sems.at[config.STREAM_OUT, slot], *tile_args)
-            memory_ref.start_state_out(conv_state_ref, conv_out_buf.at[slot],
-                                       sems.at[config.STREAM_CONV_OUT, slot],
-                                       *tile_args)
+            memory_ref.start_conv_out(conv_state_ref, conv_out_buf.at[slot],
+                                      sems.at[config.STREAM_CONV_OUT, slot],
+                                      *tile_args)
             if cfg.is_replay:
                 memory_ref.start_ckpt_out(recurrent_state_ref,
                                           rec_out_buf.at[slot],
@@ -505,9 +505,9 @@ def outer_kernel(
             tile_args = (p_id, metadata_ref, cfg)
             memory_ref.wait_out(out_ref, out_buf.at[slot],
                                 sems.at[config.STREAM_OUT, slot], *tile_args)
-            memory_ref.wait_state_out(conv_out_buf.at[slot],
-                                      sems.at[config.STREAM_CONV_OUT, slot],
-                                      *tile_args)
+            memory_ref.wait_conv_out(conv_state_ref, conv_out_buf.at[slot],
+                                     sems.at[config.STREAM_CONV_OUT, slot],
+                                     *tile_args)
             if cfg.is_replay:
                 memory_ref.wait_ckpt_out(rec_out_buf.at[slot],
                                          sems.at[config.STREAM_REC_OUT, slot],
@@ -972,7 +972,15 @@ def _fused_conv1d_kda(
     # on the gdn kernel at 0.497 ms of gdn_v3's 1.306 ms forward at T = 8192,
     # dim = 6144.
     b = b.astype(jnp.float32)
-    conv_state = conv_state.astype(jnp.float32)
+    # Note (david): the kernels take the conv state as its [kernel_size - 1,
+    # num_slots, dim] view. XLA lays a serving-sized f32 [num_slots,
+    # kernel_size - 1, dim] cache out slot-minor ({2,0,1:T(8,128)}, seen at 257
+    # and 1025 slots) so the short state axis needs no padding; that is this
+    # view's row-major layout, so the swap is a bitcast. A slot-major kernel
+    # operand instead cost a transposing copy of the whole cache before and
+    # after every call (v6e: 67 us at 257 slots, 373 us at 1025). A tiny cache
+    # XLA keeps slot-major pays a small copy here instead.
+    conv_state = jnp.swapaxes(conv_state.astype(jnp.float32), 0, 1)
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
@@ -1227,8 +1235,14 @@ def _fused_conv1d_kda(
             else:
                 kernel_metadata[key] = str(leaf)
 
-        operands = (seq_metadata, qkv, b, g, in_conv_state, in_recurrent_state,
-                    aliased_out, weights, pad_start)
+        # Note (david): unpinned, XLA may move a small conv state into VMEM
+        # (S(1)), and there the one-slot DMAs through the slot-minor view
+        # read and write the wrong rows (v6e, jax 0.11.2, e.g. 5 slots); in
+        # HBM they are exact at every size tried (5 to 1025 slots).
+        pinned_conv_state = pltpu.with_memory_space_constraint(
+            in_conv_state, pltpu.HBM)
+        operands = (seq_metadata, qkv, b, g, pinned_conv_state,
+                    in_recurrent_state, aliased_out, weights, pad_start)
         out_shapes = (out_shape, in_conv_state, in_recurrent_state)
         out_specs = (hbm_spec, hbm_spec, hbm_spec)
         if cfg.is_replay:
@@ -1277,6 +1291,6 @@ def _fused_conv1d_kda(
     out, conv_state_out, recurrent_state_out, _ = _call_kernel(
         conv_state_out, recurrent_state_out, out, config.KDAMode.PER_SEQ)
 
-    return (conv_state_out.astype(conv_out_dtype),
+    return (jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
             recurrent_state_out.astype(recurrent_out_dtype),
             replay_state_out), out

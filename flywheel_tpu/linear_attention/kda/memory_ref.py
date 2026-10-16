@@ -412,6 +412,84 @@ def wait_state_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
     wait_row_dma(buf_ref, num_states, sem)
 
 
+# Note (david): the conv state cache arrives as its [prev_kernel_size,
+# num_slots, dim_size] view, whose slot axis is the tiled second-minor one.
+# Mosaic rejects a traced row count on that axis, so every conv checkpoint
+# moves as its own [prev_kernel_size, dim_size] DMA (slot axis squeezed),
+# guarded by pl.when, and is waited on with its own descriptor.
+
+
+def conv_in_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                   p_id: int | jax.Array, metadata_ref: MetadataRef,
+                   cfg: config.KDAConfig):
+    """(is_read, DMA) per sequence: its initial conv state from
+    read_indices[s] + read_offset[s] into window position 0, read on its first
+    tile if it has an initial state, as start_state_in."""
+    copies = []
+    for idx in range(cfg.seq_tile_size):
+        record = metadata_ref.get_record(p_id, idx)
+        s_idx = record.s_idx
+        read_slot = (metadata_ref.s_idx_to_read_indices[s_idx] +
+                     metadata_ref.s_idx_to_read_offset[s_idx])
+        is_read = jnp.logical_and(
+            record.is_first_tile, metadata_ref.s_idx_has_initial_state[s_idx])
+        copies.append((is_read,
+                       pltpu.make_async_copy(hbm_ref.at[:, read_slot],
+                                             buf_ref.at[idx, 0], sem)))
+    return copies
+
+
+def start_conv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                  p_id: int | jax.Array, metadata_ref: MetadataRef,
+                  cfg: config.KDAConfig) -> None:
+    for is_read, copy in conv_in_copies(hbm_ref, buf_ref, sem, p_id,
+                                        metadata_ref, cfg):
+        pl.when(is_read)(copy.start)
+
+
+def wait_conv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                 p_id: int | jax.Array, metadata_ref: MetadataRef,
+                 cfg: config.KDAConfig) -> None:
+    for is_read, copy in conv_in_copies(hbm_ref, buf_ref, sem, p_id,
+                                        metadata_ref, cfg):
+        pl.when(is_read)(copy.wait)
+
+
+def conv_out_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                    p_id: int | jax.Array, metadata_ref: MetadataRef,
+                    cfg: config.KDAConfig):
+    """(is_written, DMA) per sequence and window position: position t of a
+    sequence's last tile goes to state_indices[s] + t, as start_state_out."""
+    copies = []
+    for idx in range(cfg.seq_tile_size):
+        record = metadata_ref.get_record(p_id, idx)
+        write_slot = metadata_ref.s_idx_to_state_indices[record.s_idx]
+        num_ckpts = jnp.where(record.is_last_tile,
+                              jnp.minimum(record.r_size, cfg.window_size), 0)
+        for pos in range(cfg.window_size):
+            copies.append((pos < num_ckpts,
+                           pltpu.make_async_copy(
+                               buf_ref.at[idx, pos],
+                               hbm_ref.at[:, write_slot + pos], sem)))
+    return copies
+
+
+def start_conv_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                   p_id: int | jax.Array, metadata_ref: MetadataRef,
+                   cfg: config.KDAConfig) -> None:
+    for is_written, copy in conv_out_copies(hbm_ref, buf_ref, sem, p_id,
+                                            metadata_ref, cfg):
+        pl.when(is_written)(copy.start)
+
+
+def wait_conv_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
+                  p_id: int | jax.Array, metadata_ref: MetadataRef,
+                  cfg: config.KDAConfig) -> None:
+    for is_written, copy in conv_out_copies(hbm_ref, buf_ref, sem, p_id,
+                                            metadata_ref, cfg):
+        pl.when(is_written)(copy.wait)
+
+
 def replay_in_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
                    p_id: int | jax.Array, idx: int,
                    metadata_ref: MetadataRef):
