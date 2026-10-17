@@ -43,11 +43,12 @@ SEM_OUT = 5
 NUM_SEMS = 6
 BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 384, 256, 128)
 STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
-# Note (david): a row computes every kv compute tile of its staged block,
-# masked or not, so a short row costs a whole block. At Qwen3-4B's 32:8 heads
-# of 128 with a 32K-token table row on v6e, 256 rows of 64-1024 tokens took
-# 2.42 ms with 4096-token blocks against 0.76 ms with 1024-token ones (RPA v3:
-# 1.33 ms), while a 16K context took 15.33 against 15.10 ms.
+# Note (david): a row runs only the kv compute tiles that hold its keys, but a
+# bigger block still issues a copy for every page in it. At Qwen3-4B's 32:8
+# heads of 128 with a 32K-token table row on v6e, 256 rows of 64-1024 tokens
+# took 1.15 ms with 4096-token blocks against 1.08 ms with 1024-token ones
+# (1.82 ms when every tile of the block ran), while a 16K context took 15.53
+# against 15.33 ms.
 MAX_BLOCK_KV = 1024
 
 
@@ -535,20 +536,19 @@ def kvcache_kernel(
       _q_copy(next_local_batch_index, next_q_slot).start()
 
     def _score_and_softmax(
-        block_index,
         slot,
         head_group,
         kv_compute_index,
         is_valid,
         fragment_has_valid_key,
-        row_max_carry,
-        row_sum_carry,
+        is_first,
+        row_max_prev,
+        row_sum_prev,
     ):
       # Note (david): the query heads of one head group are consecutive rows of
       # q, so one (rows_per_fragment, head_dim) tile rides a single K load and
       # MXU pass.
       group_start = head_group * rows_per_fragment
-      group_slice = pl.ds(group_start, rows_per_fragment)
       query = queries[group_start : group_start + rows_per_fragment, :]
       if is_merged_cache:
         # Note (david): a head's K and V share their u32 words, so the score's
@@ -588,23 +588,12 @@ def kvcache_kernel(
         capped_scores = scores
       scores = jnp.where(is_valid, capped_scores, -jnp.inf)
 
-      # Note (david): the running state is read as whole (rows, 128) tiles
-      # with every lane holding its row's value, so every broadcast against
-      # the scores or the accumulator is a vreg repeat, not a cross-lane op.
-      if kv_compute_index == 0:
-        row_max_prev = row_max_ref[group_slice, :]
-        row_sum_prev = row_sum_ref[group_slice, :]
-      else:
-        row_max_prev = row_max_carry
-        row_sum_prev = row_sum_carry
       if left is None:
         probabilities, row_max, row_sum, rescale = static_anchor_update(
             scores,
             row_max_prev,
             row_sum_prev,
-            is_first=(
-                block_index == first_block if kv_compute_index == 0 else False
-            ),
+            is_first=is_first,
             guard_threshold=guard_threshold,
         )
       else:
@@ -643,9 +632,6 @@ def kvcache_kernel(
             candidate_rescale,
             jnp.ones_like(candidate_rescale),
         )
-      if kv_compute_index == num_kv_compute_fragments - 1:
-        row_max_ref[group_slice, :] = row_max
-        row_sum_ref[group_slice, :] = row_sum
       return probabilities, rescale, values, row_max, row_sum
 
     def _pv(
@@ -771,13 +757,10 @@ def kvcache_kernel(
           for copy in _cache_write_copies(cache_row, cache_len, write_slot):
             copy.start()
 
-      valid_masks = []
-      fragment_has_valid_keys = []
-      for kv_compute_index in range(num_kv_compute_fragments):
-        key_start = (
-            block_index * block_kv
-            + kv_compute_index * block_kv_compute
-        )
+      block_start = block_index * block_kv
+
+      def _attend_fragment(kv_compute_index, row_states):
+        key_start = block_start + kv_compute_index * block_kv_compute
         # Note (david): build the mask at full fragment shape; a (1, N) mask
         # needs a sublane-broadcast relayout inside every fragment's select,
         # which measured ~40% of MQA decode time.
@@ -794,39 +777,77 @@ def kvcache_kernel(
           is_valid = is_in_window
         else:
           is_valid = is_in_window & parity_mask
-        valid_masks.append(is_valid)
-        fragment_has_valid_keys.append(
-            jnp.logical_and(
-                key_start < total_len,
-                key_start + block_kv_compute > first_key,
-            )
+        fragment_has_valid_key = jnp.logical_and(
+            key_start < total_len,
+            key_start + block_kv_compute > first_key,
         )
+        # Note (david): without a window the row's first tile is tile 0 of its
+        # first block; a window's state starts at its first visible key
+        # instead (row_sum_prev == 0 in _score_and_softmax).
+        is_first = jnp.logical_and(
+            block_index == first_block, kv_compute_index == 0
+        )
+        # Note (david): software pipeline; each head group's scores are issued
+        # one step ahead of the previous group's pv, so the MXU has the next
+        # matmul queued while pv runs.
+        next_row_states = []
+        pending_fragment = None
+        for head_group, (row_max_prev, row_sum_prev) in enumerate(row_states):
+          probabilities, rescale, values, row_max, row_sum = (
+              _score_and_softmax(
+                  slot,
+                  head_group,
+                  kv_compute_index,
+                  is_valid,
+                  fragment_has_valid_key,
+                  is_first,
+                  row_max_prev,
+                  row_sum_prev,
+              )
+          )
+          if pending_fragment is not None:
+            _pv(slot, *pending_fragment)
+          pending_fragment = (
+              head_group, kv_compute_index, probabilities, rescale, values
+          )
+          next_row_states.append((row_max, row_sum))
+        _pv(slot, *pending_fragment)
+        return tuple(next_row_states)
 
-      # Note (david): software pipeline; each fragment's scores are issued one
-      # step ahead of its own pv, so the MXU has the next matmul queued while
-      # pv runs.
-      pending_fragment = None
-      for fragment_index in range(num_head_groups * num_kv_compute_fragments):
-        head_group, kv_compute_index = divmod(
-            fragment_index, num_kv_compute_fragments
+      # Note (david): the running state is read as whole (rows, 128) tiles
+      # with every lane holding its row's value, so every broadcast against
+      # the scores or the accumulator is a vreg repeat, not a cross-lane op.
+      group_slices = [
+          pl.ds(head_group * rows_per_fragment, rows_per_fragment)
+          for head_group in range(num_head_groups)
+      ]
+      row_states = tuple(
+          (row_max_ref[group_slice, :], row_sum_ref[group_slice, :])
+          for group_slice in group_slices
+      )
+      if num_kv_compute_fragments == 1:
+        row_states = _attend_fragment(0, row_states)
+      else:
+        # Note (david): only the compute tiles holding one of the row's keys
+        # run, as in RPA v3 (cdiv(kv_len, bkv_csz) tiles). Running every tile
+        # of the staged block made a row cost the whole block: at Qwen3-4B's
+        # 16:4 heads, batch 128 and kv_len 256 on v6e, the 8192-token blocks
+        # of 2048-token tiles of #14's v7x entries took 4.33 us a row against
+        # 1.67 us running only the first tile (RPA v3: 3.32 us); at kv_len
+        # 4608 the cache read bounds both, 8.36 us a row each.
+        first_fragment = (
+            jnp.maximum(first_key - block_start, 0) // block_kv_compute
         )
-        current_fragment = _score_and_softmax(
-            block_index,
-            slot,
-            head_group,
-            kv_compute_index,
-            valid_masks[kv_compute_index],
-            fragment_has_valid_keys[kv_compute_index],
-            *(
-                pending_fragment[5:]
-                if pending_fragment is not None
-                else (None, None)
-            ),
+        end_fragment = jnp.minimum(
+            pl.cdiv(total_len - block_start, block_kv_compute),
+            num_kv_compute_fragments,
         )
-        if pending_fragment is not None:
-          _pv(slot, *pending_fragment[:5])
-        pending_fragment = (head_group, kv_compute_index, *current_fragment)
-      _pv(slot, *pending_fragment[:5])
+        row_states = lax.fori_loop(
+            first_fragment, end_fragment, _attend_fragment, row_states
+        )
+      for group_slice, (row_max, row_sum) in zip(group_slices, row_states):
+        row_max_ref[group_slice, :] = row_max
+        row_sum_ref[group_slice, :] = row_sum
       return jnp.logical_or(
           has_prefetched_next_sequence, should_prefetch_next_sequence
       )
