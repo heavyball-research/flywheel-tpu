@@ -2112,6 +2112,46 @@
       "head_dim_minor",
       false
     ],
+    "kvcache|bfloat16|h16|k4|b128|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b128|s5120|d128|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b32|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b32|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s5120|d128|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
     "kvcache|bfloat16|h32|k32|b128|s16384|d256|a1|w-|l0": [
       512,
       512,
@@ -2135,6 +2175,46 @@
     "kvcache|bfloat16|h32|k4|b32|s16384|d256|a1|w-|l0": [
       4096,
       2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b128|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b128|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b32|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b32|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
       2
     ]
   }
