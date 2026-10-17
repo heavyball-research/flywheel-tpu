@@ -11,9 +11,25 @@ import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache
 from flywheel_tpu.flash_attn_interface import fused_q_scale
+from flywheel_tpu.pallas import flash_fwd_kvcache
 from flywheel_tpu.pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
 
 INTERPRET = jax.default_backend() != "tpu"
+
+
+@pytest.fixture
+def force_kvcache_config(monkeypatch):
+  """force_kvcache_config(config) makes every decode build use config, a
+  (block_kv, block_kv_compute, num_kv_stages) tuple, until the test ends."""
+
+  def force(config):
+    monkeypatch.setattr(
+        flash_fwd_kvcache, "get_tuned_kvcache_config", lambda **_: config)
+    # Note (david): the lookup runs while the kernel is traced.
+    jax.clear_caches()
+
+  yield force
+  jax.clear_caches()
 
 
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
@@ -335,6 +351,37 @@ def test_kvcache_compute_fragments_handle_masked_prefix_and_boundary_append():
   np.testing.assert_array_equal(updated_v, expected_v)
   assert_decode_matches(out, lse, q, expected_k, expected_v, cache_seqlens + 1,
                         cache_batch_idx, (255, 0), out_tol=(3e-2, 4e-2))
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "config", "window_size"),
+    [
+        # Note (david): one block of four compute tiles; the rows end in
+        # tiles 0, 0, 1, 2 and 3.
+        (8, 2, (2048, 512, 2), (-1, -1)),
+        # Note (david): two blocks a row, four tiles each.
+        (4, 2, (1024, 256, 3), (-1, -1)),
+        # Note (david): the window opens past a long row's first tiles.
+        (8, 2, (2048, 512, 2), (700, 0)),
+    ],
+)
+def test_contiguous_cache_runs_only_tiles_with_keys(
+    force_kvcache_config, num_query_heads, num_kv_heads, config, window_size):
+  force_kvcache_config(config)
+  capacity, batch = 2048, 5
+  q, k_cache, v_cache, k, v = random_decode_inputs(
+      config[1], batch, batch, capacity, num_query_heads, num_kv_heads, 128)
+  cache_seqlens = jnp.array([3, 510, 600, 1500, capacity - 1], jnp.int32)
+  cache_batch_idx = jnp.arange(batch, dtype=jnp.int32)
+  out, lse, updated_k, updated_v = decode_with_cache_copies(
+      q, k_cache, v_cache, k, v, cache_seqlens=cache_seqlens,
+      window_size=window_size, return_softmax_lse=True, interpret=INTERPRET)
+  expected_k = k_cache.at[cache_batch_idx, cache_seqlens].set(k[:, 0])
+  expected_v = v_cache.at[cache_batch_idx, cache_seqlens].set(v[:, 0])
+  np.testing.assert_array_equal(updated_k, expected_k)
+  np.testing.assert_array_equal(updated_v, expected_v)
+  assert_decode_matches(out, lse, q, expected_k, expected_v, cache_seqlens + 1,
+                        cache_batch_idx, window_size, out_tol=(3e-2, 4e-2))
 
 
 @pytest.mark.parametrize(

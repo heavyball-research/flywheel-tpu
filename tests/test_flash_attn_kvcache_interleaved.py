@@ -6,11 +6,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache
-from tests.test_flash_attn_kvcache import (
+from tests.test_flash_attn_kvcache import (  # noqa: F401 (fixture)
     INTERPRET,
     SOFTCAP_Q_GAIN,
     assert_softcap_changes_reference,
     decode_reference,
+    force_kvcache_config,
     gather_pages,
     interleave_kv,
     random_paged_decode_inputs,
@@ -142,6 +143,35 @@ def test_interleaved_decode_window_and_padding_rows(
   np.testing.assert_array_equal(updated, expected_pool)
   assert_matches_reference(out, lse, q, expected_k, expected_v, total_seqlens,
                            rows, window_size)
+
+
+@pytest.mark.parametrize(
+    ("num_query_heads", "num_kv_heads", "head_dim", "config", "window_size",
+     "softcap"),
+    [
+        # Note (david): the v7x Qwen3-4B TP 2 shape (two head groups of two KV
+        # heads), one block of four compute tiles; the rows of
+        # run_interleaved_decode end in tiles 0, 0, 0, 3, 2 and 3.
+        (16, 4, 128, (2048, 512, 2), (-1, -1), 0.0),
+        # Note (david): the TP 1 shape, four head groups and two blocks a row.
+        (32, 8, 128, (1024, 256, 3), (-1, -1), 0.0),
+        # Note (david): the window opens past the long rows' first tiles.
+        (16, 4, 128, (2048, 512, 2), (700, 0), 0.0),
+        (8, 1, 256, (2048, 512, 2), (-1, -1), 30.0),
+    ],
+)
+def test_interleaved_decode_runs_only_tiles_with_keys(
+    force_kvcache_config, num_query_heads, num_kv_heads, head_dim, config,
+    window_size, softcap):
+  force_kvcache_config(config)
+  (out, lse, updated, expected_pool, q, expected_k, expected_v, total_seqlens,
+   rows) = run_interleaved_decode(
+       num_query_heads, num_kv_heads, head_dim, 2048, True, True,
+       window_size=window_size, seed=num_kv_heads + config[1], softcap=softcap,
+       q_gain=SOFTCAP_Q_GAIN if softcap else 1.0)
+  np.testing.assert_array_equal(updated, expected_pool)
+  assert_matches_reference(out, lse, q, expected_k, expected_v, total_seqlens,
+                           rows, window_size, softcap)
 
 
 @pytest.mark.parametrize(
