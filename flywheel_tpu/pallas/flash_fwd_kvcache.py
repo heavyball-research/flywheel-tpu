@@ -10,7 +10,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..tuned_block_sizes import KVCacheConfig, get_tuned_kvcache_config
+from ..tuned_block_sizes import (
+  KVCacheConfig,
+  get_tuned_kvcache_config,
+  kvcache_config_key,
+  warn_untuned,
+)
 from .block_sizes import (
   BF16_BYTES,
   F32_BYTES,
@@ -1065,7 +1070,7 @@ def flash_attn_kvcache_pallas(
     )
   # Note (david): softcap stays out of the tuned key because decode is bound by
   # the cache read; the tanh did not move the v6e step time.
-  tuned_config = get_tuned_kvcache_config(
+  tuned_key_fields = dict(
       dtype=q.dtype,
       num_query_heads=num_query_heads,
       num_kv_heads=num_kv_heads,
@@ -1076,11 +1081,21 @@ def flash_attn_kvcache_pallas(
       sliding_window=left,
       return_lse=return_lse,
   )
+  tuned_config = get_tuned_kvcache_config(**tuned_key_fields)
   # Note (david): a paged block is whole pages, so a tuned block_kv that does
   # not tile the page cannot be used as-is.
-  if tuned_config is not None and (
-      page_size is None or tuned_config[0] % page_size == 0
+  if (
+      tuned_config is not None
+      and page_size is not None
+      and tuned_config[0] % page_size
   ):
+    warn_untuned(
+        kvcache_config_key(**tuned_key_fields),
+        f"the entry's block_kv {tuned_config[0]} is not a multiple of the"
+        f" page size {page_size}, and a paged block must be whole pages",
+    )
+    tuned_config = None
+  if tuned_config is not None:
     block_kv, block_kv_compute, num_kv_stages = validate_kvcache_config(
         tuned_config,
         num_query_heads=num_query_heads,
