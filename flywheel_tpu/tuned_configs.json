@@ -2112,6 +2112,46 @@
       "head_dim_minor",
       false
     ],
+    "kvcache|bfloat16|h16|k4|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
     "kvcache|bfloat16|h32|k32|b128|s16384|d256|a1|w-|l0": [
       512,
       512,
@@ -2134,6 +2174,46 @@
     ],
     "kvcache|bfloat16|h32|k4|b32|s16384|d256|a1|w-|l0": [
       4096,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b128|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b128|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s8192|d128|a1|w-|l0": [
+      2048,
       2048,
       2
     ]
