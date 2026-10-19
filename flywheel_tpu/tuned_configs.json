@@ -1952,6 +1952,336 @@
     ]
   },
   "TPU v7": {
+    "fwd|hm|bfloat16|h16|b-|s1024|d128|c1|m-|l0|k4|o1": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s1024|d128|c1|m1024|l0|k4": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s1024|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s1024|d128|c1|m512|l0|k4": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s128|d128|c1|m-|l0|k4|o1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s128|d128|c1|m128|l0|k4": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s128|d128|c1|m16|l0|k4": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s128|d128|c1|m32|l0|k4": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s128|d128|c1|m64|l0|k4": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s2048|d128|c1|m-|l0|k4|o1": [
+      2048,
+      2048,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s2048|d128|c1|m1024|l0|k4": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s2048|d128|c1|m2048|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s2048|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s2048|d128|c1|m512|l0|k4": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s256|d128|c1|m-|l0|k4|o1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s256|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s4096|d128|c1|m-|l0|k4|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s4096|d128|c1|m1024|l0|k4": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s4096|d128|c1|m2048|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s4096|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s4096|d128|c1|m512|l0|k4": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s512|d128|c1|m-|l0|k4|o1": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s512|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s512|d128|c1|m512|l0|k4": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s8192|d128|c1|m-|l0|k4|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s8192|d128|c1|m1024|l0|k4": [
+      1024,
+      1024,
+      512,
+      512,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s8192|d128|c1|m2048|l0|k4": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s8192|d128|c1|m256|l0|k4": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h16|b-|s8192|d128|c1|m512|l0|k4": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s1024|d128|c1|m-|l0|k8|o1": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s1024|d128|c1|m1024|l0|k8": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s1024|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s1024|d128|c1|m512|l0|k8": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
     "fwd|hm|bfloat16|h32|b-|s1024|d256|c1|m-|l0": [
       1024,
       1024,
@@ -1968,6 +2298,56 @@
       512,
       512,
       3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s128|d128|c1|m-|l0|k8|o1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s128|d128|c1|m128|l0|k8": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s128|d128|c1|m16|l0|k8": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s128|d128|c1|m32|l0|k8": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s128|d128|c1|m64|l0|k8": [
+      128,
+      128,
+      64,
+      128,
+      2,
       1,
       "head_dim_minor",
       false
@@ -2012,6 +2392,56 @@
       "head_dim_minor",
       false
     ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d128|c1|m-|l0|k8|o1": [
+      2048,
+      2048,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d128|c1|m1024|l0|k8": [
+      1024,
+      1024,
+      512,
+      512,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d128|c1|m2048|l0|k8": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s2048|d128|c1|m512|l0|k8": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
     "fwd|hm|bfloat16|h32|b-|s2048|d256|c1|m-|l0": [
       2048,
       2048,
@@ -2032,6 +2462,26 @@
       "head_dim_minor",
       false
     ],
+    "fwd|hm|bfloat16|h32|b-|s256|d128|c1|m-|l0|k8|o1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s256|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
     "fwd|hm|bfloat16|h32|b-|s32768|d256|c1|m-|l0": [
       2048,
       2048,
@@ -2047,6 +2497,56 @@
       2048,
       256,
       256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d128|c1|m-|l0|k8|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d128|c1|m1024|l0|k8": [
+      1024,
+      1024,
+      512,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d128|c1|m2048|l0|k8": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s4096|d128|c1|m512|l0|k8": [
+      512,
+      512,
+      256,
+      512,
       2,
       1,
       "head_dim_minor",
@@ -2072,6 +2572,36 @@
       "head_dim_minor",
       false
     ],
+    "fwd|hm|bfloat16|h32|b-|s512|d128|c1|m-|l0|k8|o1": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s512|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s512|d128|c1|m512|l0|k8": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
     "fwd|hm|bfloat16|h32|b-|s65536|d256|c1|m-|l0": [
       2048,
       2048,
@@ -2088,6 +2618,56 @@
       256,
       512,
       4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d128|c1|m-|l0|k8|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d128|c1|m1024|l0|k8": [
+      1024,
+      1024,
+      512,
+      512,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d128|c1|m2048|l0|k8": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d128|c1|m256|l0|k8": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h32|b-|s8192|d128|c1|m512|l0|k8": [
+      512,
+      512,
+      256,
+      512,
+      2,
       1,
       "head_dim_minor",
       false
@@ -2122,6 +2702,16 @@
       2560,
       2
     ],
+    "kvcache|bfloat16|h16|k4|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
     "kvcache|bfloat16|h16|k4|b16|s5120|d128|a0|w-|l0": [
       2560,
       2560,
@@ -2130,6 +2720,16 @@
     "kvcache|bfloat16|h16|k4|b16|s5120|d128|a1|w-|l0": [
       2560,
       2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
       2
     ],
     "kvcache|bfloat16|h16|k4|b32|s5120|d128|a0|w-|l0": [
@@ -2142,6 +2742,16 @@
       2560,
       2
     ],
+    "kvcache|bfloat16|h16|k4|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
     "kvcache|bfloat16|h16|k4|b64|s5120|d128|a0|w-|l0": [
       5120,
       2560,
@@ -2150,6 +2760,16 @@
     "kvcache|bfloat16|h16|k4|b64|s5120|d128|a1|w-|l0": [
       5120,
       2560,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h16|k4|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
       2
     ],
     "kvcache|bfloat16|h32|k32|b128|s16384|d256|a1|w-|l0": [
@@ -2187,6 +2807,16 @@
       2560,
       2
     ],
+    "kvcache|bfloat16|h32|k8|b128|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b128|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
     "kvcache|bfloat16|h32|k8|b16|s5120|d128|a0|w-|l0": [
       2560,
       2560,
@@ -2195,6 +2825,16 @@
     "kvcache|bfloat16|h32|k8|b16|s5120|d128|a1|w-|l0": [
       2560,
       2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
       2
     ],
     "kvcache|bfloat16|h32|k8|b32|s5120|d128|a0|w-|l0": [
@@ -2207,6 +2847,16 @@
       2560,
       2
     ],
+    "kvcache|bfloat16|h32|k8|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
     "kvcache|bfloat16|h32|k8|b64|s5120|d128|a0|w-|l0": [
       2560,
       2560,
@@ -2215,6 +2865,16 @@
     "kvcache|bfloat16|h32|k8|b64|s5120|d128|a1|w-|l0": [
       2560,
       2560,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|bfloat16|h32|k8|b64|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
       2
     ]
   }

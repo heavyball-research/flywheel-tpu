@@ -17,15 +17,17 @@
 Keys are exact, not bucketed: q_block must divide the real seq_len and
 head_fold the real num_heads, so a rounded-up entry could hand back a config
 the shape cannot build. A missing key returns None and the caller uses its
-analytic defaults. A kvcache| key holds the contiguous KV-cache decode
-kernel's (block_kv, block_kv_compute, num_kv_stages); every other key holds a
-dense fwd / bwd CONFIG_FIELDS tuple.
+analytic defaults; on a TPU that issues a UserWarning, once per key. A
+kvcache| key holds the contiguous KV-cache decode kernel's (block_kv,
+block_kv_compute, num_kv_stages); every other key holds a dense fwd / bwd
+CONFIG_FIELDS tuple.
 """
 
 import functools
 import json
 import pathlib
 import re
+import warnings
 
 import jax
 import jax.numpy as jnp
@@ -160,6 +162,33 @@ def load_tuned_configs() -> dict[str, dict[str, list[int | str | bool]]]:
   return json.loads(TUNED_CONFIGS_PATH.read_text())
 
 
+@functools.cache
+def _warn_untuned_once(device_name: str, key: str, reason: str) -> None:
+  detail = f" ({reason})" if reason else ""
+  warnings.warn(
+      f"flywheel_tpu: no usable tuned config for {key} on {device_name} in"
+      f" {TUNED_CONFIGS_PATH.name}{detail}; falling back to the default"
+      " config."
+  )
+
+
+def warn_untuned(key: str, reason: str = "") -> None:
+  """Warn, once per device, key and reason, that a kernel build on a TPU
+  falls back to its default config. Off TPU there are no tables to miss."""
+  device_name = get_device_name()
+  if device_name.startswith("TPU"):
+    _warn_untuned_once(device_name, key, reason)
+
+
+def lookup_tuned_config(key: str) -> list[int | str | bool] | None:
+  """The current device's tuned_configs.json entry for key, warning when
+  there is none."""
+  config = load_tuned_configs().get(get_device_name(), {}).get(key)
+  if config is None:
+    warn_untuned(key)
+  return config
+
+
 def get_tuned_config(
     direction: str, *, head_dim_v: int, **key_fields: int | bool | None
 ) -> TunedConfig | None:
@@ -171,8 +200,7 @@ def get_tuned_config(
   if head_dim_v != key_fields["head_dim"]:
     return None
   else:
-    device_table = load_tuned_configs().get(get_device_name(), {})
-    config = device_table.get(tuned_config_key(direction, **key_fields))
+    config = lookup_tuned_config(tuned_config_key(direction, **key_fields))
     return None if config is None else tuple(config)
 
 
@@ -200,6 +228,5 @@ def kvcache_config_key(
 def get_tuned_kvcache_config(
     **key_fields: DTypeLike | int | bool | None,
 ) -> KVCacheConfig | None:
-  device_table = load_tuned_configs().get(get_device_name(), {})
-  config = device_table.get(kvcache_config_key(**key_fields))
+  config = lookup_tuned_config(kvcache_config_key(**key_fields))
   return None if config is None else tuple(config)
