@@ -64,7 +64,7 @@ flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                 alibi_slopes=None, deterministic=False, return_attn_probs=False,
                 return_softmax_lse=False, interpret=False, head_dim=None,
                 token_major=False, *, rotary_cos=None, rotary_sin=None,
-                rotary_interleaved=True, rotary_k=True, heads_outer_fold=False):
+                rotary_interleaved=False, rotary_k=True, heads_outer_fold=False):
 """Unlike flash-attn, the default layout is head-major, (batch, nheads, seqlen, headdim),
 which is the kernel's own layout, so no operand is relaid out.
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -122,7 +122,7 @@ flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_se
                        softcap=0.0, alibi_slopes=None, deterministic=False,
                        return_attn_probs=False, return_softmax_lse=False, interpret=False,
                        head_dim=None, token_major=False, block_sizes=None, *,
-                       rotary_cos=None, rotary_sin=None, rotary_interleaved=True,
+                       rotary_cos=None, rotary_sin=None, rotary_interleaved=False,
                        rotary_k=True, block_table=None, seqused_k=None, num_active=None):
 """Attention over sequences packed along the token axis. Unlike flash-attn, the default layout
 is head-major, (nheads, total, headdim), which is the kernel's own layout, so no operand is

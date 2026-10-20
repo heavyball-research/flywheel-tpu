@@ -147,7 +147,7 @@ def paged_scratch_shapes(
     # Note (david): prepare_rotary's one batch plane is shared by every head,
     # so one Q coefficient group is staged.
     rotary_shapes = [
-        ((num_stages, 1, 2, bq, head_dim // 2), jnp.dtype(rotary_dtype))]
+        ((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))]
   if return_lse:
     lse_shapes = [((num_stages, bq, NUM_LANES), f32)]
   else:
@@ -288,7 +288,7 @@ def flash_attn_varlen_paged(
     interpret: bool,
     block_sizes: BlockSizes | None = None,
     rotary: tuple[jax.Array, None] | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     window_left: int | None = None,
     softcap: float = 0.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -414,7 +414,7 @@ def flash_attn_varlen_paged(
     padded_rotary = None
   else:
     padded_rotary = (
-        jnp.pad(rotary[0], ((0, 0), (0, 0), (0, num_pad_q), (0, 0))), None)
+        jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))), None)
 
   cu_q = cu_seqlens_q.astype(jnp.int32)
   smem_operands = [

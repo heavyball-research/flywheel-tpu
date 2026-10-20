@@ -64,9 +64,9 @@ TOKEN_MAJOR_PACKED_AXIS = 0
 HEAD_MAJOR_PACKED_AXIS = 1
 AXIS_NAMES = {"b": "batch", "h": "nheads", "s": "seqlen", "t": "total",
               "d": "headdim"}
-# Note (david): prepare_rotary returns (2, batch, tokens, head_dim / 2), cos
-# then sin.
-ROTARY_TOKEN_AXIS = 2
+# Note (david): prepare_rotary returns (batch, tokens, head_dim) packed cos/sin
+# planes.
+ROTARY_TOKEN_AXIS = 1
 
 
 def pad_seqlen(seqlen: int) -> int:
@@ -590,7 +590,7 @@ def flash_attn_func(
     *,
     rotary_cos: jax.Array | None = None,
     rotary_sin: jax.Array | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     rotary_k: bool = True,
     heads_outer_fold: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1065,7 +1065,7 @@ def flash_attn_varlen_func(
     *,
     rotary_cos: jax.Array | None = None,
     rotary_sin: jax.Array | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     rotary_k: bool = True,
     block_table: jax.Array | None = None,
     seqused_k: jax.Array | None = None,
