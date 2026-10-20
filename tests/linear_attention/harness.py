@@ -52,17 +52,20 @@ class Ops:
     fused: Callable[..., tuple]
     replay: Callable[..., tuple]
     record_dim: Callable[..., int]
+    gate_dim: Callable[..., int]
     next_replay_lens: Callable[..., jax.Array]
     per_channel_gate: bool
     gate_dtype: jnp.dtype
 
 
 GDN = Ops(gdn_wrapper.fused_conv1d_gdn, gdn_wrapper.fused_conv1d_gdn_replay,
-          gdn_wrapper.replay_record_dim, gdn_wrapper.next_replay_lens,
-          per_channel_gate=False, gate_dtype=jnp.float32)
+          gdn_wrapper.replay_record_dim, gdn_wrapper.replay_gate_dim,
+          gdn_wrapper.next_replay_lens, per_channel_gate=False,
+          gate_dtype=jnp.float32)
 KDA = Ops(kda_wrapper.fused_conv1d_kda, kda_wrapper.fused_conv1d_kda_replay,
-          kda_wrapper.replay_record_dim, kda_wrapper.next_replay_lens,
-          per_channel_gate=True, gate_dtype=jnp.bfloat16)
+          kda_wrapper.replay_record_dim, kda_wrapper.replay_gate_dim,
+          kda_wrapper.next_replay_lens, per_channel_gate=True,
+          gate_dtype=jnp.bfloat16)
 
 
 def param_grid(id_format: str, rows: list[tuple]) -> list:
@@ -270,13 +273,15 @@ class Fused:
         state_pool = jnp.asarray(self.state_pool)
         num_seqs = self.lengths.size
         if record_dtype is not None:
-            shadow = state_pool.astype(jnp.bfloat16)
-            # Note (david): NaN records catch any read past the committed
-            # ones.
+            # Note (david): NaN records and gates catch any read past the
+            # committed ones.
+            record_dims = (self.n_kq, self.n_v, self.d_k, self.d_v)
             replay_state = jnp.full(
                 (state_pool.shape[0], REPLAY_WINDOW,
-                 self.ops.record_dim(self.n_kq, self.n_v, self.d_k,
-                                     self.d_v)), jnp.nan, record_dtype)
+                 self.ops.record_dim(*record_dims)), jnp.nan, record_dtype)
+            replay_gates = jnp.full(
+                (state_pool.shape[0], REPLAY_WINDOW,
+                 self.ops.gate_dim(*record_dims)), jnp.nan, jnp.float32)
             replay_lens = jnp.zeros((num_seqs, ), jnp.int32)
 
         out_rows, outs = [], []
@@ -296,10 +301,10 @@ class Fused:
                     **dims, **kernel_kwargs)
             else:
                 active_lens = replay_lens[active]
-                (conv_pool, state_pool, shadow,
-                 replay_state), out = self.ops.replay(
-                     *step_inputs, conv_pool, state_pool, shadow,
-                     replay_state, *weights, query_start_loc, slots,
+                (conv_pool, state_pool, replay_state,
+                 replay_gates), out = self.ops.replay(
+                     *step_inputs, conv_pool, state_pool, replay_state,
+                     replay_gates, *weights, query_start_loc, slots,
                      distribution, seq_lens, slots, active_lens,
                      replay_window=REPLAY_WINDOW, **dims, **kernel_kwargs)
                 replay_lens = replay_lens.at[active].set(
@@ -318,33 +323,33 @@ class Fused:
             return self._output(out), state_pool[self.state_indices]
         final_states = [
             self._materialize(state_pool[slot], replay_state[slot],
-                              int(replay_lens[seq]))
+                              replay_gates[slot], int(replay_lens[seq]))
             for seq, slot in enumerate(self.state_indices)
         ]
         return self._output(out), jnp.asarray(np.stack(final_states))
 
     def _materialize(self, checkpoint: jax.Array, records: jax.Array,
-                     num_records: int) -> np.ndarray:
+                     gates: jax.Array, num_records: int) -> np.ndarray:
         """The state a ReplaySSM checkpoint and its first num_records
         records represent, folded in f64.
 
-        A record holds u [HV * V], the key k [H * K] and the log decay g,
-        [HV] for GDN or [HV * K] for KDA; folding it maps S to
-        S * exp(g) + k u^T.
+        A record holds u [HV * V] and the key k [H * K], and its gate row
+        the log decay g, [HV] (lane padded) for GDN or [HV * K] for KDA;
+        folding it maps S to S * exp(g) + k u^T.
         """
         k_offset = self.n_v * self.d_v
-        g_offset = k_offset + self.n_kq * self.d_k
         state = np.asarray(checkpoint, np.float64)
-        for row in np.asarray(records[:num_records], np.float64):
+        for row, gate_row in zip(
+                np.asarray(records[:num_records], np.float64),
+                np.asarray(gates[:num_records], np.float64)):
             u = row[:k_offset].reshape(self.n_v, self.d_v)
-            k = np.repeat(row[k_offset:g_offset].reshape(self.n_kq, self.d_k),
+            k = np.repeat(row[k_offset:].reshape(self.n_kq, self.d_k),
                           self.n_v // self.n_kq, axis=0)
             if self.ops.per_channel_gate:
-                decay = np.exp(row[g_offset:g_offset + self.n_v *
-                                   self.d_k].reshape(self.n_v, self.d_k))
+                decay = np.exp(gate_row.reshape(self.n_v, self.d_k))
                 state = state * decay[:, :, None]
             else:
-                decay = np.exp(row[g_offset:g_offset + self.n_v])
+                decay = np.exp(gate_row[:self.n_v])
                 state = state * decay[:, None, None]
             state = state + k[:, :, None] * u[:, None, :]
         return state.astype(np.float32)

@@ -118,18 +118,16 @@ def inner_kernel(
     carry_recurrent_scratch_ref: jax.Array | None,
     replay_in_ref: jax.Array | None,
     replay_out_ref: jax.Array | None,
-    shadow_in_ref: jax.Array | None,
-    shadow_out_ref: jax.Array | None,
-    wait_flush_in: Callable[[int], None] | None,
+    replay_gate_in_ref: jax.Array | None,
+    replay_gate_out_ref: jax.Array | None,
     start_flush_out: Callable[[int], None] | None,
     *,
     cfg: config.KDAConfig,
 ) -> None:
     """Compute one tile from its VMEM ring slots and stage its outputs.
 
-    A replay tile also owns its flushes' DMAs: wait_flush_in(idx) waits for
-    record idx's f32 checkpoint read and start_flush_out(idx) starts its
-    checkpoint and shadow writes.
+    A replay tile also starts its flushes' DMAs: start_flush_out(idx) starts
+    record idx's checkpoint write.
     """
     profile_scope = compute_kda.profile_scope
     with profile_scope("load_states"):
@@ -140,7 +138,6 @@ def inner_kernel(
             recurrent_slot_ref=recurrent_in_ref,
             carry_conv_scratch_ref=carry_conv_scratch_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
-            shadow_slot_ref=shadow_in_ref,
             cfg=cfg,
         )
 
@@ -159,9 +156,6 @@ def inner_kernel(
             conv_out_ref[...] = new_conv_state
             recurrent_out_ref[...] = new_recurrent_state.astype(
                 recurrent_out_ref.dtype)
-            if shadow_out_ref is not None:
-                shadow_out_ref[...] = new_recurrent_state.astype(
-                    shadow_out_ref.dtype)
             if carry_conv_scratch_ref is not None:
                 carry_conv_scratch_ref[...] = new_conv_state[:, -1]
             if carry_recurrent_scratch_ref is not None:
@@ -183,8 +177,10 @@ def inner_kernel(
             qkv_out = compute_kda.silu(qkv_out)
         q, k, v, b, g = vmem_ldst.load_activation_as_chunked(
             qkv_vreg=qkv_out, g_vreg=g_in, b_vmem_ref=b_slot_ref, cfg=cfg)
-        record_shape = (cfg.replay_window, cfg.record_dim)
-        record_rows = lax.broadcasted_iota(jnp.int32, record_shape, 0)
+        record_rows = lax.broadcasted_iota(
+            jnp.int32, (cfg.replay_window, cfg.record_dim), 0)
+        gate_rows = lax.broadcasted_iota(
+            jnp.int32, (cfg.replay_window, cfg.gate_dim), 0)
 
         def _num_records(record):
             return jnp.where(record.is_first_tile,
@@ -198,20 +194,32 @@ def inner_kernel(
                 def _flush(idx=idx, record=record):
                     checkpoint = compute_kda.replay_flush(
                         records=replay_in_ref[idx].astype(jnp.float32),
+                        gates=replay_gate_in_ref[idx],
                         num_records=_num_records(record),
                         checkpoint_ref=recurrent_in_ref.at[idx, 0],
-                        wait_checkpoint=functools.partial(wait_flush_in, idx),
                         cfg=cfg)
                     recurrent_out_ref[idx, 0] = checkpoint.astype(
                         recurrent_out_ref.dtype)
-                    shadow_out_ref[idx, 0] = checkpoint.astype(
-                        shadow_out_ref.dtype)
                     start_flush_out(idx)
 
-        # Note (david): folding mid tile overlaps the flush's f32 read with the
-        # steps before it and its writes with the steps after. v6e, B=256,
-        # decode, tile 4: 494.4 us with the flush DMAs at the tile boundaries,
-        # 416.0 us folding after 2 steps.
+        def _merge_rows(rows, new_rows, rows_in, base, num_new_rows):
+            """rows_in with new_rows' first num_new_rows rows written from row
+            base on."""
+            if cfg.replay_window > cfg.window_size:
+                new_rows = jnp.concatenate([
+                    new_rows,
+                    jnp.zeros((cfg.replay_window - cfg.window_size,
+                               new_rows.shape[-1]), new_rows.dtype)
+                ], axis=0)
+            shifted = pltpu.roll(new_rows, base, 0)
+            is_new_row = (rows >= base) & (rows < base + num_new_rows)
+            return jnp.where(is_new_row, shifted, rows_in)
+
+        # Note (david): folding mid tile overlaps the flush's checkpoint writes
+        # with the steps after it. When only the flushes read the f32
+        # checkpoint (v6e, B=256, decode, tile 4) this measured 494.4 us with
+        # the flush DMAs at the tile boundaries and 416.0 us folding after 2
+        # steps; not re-measured since every decode reads it.
         flush_pass_pos = cfg.seq_tile_size // 2
         seq_outs = []
         for idx in range(cfg.seq_tile_size):
@@ -220,33 +228,26 @@ def inner_kernel(
             record = metadata_ref.get_record(p_id, idx)
             s_idx = record.s_idx
             records_in = replay_in_ref[idx].astype(jnp.float32)
-            out, new_records = compute_kda.replay_kda(
+            gates_in = replay_gate_in_ref[idx]
+            out, new_records, new_gates = compute_kda.replay_kda(
                 q_chunked=q[idx], k_chunked=k[idx], v_chunked=v[idx],
                 b_rows=b[idx], g_chunked=g[idx], num_tokens=record.r_size,
                 num_records=_num_records(record), records=records_in,
-                shadow_ref=shadow_in_ref.at[idx, 0], a_log=a_log,
-                dt_bias=dt_bias, cfg=cfg)
+                gates=gates_in, checkpoint_ref=recurrent_in_ref.at[idx, 0],
+                a_log=a_log, dt_bias=dt_bias, cfg=cfg)
             seq_outs.append(out)
             with profile_scope("replay_merge"):
                 base = metadata_ref.replay_base(s_idx)
-                if cfg.replay_window == cfg.window_size:
-                    padded_records = new_records
-                else:
-                    padded_records = jnp.concatenate([
-                        new_records,
-                        jnp.zeros((cfg.replay_window - cfg.window_size,
-                                   cfg.record_dim), new_records.dtype)
-                    ], axis=0)
-                shifted = pltpu.roll(padded_records, base, 0)
-                is_new_row = ((record_rows >= base) &
-                              (record_rows < base + record.r_size))
                 # Note (david): the aligned window replay_out_copy writes also
                 # covers committed rows, so the image keeps the rows it read.
                 # The roll and the merge run on unpacked f32 rows; only the
-                # merged image is cast to the storage dtype.
-                replay_out_ref[idx] = jnp.where(
-                    is_new_row, shifted, records_in).astype(
-                        replay_out_ref.dtype)
+                # merged image is cast to the storage dtype. The gates are f32
+                # and take the records' rows.
+                replay_out_ref[idx] = _merge_rows(
+                    record_rows, new_records, records_in, base,
+                    record.r_size).astype(replay_out_ref.dtype)
+                replay_gate_out_ref[idx] = _merge_rows(
+                    gate_rows, new_gates, gates_in, base, record.r_size)
 
         with profile_scope("store_out"):
             store_out_rows(out_slot_ref, jnp.stack(seq_outs, axis=0), 0,
@@ -418,7 +419,7 @@ def outer_kernel(
     weights_ref: memory_ref.WeightRefs,
     pad_start_ref: jax.Array | None,
     replay_state_ref: jax.Array | None,
-    shadow_state_ref: jax.Array | None,
+    replay_gates_ref: jax.Array | None,
     out_ref: jax.Array,
     conv_state_out_ref: jax.Array,
     recurrent_state_out_ref: jax.Array,
@@ -434,8 +435,8 @@ def outer_kernel(
     rec_out_buf: jax.Array,
     replay_in_buf: jax.Array | None,
     replay_out_buf: jax.Array | None,
-    shadow_in_buf: jax.Array | None,
-    shadow_out_buf: jax.Array | None,
+    replay_gate_in_buf: jax.Array | None,
+    replay_gate_out_buf: jax.Array | None,
     out_buf: jax.Array,
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
@@ -448,13 +449,13 @@ def outer_kernel(
     tile t computes and the outputs of tile t - 1 are waited only after tile
     t's outputs start, so both overlap tile t's compute. State inputs and
     outputs use separate rings, so no slot is read by one DMA while another
-    writes it. A replay tile's flushes wait for their f32 checkpoint reads and
-    start their checkpoint writes inside its compute.
+    writes it. A replay tile's flushes start their checkpoint writes inside
+    its compute.
     """
     # Note (david): the tile loop indexes its VMEM rings as t % 2 and 1 - slot.
     assert cfg.num_buffers == config.NUM_BUFFERS, cfg.num_buffers
     # Note (david): aliased_out_ref aliases out_ref and the state outputs alias
-    # their inputs (the replay and shadow ones, when present, follow the
+    # their inputs (the replay records and gates, when present, follow the
     # recurrent one); the DMAs go through the other ref of each pair.
     del aliased_out_ref, conv_state_out_ref, recurrent_state_out_ref
     del extra_state_out_refs
@@ -484,26 +485,19 @@ def outer_kernel(
             memory_ref.start_conv_in(conv_state_ref, conv_in_buf.at[slot],
                                      sems.at[config.STREAM_CONV_IN, slot],
                                      *tile_args)
+            # Note (david): every replay decode reads its f32 checkpoint, whose
+            # single slot ignores the read offset.
+            memory_ref.start_state_in(recurrent_state_ref, rec_in_buf.at[slot],
+                                      sems.at[config.STREAM_REC_IN, slot],
+                                      *tile_args,
+                                      apply_read_offset=not cfg.is_replay)
             if cfg.is_replay:
-                memory_ref.start_state_in(
-                    shadow_state_ref, shadow_in_buf.at[slot],
-                    sems.at[config.STREAM_SHADOW_IN, slot], *tile_args,
-                    apply_read_offset=False)
                 memory_ref.start_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
-                # Note (david): only the flushes read the f32 checkpoints, mid
-                # tile, so they queue behind the inputs the tile waits for at
-                # its start.
-                memory_ref.start_state_in(
-                    recurrent_state_ref, rec_in_buf.at[slot],
-                    sems.at[config.STREAM_REC_IN, slot], *tile_args,
-                    apply_read_offset=False, only_flushing=True)
-            else:
-                memory_ref.start_state_in(recurrent_state_ref,
-                                          rec_in_buf.at[slot],
-                                          sems.at[config.STREAM_REC_IN, slot],
-                                          *tile_args)
+                memory_ref.start_replay_in(
+                    replay_gates_ref, replay_gate_in_buf.at[slot],
+                    sems.at[config.STREAM_REPLAY_GATE_IN, slot], *tile_args)
 
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
@@ -519,19 +513,16 @@ def outer_kernel(
             memory_ref.wait_conv_in(conv_state_ref, conv_in_buf.at[slot],
                                     sems.at[config.STREAM_CONV_IN, slot],
                                     *tile_args)
-            # Note (david): a replay tile waits for its f32 checkpoint reads
-            # in inner_kernel, right before a flush reads one.
+            memory_ref.wait_state_in(rec_in_buf.at[slot],
+                                     sems.at[config.STREAM_REC_IN, slot],
+                                     *tile_args)
             if cfg.is_replay:
-                memory_ref.wait_state_in(
-                    shadow_in_buf.at[slot],
-                    sems.at[config.STREAM_SHADOW_IN, slot], *tile_args)
                 memory_ref.wait_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
-            else:
-                memory_ref.wait_state_in(rec_in_buf.at[slot],
-                                         sems.at[config.STREAM_REC_IN, slot],
-                                         *tile_args)
+                memory_ref.wait_replay_in(
+                    replay_gates_ref, replay_gate_in_buf.at[slot],
+                    sems.at[config.STREAM_REPLAY_GATE_IN, slot], *tile_args)
 
     def _start_out(p_id, slot):
         with profile_scope("start_out"):
@@ -547,14 +538,13 @@ def outer_kernel(
                 memory_ref.start_replay_out(
                     replay_state_ref, replay_out_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_OUT, slot], *tile_args)
+                memory_ref.start_replay_out(
+                    replay_gates_ref, replay_gate_out_buf.at[slot],
+                    sems.at[config.STREAM_REPLAY_GATE_OUT, slot], *tile_args)
             else:
                 memory_ref.start_state_out(
                     recurrent_state_ref, rec_out_buf.at[slot],
                     sems.at[config.STREAM_REC_OUT, slot], *tile_args)
-                if cfg.has_shadow:
-                    memory_ref.start_state_out(
-                        shadow_state_ref, shadow_out_buf.at[slot],
-                        sems.at[config.STREAM_SHADOW_OUT, slot], *tile_args)
 
     def _wait_out(p_id, slot):
         with profile_scope("wait_out"):
@@ -568,20 +558,16 @@ def outer_kernel(
                 memory_ref.wait_ckpt_out(rec_out_buf.at[slot],
                                          sems.at[config.STREAM_REC_OUT, slot],
                                          *tile_args)
-                memory_ref.wait_ckpt_out(
-                    shadow_out_buf.at[slot],
-                    sems.at[config.STREAM_SHADOW_OUT, slot], *tile_args)
                 memory_ref.wait_replay_out(
                     replay_state_ref, replay_out_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_OUT, slot], *tile_args)
+                memory_ref.wait_replay_out(
+                    replay_gates_ref, replay_gate_out_buf.at[slot],
+                    sems.at[config.STREAM_REPLAY_GATE_OUT, slot], *tile_args)
             else:
                 memory_ref.wait_state_out(
                     rec_out_buf.at[slot],
                     sems.at[config.STREAM_REC_OUT, slot], *tile_args)
-                if cfg.has_shadow:
-                    memory_ref.wait_state_out(
-                        shadow_out_buf.at[slot],
-                        sems.at[config.STREAM_SHADOW_OUT, slot], *tile_args)
 
     @pl.when(num_tiles > 0)
     def _prologue():
@@ -610,19 +596,10 @@ def outer_kernel(
         def _prefetch_next():
             _start_in(tile_idx + 1, other_slot)
 
-        def _wait_flush_in(idx):
-            memory_ref.wait_flushed_ckpt_in(
-                rec_in_buf.at[slot], sems.at[config.STREAM_REC_IN, slot],
-                tile_idx, idx, metadata_ref, cfg)
-
         def _start_flush_out(idx):
             memory_ref.start_flushed_ckpt_out(
                 recurrent_state_ref, rec_out_buf.at[slot],
                 sems.at[config.STREAM_REC_OUT, slot], tile_idx, idx,
-                metadata_ref)
-            memory_ref.start_flushed_ckpt_out(
-                shadow_state_ref, shadow_out_buf.at[slot],
-                sems.at[config.STREAM_SHADOW_OUT, slot], tile_idx, idx,
                 metadata_ref)
 
         _wait_in(tile_idx, slot)
@@ -642,9 +619,10 @@ def outer_kernel(
             carry_recurrent_scratch_ref,
             None if replay_in_buf is None else replay_in_buf.at[slot],
             None if replay_out_buf is None else replay_out_buf.at[slot],
-            None if shadow_in_buf is None else shadow_in_buf.at[slot],
-            None if shadow_out_buf is None else shadow_out_buf.at[slot],
-            _wait_flush_in if cfg.is_replay else None,
+            None if replay_gate_in_buf is None else
+            replay_gate_in_buf.at[slot],
+            None if replay_gate_out_buf is None else
+            replay_gate_out_buf.at[slot],
             _start_flush_out if cfg.is_replay else None,
             cfg=cfg,
         )
@@ -765,8 +743,17 @@ STATIC_ARGNAMES = (
 
 
 def replay_record_dim(n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
-    """Lanes of one replay record, the last axis of the replay state."""
-    return n_v * d_v + n_kq * d_k + n_v * d_k
+    """Lanes of one replay record [u | k], the last axis of the replay
+    state."""
+    return n_v * d_v + n_kq * d_k
+
+
+def replay_gate_dim(n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
+    """Lanes of one replay gate row, the last axis of the replay gates: the
+    per-key-channel log decay per value head. Takes replay_record_dim's
+    arguments."""
+    del n_kq, d_v
+    return n_v * d_k
 
 
 @jax.jit(donate_argnames=("conv_state", "recurrent_state"),
@@ -881,8 +868,8 @@ def fused_conv1d_kda(
     return (conv_state, recurrent_state), out
 
 
-@jax.jit(donate_argnames=("conv_state", "recurrent_state", "recurrent_shadow",
-                          "replay_state"),
+@jax.jit(donate_argnames=("conv_state", "recurrent_state", "replay_state",
+                          "replay_gates"),
          static_argnames=STATIC_ARGNAMES + ("replay_window", ))
 def fused_conv1d_kda_replay(
     qkv: jax.Array,
@@ -890,8 +877,8 @@ def fused_conv1d_kda_replay(
     g: jax.Array,
     conv_state: jax.Array,
     recurrent_state: jax.Array,
-    recurrent_shadow: jax.Array,
     replay_state: jax.Array,
+    replay_gates: jax.Array,
     conv_weight: jax.Array,
     conv_bias: jax.Array | None,
     a_log: jax.Array,
@@ -923,18 +910,18 @@ def fused_conv1d_kda_replay(
 
     The replay protocol is that of gdn.wrapper.fused_conv1d_gdn_replay: a
     decode sequence keeps the checkpoint in recurrent_state[slot] plus the
-    first replay_lens[s] records of replay_state[slot], appends its tokens'
-    records, and writes the checkpoint only when it flushes. A KDA record also
-    holds the per-key-channel log decay, n_v * d_k lanes, so it is about 1.6x
-    a GDN record. A decode reads the bf16 shadow of the f32 checkpoint and
-    only a flush the checkpoint, as there.
+    first replay_lens[s] records of replay_state[slot] and
+    replay_gates[slot], appends its tokens' records, and writes the
+    checkpoint only when it flushes. A KDA gate row holds the
+    per-key-channel log decay, n_v * d_k f32 lanes, where a GDN one holds one
+    log decay per value head.
 
     Args:
         recurrent_state: f32 checkpoint cache [num_slots, n_v, d_k, d_v].
-        recurrent_shadow: Its bf16 shadow, same shape; the caller initializes
-            it as recurrent_state.astype(bf16).
         replay_state: f32 or bf16 record buffer [num_slots, replay_window,
             replay_record_dim(n_kq, n_v, d_k, d_v)].
+        replay_gates: f32 gates of the records [num_slots, replay_window,
+            replay_gate_dim(n_kq, n_v, d_k, d_v)].
         replay_lens: int32 committed records of each sequence [num_seqs],
             0 <= replay_lens[s] <= replay_window.
         replay_window: Records a sequence keeps before it flushes; a multiple
@@ -942,14 +929,14 @@ def fused_conv1d_kda_replay(
         The other arguments are those of fused_conv1d_kda.
 
     Returns:
-        (new_conv_state, new_recurrent_state, new_recurrent_shadow,
-        new_replay_state) and out.
+        (new_conv_state, new_recurrent_state, new_replay_state,
+        new_replay_gates) and out.
     """
     return launch_fused_conv1d_kda(
         qkv, b, g, conv_state, recurrent_state, conv_weight, conv_bias, a_log,
         dt_bias, query_start_loc, state_indices, distribution, seq_lens,
-        read_state_indices, read_offsets, replay_state, replay_lens,
-        recurrent_shadow, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
+        read_state_indices, read_offsets, replay_state, replay_gates,
+        replay_lens, n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
         kernel_size=kernel_size, num_spec_tokens=num_spec_tokens,
         zero_initialize_out=zero_initialize_out,
         compute_precision=compute_precision,
@@ -997,8 +984,8 @@ def launch_fused_conv1d_kda(
     read_state_indices: jax.Array,
     read_offsets: jax.Array | None,
     replay_state: jax.Array | None,
+    replay_gates: jax.Array | None,
     replay_lens: jax.Array | None,
-    recurrent_shadow: jax.Array | None,
     *,
     n_kq: int,
     n_v: int,
@@ -1017,7 +1004,7 @@ def launch_fused_conv1d_kda(
 ) -> tuple[tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None],
            jax.Array]:
     """fused_conv1d_kda, with a ReplaySSM decode segment when
-    replay_window > 0. Returns (conv, recurrent, shadow, replay) states and
+    replay_window > 0. Returns (conv, recurrent, replay, gates) states and
     out, the last two None without replay."""
     if lower_bound is not None and (not math.isfinite(lower_bound) or
                                     lower_bound >= 0):
@@ -1108,17 +1095,19 @@ def launch_fused_conv1d_kda(
         if replay_state.dtype not in (jnp.float32, jnp.bfloat16):
             raise TypeError("replay_state must be float32 or bfloat16, got "
                             f"{replay_state.dtype}")
+        gate_shape = (recurrent_state.shape[0], replay_window,
+                      replay_gate_dim(n_kq, n_v, d_k, d_v))
+        if replay_gates.shape != gate_shape:
+            raise ValueError(f"replay_gates must be {gate_shape}, got "
+                             f"{replay_gates.shape}")
+        if replay_gates.dtype != jnp.float32:
+            raise TypeError("replay_gates must be float32, got "
+                            f"{replay_gates.dtype}")
         if replay_lens.shape != state_indices.shape:
             raise ValueError("replay_lens must have one entry per sequence")
         if recurrent_state.dtype != jnp.float32:
             raise TypeError("a replay checkpoint must be float32, got "
                             f"{recurrent_state.dtype}")
-        if (recurrent_shadow.shape != recurrent_state.shape
-                or recurrent_shadow.dtype != jnp.bfloat16):
-            raise ValueError(
-                "recurrent_shadow must be bfloat16 "
-                f"{recurrent_state.shape}, got {recurrent_shadow.dtype} "
-                f"{recurrent_shadow.shape}")
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -1128,22 +1117,29 @@ def launch_fused_conv1d_kda(
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if replay_window:
-        # Note (david): a replay tile reads one checkpoint and writes at most
-        # one per sequence whatever its window; only the conv state keeps a
-        # checkpoint per window position.
+        # Note (david): a replay tile reads one f32 checkpoint and writes at
+        # most one per sequence whatever its window; only the conv state keeps
+        # a checkpoint per window position. Each sequence also leaves one more
+        # checkpoint for the compiler's temporaries. The tile is not shrunk to
+        # fit: a caller whose shape does not fit picks a smaller one.
         decode_tile_size = min(decode_tile_size, batch_size)
-        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
-        shadow_bytes = n_v * d_k * d_v * BF16_BYTES
-        record_bytes = (replay_window * replay_state.shape[-1] *
-                        replay_state.dtype.itemsize)
+        state_bytes = n_v * d_k * d_v * F32_BYTES
+        record_bytes = replay_window * (
+            replay_state.shape[-1] * replay_state.dtype.itemsize +
+            replay_gates.shape[-1] * F32_BYTES)
         conv_ckpt_bytes = (kernel_size - 1) * dim * F32_BYTES
         ring_bytes_per_seq = config.NUM_BUFFERS * (
-            2 * state_bytes + 2 * shadow_bytes +
-            (num_spec_tokens + 2) * conv_ckpt_bytes + 2 * record_bytes)
+            2 * state_bytes + (num_spec_tokens + 2) * conv_ckpt_bytes +
+            2 * record_bytes)
         vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        if decode_tile_size * ring_bytes_per_seq > vmem_limit:
-            decode_tile_size = max(
-                1, vmem_limit // (ring_bytes_per_seq + state_bytes))
+        vmem_bytes_per_seq = ring_bytes_per_seq + state_bytes
+        if decode_tile_size * vmem_bytes_per_seq > vmem_limit:
+            raise ValueError(
+                f"decode_tile_size {decode_tile_size} needs "
+                f"{decode_tile_size * vmem_bytes_per_seq / 2**20:.1f} MiB of "
+                "VMEM for its replay decode tiles, over the "
+                f"{vmem_limit / 2**20:.1f} MiB limit; the largest that fits "
+                f"is {vmem_limit // vmem_bytes_per_seq}")
     elif num_spec_tokens > 0:
         # Note (david): a verify window keeps one state checkpoint per position
         # and sequence in VMEM, multiplying the per-sequence footprint by the
@@ -1210,8 +1206,8 @@ def launch_fused_conv1d_kda(
         in_recurrent_state: jax.Array,
         aliased_out: jax.Array | None,
         mode: config.KDAMode,
-        in_shadow: jax.Array | None,
         in_replay_state: jax.Array | None,
+        in_replay_gates: jax.Array | None,
     ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array | None,
                jax.Array | None]:
         if mode == config.KDAMode.PER_SEQ:
@@ -1237,7 +1233,6 @@ def launch_fused_conv1d_kda(
             lower_bound=lower_bound,
             beta_is_activated=beta_is_activated,
             replay_window=kernel_replay_window,
-            has_shadow=in_shadow is not None,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -1340,9 +1335,9 @@ def launch_fused_conv1d_kda(
                     hbm_spec, aliased_out_spec, weights_spec, pad_spec)
         out_shapes = (out_shape, in_conv_state, in_recurrent_state)
         out_specs = (hbm_spec, hbm_spec, hbm_spec)
-        # Note (david): the replay state and the shadow follow every other
+        # Note (david): the replay records and gates follow every other
         # operand, so their flat input index counts the leaves before them.
-        for extra_state in (in_replay_state, in_shadow):
+        for extra_state in (in_replay_state, in_replay_gates):
             if extra_state is None:
                 in_specs += (None, )
             else:
@@ -1369,19 +1364,18 @@ def launch_fused_conv1d_kda(
             name=f"fused_conv1d_kda_{mode.value}{kernel_name_suffix}",
             metadata=kernel_metadata,
         )(*operands)
-        extra_outs = iter(results[3:])
-        replay_out = None if in_replay_state is None else next(extra_outs)
-        shadow_out = None if in_shadow is None else next(extra_outs)
-        return *results[:3], shadow_out, replay_out
+        if in_replay_state is None:
+            return *results, None, None
+        return tuple(results)
 
-    (out, conv_state_out, recurrent_state_out, shadow_out,
-     replay_state_out) = _call_kernel(conv_state, recurrent_state, None,
+    (out, conv_state_out, recurrent_state_out, replay_state_out,
+     replay_gates_out) = _call_kernel(conv_state, recurrent_state, None,
                                       config.KDAMode.BATCHED,
-                                      recurrent_shadow, replay_state)
-    out, conv_state_out, recurrent_state_out, shadow_out, _ = _call_kernel(
+                                      replay_state, replay_gates)
+    out, conv_state_out, recurrent_state_out, _, _ = _call_kernel(
         conv_state_out, recurrent_state_out, out, config.KDAMode.PER_SEQ,
-        shadow_out, None)
+        None, None)
 
     return (jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
-            recurrent_state_out.astype(recurrent_out_dtype), shadow_out,
-            replay_state_out), out
+            recurrent_state_out.astype(recurrent_out_dtype), replay_state_out,
+            replay_gates_out), out

@@ -1072,16 +1072,19 @@ def recurrent_kda(
 
 
 def replay_record_parts(
-        records: jax.Array, num_records: jax.Array,
+        records: jax.Array, gates: jax.Array, num_records: jax.Array,
         cfg: config.KDAConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
-    rows, v_head_dim], k [num_kq_heads, rows, kq_head_dim] and g
-    [num_v_heads, rows, kq_head_dim]; rows from num_records on are zero."""
+    rows, v_head_dim] and k [num_kq_heads, rows, kq_head_dim], and its
+    [replay_window, gate_dim] gates into g [num_v_heads, rows, kq_head_dim];
+    rows from num_records on are zero."""
     d_k, d_v = cfg.kq_head_dim, cfg.v_head_dim
     # Note (david): rows past num_records may hold NaN from stale VMEM, so they
     # are selected away, not scaled: 0 * NaN is NaN.
     record_row = jax.lax.broadcasted_iota(jnp.int32, records.shape, 0)
     records = jnp.where(record_row < num_records, records, 0)
+    gate_record_row = jax.lax.broadcasted_iota(jnp.int32, gates.shape, 0)
+    gates = jnp.where(gate_record_row < num_records, gates, 0)
     u_records = jnp.stack([
         records[:, head * d_v:(head + 1) * d_v]
         for head in range(cfg.num_v_heads)
@@ -1092,8 +1095,7 @@ def replay_record_parts(
         for head in range(cfg.num_kq_heads)
     ])
     g_records = jnp.stack([
-        records[:, cfg.record_g_offset + head * d_k:
-                cfg.record_g_offset + (head + 1) * d_k]
+        gates[:, head * d_k:(head + 1) * d_k]
         for head in range(cfg.num_v_heads)
     ])
     return u_records, k_records, g_records
@@ -1108,11 +1110,12 @@ def replay_kda(
     num_tokens: jax.Array,
     num_records: jax.Array,
     records: jax.Array,
-    shadow_ref: jax.Ref,
+    gates: jax.Array,
+    checkpoint_ref: jax.Ref,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.KDAConfig,
-) -> tuple[jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One ReplaySSM step of one sequence: outputs and new records, no state.
 
     With G the per-key-channel cumulative log decay over the committed
@@ -1122,10 +1125,10 @@ def replay_kda(
 
     exp(G_t - G_j) splits at the records' end E into exp(G_t - G_E) *
     exp(G_E - G_j), both at most 1, so the decays fold into the new tokens'
-    k / q and the records' k; S, the bf16 shadow in shadow_ref, then enters
-    only through [k; q] @ S. Rows from num_tokens on are padding. Returns the
-    packed output [window, num_v_heads * v_head_dim] and the new records
-    [window, record_dim].
+    k / q and the records' k; S, the f32 checkpoint in checkpoint_ref, then
+    enters only through [k; q] @ S. Rows from num_tokens on are padding.
+    Returns the packed output [window, num_v_heads * v_head_dim], the new
+    records [window, record_dim] and their gates [window, gate_dim].
     """
     window = cfg.window_size
     num_v_heads = cfg.num_v_heads
@@ -1148,7 +1151,7 @@ def replay_kda(
                   dt_bias.astype(compute), cfg.lower_bound), 0)
 
     u_records, k_records, g_records = replay_record_parts(
-        records, num_records, cfg)
+        records, gates, num_records, cfg)
 
     q = l2_norm(q) * d_k**-0.5
     k = l2_norm(k)
@@ -1171,11 +1174,11 @@ def replay_kda(
 
     with profile_scope("replay_ckpt_read"):
         # Note (david): a default-precision f32 dot rounds both operands to
-        # bf16 (round to nearest), so this dot on the bf16 shadow is bitwise
-        # the one on the f32 checkpoint (v6e).
+        # bf16 (round to nearest) anyway (v6e), so S is rounded explicitly
+        # and the dot runs on bf16 operands.
         ckpt_reads = batched_matmul(
             (kq_decayed * jnp.exp(g_records_total)).astype(jnp.bfloat16),
-            shadow_ref[...])
+            checkpoint_ref[...].astype(jnp.bfloat16))
 
     with profile_scope("replay_record_read"):
         record_coeffs = jax.lax.dot_general(
@@ -1222,27 +1225,24 @@ def replay_kda(
 
     new_records = jnp.concatenate(
         [u[head] for head in range(num_v_heads)] +
-        [k[head] for head in range(cfg.num_kq_heads)] +
-        [g[head] for head in range(num_v_heads)], axis=-1)
+        [k[head] for head in range(cfg.num_kq_heads)], axis=-1)
+    new_gates = jnp.concatenate([g[head] for head in range(num_v_heads)],
+                                axis=-1)
 
-    return pack_out(out, cfg), new_records
+    return pack_out(out, cfg), new_records, new_gates
 
 
 def replay_flush(
     records: jax.Array,
+    gates: jax.Array,
     num_records: jax.Array,
     checkpoint_ref: jax.Ref,
-    wait_checkpoint: Callable[[], None],
     cfg: config.KDAConfig,
 ) -> jax.Array:
     """Fold one sequence's first num_records records into its f32 checkpoint
-    and return the new checkpoint.
-
-    wait_checkpoint runs right before checkpoint_ref is read, so the caller
-    can wait for its DMA there.
-    """
+    and return the new checkpoint."""
     u_records, k_records, g_records = replay_record_parts(
-        records, num_records, cfg)
+        records, gates, num_records, cfg)
     # Note (david): the fold is the only place record error enters the
     # recurrence, and it runs once per flush, so it pays for f32 precision.
     with profile_scope("replay_flush"):
@@ -1256,6 +1256,5 @@ def replay_flush(
                                 precision=jax.lax.Precision.HIGHEST)
         decay_total = fused_transpose_broadcast(
             jnp.exp(g_records_total), src_dim=2, dst_dim=1)
-        wait_checkpoint()
         return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
                 update)
