@@ -1326,11 +1326,17 @@ def launch_fused_conv1d_kda(
 
         # Note (david): unpinned, XLA may place a small conv state in VMEM,
         # where the one-slot DMAs through the slot-minor view move the wrong
-        # rows (v6e, jax 0.11.2, 5 slots).
-        pinned_conv_state = pltpu.with_memory_space_constraint(
-            in_conv_state, pltpu.HBM)
-        operands = (seq_metadata, qkv, b, g, pinned_conv_state,
-                    in_recurrent_state, aliased_out, weights, pad_start)
+        # rows (v6e, jax 0.11.2, 5 slots). Every state is pinned: memory space
+        # assignment otherwise moves any that fits its VMEM budget there and
+        # back around each call, the whole buffer however few slots the call
+        # touches. Qwen3.5-4B in tpu-inference (v6e, 65 slots, 32 decoding
+        # sequences): the 12.8 MB bf16 records of 22-24 of the 24 GDN layers,
+        # a 9.55 ms decode step against 9.08 ms pinned.
+        def _pin(state):
+            return pltpu.with_memory_space_constraint(state, pltpu.HBM)
+
+        operands = (seq_metadata, qkv, b, g, _pin(in_conv_state),
+                    _pin(in_recurrent_state), aliased_out, weights, pad_start)
         in_specs = (metadata_spec, hbm_spec, hbm_spec, hbm_spec, hbm_spec,
                     hbm_spec, aliased_out_spec, weights_spec, pad_spec)
         out_shapes = (out_shape, in_conv_state, in_recurrent_state)
@@ -1347,6 +1353,7 @@ def launch_fused_conv1d_kda(
                 in_specs += (hbm_spec, )
                 out_shapes += (extra_state, )
                 out_specs += (hbm_spec, )
+                extra_state = _pin(extra_state)
             operands += (extra_state, )
 
         results = pl.pallas_call(
