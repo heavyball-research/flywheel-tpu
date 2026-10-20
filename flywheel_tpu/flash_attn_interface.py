@@ -590,7 +590,7 @@ def flash_attn_func(
     *,
     rotary_cos: jax.Array | None = None,
     rotary_sin: jax.Array | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     rotary_k: bool = True,
     heads_outer_fold: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1065,7 +1065,7 @@ def flash_attn_varlen_func(
     *,
     rotary_cos: jax.Array | None = None,
     rotary_sin: jax.Array | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     rotary_k: bool = True,
     block_table: jax.Array | None = None,
     seqused_k: jax.Array | None = None,

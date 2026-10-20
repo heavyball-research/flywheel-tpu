@@ -288,7 +288,7 @@ def flash_attn_varlen_paged(
     interpret: bool,
     block_sizes: BlockSizes | None = None,
     rotary: tuple[jax.Array, None] | None = None,
-    rotary_interleaved: bool = True,
+    rotary_interleaved: bool = False,
     window_left: int | None = None,
     softcap: float = 0.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
