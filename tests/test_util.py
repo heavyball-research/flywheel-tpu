@@ -1,4 +1,5 @@
-"""Naive attention and the random padding masks the flash attn tests share."""
+"""Naive attention, the RoPE reference and the random padding masks the flash attn tests
+share."""
 
 import math
 
@@ -53,6 +54,42 @@ def generate_qkv(q, k, v, query_padding_mask, key_padding_mask):
         max_seqlen_k,
         output_pad_fn,
     )
+
+
+def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlens=None):
+    """FlashAttention's apply_rotary_emb on (batch_size, seqlen, nheads, d), or on packed
+    (total, nheads, d) with cu_seqlens.
+
+    cos / sin: (seqlen_ro, rotary_dim / 2). Token t of sequence b sits at position
+    seqlen_offsets[b] + t (seqlen_offsets an int or (batch_size,)); a position past the
+    table, or a packed token past cu_seqlens[-1], stays unrotated. interleaved pairs
+    adjacent dims instead of the two halves of the first rotary_dim dims. The rotation
+    runs in f32 and rounds once to x's dtype, as the kernels do.
+    """
+    seqlen_ro, rotary_dim = cos.shape[0], 2 * cos.shape[1]
+    if cu_seqlens is None:
+        positions = jnp.reshape(jnp.asarray(seqlen_offsets), (-1, 1)) + jnp.arange(x.shape[1])
+    else:
+        token_ids = jnp.arange(x.shape[0])
+        num_seqs = cu_seqlens.shape[0] - 1
+        seq_ids = jnp.searchsorted(cu_seqlens, token_ids, side="right") - 1
+        seq_ids = jnp.minimum(seq_ids, num_seqs - 1)
+        offsets = jnp.broadcast_to(jnp.asarray(seqlen_offsets), (num_seqs,))
+        positions = token_ids - cu_seqlens[seq_ids] + offsets[seq_ids]
+        positions = jnp.where(token_ids < cu_seqlens[-1], positions, seqlen_ro)
+    in_table = (positions < seqlen_ro)[..., None]
+    index = jnp.where(in_table[..., 0], positions, 0)
+    cos = jnp.where(in_table, cos.astype(jnp.float32)[index], 1.0)[..., None, :]
+    sin = jnp.where(in_table, sin.astype(jnp.float32)[index], 0.0)[..., None, :]
+    x_ro = x[..., :rotary_dim].astype(jnp.float32)
+    if interleaved:
+        x1, x2 = x_ro[..., 0::2], x_ro[..., 1::2]
+        rotated = jnp.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
+        rotated = rotated.reshape(x_ro.shape)
+    else:
+        x1, x2 = jnp.split(x_ro, 2, axis=-1)
+        rotated = jnp.concatenate((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
+    return jnp.concatenate((rotated.astype(x.dtype), x[..., rotary_dim:]), axis=-1)
 
 
 def construct_local_mask(

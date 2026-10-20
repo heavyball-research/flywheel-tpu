@@ -19,6 +19,7 @@ import pytest
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from tests.padding import pad_input, unpad_input
 from tests.test_util import (
+    apply_rotary_emb,
     attention_ref,
     generate_qkv,
     generate_random_padding_mask,
@@ -33,6 +34,12 @@ COMPILED_HDIMS = [64, 96, 128, 192, 256]
 # Note (david): kernel tiles are 128 tokens wide, so the dense kernel and every KV
 # cache layout need seqlen_k or the page size to be a multiple of 128.
 TILE = 128
+# Note (david): (softcap, local, rotary_fraction, rotary_interleaved). RoPE is orthogonal
+# to softcap and local windows, so it runs on the plain mask only, and the kernels rotate
+# the full head only, so rotary_fraction skips FlashAttention's 0.5.
+FEATURE_CASES = [
+    (softcap, local, 0.0, False) for softcap in (0.0, 15.0) for local in (False, True)
+] + [(0.0, False, 1.0, rotary_interleaved) for rotary_interleaved in (False, True)]
 
 
 def on_backend(seqlens):
@@ -49,6 +56,31 @@ def dense_cases(seqlens):
             for seqlen_q, seqlen_k in seqlens
             for causal in (False, True)
             if causal or seqlen_k % TILE == 0
+        ]
+    )
+
+
+def dense_feature_cases(seqlens):
+    """dense_cases with (softcap, local, rotary_fraction, rotary_interleaved) appended;
+    RoPE puts the queries on the last seqlen_q keys, so it needs seqlen_q <= seqlen_k."""
+    return [
+        (seqlen_q, seqlen_k, causal, softcap, local, rotary_fraction, rotary_interleaved)
+        for seqlen_q, seqlen_k, causal in dense_cases(seqlens)
+        for softcap, local, rotary_fraction, rotary_interleaved in FEATURE_CASES
+        if rotary_fraction == 0.0 or seqlen_q <= seqlen_k
+    ]
+
+
+def varlen_feature_cases(seqlens):
+    """(seqlen_q, seqlen_k, causal, softcap, local, rotary_fraction, rotary_interleaved)
+    for flash_attn_varlen_func; the test trims each sequence's query length to what the
+    mask and RoPE need."""
+    return on_backend(
+        [
+            (seqlen_q, seqlen_k, causal, *features)
+            for seqlen_q, seqlen_k in seqlens
+            for causal in (False, True)
+            for features in FEATURE_CASES
         ]
     )
 
@@ -89,12 +121,10 @@ def assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol):
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("d", COMPILED_HDIMS)
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k,causal",
-    dense_cases([
+    "seqlen_q,seqlen_k,causal,softcap,local,rotary_fraction,rotary_interleaved",
+    dense_feature_cases([
         (1, 1),
         (64, 128),
         (128, 192),
@@ -117,11 +147,24 @@ def assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol):
         (4224, 4224),
     ]),
 )
-def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_type, dtype):
+def test_flash_attn_output(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local,
+    softcap,
+    rotary_fraction,
+    rotary_interleaved,
+    mha_type,
+    dtype,
+):
     rng = np.random.default_rng(0)
     batch_size = 9 if seqlen_k <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # rotary_dim must be a multiple of 16, and must be <= d
+    rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     for dv in dv_vals:
         print(f"{dv = }")
@@ -132,12 +175,25 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_ty
         k = randn(rng, (batch_size, seqlen_k, nheads_kv, d), dtype)
         v = randn(rng, (batch_size, seqlen_k, nheads_kv, dv), dtype)
         window_size = (-1, -1) if not local else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        if rotary_dim > 0:
+            angle = rng.random((seqlen_k, rotary_dim // 2)) * 2 * math.pi
+            cos = jnp.asarray(np.cos(angle), dtype)
+            sin = jnp.asarray(np.sin(angle), dtype)
+            # Note (david): flash_attn_func rotates K at positions 0..seqlen_k - 1 and Q
+            # at the last seqlen_q of them.
+            q_ro = apply_rotary_emb(
+                q, cos, sin, seqlen_offsets=seqlen_k - seqlen_q, interleaved=rotary_interleaved
+            )
+            k_ro = apply_rotary_emb(k, cos, sin, interleaved=rotary_interleaved)
+        else:
+            cos, sin = None, None
+            q_ro, k_ro = q, k
         out_ref, lse_ref = attention_ref(
-            q, k, v, causal=causal, window_size=window_size, softcap=softcap
+            q_ro, k_ro, v, causal=causal, window_size=window_size, softcap=softcap
         )
         out_bf16, lse_bf16 = attention_ref(
-            q,
-            k,
+            q_ro,
+            k_ro,
             v,
             causal=causal,
             window_size=window_size,
@@ -157,6 +213,9 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_ty
             softcap=softcap,
             return_softmax_lse=True,
             interpret=INTERPRET,
+            rotary_cos=cos,
+            rotary_sin=sin,
+            rotary_interleaved=rotary_interleaved,
         )
         out = to_head_major(out)
         print(f"Output max diff: {max_abs(out - out_ref)}")
@@ -167,8 +226,8 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_ty
         assert_lse_close(lse, lse_ref, lse_bf16, jnp.isfinite(lse_ref), rtol)
 
         # Note (david): flash_attn_func's backward covers causal and full masks only;
-        # window_size and softcap are forward-only.
-        if not local and softcap == 0.0:
+        # window_size, softcap and RoPE are forward-only.
+        if not local and softcap == 0.0 and rotary_dim == 0:
             g = randn(rng, out.shape, dtype)
 
             def attn(q, k, v):
@@ -204,13 +263,10 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_ty
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", COMPILED_HDIMS)
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    on_backend([
+    "seqlen_q,seqlen_k,causal,softcap,local,rotary_fraction,rotary_interleaved",
+    varlen_feature_cases([
         (1, 1),
         (1, 3),
         (2, 1),
@@ -234,11 +290,24 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_ty
         (4096, 4096),
     ]),
 )
-def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap, mha_type, dtype):
+def test_flash_attn_varlen_output(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local,
+    softcap,
+    rotary_fraction,
+    rotary_interleaved,
+    mha_type,
+    dtype,
+):
     rng = np.random.default_rng(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 9 if seqlen_q <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
+    # rotary_dim must be a multiple of 16, and must be <= d
+    rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     for dv in dv_vals:
         print(f"{dv = }")
@@ -258,7 +327,8 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap,
         # Note (david): flash_attn_varlen_func leaves a row with no visible key
         # unspecified, so no sequence has one: every key length is positive, and
         # under a right bound r each query length stays within its key length + r.
-        right = 0 if causal else window_size[1]
+        # RoPE puts each sequence's queries on its last keys, which needs r = 0.
+        right = 0 if causal or rotary_dim > 0 else window_size[1]
         if right >= 0:
             query_padding_mask = query_padding_mask & (
                 jnp.arange(seqlen_q)[None, :] < key_padding_mask.sum(-1, keepdims=True) + right
@@ -273,9 +343,24 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap,
             max_seqlen_k,
             output_pad_fn,
         ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask)
+        if rotary_dim > 0:
+            angle = rng.random((seqlen_k, rotary_dim // 2)) * 2 * math.pi
+            cos = jnp.asarray(np.cos(angle), dtype)
+            sin = jnp.asarray(np.sin(angle), dtype)
+            q_ro = apply_rotary_emb(
+                q,
+                cos,
+                sin,
+                seqlen_offsets=key_padding_mask.sum(-1) - query_padding_mask.sum(-1),
+                interleaved=rotary_interleaved,
+            )
+            k_ro = apply_rotary_emb(k, cos, sin, interleaved=rotary_interleaved)
+        else:
+            cos, sin = None, None
+            q_ro, k_ro = q, k
         out_ref, lse_ref = attention_ref(
-            q,
-            k,
+            q_ro,
+            k_ro,
             v,
             query_padding_mask,
             key_padding_mask,
@@ -284,8 +369,8 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap,
             softcap=softcap,
         )
         out_bf16, lse_bf16 = attention_ref(
-            q,
-            k,
+            q_ro,
+            k_ro,
             v,
             query_padding_mask,
             key_padding_mask,
@@ -314,6 +399,9 @@ def test_flash_attn_varlen_output(seqlen_q, seqlen_k, d, causal, local, softcap,
             softcap=softcap,
             return_softmax_lse=True,
             interpret=INTERPRET,
+            rotary_cos=cos,
+            rotary_sin=sin,
+            rotary_interleaved=rotary_interleaved,
         )
         out = output_pad_fn(to_head_major(out_unpad))
         lse = jnp.swapaxes(output_pad_fn(lse_unpad.T), 1, 2)

@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
+from tests.test_util import apply_rotary_emb
 
 INTERPRET = jax.default_backend() != "tpu"
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)
@@ -255,6 +256,34 @@ def test_ragged_cache_head_tiles(heads, kv_heads, head_dim):
   expected = ragged_reference(*case, causal=True)
   actual = run_paged(*case, causal=True)
   assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("heads,kv_heads", [(4, 4), (4, 1), (6, 3)])
+def test_paged_rotary_q_at_cache_positions(heads, kv_heads, causal,
+                                           rotary_interleaved):
+  # Note (david): the cache holds K already rotated, so the paged path rotates
+  # Q only (rotary_k=False), token t of a request at cache_seqlens + t, as
+  # FlashAttention's kvcache test rotates the appended q; under a non-causal
+  # mask FlashAttention puts every query at cache_seqlens instead. The tables
+  # are f32, as serving passes them.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(3, 1, 130), prefixes=(127, 0, 251), heads=heads,
+      kv_heads=kv_heads)
+  seqlen_ro, head_dim = table.shape[1] * kc.shape[1], q.shape[-1]
+  angle = np.random.default_rng(23).random(
+      (seqlen_ro, head_dim // 2)) * 2 * math.pi
+  cos = jnp.asarray(np.cos(angle), jnp.float32)
+  sin = jnp.asarray(np.sin(angle), jnp.float32)
+  q_ro = apply_rotary_emb(q, cos, sin, interleaved=rotary_interleaved,
+                          seqlen_offsets=lengths, cu_seqlens=cu)
+  expected = ragged_reference(q_ro, kc, vc, k, v, cu, lengths, table,
+                              causal=causal)
+  actual = run_paged(q, kc, vc, k, v, cu, lengths, table, causal=causal,
+                     rotary_cos=cos, rotary_sin=sin,
+                     rotary_interleaved=rotary_interleaved, rotary_k=False)
+  assert_extend_matches(actual, expected, cu, lengths)
 
 
 @pytest.mark.parametrize("causal", [False, True])
