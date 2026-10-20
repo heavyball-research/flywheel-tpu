@@ -6,8 +6,9 @@ steps, through the fused kernel and its ReplaySSM variant (see harness).
 q, k, v are the input of a random short conv, whose output the reference
 sees; log decays g enter through encode_gate, and beta is drawn as the
 logits the kernel takes. The gate_in_kernel tests check the in-kernel gate
-against the same kernel on naive_gdn_gate's log decay. Rows whose conv
-width (2 * H + HV) * D is no multiple of 128 skip.
+against the same kernel on naive_gdn_gate's log decay. The grids hold only
+rows whose conv width (2 * H + HV) * D is a multiple of 128, since the
+kernels' conv works on whole 128-lane slabs of qkv.
 """
 
 import jax
@@ -71,8 +72,6 @@ def reference(fused: Fused, beta: jax.Array, g: jax.Array,
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}-gate_logit_normalizer{}",
         [
-            (1, 63, 1, 1, 64, 1),
-            (2, 500, 4, 4, 60, 1),
             (2, 1000, 2, 8, 128, 0.1),
             (3, 1024, 2, 2, 128, 1),
             (4, 1024, 3, 3, 128, 10),
@@ -80,7 +79,6 @@ def reference(fused: Fused, beta: jax.Array, g: jax.Array,
             (2, 1024, 4, 4, 128, 0.1),
             (2, 1024, 4, 8, 128, 10),
         ],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
@@ -113,9 +111,6 @@ def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
         [
             (4, 1024, 4, 4, 128, 1, 1.0, 0.012),
             (2, 75, 4, 4, 64, 0.01, 0, 0.005),
-            (2, 500, 3, 3, 60, 1, 0, 0.005),
-            (2, 1000, 3, 3, 64, 1, 0.5, 0.005),
-            (3, 1024, 4, 4, 100, 0.1, 0, 0.005),
             (4, 1024, 4, 4, 128, 1, 0, 0.006),
             (2, 1500, 4, 4, 128, 10, 0, 0.005),
             (4, 2048, 8, 8, 64, 1, 0, 0.005),
@@ -123,7 +118,6 @@ def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
             (2, 512, 2, 8, 64, 0.1, 0, 0.0065),
             (2, 1024, 4, 8, 128, 1, 0, 0.005),
         ],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_chunk(B: int, T: int, H: int, HV: int, D: int,
@@ -151,7 +145,6 @@ def test_chunk(B: int, T: int, H: int, HV: int, D: int,
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}-gate{}-chunk{}",
         [(1, 64, 2, 4, 32, 1.0, chunk_size) for chunk_size in [16, 32, 64]],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_chunk_with_chunk_size(B: int, T: int, H: int, HV: int, D: int,
@@ -181,7 +174,6 @@ def test_chunk_with_chunk_size(B: int, T: int, H: int, HV: int, D: int,
             (2, 500, 4, 4, 64),
             (4, 2048, 8, 8, 64),
         ],
-        lambda B, T, H, HV, D: (H, HV, D),
     ),
 )
 def test_chunk_beta_sigmoid_in_kernel(B: int, T: int, H: int, HV: int,
@@ -210,13 +202,11 @@ def test_chunk_beta_sigmoid_in_kernel(B: int, T: int, H: int, HV: int,
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}-has_dt_bias{}",
         [
-            (1, 64, 1, 1, 64, False),
             (2, 256, 2, 2, 64, True),
             (2, 512, 2, 4, 64, True),
             (3, 1000, 2, 8, 128, False),
             (4, 1024, 4, 4, 128, True),
         ],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
@@ -249,10 +239,8 @@ def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}",
         [
-            (1, 64, 1, 1, 64),
             (4, 1024, 4, 4, 128),
         ],
-        lambda B, T, H, HV, D: (H, HV, D),
     ),
 )
 def test_fused_recurrent_beta_sigmoid_in_kernel(
@@ -286,7 +274,6 @@ def test_fused_recurrent_beta_sigmoid_in_kernel(
             (2, 4, 64, False, [0, 256, 500, 1000]),
             (4, 4, 128, True, [0, 15, 100, 300, 1200, 2000]),
         ],
-        lambda H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_fused_recurrent_gate_in_kernel_varlen(
@@ -320,14 +307,11 @@ def test_fused_recurrent_gate_in_kernel_varlen(
     param_grid(
         "H{}-HV{}-D{}-mask_p{}-cu_seqlens{}",
         [
-            (4, 4, 60, 0, [0, 15]),
             (4, 4, 64, 0, [0, 256, 500, 1000]),
             (4, 4, 64, 0.5, [0, 256, 500, 1000]),
-            (4, 4, 100, 0, [0, 15, 100, 300, 1200, 2000]),
             (2, 4, 64, 0, [0, 256, 500, 1000]),
             (2, 8, 64, 0, [0, 256, 500, 1000]),
         ],
-        lambda H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_chunk_varlen(H: int, HV: int, D: int, mask_p: float,
@@ -357,13 +341,9 @@ def test_chunk_varlen(H: int, HV: int, D: int, mask_p: float,
     param_grid(
         "H{}-D{}-mask_p{}-cu_seqlens{}",
         [
-            (4, 60, 0, [0, 8192]),
-            (4, 60, 0, [0, 15]),
             (4, 64, 0, [0, 256, 500, 1000]),
             (4, 64, 0.5, [0, 256, 500, 1000]),
-            (4, 100, 0, [0, 15, 100, 300, 1200, 2000]),
         ],
-        lambda H, D, *_: (H, H, D),
     ),
 )
 def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
@@ -394,13 +374,9 @@ def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
         "B{}-T{}-H{}-D{}-has_dt_bias{}",
         [
             (2, 75, 4, 64, True),
-            (2, 500, 3, 60, False),
-            (2, 1000, 3, 64, True),
-            (3, 1024, 4, 100, True),
             (4, 1024, 4, 128, False),
             (4, 2048, 8, 64, True),
         ],
-        lambda B, T, H, D, _: (H, H, D),
     ),
 )
 def test_chunk_gate_in_kernel(B: int, T: int, H: int, D: int,
@@ -434,7 +410,6 @@ def test_chunk_gate_in_kernel(B: int, T: int, H: int, D: int,
             (2, 512, 2, 8, 64, True),
             (2, 1024, 4, 8, 128, True),
         ],
-        lambda B, T, Hq, H, D, _: (Hq, H, D),
     ),
 )
 def test_chunk_gate_in_kernel_gqa(B: int, T: int, Hq: int, H: int, D: int,
@@ -463,12 +438,9 @@ def test_chunk_gate_in_kernel_gqa(B: int, T: int, Hq: int, H: int, D: int,
     param_grid(
         "H{}-D{}-has_dt_bias{}-cu_seqlens{}",
         [
-            (4, 60, True, [0, 15]),
             (4, 64, False, [0, 256, 500, 1000]),
             (4, 64, True, [0, 256, 500, 1000]),
-            (4, 100, True, [0, 15, 100, 300, 1200, 2000]),
         ],
-        lambda H, D, *_: (H, H, D),
     ),
 )
 def test_chunk_gate_in_kernel_varlen(H: int, D: int, has_dt_bias: bool,

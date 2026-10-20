@@ -65,25 +65,9 @@ KDA = Ops(kda_wrapper.fused_conv1d_kda, kda_wrapper.fused_conv1d_kda_replay,
           per_channel_gate=True, gate_dtype=jnp.bfloat16)
 
 
-def unsupported(num_kq_heads: int, num_v_heads: int,
-                head_dim: int) -> list[pytest.MarkDecorator]:
-    """The skip mark of a grid row the kernels cannot run: their conv works
-    on whole 128-lane slabs of qkv."""
-    if (2 * num_kq_heads + num_v_heads) * head_dim % 128 == 0:
-        return []
-    return [
-        pytest.mark.skip(reason="the conv needs (2 * H + HV) * D % 128 == 0")
-    ]
-
-
-def param_grid(id_format: str, rows: list[tuple],
-             heads: Callable[..., tuple[int, int, int]]) -> list:
-    """pytest params of a grid; heads picks (H, HV, D) from a row."""
-    return [
-        pytest.param(*row,
-                     id=id_format.format(*row),
-                     marks=unsupported(*heads(*row))) for row in rows
-    ]
+def param_grid(id_format: str, rows: list[tuple]) -> list:
+    """pytest params of a grid, each row's id formatted from its values."""
+    return [pytest.param(*row, id=id_format.format(*row)) for row in rows]
 
 
 def bf16_values(x: jax.Array) -> jax.Array:

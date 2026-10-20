@@ -6,10 +6,11 @@ q, k, v are the input of a random short conv, whose output the reference
 sees. An activated beta enters with beta_is_activated; a log decay g enters
 through encode_gate, and a raw gate (use_gate_in_kernel) as the kernel's
 bf16 gate. test_fused_recurrent_gate_in_kernel checks the in-kernel gate
-against the same kernel on the naive gate's log decay, and the
-use_beta_sigmoid_in_kernel tests check raw beta logits against the
-activated beta. Rows whose conv width (2 * H + HV) * D is no multiple of
-128 skip.
+against the same kernel on the naive gate's log decay, and
+test_fused_recurrent_use_beta_sigmoid_in_kernel checks raw beta logits
+against the activated beta. The grids hold only rows whose conv width
+(2 * H + HV) * D is a multiple of 128, since the kernels' conv works on
+whole 128-lane slabs of qkv.
 """
 
 import math
@@ -114,14 +115,9 @@ def test_chunk_invalid_chunk_size() -> None:
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}-gate_logit_normalizer{}",
         [
-            (1, 64, 1, 1, 64, 1),
-            (2, 512, 3, 3, 60, 1),
-            (3, 1000, 4, 4, 100, 1),
             (4, 1024, 4, 4, 128, 1),
-            (2, 512, 2, 4, 60, 1),
             (2, 1024, 2, 8, 128, 1),
         ],
-        lambda B, T, H, HV, D, _: (H, HV, D),
     ),
 )
 def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
@@ -152,7 +148,6 @@ def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
         [
             (2, 256, 4, 64),
         ],
-        lambda B, T, H, D: (H, H, D),
     ),
 )
 def test_fused_recurrent_use_beta_sigmoid_in_kernel(
@@ -183,15 +178,12 @@ def test_fused_recurrent_use_beta_sigmoid_in_kernel(
     param_grid(
         "B{}-T{}-H{}-HV{}-D{}-has_a_log{}-has_dt_bias{}-safe_gate{}",
         [
-            (1, 64, 1, 1, 64, True, False, False),
             (2, 256, 2, 2, 64, True, True, False),
             (2, 512, 2, 4, 64, True, True, True),
             (3, 1000, 2, 8, 128, True, False, False),
             (4, 1024, 4, 4, 128, True, True, True),
-            (1, 64, 1, 1, 64, False, False, True),
             (2, 256, 2, 4, 64, False, True, True),
         ],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
@@ -237,7 +229,6 @@ def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
             (32, 8, 64, 1.0, True, False),
             (7, 32, 128, 0.5, True, True),
         ],
-        lambda B, H, D, *_: (H, H, D),
     ),
 )
 def test_fused_recurrent_vllm_decode(B: int, H: int, D: int,
@@ -308,10 +299,6 @@ def test_fused_recurrent_vllm_decode(B: int, H: int, D: int,
         "B{}-T{}-H{}-HV{}-D{}-gate_logit_normalizer{}-mask_p{}"
         "-use_gate{}-safe_gate{}-chunk_size{}",
         [
-            (1, 63, 1, 1, 64, 1, 0, False, True, 64),
-            (2, 500, 3, 3, 60, 1, 0, False, True, 64),
-            (2, 1000, 3, 3, 64, 1, 0.5, False, False, 64),
-            (3, 1024, 4, 4, 100, 0.1, 0, False, False, 64),
             (4, 1024, 4, 4, 128, 1, 0, False, True, 64),
             (2, 1500, 4, 4, 128, 10, 0, True, False, 64),
             (4, 2048, 8, 8, 64, 1, 0, True, True, 64),
@@ -322,7 +309,6 @@ def test_fused_recurrent_vllm_decode(B: int, H: int, D: int,
             (2, 1024, 2, 4, 64, 1, 0, True, True, 64),
             (2, 1024, 2, 8, 128, 1, 0, True, False, 64),
         ],
-        lambda B, T, H, HV, D, *_: (H, HV, D),
     ),
 )
 def test_chunk(B: int, T: int, H: int, HV: int, D: int,
@@ -373,7 +359,6 @@ def test_chunk(B: int, T: int, H: int, HV: int, D: int,
              (40, 33, 2, 64, 32),
              (70, 65, 2, 64, 64),
          ]],
-        lambda T, P, H, D, *_: (H, H, D),
     ),
 )
 def test_chunk_causality(T: int, P: int, H: int, D: int, chunk_size: int,
@@ -466,37 +451,6 @@ def test_chunk_lower_bound(lower_bound: float, use_gate_in_kernel: bool,
         assert_close(name, ref_value, tri_value, 0.005)
 
 
-@pytest.mark.parametrize(
-    ("B", "T", "H", "D"),
-    [
-        pytest.param(
-            1, 8192, 96, 128, id="B1-T8192-H96-D128",
-            marks=pytest.mark.skip(
-                reason="fused_conv1d_kda runs out of VMEM at H = 96, D = 128"
-            )),
-    ],
-)
-def test_chunk_use_beta_sigmoid_in_kernel(B: int, T: int, H: int,
-                                          D: int) -> None:
-    """Raw beta logits with the in-kernel sigmoid match the activated beta."""
-    rng = np.random.default_rng(42)
-    q = rand(rng, (B, T, H, D))
-    k = rand(rng, (B, T, H, D))
-    v = rand(rng, (B, T, H, D))
-    g = logsigmoid(randn(rng, (B, T, H, D)))
-    beta_raw = randn(rng, (B, T, H))
-    beta_post = jax.nn.sigmoid(beta_raw)
-    h0 = randn(rng, (B, H, D, D))
-    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
-    raw_g, _ = encode_gate(KDA, g)
-
-    ref, ref_ht = fused.chunk(raw_g, beta_post, beta_is_activated=True)
-    tri, tri_ht = fused.chunk(raw_g, beta_raw)
-    rtol = 1e-4
-    assert_close("o", ref, tri, rtol)
-    assert_close("ht", ref_ht, tri_ht, rtol)
-
-
 def varlen_inputs(
     rng: np.random.Generator, H: int, D: int, mask_p: float,
     cu_seqlens: list[int], use_gate_in_kernel: bool, safe_gate: bool
@@ -542,15 +496,11 @@ def varlen_inputs(
     param_grid(
         "H{}-D{}-mask_p{}-cu_seqlens{}-gate{}-safe_gate{}-chunk_size{}",
         [
-            (4, 60, 0.1, [0, 15], True, False, 64, 0.005),
             (4, 64, 0.9, [0, 256, 500, 1000], True, False, 64, 0.0065),
             (4, 128, 0.5, [0, 256, 500, 1000], False, False, 64, 0.005),
-            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], True, False, 64, 0.005),
             (4, 256, 0, [0, 100, 300, 1200, 3000, 4096], False, True, 64,
              0.005),
-            (4, 60, 0.1, [0, 31, 96, 160], True, False, 32, 0.005),
         ],
-        lambda H, D, *_: (H, H, D),
     ),
 )
 def test_chunk_varlen(H: int, D: int, mask_p: float, cu_seqlens: list[int],
@@ -576,13 +526,10 @@ def test_chunk_varlen(H: int, D: int, mask_p: float, cu_seqlens: list[int],
     param_grid(
         "H{}-D{}-mask_p{}-cu_seqlens{}-gate{}-safe_gate{}",
         [
-            (4, 60, 0.1, [0, 8192], True, False, 0.005),
             (4, 64, 0.9, [0, 256, 500, 1000], True, False, 0.0065),
             (4, 128, 0.5, [0, 256, 500, 1000], False, False, 0.005),
-            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], True, False, 0.005),
             (4, 256, 0, [0, 100, 300, 1200, 3000, 4096], False, True, 0.005),
         ],
-        lambda H, D, *_: (H, H, D),
     ),
 )
 def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
