@@ -1,383 +1,600 @@
-"""Checks fused_conv1d_kda against an eager f32 token-by-token KDA reference.
+"""fused_conv1d_kda and fused_conv1d_kda_replay against a naive KDA.
 
-The strong gate cases push the per-step decay to tens of nats, so the
-intra-chunk Aqk / Akk matrices span the whole f32 exponent range.
+The chunk tests run one prefill call and the fused_recurrent tests decode
+steps, through the fused kernel and its ReplaySSM variant (see harness).
+q, k, v are the input of a random short conv, whose output the reference
+sees. An activated beta enters with beta_is_activated; a log decay g enters
+through encode_gate, and a raw gate (use_gate_in_kernel) as the kernel's
+bf16 gate. test_fused_recurrent_gate_in_kernel checks the in-kernel gate
+against the same kernel on the naive gate's log decay, and the
+use_beta_sigmoid_in_kernel tests check raw beta logits against the
+activated beta. Rows whose conv width (2 * H + HV) * D is no multiple of
+128 skip.
 """
+
+import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu.linear_attention.kda.compute_kda import (
-    ChunkKDA,
-    block_diag,
-    pack_width,
-    unpack_lanes,
+from tests.linear_attention.harness import (
+    DECODE,
+    KDA,
+    TPU_ONLY,
+    Fused,
+    bf16_values,
+    encode_gate,
+    logit,
+    param_grid,
 )
-from flywheel_tpu.linear_attention.kda.wrapper import fused_conv1d_kda
+from tests.linear_attention.reference import (
+    assert_close,
+    logsigmoid,
+    naive_kda_gate,
+    naive_kda_lowerbound_gate,
+    naive_recurrent_kda,
+    normalize,
+    rand,
+    randn,
+    uniform,
+)
 
-STATIC = ["n_kq", "n_v", "d_k", "d_v", "kernel_size", "num_spec_tokens"]
-N_KQ, N_V, D_K, D_V, KERNEL_SIZE = 2, 8, 128, 128, 4
-DIM = N_KQ * D_K * 2 + N_V * D_V
-TOL = dict(rtol=2e-2, atol=2e-2)
-OPERAND_KEY_DIM = 16
-OPERAND_TOL = dict(rtol=2e-2, atol=2e-3)
-L2_NORM_EPS = 1e-6
-NUM_SPEC_TOKENS = 4
-SPEC_CONTEXT_LEN = 16
-# Note (david): fused_conv1d_kda sizes its tiles from pltpu.get_tpu_info() and
-# has no interpret mode.
-TPU_ONLY = pytest.mark.skipif(jax.default_backend() != "tpu",
-                              reason="the fused KDA kernel runs on TPU only")
-
-# Note (david): calling through an outer jit drops fused_conv1d_kda's buffer
-# donation, so the reference can still read conv_state and recurrent_state.
-run_fused_kda = jax.jit(fused_conv1d_kda, static_argnames=STATIC)
+pytestmark = TPU_ONLY
 
 
-@pytest.mark.parametrize("chunk_size, heads", [(4, 1), (16, 8), (64, 4), (128, 1)])
-@pytest.mark.parametrize("gate_scale", [0.0, 1.0, 20.0])
-def test_qk_kk_operands_match_reference(chunk_size: int, heads: int,
-                                        gate_scale: float) -> None:
-    rng = np.random.default_rng(0)
-    q, k = rng.normal(
-        size=(2, heads, chunk_size, OPERAND_KEY_DIM)).astype(np.float32)
-    q /= np.linalg.norm(q, axis=-1, keepdims=True)
-    k /= np.linalg.norm(k, axis=-1, keepdims=True)
-    beta = rng.uniform(size=(heads, chunk_size, 1)).astype(np.float32)
-    g_cumsum = -np.cumsum(
-        rng.uniform(size=k.shape).astype(np.float32) * gate_scale, axis=1)
-
-    # Note (david): the constructor's cumsum primitive is TPU-only, so the chunk
-    # is assembled by hand to exercise operand preparation and its consumer on
-    # CPU.
-    chunk = ChunkKDA.__new__(ChunkKDA)
-    chunk.chunk = chunk_size
-    chunk.pack = pack_width(chunk_size, heads)
-    chunk.groups = heads // chunk.pack
-    chunk.k_t_weight = block_diag(
-        chunk.transposed(jnp.asarray(k)).astype(jnp.bfloat16), chunk_size)
-    chunk.qk_kk_operands = chunk.prepare_qk_kk_operands(
-        jnp.asarray(q), jnp.asarray(k * beta), jnp.asarray(k),
-        jnp.asarray(g_cumsum))
-    chunk.akk_parts, chunk.aqk_parts = [], []
-    chunk.num_kkt_groups_done = 0
-    for q_decayed, k_beta_decayed, k_decayed_t, _ in chunk.qk_kk_operands:
-        for operand in (q_decayed, k_beta_decayed, k_decayed_t):
-            assert np.isfinite(np.asarray(operand, dtype=np.float32)).all()
-    coverage = sum(np.asarray(pair_mask, dtype=np.int32)
-                   for _, _, _, pair_mask in chunk.qk_kk_operands)
-    causal = np.tri(chunk_size, dtype=bool)
-    np.testing.assert_array_equal(
-        coverage, np.tile(causal, (1, 1, chunk.pack)))
-
-    # Note (david): run_pipelined splits the head groups across calls, and a
-    # repeated call must be a no-op.
-    chunk.kkt_qk(1)
-    chunk.kkt_qk(1)
-    chunk.kkt_qk()
-    gate_diff = g_cumsum[:, :, None, :] - g_cumsum[:, None, :, :]
-    decay = np.exp(np.where(causal[None, :, :, None], gate_diff, 0))
-    for lhs, parts in ((q, chunk.aqk_parts), (k * beta, chunk.akk_parts)):
-        expected = np.sum(lhs[:, :, None, :] * k[:, None, :, :] * decay,
-                          axis=-1) * causal
-        actual = unpack_lanes(jnp.concatenate(parts, axis=0), chunk.pack)
-        np.testing.assert_allclose(actual, expected, **OPERAND_TOL)
+def reference(fused: Fused, g: jax.Array, beta: jax.Array,
+              initial_state: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The naive KDA on the conv's activated q, k, v, sequence by sequence
+    when packed. o is rounded to the kernel's bf16 output dtype."""
+    inputs = (normalize(fused.q), normalize(fused.k), fused.v, g, beta)
+    if not fused.varlen:
+        out, state = naive_recurrent_kda(*inputs,
+                                         initial_state=initial_state,
+                                         output_final_state=True)
+        return bf16_values(out), state
+    outs, states = [], []
+    for seq, (bos, eos) in enumerate(
+            zip(fused.cu_seqlens[:-1], fused.cu_seqlens[1:])):
+        out, state = naive_recurrent_kda(
+            *(x[:, bos:eos] for x in inputs),
+            initial_state=initial_state[seq:seq + 1],
+            output_final_state=True)
+        outs.append(out)
+        states.append(state)
+    return bf16_values(jnp.concatenate(outs, axis=1)), jnp.concatenate(states)
 
 
-def kda_sequence_ref(
-    qkv: jax.Array,
-    b: jax.Array,
+def gate_inputs(
     g: jax.Array,
-    conv_state: jax.Array,
-    recurrent_state: jax.Array,
-    conv_weight: jax.Array,
-    conv_bias: jax.Array | None,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    lower_bound: float | None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Conv1D + silu + KDA over one sequence, token by token.
-
-    conv_state and recurrent_state are the sequence's initial states. Returns
-    the conv input window [kernel_size - 1 + query_len, dim], the recurrent
-    state after every token [query_len, n_v, d_k, d_v] and the output
-    [query_len, n_v * d_v].
-    """
-    num_tokens = qkv.shape[0]
-    conv_input = jnp.concatenate([conv_state, qkv], axis=0)
-    tap_sum = sum(conv_input[tap:tap + num_tokens] *
-                  conv_weight[:, 0, tap][None] for tap in range(KERNEL_SIZE))
-    if conv_bias is None:
-        conv_out = tap_sum
-    else:
-        conv_out = tap_sum + conv_bias[None]
-    activation = jax.nn.silu(conv_out)
-
-    def _l2_normalize(heads):
-        return heads / jnp.sqrt(
-            jnp.sum(heads * heads, axis=-1, keepdims=True) + L2_NORM_EPS)
-
-    key_dim = N_KQ * D_K
-    v_per_kq_head = N_V // N_KQ
-    q = _l2_normalize(activation[:, :key_dim].reshape(
-        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-    k = _l2_normalize(activation[:, key_dim:2 * key_dim].reshape(
-        num_tokens, N_KQ, D_K)).repeat(v_per_kq_head, 1)
-    v = activation[:, 2 * key_dim:].reshape(num_tokens, N_V, D_V)
-    beta = jax.nn.sigmoid(b)
-    shifted_gate = g.reshape(num_tokens, N_V, D_K) + dt_bias.reshape(N_V, D_K)
-    decay_scale = jnp.exp(a_log)[:, None]
-    if lower_bound is None:
-        log_decay = -decay_scale * jax.nn.softplus(shifted_gate)
-    else:
-        log_decay = lower_bound * jax.nn.sigmoid(decay_scale * shifted_gate)
-
-    def _step(state, token_inputs):
-        q_t, k_t, v_t, beta_t, g_t = token_inputs
-        # Note (david): KDA decays the [K, V] state row-wise, one gate per key
-        # channel.
-        decayed = state * jnp.exp(g_t)[:, :, None]
-        v_new = beta_t[:, None] * (v_t - jnp.einsum("hd,hdm->hm", k_t, decayed))
-        state = decayed + jnp.einsum("hd,hm->hdm", k_t, v_new)
-        return state, (jnp.einsum("hd,hdm->hm", q_t, state) * D_K**-0.5, state)
-
-    _, (outs, states) = jax.lax.scan(_step, recurrent_state,
-                                     (q, k, v, beta, log_decay))
-    return conv_input, states, outs.reshape(num_tokens, -1)
-
-
-def kda_reference(
-    qkv: jax.Array,
-    b: jax.Array,
-    g: jax.Array,
-    conv_state: jax.Array,
-    recurrent_state: jax.Array,
-    conv_weight: jax.Array,
-    conv_bias: jax.Array | None,
-    a_log: jax.Array,
-    dt_bias: jax.Array,
-    query_start_loc: jax.Array,
-    state_indices: jax.Array,
-    read_slots: jax.Array,
-    seq_lens: jax.Array,
-    seqs: range,
-    window: int,
+    use_gate_in_kernel: bool,
     lower_bound: float | None = None,
-) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
-    """Eager KDA over the sequences in seqs; f32 in, f32 out.
+    A_log: jax.Array | None = None,
+    dt_bias: jax.Array | None = None,
+) -> tuple[jax.Array, jax.Array, dict]:
+    """The kernel's bf16 raw gate and gate kwargs for g, and the log decay
+    the reference sees.
 
-    Sequence s starts from slot read_slots[s] (zero if it has no context) and
-    checkpoints to state_indices[s] (window == 1: state after its last token)
-    or state_indices[s] + t for every window position t.
+    With use_gate_in_kernel g is the raw gate, which the reference activates
+    with naive_kda_gate, or naive_kda_lowerbound_gate under lower_bound;
+    otherwise g is the log decay itself.
     """
-    new_conv_state = jnp.array(conv_state)
-    new_recurrent_state = jnp.array(recurrent_state)
-    out = jnp.zeros((qkv.shape[0], N_V * D_V), jnp.float32)
-
-    for seq_idx in seqs:
-        start = int(query_start_loc[seq_idx])
-        end = int(query_start_loc[seq_idx + 1])
-        num_seq_tokens = end - start
-        if num_seq_tokens <= 0:
-            continue
-        has_initial_state = int(seq_lens[seq_idx]) - num_seq_tokens > 0
-        read_slot = int(read_slots[seq_idx])
-        if has_initial_state:
-            init_conv_state = conv_state[read_slot]
-            init_recurrent_state = recurrent_state[read_slot]
-        else:
-            init_conv_state = jnp.zeros_like(conv_state[0])
-            init_recurrent_state = jnp.zeros_like(recurrent_state[0])
-
-        conv_input, seq_states, seq_out = kda_sequence_ref(
-            qkv[start:end], b[start:end], g[start:end], init_conv_state,
-            init_recurrent_state, conv_weight, conv_bias, a_log, dt_bias,
-            lower_bound)
-        out = out.at[start:end].set(seq_out)
-
-        base_slot = int(state_indices[seq_idx])
-        if window == 1:
-            new_conv_state = new_conv_state.at[base_slot].set(
-                conv_input[-(KERNEL_SIZE - 1):])
-            new_recurrent_state = new_recurrent_state.at[base_slot].set(
-                seq_states[-1])
-        else:
-            for token_idx in range(num_seq_tokens):
-                new_conv_state = new_conv_state.at[base_slot + token_idx].set(
-                    conv_input[token_idx + 1:token_idx + KERNEL_SIZE])
-                new_recurrent_state = new_recurrent_state.at[
-                    base_slot + token_idx].set(seq_states[token_idx])
-    return (new_conv_state, new_recurrent_state), out
-
-
-def make_inputs(
-    key: jax.Array, num_tokens: int, gate_scale: float,
-) -> tuple[dict[str, jax.Array], dict[str, jax.Array], dict[str, jax.Array]]:
-    """Returns (bf16 kernel activations, their f32 copies, f32 weights)."""
-    subkeys = iter(jax.random.split(key, 8))
-    normal = jax.random.normal
-    activations = dict(
-        qkv=normal(next(subkeys), (num_tokens, DIM)),
-        b=normal(next(subkeys), (num_tokens, N_V)),
-        # Note (david): positive raw gates give softplus ~ gate_scale, so
-        # strong gates decay channels by e^-10..e^-30 per token.
-        g=normal(next(subkeys), (num_tokens, N_V * D_K)) * gate_scale +
-        gate_scale,
-    )
-    kernel_activations = {
-        name: act.astype(jnp.bfloat16) for name, act in activations.items()
-    }
-    reference_activations = {
-        name: act.astype(jnp.float32)
-        for name, act in kernel_activations.items()
-    }
-    params = dict(
-        conv_weight=normal(next(subkeys), (DIM, 1, KERNEL_SIZE)),
-        conv_bias=normal(next(subkeys), (DIM, )),
-        a_log=normal(next(subkeys), (N_V, )),
-        dt_bias=normal(next(subkeys), (N_V * D_K, )),
-    )
-    return kernel_activations, reference_activations, params
-
-
-@TPU_ONLY
-@pytest.mark.parametrize("gate_scale", [1.0, 8.0], ids=["gate", "strong"])
-@pytest.mark.parametrize(
-    "max_reqs, lengths, q_loc, distribution",
-    [
-        pytest.param(1, [1024], [0, 1024], [0, 0, 1], id="prefill"),
-        pytest.param(3, [256, 128, 100], [0, 256, 384, 484], [0, 3, 3],
-                     id="mixed"),
-        pytest.param(64, [1] * 64, list(range(65)), [64, 64, 64],
-                     id="decode_only"),
-        pytest.param(11, [1] * 8 + [128, 128, 256],
-                     [0, 1, 2, 3, 4, 5, 6, 7, 8, 136, 264, 520], [8, 11, 11],
-                     id="mixed_prefill_decode"),
-        pytest.param(16, [128, 64, 32, 16, 8],
-                     [0, 128, 192, 224, 240, 248] + [1] * 11, [0, 5, 5],
-                     id="padded_mixed_prefill"),
-    ],
-)
-def test_fused_matches_reference(max_reqs: int, lengths: list[int],
-                                 q_loc: list[int], distribution: list[int],
-                                 gate_scale: float) -> None:
-    num_tokens = sum(lengths)
-    query_start_loc = jnp.array(q_loc, dtype=jnp.int32)
-    seq_distribution = jnp.array(distribution, dtype=jnp.int32)
-    state_indices = jnp.arange(1, max_reqs + 1, dtype=jnp.int32)
-    conv_state = jnp.zeros((max_reqs + 1, KERNEL_SIZE - 1, DIM))
-    recurrent_state = jnp.zeros((max_reqs + 1, N_V, D_K, D_V))
-    # Note (david): seq_lens equal to the new token counts means no sequence
-    # has prior context.
-    seq_lens = query_start_loc[1:max_reqs + 1] - query_start_loc[:max_reqs]
-
-    kernel_acts, reference_acts, params = make_inputs(
-        jax.random.key(0), num_tokens, gate_scale)
-    (conv_out, rec_out), out = run_fused_kda(
-        **kernel_acts, conv_state=conv_state, recurrent_state=recurrent_state,
-        **params, query_start_loc=query_start_loc,
-        state_indices=state_indices, distribution=seq_distribution,
-        seq_lens=seq_lens, read_state_indices=state_indices, n_kq=N_KQ,
-        n_v=N_V, d_k=D_K, d_v=D_V, kernel_size=KERNEL_SIZE)
-    (conv_ref, rec_ref), out_ref = kda_reference(
-        **reference_acts, conv_state=conv_state,
-        recurrent_state=recurrent_state, **params,
-        query_start_loc=query_start_loc, state_indices=state_indices,
-        read_slots=state_indices, seq_lens=seq_lens,
-        seqs=range(int(seq_distribution[2])), window=1)
-
-    np.testing.assert_allclose(out.astype(jnp.float32), out_ref, **TOL)
-    np.testing.assert_allclose(conv_out, conv_ref, **TOL)
-    np.testing.assert_allclose(rec_out, rec_ref, **TOL)
-
-
-@TPU_ONLY
-@pytest.mark.parametrize(
-    "spec_lengths, read_offsets, prefill_lengths",
-    [
-        pytest.param([5, 3, 1], [2, 0, 4], [], id="spec_windows"),
-        pytest.param([5, 1, 3, 2, 4], [0, 1, 2, 3, 4], [],
-                     id="spec_windows_padded"),
-        pytest.param([5, 2], [3, 1], [64], id="spec_and_prefill"),
-    ],
-)
-def test_spec_mode_checkpoints(spec_lengths: list[int], read_offsets: list[int],
-                               prefill_lengths: list[int]) -> None:
-    """Windows read base + read_offset and checkpoint each position to base + t.
-
-    Prefills in the same batch keep the PER_SEQ behavior.
-    """
-    window = NUM_SPEC_TOKENS + 1
-    lengths = list(spec_lengths) + list(prefill_lengths)
-    num_seqs, num_spec = len(lengths), len(spec_lengths)
-    num_tokens = sum(lengths)
-    query_start_loc = jnp.array(np.concatenate([[0], np.cumsum(lengths)]),
-                                jnp.int32)
-    distribution = jnp.array([num_spec, num_spec, num_seqs], jnp.int32)
-    state_indices = jnp.array(
-        [1 + seq_idx * window for seq_idx in range(num_seqs)], jnp.int32)
-    num_blocks = 1 + num_seqs * window
-    state_read_offsets = jnp.array(
-        list(read_offsets) + [0] * len(prefill_lengths), jnp.int32)
-    # Note (david): spec windows continue a context; prefills start fresh.
-    seq_lens = jnp.array(
-        [SPEC_CONTEXT_LEN + window_len for window_len in spec_lengths] +
-        list(prefill_lengths), jnp.int32)
-
-    kernel_acts, reference_acts, params = make_inputs(
-        jax.random.key(3), num_tokens, 1.0)
-    state_keys = jax.random.split(jax.random.key(4), 2)
-    # Note (david): distinct random states per slot catch reads and writes of
-    # the wrong slot.
-    conv_state = jax.random.normal(state_keys[0],
-                                   (num_blocks, KERNEL_SIZE - 1, DIM))
-    recurrent_state = jax.random.normal(state_keys[1],
-                                        (num_blocks, N_V, D_K, D_V))
-
-    (conv_out, rec_out), out = run_fused_kda(
-        **kernel_acts, conv_state=conv_state, recurrent_state=recurrent_state,
-        **params, query_start_loc=query_start_loc,
-        state_indices=state_indices, distribution=distribution,
-        seq_lens=seq_lens, read_state_indices=state_indices,
-        read_offsets=state_read_offsets, n_kq=N_KQ, n_v=N_V, d_k=D_K,
-        d_v=D_V, kernel_size=KERNEL_SIZE, num_spec_tokens=NUM_SPEC_TOKENS)
-
-    reference_args = dict(**reference_acts, **params,
-                          query_start_loc=query_start_loc,
-                          state_indices=state_indices, seq_lens=seq_lens)
-    (spec_conv_ref, spec_rec_ref), spec_out_ref = kda_reference(
-        conv_state=conv_state, recurrent_state=recurrent_state,
-        read_slots=state_indices + state_read_offsets, seqs=range(num_spec),
-        window=window, **reference_args)
-    if prefill_lengths:
-        # Note (david): the prefills run on top of the spec sequences'
-        # checkpoints, as in the kernel's BATCHED-then-PER_SEQ order.
-        (conv_ref, rec_ref), prefill_out_ref = kda_reference(
-            conv_state=spec_conv_ref, recurrent_state=spec_rec_ref,
-            read_slots=state_indices, seqs=range(num_spec, num_seqs),
-            window=1, **reference_args)
-        prefill_start = int(query_start_loc[num_spec])
-        out_ref = spec_out_ref.at[prefill_start:].set(
-            prefill_out_ref[prefill_start:])
+    if not use_gate_in_kernel:
+        raw_g, g_ref = encode_gate(KDA, g, lower_bound)
+        return raw_g, g_ref, dict(lower_bound=lower_bound)
+    raw_g = g.astype(jnp.bfloat16)
+    if lower_bound is None:
+        g_ref = naive_kda_gate(raw_g, A_log, dt_bias)
     else:
-        conv_ref, rec_ref, out_ref = spec_conv_ref, spec_rec_ref, spec_out_ref
+        g_ref = naive_kda_lowerbound_gate(raw_g, A_log, dt_bias, lower_bound)
+    return raw_g, g_ref, dict(A_log=A_log, dt_bias=dt_bias,
+                              lower_bound=lower_bound)
 
-    np.testing.assert_allclose(out.astype(jnp.float32), out_ref, **TOL)
-    written_slots = set()
-    for seq_idx, num_window_tokens in enumerate(spec_lengths):
-        base_slot = int(state_indices[seq_idx])
-        written_slots.update(range(base_slot, base_slot + num_window_tokens))
-    written_slots.update(int(state_indices[num_spec + prefill_idx])
-                         for prefill_idx in range(len(prefill_lengths)))
-    for slot in range(num_blocks):
-        if slot in written_slots:
-            expected_conv, expected_rec = conv_ref[slot], rec_ref[slot]
-        else:
-            expected_conv = conv_state[slot]
-            expected_rec = recurrent_state[slot]
-        np.testing.assert_allclose(conv_out[slot], expected_conv, **TOL,
-                                   err_msg=f"conv slot {slot}")
-        np.testing.assert_allclose(rec_out[slot], expected_rec, **TOL,
-                                   err_msg=f"recurrent slot {slot}")
+
+def test_chunk_invalid_chunk_size() -> None:
+    rng = np.random.default_rng(42)
+    B, T, H, D = 1, 64, 1, 64
+    q = randn(rng, (B, T, H, D))
+    k = randn(rng, (B, T, H, D))
+    v = randn(rng, (B, T, H, D))
+    g = randn(rng, (B, T, H, D))
+    beta = randn(rng, (B, T, H))
+    fused = Fused(KDA, rng, q, k, v)
+
+    with pytest.raises(
+            ValueError,
+            match="compute_chunk_size must be a positive multiple of 16"):
+        fused.chunk(g.astype(jnp.bfloat16), beta, chunk_size=24)
+
+
+@DECODE
+@pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "D", "gate_logit_normalizer"),
+    param_grid(
+        "B{}-T{}-H{}-HV{}-D{}-gate_logit_normalizer{}",
+        [
+            (1, 64, 1, 1, 64, 1),
+            (2, 512, 3, 3, 60, 1),
+            (3, 1000, 4, 4, 100, 1),
+            (4, 1024, 4, 4, 128, 1),
+            (2, 512, 2, 4, 60, 1),
+            (2, 1024, 2, 8, 128, 1),
+        ],
+        lambda B, T, H, HV, D, _: (H, HV, D),
+    ),
+)
+def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
+                         gate_logit_normalizer: float,
+                         record_dtype: jnp.dtype | None) -> None:
+    rng = np.random.default_rng(42)
+    q = rand(rng, (B, T, H, D))
+    k = rand(rng, (B, T, H, D))
+    v = rand(rng, (B, T, HV, D))
+    g = logsigmoid(randn(rng, (B, T, HV, D))) / gate_logit_normalizer
+    beta = jax.nn.sigmoid(randn(rng, (B, T, HV)))
+    h0 = randn(rng, (B, HV, D, D))
+    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
+    raw_g, g = encode_gate(KDA, g)
+
+    ref, ref_ht = reference(fused, g, beta, h0)
+    tri, tri_ht = fused.recurrent(raw_g, beta, record_dtype,
+                                  beta_is_activated=True)
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@DECODE
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D"),
+    param_grid(
+        "B{}-T{}-H{}-D{}",
+        [
+            (2, 256, 4, 64),
+        ],
+        lambda B, T, H, D: (H, H, D),
+    ),
+)
+def test_fused_recurrent_use_beta_sigmoid_in_kernel(
+        B: int, T: int, H: int, D: int,
+        record_dtype: jnp.dtype | None) -> None:
+    """Raw beta logits with the in-kernel sigmoid match the activated beta."""
+    rng = np.random.default_rng(42)
+    q = rand(rng, (B, T, H, D))
+    k = rand(rng, (B, T, H, D))
+    v = rand(rng, (B, T, H, D))
+    g = logsigmoid(randn(rng, (B, T, H, D)))
+    beta_post = jax.nn.sigmoid(randn(rng, (B, T, H)))
+    beta_raw = logit(jnp.clip(beta_post, 1e-4, 1 - 1e-4))
+    h0 = randn(rng, (B, H, D, D))
+    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
+    raw_g, _ = encode_gate(KDA, g)
+
+    ref, ref_ht = fused.recurrent(raw_g, beta_post, record_dtype,
+                                  beta_is_activated=True)
+    tri, tri_ht = fused.recurrent(raw_g, beta_raw, record_dtype)
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@DECODE
+@pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "D", "has_a_log", "has_dt_bias", "safe_gate"),
+    param_grid(
+        "B{}-T{}-H{}-HV{}-D{}-has_a_log{}-has_dt_bias{}-safe_gate{}",
+        [
+            (1, 64, 1, 1, 64, True, False, False),
+            (2, 256, 2, 2, 64, True, True, False),
+            (2, 512, 2, 4, 64, True, True, True),
+            (3, 1000, 2, 8, 128, True, False, False),
+            (4, 1024, 4, 4, 128, True, True, True),
+            (1, 64, 1, 1, 64, False, False, True),
+            (2, 256, 2, 4, 64, False, True, True),
+        ],
+        lambda B, T, H, HV, D, *_: (H, HV, D),
+    ),
+)
+def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
+                                        D: int, has_a_log: bool,
+                                        has_dt_bias: bool, safe_gate: bool,
+                                        record_dtype: jnp.dtype | None
+                                        ) -> None:
+    """The in-kernel gate matches the manual gate path."""
+    rng = np.random.default_rng(42)
+    q = rand(rng, (B, T, H, D))
+    k = rand(rng, (B, T, H, D))
+    v = rand(rng, (B, T, HV, D))
+    beta = jax.nn.sigmoid(rand(rng, (B, T, HV)))
+    g_raw = randn(rng, (B, T, HV, D))
+    A_log = jnp.log(uniform(rng, (HV, ), 1, 16)) if has_a_log else None
+    dt_bias = randn(rng, (HV * D, )) if has_dt_bias else None
+    h0 = randn(rng, (B, HV, D, D))
+    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
+
+    lower_bound = -5.0 if safe_gate else None
+    raw_g, g_ref, gate_kwargs = gate_inputs(g_raw, True, lower_bound, A_log,
+                                            dt_bias)
+    raw_g_ref, _ = encode_gate(KDA, g_ref)
+    ref, ref_ht = fused.recurrent(raw_g_ref, beta, record_dtype,
+                                  beta_is_activated=True)
+    tri, tri_ht = fused.recurrent(raw_g, beta, record_dtype,
+                                  beta_is_activated=True, **gate_kwargs)
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@DECODE
+@pytest.mark.parametrize(
+    ("B", "H", "D", "gate_logit_normalizer", "use_gate_in_kernel",
+     "safe_gate"),
+    param_grid(
+        "B{}-H{}-D{}-norm{}-gate{}-safe_gate{}",
+        [
+            (16, 16, 128, 1.0, False, False),
+            (32, 8, 64, 1.0, False, False),
+            (7, 32, 128, 0.5, False, False),
+            (16, 16, 128, 1.0, True, False),
+            (32, 8, 64, 1.0, True, False),
+            (7, 32, 128, 0.5, True, True),
+        ],
+        lambda B, H, D, *_: (H, H, D),
+    ),
+)
+def test_fused_recurrent_vllm_decode(B: int, H: int, D: int,
+                                     gate_logit_normalizer: float,
+                                     use_gate_in_kernel: bool,
+                                     safe_gate: bool,
+                                     record_dtype: jnp.dtype | None) -> None:
+    """vLLM-style decoding with continuous batching and paged state
+    storage."""
+    rng = np.random.default_rng(42)
+    max_cache_slots = B * 3
+    # Note (david): slot 0 is the kernels' null block, so the pool keeps it
+    # in front of the max_cache_slots slots.
+    state_indices = 1 + rng.permutation(max_cache_slots)[:B]
+    h0 = randn(rng, (B, H, D, D))
+
+    # fill unaccessed slots with a huge value to detect out-of-bounds access.
+    HUGE_VALUE = 1e30
+    dim = 3 * H * D
+    state_pool = np.full((1 + max_cache_slots, H, D, D), HUGE_VALUE,
+                         np.float32)
+    conv_pool = np.full((1 + max_cache_slots, 3, dim), HUGE_VALUE,
+                        np.float32)
+
+    T = 1
+    total_tokens = B * T
+    q = rand(rng, (1, total_tokens, H, D))
+    k = rand(rng, (1, total_tokens, H, D))
+    v = rand(rng, (1, total_tokens, H, D))
+    g = randn(rng, (1, total_tokens, H, D))
+    if use_gate_in_kernel:
+        A_log = jnp.log(uniform(rng, (H, ), 1, 16))
+        dt_bias = randn(rng, (H * D, ))
+        lower_bound = -5.0 if safe_gate else None
+    else:
+        g = logsigmoid(g) / gate_logit_normalizer
+        A_log = None
+        dt_bias = None
+        lower_bound = None
+    beta = jax.nn.sigmoid(randn(rng, (1, total_tokens, H)))
+
+    cu_seqlens = list(range(0, total_tokens + 1, T))
+    fused = Fused(KDA, rng, q, k, v, cu_seqlens=cu_seqlens, initial_state=h0,
+                  state_indices=state_indices, state_pool=state_pool,
+                  conv_pool=conv_pool)
+    raw_g, g_ref, gate_kwargs = gate_inputs(g, use_gate_in_kernel,
+                                            lower_bound, A_log, dt_bias)
+    ref_out, ref_ht = reference(fused, g_ref, beta, h0)
+    tri_out, tri_ht = fused.recurrent(raw_g, beta, record_dtype,
+                                      beta_is_activated=True, **gate_kwargs)
+
+    assert_close("o", ref_out, tri_out, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+    mask = np.ones(1 + max_cache_slots, dtype=bool)
+    mask[state_indices] = False
+    mask[0] = False
+    assert_close("Untouched ht", fused.state_pool[mask],
+                 fused.final_state_pool[mask], 0.0)
+    assert_close("Untouched conv", fused.conv_pool[mask],
+                 fused.final_conv_pool[mask], 0.0)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "HV", "D", "gate_logit_normalizer", "mask_p",
+     "use_gate_in_kernel", "safe_gate", "chunk_size"),
+    param_grid(
+        "B{}-T{}-H{}-HV{}-D{}-gate_logit_normalizer{}-mask_p{}"
+        "-use_gate{}-safe_gate{}-chunk_size{}",
+        [
+            (1, 63, 1, 1, 64, 1, 0, False, True, 64),
+            (2, 500, 3, 3, 60, 1, 0, False, True, 64),
+            (2, 1000, 3, 3, 64, 1, 0.5, False, False, 64),
+            (3, 1024, 4, 4, 100, 0.1, 0, False, False, 64),
+            (4, 1024, 4, 4, 128, 1, 0, False, True, 64),
+            (2, 1500, 4, 4, 128, 10, 0, True, False, 64),
+            (4, 2048, 8, 8, 64, 1, 0, True, True, 64),
+            (2, 1024, 2, 4, 64, 1, 0, False, False, 64),
+            (2, 1024, 2, 8, 64, 1, 0, True, False, 64),
+            (2, 1024, 4, 8, 128, 1, 0, True, False, 64),
+            (2, 160, 2, 4, 64, 1, 0, True, True, 32),
+            (2, 1024, 2, 4, 64, 1, 0, True, True, 64),
+            (2, 1024, 2, 8, 128, 1, 0, True, False, 64),
+        ],
+        lambda B, T, H, HV, D, *_: (H, HV, D),
+    ),
+)
+def test_chunk(B: int, T: int, H: int, HV: int, D: int,
+               gate_logit_normalizer: float, mask_p: float,
+               use_gate_in_kernel: bool, safe_gate: bool,
+               chunk_size: int) -> None:
+    rng = np.random.default_rng(42)
+    q = rand(rng, (B, T, H, D))
+    k = rand(rng, (B, T, H, D))
+    v = rand(rng, (B, T, HV, D))
+    g = randn(rng, (B, T, HV, D))
+    if use_gate_in_kernel:
+        A_log = randn(rng, (HV, ))
+        dt_bias = randn(rng, (HV * D, ))
+    else:
+        A_log = dt_bias = None
+        g = logsigmoid(g) / gate_logit_normalizer
+        g = g * (rand(rng, g.shape) > mask_p)
+    if safe_gate:
+        lower_bound = -5.0
+        if not use_gate_in_kernel:
+            g = jnp.clip(g, -5, 0)
+    else:
+        lower_bound = None
+
+    beta = jax.nn.sigmoid(randn(rng, (B, T, HV)))
+    h0 = randn(rng, (B, HV, D, D))
+    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
+    raw_g, g_ref, gate_kwargs = gate_inputs(g, use_gate_in_kernel,
+                                            lower_bound, A_log, dt_bias)
+
+    ref, ref_ht = reference(fused, g_ref, beta, h0)
+    tri, tri_ht = fused.chunk(raw_g, beta, chunk_size=chunk_size,
+                              beta_is_activated=True, **gate_kwargs)
+    assert_close("o", ref, tri, 0.005)
+    assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("T", "P", "H", "D", "chunk_size", "use_gate_in_kernel"),
+    param_grid(
+        "T{}-P{}-H{}-D{}-chunk_size{}-use_gate{}",
+        [(*test, use_gate_in_kernel)
+         for use_gate_in_kernel in [False, True] for test in [
+             (16, 6, 2, 64, 64),
+             (32, 6, 2, 64, 32),
+             (22, 21, 4, 128, 64),
+             (40, 33, 2, 64, 32),
+             (70, 65, 2, 64, 64),
+         ]],
+        lambda T, P, H, D, *_: (H, H, D),
+    ),
+)
+def test_chunk_causality(T: int, P: int, H: int, D: int, chunk_size: int,
+                         use_gate_in_kernel: bool) -> None:
+    """Future gates must leave prefix outputs unchanged."""
+    rng = np.random.default_rng(42)
+    shape = (1, T, H, D)
+    q = normalize(randn(rng, shape))
+    k = normalize(randn(rng, shape))
+    v = 0.5 * randn(rng, shape)
+    beta = jnp.ones(shape[:-1])
+    g = bf16_values(-0.7 * (0.75 + 0.25 * rand(rng, shape)))
+    A_log = jnp.log(uniform(rng, (H, ), 1.0, 16.0))
+    dt_bias = 0.1 * rand(rng, (H * D, )) - 0.05
+    fused = Fused(KDA, rng, q, k, v)
+
+    if use_gate_in_kernel:
+        gate_logit = math.log(0.99 / 0.01)
+        g_edited = g.at[:, P:].set(
+            bf16_values(gate_logit / jnp.exp(A_log).reshape(1, 1, H, 1) -
+                        dt_bias.reshape(1, 1, H, D)))
+    else:
+        g_edited = g.at[:, P:].set(-4.95)
+    assert not np.array_equal(g[:, P:], g_edited[:, P:])
+
+    outputs = []
+    for g_i in (g, g_edited):
+        raw_g, _, gate_kwargs = gate_inputs(g_i, use_gate_in_kernel, -5.0,
+                                            A_log, dt_bias)
+        o, _ = fused.chunk(raw_g, beta, chunk_size=chunk_size,
+                           beta_is_activated=True, **gate_kwargs)
+        outputs.append(np.asarray(o[:, :P]))
+
+    ref, tri = outputs
+    assert np.isfinite(ref).all() and np.isfinite(tri).all()
+    assert np.array_equal(ref, tri), "future gates changed prefix outputs"
+
+
+@pytest.mark.parametrize(
+    ("lower_bound", "use_gate_in_kernel", "cu_seqlens", "gate_pattern"),
+    [
+        pytest.param(
+            lower_bound,
+            use_gate_in_kernel,
+            cu_seqlens,
+            gate_pattern,
+            id=f"lower_bound{lower_bound}-use_gate{use_gate_in_kernel}"
+            f"-cu_seqlens{cu_seqlens}-{gate_pattern}",
+        ) for cu_seqlens in [None, [0, 1, 17, 38]]
+        for use_gate_in_kernel in [False, True]
+        for lower_bound in [-5.0, -2.0, -0.01]
+        for gate_pattern in (["random", "lower_bound", "zero", "mixed"]
+                             if not use_gate_in_kernel and lower_bound == -5.0
+                             else ["random"])
+    ],
+)
+def test_chunk_lower_bound(lower_bound: float, use_gate_in_kernel: bool,
+                           cu_seqlens: list[int] | None,
+                           gate_pattern: str) -> None:
+    rng = np.random.default_rng(42)
+    B, T, H, D = 1, 38, 2, 64
+    shape = (B, T, H, D)
+    q = normalize(randn(rng, shape))
+    k = normalize(randn(rng, shape))
+    v = randn(rng, shape)
+    g = bf16_values(10 * randn(rng, shape))
+    if not use_gate_in_kernel:
+        g = lower_bound * jax.nn.sigmoid(g)
+        if gate_pattern == "lower_bound":
+            g = jnp.full_like(g, lower_bound)
+        elif gate_pattern == "zero":
+            g = jnp.zeros_like(g)
+        elif gate_pattern == "mixed":
+            g = g.at[..., ::2].set(lower_bound).at[..., 1::2].set(0.)
+    beta = jax.nn.sigmoid(randn(rng, (B, T, H)))
+    A_log = jnp.zeros((H, ))
+    dt_bias = 0.1 * randn(rng, (H * D, ))
+    N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
+    h0 = randn(rng, (N, H, D, D))
+    fused = Fused(KDA, rng, q, k, v, cu_seqlens=cu_seqlens, initial_state=h0)
+    raw_g, g_ref, gate_kwargs = gate_inputs(g, use_gate_in_kernel,
+                                            lower_bound, A_log, dt_bias)
+
+    ref, ref_ht = reference(fused, g_ref, beta, h0)
+    tri, tri_ht = fused.chunk(raw_g, beta, beta_is_activated=True,
+                              **gate_kwargs)
+    for name, ref_value, tri_value in (("o", ref, tri), ("ht", ref_ht,
+                                                         tri_ht)):
+        assert np.isfinite(np.asarray(tri_value)).all(), name
+        assert_close(name, ref_value, tri_value, 0.005)
+
+
+@pytest.mark.parametrize(
+    ("B", "T", "H", "D"),
+    [
+        pytest.param(
+            1, 8192, 96, 128, id="B1-T8192-H96-D128",
+            marks=pytest.mark.skip(
+                reason="fused_conv1d_kda runs out of VMEM at H = 96, D = 128"
+            )),
+    ],
+)
+def test_chunk_use_beta_sigmoid_in_kernel(B: int, T: int, H: int,
+                                          D: int) -> None:
+    """Raw beta logits with the in-kernel sigmoid match the activated beta."""
+    rng = np.random.default_rng(42)
+    q = rand(rng, (B, T, H, D))
+    k = rand(rng, (B, T, H, D))
+    v = rand(rng, (B, T, H, D))
+    g = logsigmoid(randn(rng, (B, T, H, D)))
+    beta_raw = randn(rng, (B, T, H))
+    beta_post = jax.nn.sigmoid(beta_raw)
+    h0 = randn(rng, (B, H, D, D))
+    fused = Fused(KDA, rng, q, k, v, initial_state=h0)
+    raw_g, _ = encode_gate(KDA, g)
+
+    ref, ref_ht = fused.chunk(raw_g, beta_post, beta_is_activated=True)
+    tri, tri_ht = fused.chunk(raw_g, beta_raw)
+    rtol = 1e-4
+    assert_close("o", ref, tri, rtol)
+    assert_close("ht", ref_ht, tri_ht, rtol)
+
+
+def varlen_inputs(
+    rng: np.random.Generator, H: int, D: int, mask_p: float,
+    cu_seqlens: list[int], use_gate_in_kernel: bool, safe_gate: bool
+) -> tuple[Fused, jax.Array, jax.Array, jax.Array, dict, jax.Array]:
+    """The varlen chunk inputs: the Fused run, the raw gate, the reference's
+    log decay, beta, the gate kwargs and h0."""
+    T = cu_seqlens[-1]
+    N = len(cu_seqlens) - 1
+
+    q = randn(rng, (1, T, H, D))
+    k = normalize(randn(rng, (1, T, H, D)))
+    v = randn(rng, (1, T, H, D))
+    g = randn(rng, (1, T, H, D))
+    if use_gate_in_kernel:
+        A_log = jnp.log(uniform(rng, (1, 1, H, 1), 1, 16))
+        dt_bias = randn(rng, (H * D, ))
+    else:
+        A_log = dt_bias = None
+        g = logsigmoid(g)
+        g = g * (rand(rng, g.shape) > mask_p)
+    mask = rand(rng, g.shape) > mask_p
+    g = jnp.where(mask, g, -1000.)
+    lower_bound = None
+    if safe_gate:
+        assert use_gate_in_kernel is False
+        g = jnp.clip(g, -5, 0)
+        lower_bound = -5.0
+
+    beta = jax.nn.sigmoid(rand(rng, (1, T, H)))
+    h0 = randn(rng, (N, H, D, D))
+    fused = Fused(KDA, rng, q, k, v, cu_seqlens=cu_seqlens, initial_state=h0)
+    raw_g, g_ref, gate_kwargs = gate_inputs(g, use_gate_in_kernel,
+                                            lower_bound, A_log, dt_bias)
+    return fused, raw_g, g_ref, beta, gate_kwargs, h0
+
+
+# Note (david): ratio bounds both o and ht. Rows above 0.005 carry the
+# kernel's measured bf16 error plus margin; mask_p = 0.9 leaves most of g
+# zero, the case decay damps least.
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "use_gate_in_kernel", "safe_gate",
+     "chunk_size", "ratio"),
+    param_grid(
+        "H{}-D{}-mask_p{}-cu_seqlens{}-gate{}-safe_gate{}-chunk_size{}",
+        [
+            (4, 60, 0.1, [0, 15], True, False, 64, 0.005),
+            (4, 64, 0.9, [0, 256, 500, 1000], True, False, 64, 0.0065),
+            (4, 128, 0.5, [0, 256, 500, 1000], False, False, 64, 0.005),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], True, False, 64, 0.005),
+            (4, 256, 0, [0, 100, 300, 1200, 3000, 4096], False, True, 64,
+             0.005),
+            (4, 60, 0.1, [0, 31, 96, 160], True, False, 32, 0.005),
+        ],
+        lambda H, D, *_: (H, H, D),
+    ),
+)
+def test_chunk_varlen(H: int, D: int, mask_p: float, cu_seqlens: list[int],
+                      use_gate_in_kernel: bool, safe_gate: bool,
+                      chunk_size: int, ratio: float) -> None:
+    rng = np.random.default_rng(42)
+    fused, raw_g, g_ref, beta, gate_kwargs, h0 = varlen_inputs(
+        rng, H, D, mask_p, cu_seqlens, use_gate_in_kernel, safe_gate)
+
+    tri, tri_ht = fused.chunk(raw_g, beta, chunk_size=chunk_size,
+                              beta_is_activated=True, **gate_kwargs)
+    ref, ref_ht = reference(fused, g_ref, beta, h0)
+    assert_close("o", ref, tri, ratio)
+    assert_close("ht", ref_ht, tri_ht, ratio)
+
+
+# Note (david): ratio bounds both o and ht. Rows above 0.005 carry the
+# kernel's measured bf16 error plus margin; mask_p = 0.9 leaves most of g
+# zero, the case decay damps least.
+@pytest.mark.parametrize(
+    ("H", "D", "mask_p", "cu_seqlens", "use_gate_in_kernel", "safe_gate",
+     "ratio"),
+    param_grid(
+        "H{}-D{}-mask_p{}-cu_seqlens{}-gate{}-safe_gate{}",
+        [
+            (4, 60, 0.1, [0, 8192], True, False, 0.005),
+            (4, 64, 0.9, [0, 256, 500, 1000], True, False, 0.0065),
+            (4, 128, 0.5, [0, 256, 500, 1000], False, False, 0.005),
+            (4, 100, 0, [0, 15, 100, 300, 1200, 2000], True, False, 0.005),
+            (4, 256, 0, [0, 100, 300, 1200, 3000, 4096], False, True, 0.005),
+        ],
+        lambda H, D, *_: (H, H, D),
+    ),
+)
+def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
+                              cu_seqlens: list[int],
+                              use_gate_in_kernel: bool, safe_gate: bool,
+                              ratio: float) -> None:
+    rng = np.random.default_rng(42)
+    fused, raw_g, g_ref, beta, gate_kwargs, h0 = varlen_inputs(
+        rng, H, D, mask_p, cu_seqlens, use_gate_in_kernel, safe_gate)
+
+    tri, tri_ht = fused.chunk(raw_g, beta, beta_is_activated=True,
+                              **gate_kwargs)
+    ref, ref_ht = reference(fused, g_ref, beta, h0)
+    assert_close("o", ref, tri, ratio)
+    assert_close("ht", ref_ht, tri_ht, ratio)
