@@ -3,6 +3,7 @@
 import jax
 import jax.numpy as jnp
 from jax import lax
+from jax.experimental.pallas import tpu as pltpu
 
 # Note (david): GPU FlashAttention requires rotary_dim divisible by 16; keep the
 # same table contract.
@@ -30,8 +31,11 @@ def prepare_rotary(
   float32 keeps the in-kernel f32 rotation identical to an f32 RoPE outside the
   kernel. Prefill positions are 0..len_k-1 for K and len_k-len_q..len_k-1 for Q
   per sequence. Returns (q_coefficients, k_coefficients), each
-  (2, 1, tokens, head_dim / 2) holding cos then sin; the singleton axis is
-  shared by all batch rows or packed heads. k_coefficients is None when
+  (1, tokens, head_dim) with cos and sin packed in the rotation's own pairing:
+  [cos | sin] for split halves, [cos_0, sin_0, cos_1, sin_1, ...] interleaved,
+  so rotate_tile pairs them with the same rolls as the head. The packed plane
+  is the same bytes as separate half-width cos and sin planes. The singleton
+  axis is shared by all batch rows or packed heads. k_coefficients is None when
   rotate_k is False (K arrives already rotated). Returns None without tables.
 
   seqused_k replaces cu_k for a paged KV cache, whose K arrives rotated
@@ -115,9 +119,13 @@ def prepare_rotary(
       else:
         k_positions = None
 
-    q_coefficients = jnp.stack((cos[q_positions], sin[q_positions]))[:, None]
+    if interleaved:
+      table = jnp.stack((cos, sin), axis=-1).reshape(cos.shape[0], rotary_dim)
+    else:
+      table = jnp.concatenate((cos, sin), axis=-1)
+    q_coefficients = table[q_positions][None]
     if rotate_k:
-      k_coefficients = jnp.stack((cos[k_positions], sin[k_positions]))[:, None]
+      k_coefficients = table[k_positions][None]
     else:
       k_coefficients = None
     return q_coefficients, k_coefficients
@@ -125,37 +133,42 @@ def prepare_rotary(
 
 def rotate_tile(
     tile: jax.Array,
-    cos: jax.Array,
-    sin: jax.Array,
+    coefficients: jax.Array,
     *,
     interleaved: bool,
     head_dim_minor: bool,
 ) -> jax.Array:
   """Rotate one head tile in f32, then round once to its dtype.
 
-  cos and sin axes already match the tile's physical Q/K layout.
+  coefficients is prepare_rotary's packed cos/sin plane for the tile's tokens,
+  laid out like the tile's physical Q/K layout.
   """
   head_dim_axis = 1 if head_dim_minor else 0
-  half_dim = cos.shape[head_dim_axis]
+  head_dim = tile.shape[head_dim_axis]
   dim_ids = lax.broadcasted_iota(jnp.int32, tile.shape, head_dim_axis)
+  # Note (david): Mosaic's dynamic_gather reads one source vreg along the
+  # gather axis, so a head wider than 128 lanes cannot gather its partner,
+  # while rolls cross vregs. pltpu.roll takes non-negative shifts only, so a
+  # roll by head_dim - 1 brings each dim its successor.
   if interleaved:
     is_first_of_pair = dim_ids % 2 == 0
-    partner_ids = dim_ids ^ 1
-    frequency_ids = dim_ids // 2
+
+    def _swap_pairs(value):
+      # Note (david): the wrapped dims of both rolls are never selected.
+      return jnp.where(is_first_of_pair,
+                       pltpu.roll(value, head_dim - 1, head_dim_axis),
+                       pltpu.roll(value, 1, head_dim_axis))
   else:
-    is_first_of_pair = dim_ids < half_dim
-    partner_ids = jnp.where(
-        is_first_of_pair, dim_ids + half_dim, dim_ids - half_dim)
-    frequency_ids = dim_ids % half_dim
+    is_first_of_pair = dim_ids < head_dim // 2
+
+    def _swap_pairs(value):
+      return pltpu.roll(value, head_dim // 2, head_dim_axis)
   tile_f32 = tile.astype(jnp.float32)
-  # Note (david): take_along_axis lowers to Mosaic's native dynamic_gather, so
-  # no lane-axis reshape, unaligned bf16 Ref slice or cross-head permutation.
-  partner = jnp.take_along_axis(tile_f32, partner_ids, axis=head_dim_axis,
-                                mode="promise_in_bounds")
-  cosine = jnp.take_along_axis(cos.astype(jnp.float32), frequency_ids,
-                               axis=head_dim_axis, mode="promise_in_bounds")
-  sine = jnp.take_along_axis(sin.astype(jnp.float32), frequency_ids,
-                             axis=head_dim_axis, mode="promise_in_bounds")
-  signed_partner = jnp.where(is_first_of_pair, -partner, partner)
-  rotated = tile_f32 * cosine + signed_partner * sine
+  packed = coefficients.astype(jnp.float32)
+  # Note (david): swapping the packed plane's pairs puts sin under each cos and
+  # cos under each sin, so one select per plane spreads both over the head.
+  swapped = _swap_pairs(packed)
+  cosine = jnp.where(is_first_of_pair, packed, swapped)
+  sine = jnp.where(is_first_of_pair, -swapped, packed)
+  rotated = tile_f32 * cosine + _swap_pairs(tile_f32) * sine
   return rotated.astype(tile.dtype)

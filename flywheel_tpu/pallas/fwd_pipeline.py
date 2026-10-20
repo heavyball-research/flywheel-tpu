@@ -268,8 +268,8 @@ def fwd_body(
     for g in range(rotary_groups):
       batch_idx = 0 if rotary_batch == 1 else (head + g) // heads_per_batch
       rows = pl.ds(tok, block)
-      coeff_window = (coeff_hbm.at[:, batch_idx, rows, :] if is_head_dim_minor
-                      else coeff_hbm.at[:, batch_idx, :, rows])
+      coeff_window = (coeff_hbm.at[batch_idx, rows, :] if is_head_dim_minor
+                      else coeff_hbm.at[batch_idx, :, rows])
       yield pltpu.make_async_copy(
           coeff_window, coeff_buf.at[slot, g], sems.at[sem_plane, slot])
 
@@ -277,11 +277,9 @@ def fwd_body(
     for g in range(head_fold):
       head_ref, half = _fold_lane(buf.at[slot], g, block, lane_width_qk)
       coeff_group = 0 if rotary_groups == 1 else g
-      cos = coeff_buf[slot, coeff_group, 0]
-      sin = coeff_buf[slot, coeff_group, 1]
       staged = head_ref[...]
       head_value = _take_half(staged, half, lane_width_qk)
-      rotated = rotate_tile(head_value, cos, sin,
+      rotated = rotate_tile(head_value, coeff_buf[slot, coeff_group],
                             interleaved=rotary_interleaved,
                             head_dim_minor=is_head_dim_minor)
       head_ref[...] = (rotated if half is None
@@ -293,7 +291,7 @@ def fwd_body(
     def _rotate_head(h, carry):
       head_ref = q_buf.at[slot, h]
       head_ref[...] = rotate_tile(
-          head_ref[...], rotary_q_buf[slot, 0, 0], rotary_q_buf[slot, 0, 1],
+          head_ref[...], rotary_q_buf[slot, 0],
           interleaved=rotary_interleaved, head_dim_minor=is_head_dim_minor)
       return carry
 
@@ -1386,7 +1384,7 @@ def forward_common(
 
   kernel is the mode kernel with its schedule already bound; every fwd_body
   static that follows from block_sizes or the q/k/v shapes is bound here.
-  rotary is the (2, batch, tokens, head_dim / 2) Q and K coefficient pair
+  rotary is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair
   (K None when K arrives rotated). Returns o shaped like q (head_dim_v wide),
   or (o, lse) with a (num_q_heads, q_seq_len) float32 natural-log lse.
 
@@ -1536,16 +1534,16 @@ def forward_common(
       raise ValueError("rotary must contain Q and K coefficient arrays.")
     rotary_q_coeff, rotary_k_coeff = rotary
     rotary_k = rotary_k_coeff is not None
-    if (rotary_q_coeff.ndim != 4 or rotary_q_coeff.shape[0] != 2
-        or rotary_q_coeff.shape[1] == 0
-        or rotary_q_coeff.shape[2] != q_seq_len
-        or (rotary_k and (rotary_k_coeff.ndim != 4
-                          or rotary_q_coeff.shape[:2] != rotary_k_coeff.shape[:2]
-                          or rotary_k_coeff.shape[2] != kv_seq_len
-                          or rotary_q_coeff.shape[3] != rotary_k_coeff.shape[3]))):
-      raise ValueError("rotary coefficients must be (2, batch, tokens, head_dim/2).")
-    rotary_dim = 2 * rotary_q_coeff.shape[3]
-    rotary_batch = rotary_q_coeff.shape[1]
+    if (rotary_q_coeff.ndim != 3
+        or rotary_q_coeff.shape[0] == 0
+        or rotary_q_coeff.shape[1] != q_seq_len
+        or (rotary_k and (rotary_k_coeff.ndim != 3
+                          or rotary_q_coeff.shape[0] != rotary_k_coeff.shape[0]
+                          or rotary_k_coeff.shape[1] != kv_seq_len
+                          or rotary_q_coeff.shape[2] != rotary_k_coeff.shape[2]))):
+      raise ValueError("rotary coefficients must be (batch, tokens, head_dim).")
+    rotary_dim = rotary_q_coeff.shape[2]
+    rotary_batch = rotary_q_coeff.shape[0]
     # Note (david): float32 coefficients keep the in-kernel f32 rotation
     # identical to an f32 RoPE computed outside the kernel.
     rotary_dtype = rotary_q_coeff.dtype
@@ -1624,8 +1622,8 @@ def forward_common(
     scratch_shapes.append(vmem((1, 2, bkv), jnp.int32))
   if rotary_dim:
     scratch_shapes += [
-        vmem((num_stages, rotary_groups, 2,
-              *from_head_minor((block, rotary_dim // 2), qkv_layout)),
+        vmem((num_stages, rotary_groups,
+              *from_head_minor((block, rotary_dim), qkv_layout)),
              rotary_dtype)
         for block in ((bq, bkv) if rotary_k else (bq,))
     ]

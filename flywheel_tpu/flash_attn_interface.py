@@ -64,9 +64,9 @@ TOKEN_MAJOR_PACKED_AXIS = 0
 HEAD_MAJOR_PACKED_AXIS = 1
 AXIS_NAMES = {"b": "batch", "h": "nheads", "s": "seqlen", "t": "total",
               "d": "headdim"}
-# Note (david): prepare_rotary returns (2, batch, tokens, head_dim / 2), cos
-# then sin.
-ROTARY_TOKEN_AXIS = 2
+# Note (david): prepare_rotary returns (batch, tokens, head_dim) packed cos/sin
+# planes.
+ROTARY_TOKEN_AXIS = 1
 
 
 def pad_seqlen(seqlen: int) -> int:
