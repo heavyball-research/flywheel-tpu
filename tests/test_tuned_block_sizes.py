@@ -3,15 +3,13 @@ key, and the kernel then builds with its default config."""
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache, tuned_block_sizes
 from flywheel_tpu.pallas import flash_fwd_kvcache
-from tests.test_flash_attn_kvcache import (
-    INTERPRET,
-    interleave_kv,
-    random_paged_decode_inputs,
-)
+from tests.test_flash_attn import INTERPRET, generate_block_kvcache, interleave_kv
+from tests.test_util import randn
 
 # A TPU v7 decode entry, and the same shape at a batch with no entry.
 TUNED_DECODE = dict(
@@ -78,8 +76,11 @@ def test_tuned_block_kv_not_a_multiple_of_the_page_size_warns(
       flash_fwd_kvcache, "get_tuned_kvcache_config", lambda **_: (128, 128, 2))
   # The lookup runs while the kernel is traced.
   jax.clear_caches()
-  q, k_pages, v_pages, block_table, k, v = random_paged_decode_inputs(
-      0, 2, 512, 256, 16, 4, 128)
+  rng = np.random.default_rng(0)
+  _, _, block_table, k_pages, v_pages, _ = generate_block_kvcache(
+      512, 256, 2, 4, 128, 128, rng, jnp.bfloat16)
+  q = randn(rng, (2, 1, 16, 128))
+  k, v = randn(rng, (2, 1, 4, 128)), randn(rng, (2, 1, 4, 128))
   out, _ = flash_attn_with_kvcache(
       q, interleave_kv(k_pages, v_pages), None, k, v,
       cache_seqlens=jnp.array([300, 511], jnp.int32), block_table=block_table,
