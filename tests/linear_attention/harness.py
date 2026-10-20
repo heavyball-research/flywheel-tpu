@@ -53,6 +53,8 @@ class Ops:
     replay: Callable[..., tuple]
     record_dim: Callable[..., int]
     gate_dim: Callable[..., int]
+    split_checkpoint: Callable[[jax.Array], jax.Array]
+    merge_checkpoint: Callable[[jax.Array], jax.Array]
     next_replay_lens: Callable[..., jax.Array]
     per_channel_gate: bool
     gate_dtype: jnp.dtype
@@ -60,10 +62,12 @@ class Ops:
 
 GDN = Ops(gdn_wrapper.fused_conv1d_gdn, gdn_wrapper.fused_conv1d_gdn_replay,
           gdn_wrapper.replay_record_dim, gdn_wrapper.replay_gate_dim,
+          gdn_wrapper.split_checkpoint, gdn_wrapper.merge_checkpoint,
           gdn_wrapper.next_replay_lens, per_channel_gate=False,
           gate_dtype=jnp.float32)
 KDA = Ops(kda_wrapper.fused_conv1d_kda, kda_wrapper.fused_conv1d_kda_replay,
           kda_wrapper.replay_record_dim, kda_wrapper.replay_gate_dim,
+          kda_wrapper.split_checkpoint, kda_wrapper.merge_checkpoint,
           kda_wrapper.next_replay_lens, per_channel_gate=True,
           gate_dtype=jnp.bfloat16)
 
@@ -273,6 +277,7 @@ class Fused:
         state_pool = jnp.asarray(self.state_pool)
         num_seqs = self.lengths.size
         if record_dtype is not None:
+            state_pool = self.ops.split_checkpoint(state_pool)
             # Note (david): NaN records and gates catch any read past the
             # committed ones.
             record_dims = (self.n_kq, self.n_v, self.d_k, self.d_v)
@@ -318,6 +323,8 @@ class Fused:
         out = jnp.zeros((self.qkv.shape[0], self.n_v * self.d_v),
                         jnp.float32).at[np.concatenate(out_rows)].set(
                             jnp.concatenate(outs).astype(jnp.float32))
+        if record_dtype is not None:
+            state_pool = self.ops.merge_checkpoint(state_pool)
         self.final_conv_pool, self.final_state_pool = conv_pool, state_pool
         if record_dtype is None:
             return self._output(out), state_pool[self.state_indices]

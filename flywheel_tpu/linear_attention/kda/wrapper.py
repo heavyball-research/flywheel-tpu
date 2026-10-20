@@ -120,14 +120,18 @@ def inner_kernel(
     replay_out_ref: jax.Array | None,
     replay_gate_in_ref: jax.Array | None,
     replay_gate_out_ref: jax.Array | None,
+    recurrent_lo_in_ref: jax.Array | None,
+    wait_flush_in: Callable[[int], None] | None,
     start_flush_out: Callable[[int], None] | None,
     *,
     cfg: config.KDAConfig,
 ) -> None:
     """Compute one tile from its VMEM ring slots and stage its outputs.
 
-    A replay tile also starts its flushes' DMAs: start_flush_out(idx) starts
-    record idx's checkpoint write.
+    A replay tile reads its checkpoints' hi planes from recurrent_in_ref and
+    owns its flushes' DMAs: wait_flush_in(idx) waits for record idx's lo plane
+    read into recurrent_lo_in_ref and start_flush_out(idx) starts its
+    checkpoint write.
     """
     profile_scope = compute_kda.profile_scope
     with profile_scope("load_states"):
@@ -136,6 +140,7 @@ def inner_kernel(
             p_id=p_id,
             conv_state_slot_ref=conv_in_ref,
             recurrent_slot_ref=recurrent_in_ref,
+            recurrent_lo_slot_ref=recurrent_lo_in_ref,
             carry_conv_scratch_ref=carry_conv_scratch_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
             cfg=cfg,
@@ -154,8 +159,12 @@ def inner_kernel(
     def _store_states(new_conv_state, new_recurrent_state):
         with profile_scope("state_store"):
             conv_out_ref[...] = new_conv_state
-            recurrent_out_ref[...] = new_recurrent_state.astype(
-                recurrent_out_ref.dtype)
+            if cfg.split_checkpoint:
+                recurrent_out_ref[...] = jnp.stack(
+                    compute_kda.split_checkpoint(new_recurrent_state), axis=-4)
+            else:
+                recurrent_out_ref[...] = new_recurrent_state.astype(
+                    recurrent_out_ref.dtype)
             if carry_conv_scratch_ref is not None:
                 carry_conv_scratch_ref[...] = new_conv_state[:, -1]
             if carry_recurrent_scratch_ref is not None:
@@ -196,10 +205,14 @@ def inner_kernel(
                         records=replay_in_ref[idx].astype(jnp.float32),
                         gates=replay_gate_in_ref[idx],
                         num_records=_num_records(record),
-                        checkpoint_ref=recurrent_in_ref.at[idx, 0],
+                        checkpoint_hi_ref=recurrent_in_ref.at[idx, 0],
+                        checkpoint_lo_ref=recurrent_lo_in_ref.at[idx, 0],
+                        wait_checkpoint_lo=functools.partial(
+                            wait_flush_in, idx),
                         cfg=cfg)
-                    recurrent_out_ref[idx, 0] = checkpoint.astype(
-                        recurrent_out_ref.dtype)
+                    hi, lo = compute_kda.split_checkpoint(checkpoint)
+                    recurrent_out_ref[idx, 0, 0] = hi
+                    recurrent_out_ref[idx, 0, 1] = lo
                     start_flush_out(idx)
 
         def _merge_rows(rows, new_rows, rows_in, base, num_new_rows):
@@ -215,11 +228,11 @@ def inner_kernel(
             is_new_row = (rows >= base) & (rows < base + num_new_rows)
             return jnp.where(is_new_row, shifted, rows_in)
 
-        # Note (david): folding mid tile overlaps the flush's checkpoint writes
-        # with the steps after it. When only the flushes read the f32
-        # checkpoint (v6e, B=256, decode, tile 4) this measured 494.4 us with
-        # the flush DMAs at the tile boundaries and 416.0 us folding after 2
-        # steps; not re-measured since every decode reads it.
+        # Note (david): folding mid tile overlaps the flush's lo plane read
+        # with the steps before it and its writes with the steps after. With
+        # an f32 flush read in place of the lo plane (v6e, B=256, decode, tile
+        # 4) this measured 494.4 us with the flush DMAs at the tile
+        # boundaries and 416.0 us folding after 2 steps.
         flush_pass_pos = cfg.seq_tile_size // 2
         seq_outs = []
         for idx in range(cfg.seq_tile_size):
@@ -233,7 +246,7 @@ def inner_kernel(
                 q_chunked=q[idx], k_chunked=k[idx], v_chunked=v[idx],
                 b_rows=b[idx], g_chunked=g[idx], num_tokens=record.r_size,
                 num_records=_num_records(record), records=records_in,
-                gates=gates_in, checkpoint_ref=recurrent_in_ref.at[idx, 0],
+                gates=gates_in, checkpoint_hi_ref=recurrent_in_ref.at[idx, 0],
                 a_log=a_log, dt_bias=dt_bias, cfg=cfg)
             seq_outs.append(out)
             with profile_scope("replay_merge"):
@@ -431,6 +444,7 @@ def outer_kernel(
     g_buf: jax.Array,
     conv_in_buf: jax.Array,
     rec_in_buf: jax.Array,
+    rec_lo_in_buf: jax.Array | None,
     conv_out_buf: jax.Array,
     rec_out_buf: jax.Array,
     replay_in_buf: jax.Array | None,
@@ -449,8 +463,8 @@ def outer_kernel(
     tile t computes and the outputs of tile t - 1 are waited only after tile
     t's outputs start, so both overlap tile t's compute. State inputs and
     outputs use separate rings, so no slot is read by one DMA while another
-    writes it. A replay tile's flushes start their checkpoint writes inside
-    its compute.
+    writes it. A replay tile's flushes wait for their checkpoints' lo plane
+    reads and start their checkpoint writes inside its compute.
     """
     # Note (david): the tile loop indexes its VMEM rings as t % 2 and 1 - slot.
     assert cfg.num_buffers == config.NUM_BUFFERS, cfg.num_buffers
@@ -485,19 +499,30 @@ def outer_kernel(
             memory_ref.start_conv_in(conv_state_ref, conv_in_buf.at[slot],
                                      sems.at[config.STREAM_CONV_IN, slot],
                                      *tile_args)
-            # Note (david): every replay decode reads its f32 checkpoint, whose
-            # single slot ignores the read offset.
-            memory_ref.start_state_in(recurrent_state_ref, rec_in_buf.at[slot],
-                                      sems.at[config.STREAM_REC_IN, slot],
-                                      *tile_args,
-                                      apply_read_offset=not cfg.is_replay)
             if cfg.is_replay:
+                # Note (david): every decode reads its checkpoint's hi plane,
+                # and the single slot of a replay checkpoint ignores the read
+                # offset. Only the flushes read the lo plane, mid tile, so it
+                # queues behind the inputs the tile waits for at its start.
+                memory_ref.start_state_in(
+                    recurrent_state_ref, rec_in_buf.at[slot],
+                    sems.at[config.STREAM_REC_IN, slot], *tile_args,
+                    apply_read_offset=False, plane=0)
                 memory_ref.start_replay_in(
                     replay_state_ref, replay_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_IN, slot], *tile_args)
                 memory_ref.start_replay_in(
                     replay_gates_ref, replay_gate_in_buf.at[slot],
                     sems.at[config.STREAM_REPLAY_GATE_IN, slot], *tile_args)
+                memory_ref.start_state_in(
+                    recurrent_state_ref, rec_lo_in_buf.at[slot],
+                    sems.at[config.STREAM_REC_LO_IN, slot], *tile_args,
+                    apply_read_offset=False, only_flushing=True, plane=1)
+            else:
+                memory_ref.start_state_in(recurrent_state_ref,
+                                          rec_in_buf.at[slot],
+                                          sems.at[config.STREAM_REC_IN, slot],
+                                          *tile_args)
 
     def _wait_in(p_id, slot):
         with profile_scope("wait_in"):
@@ -596,6 +621,11 @@ def outer_kernel(
         def _prefetch_next():
             _start_in(tile_idx + 1, other_slot)
 
+        def _wait_flush_in(idx):
+            memory_ref.wait_flushed_ckpt_in(
+                rec_lo_in_buf.at[slot], sems.at[config.STREAM_REC_LO_IN, slot],
+                tile_idx, idx, metadata_ref, cfg)
+
         def _start_flush_out(idx):
             memory_ref.start_flushed_ckpt_out(
                 recurrent_state_ref, rec_out_buf.at[slot],
@@ -623,6 +653,8 @@ def outer_kernel(
             replay_gate_in_buf.at[slot],
             None if replay_gate_out_buf is None else
             replay_gate_out_buf.at[slot],
+            None if rec_lo_in_buf is None else rec_lo_in_buf.at[slot],
+            _wait_flush_in if cfg.is_replay else None,
             _start_flush_out if cfg.is_replay else None,
             cfg=cfg,
         )
@@ -754,6 +786,40 @@ def replay_gate_dim(n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
     arguments."""
     del n_kq, d_v
     return n_v * d_k
+
+
+def replay_checkpoint_shape(n_kq: int, n_v: int, d_k: int,
+                            d_v: int) -> tuple[int, int, int, int]:
+    """Shape of one slot of the int32 replay checkpoint: the hi and lo planes
+    of an f32 [n_v, d_k, d_v] checkpoint, two 16-bit values per word (rows i
+    and i + d_k / 2). Takes replay_record_dim's arguments."""
+    del n_kq
+    # Note (david): a decode unpacks the two row halves of a word onto whole
+    # f32 sublane tiles.
+    if d_k % (2 * config.SUBLANE_ALIGN):
+        raise ValueError("a replay checkpoint needs d_k divisible by "
+                         f"{2 * config.SUBLANE_ALIGN}, got {d_k}")
+    return (2, n_v, d_k // 2, d_v)
+
+
+def split_checkpoint(recurrent_state: jax.Array) -> jax.Array:
+    """The int32 replay checkpoint [..., 2, n_v, d_k // 2, d_v] of f32
+    recurrent states [..., n_v, d_k, d_v]: plane 0 holds each value's bf16
+    rounded half up on its bit pattern, plane 1 its low 16 bits."""
+    if recurrent_state.dtype != jnp.float32:
+        raise TypeError("split_checkpoint takes float32 states, got "
+                        f"{recurrent_state.dtype}")
+    return jnp.stack(compute_kda.split_checkpoint(recurrent_state), axis=-4)
+
+
+def merge_checkpoint(checkpoint: jax.Array) -> jax.Array:
+    """The f32 recurrent states [..., n_v, d_k, d_v] of an int32 replay
+    checkpoint [..., 2, n_v, d_k // 2, d_v], bit for bit."""
+    if checkpoint.dtype != jnp.int32 or checkpoint.shape[-4] != 2:
+        raise TypeError("merge_checkpoint takes int32 [..., 2, n_v, d_k // 2, "
+                        f"d_v], got {checkpoint.dtype} {checkpoint.shape}")
+    return compute_kda.merge_checkpoint(checkpoint[..., 0, :, :, :],
+                                        checkpoint[..., 1, :, :, :])
 
 
 @jax.jit(donate_argnames=("conv_state", "recurrent_state"),
@@ -914,10 +980,14 @@ def fused_conv1d_kda_replay(
     replay_gates[slot], appends its tokens' records, and writes the
     checkpoint only when it flushes. A KDA gate row holds the
     per-key-channel log decay, n_v * d_k f32 lanes, where a GDN one holds one
-    log decay per value head.
+    log decay per value head. The checkpoint's hi and lo planes are as there:
+    a decode reads only the hi plane, a flush or prefill both.
 
     Args:
-        recurrent_state: f32 checkpoint cache [num_slots, n_v, d_k, d_v].
+        recurrent_state: int32 checkpoint cache [num_slots,
+            *replay_checkpoint_shape(n_kq, n_v, d_k, d_v)], each f32
+            checkpoint as a hi and a lo plane; split_checkpoint and
+            merge_checkpoint convert. All-zero planes are the zero state.
         replay_state: f32 or bf16 record buffer [num_slots, replay_window,
             replay_record_dim(n_kq, n_v, d_k, d_v)].
         replay_gates: f32 gates of the records [num_slots, replay_window,
@@ -1105,9 +1175,13 @@ def launch_fused_conv1d_kda(
                             f"{replay_gates.dtype}")
         if replay_lens.shape != state_indices.shape:
             raise ValueError("replay_lens must have one entry per sequence")
-        if recurrent_state.dtype != jnp.float32:
-            raise TypeError("a replay checkpoint must be float32, got "
-                            f"{recurrent_state.dtype}")
+        checkpoint_shape = (recurrent_state.shape[0],
+                            *replay_checkpoint_shape(n_kq, n_v, d_k, d_v))
+        if (recurrent_state.dtype != jnp.int32
+                or recurrent_state.shape != checkpoint_shape):
+            raise TypeError(
+                f"a replay checkpoint must be int32 {checkpoint_shape}, got "
+                f"{recurrent_state.dtype} {recurrent_state.shape}")
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -1117,11 +1191,13 @@ def launch_fused_conv1d_kda(
     aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
 
     if replay_window:
-        # Note (david): a replay tile reads one f32 checkpoint and writes at
-        # most one per sequence whatever its window; only the conv state keeps
-        # a checkpoint per window position. Each sequence also leaves one more
-        # checkpoint for the compiler's temporaries. The tile is not shrunk to
-        # fit: a caller whose shape does not fit picks a smaller one.
+        # Note (david): a replay tile reads a checkpoint's hi plane, and its
+        # lo plane on a flush, and writes at most one checkpoint per sequence
+        # whatever its window: two f32 checkpoints' bytes per sequence and
+        # ring slot. Only the conv state keeps a checkpoint per window
+        # position. Each sequence also leaves one more checkpoint for the
+        # compiler's temporaries. The tile is not shrunk to fit: a caller
+        # whose shape does not fit picks a smaller one.
         decode_tile_size = min(decode_tile_size, batch_size)
         state_bytes = n_v * d_k * d_v * F32_BYTES
         record_bytes = replay_window * (
@@ -1233,6 +1309,7 @@ def launch_fused_conv1d_kda(
             lower_bound=lower_bound,
             beta_is_activated=beta_is_activated,
             replay_window=kernel_replay_window,
+            split_checkpoint=replay_window > 0,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,

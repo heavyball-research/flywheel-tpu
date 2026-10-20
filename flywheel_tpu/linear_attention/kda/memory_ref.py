@@ -340,12 +340,18 @@ def wait_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).wait()
 
 
-def reads_state(record: PackedPIdRecord,
-                metadata_ref: MetadataRef) -> jax.Array:
+def reads_state(record: PackedPIdRecord, metadata_ref: MetadataRef,
+                only_flushing: bool) -> jax.Array:
     """Whether the record's sequence fetches its initial state: on its first
-    tile, if it has one."""
-    return jnp.logical_and(record.is_first_tile,
-                           metadata_ref.s_idx_has_initial_state[record.s_idx])
+    tile, if it has one, and with only_flushing only if it flushes."""
+    s_idx = record.s_idx
+    should_read = jnp.logical_and(record.is_first_tile,
+                                  metadata_ref.s_idx_has_initial_state[s_idx])
+    if only_flushing:
+        return jnp.logical_and(should_read,
+                               metadata_ref.s_idx_to_flush[s_idx] != 0)
+    else:
+        return should_read
 
 
 def start_state_in(hbm_ref: jax.Ref,
@@ -354,11 +360,15 @@ def start_state_in(hbm_ref: jax.Ref,
                    p_id: int | jax.Array,
                    metadata_ref: MetadataRef,
                    cfg: config.KDAConfig,
-                   apply_read_offset: bool = True) -> None:
+                   apply_read_offset: bool = True,
+                   only_flushing: bool = False,
+                   plane: int | None = None) -> None:
     """Fetch each sequence's initial checkpoint into window position 0.
 
     Only a sequence's first tile reads, and only if it has an initial state.
     A replay checkpoint has a single slot, so it ignores the read offset.
+    plane picks one plane of a split checkpoint; with only_flushing only the
+    flushing sequences read.
     """
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
@@ -368,20 +378,30 @@ def start_state_in(hbm_ref: jax.Ref,
                          metadata_ref.s_idx_to_read_offset[s_idx])
         else:
             read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
-        num_states = jnp.where(reads_state(record, metadata_ref), 1, 0)
+        num_states = jnp.where(
+            reads_state(record, metadata_ref, only_flushing), 1, 0)
+        if plane is None:
+            state_ref = hbm_ref.at[pl.ds(read_slot, num_states)]
+        else:
+            state_ref = hbm_ref.at[pl.ds(read_slot, num_states), plane]
         pltpu.make_async_copy(
-            hbm_ref.at[pl.ds(read_slot, num_states)],
+            state_ref,
             buf_ref.at[idx, pl.ds(0, num_states)],
             sem,
         ).start()
 
 
-def wait_state_in(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                  metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
+def wait_state_in(buf_ref: jax.Ref,
+                  sem: jax.Ref,
+                  p_id: int | jax.Array,
+                  metadata_ref: MetadataRef,
+                  cfg: config.KDAConfig,
+                  only_flushing: bool = False) -> None:
     num_states = 0
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
-        num_states += jnp.where(reads_state(record, metadata_ref), 1, 0)
+        num_states += jnp.where(
+            reads_state(record, metadata_ref, only_flushing), 1, 0)
     wait_row_dma(buf_ref, num_states, sem)
 
 
@@ -567,6 +587,30 @@ def num_flushed_ckpts(record: PackedPIdRecord,
                       metadata_ref: MetadataRef) -> jax.Array:
     is_flush = metadata_ref.s_idx_to_flush[record.s_idx] != 0
     return jnp.where(jnp.logical_and(record.is_last_tile, is_flush), 1, 0)
+
+
+def wait_flushed_ckpt_in(buf_ref: jax.Ref, sem: jax.Ref,
+                         p_id: int | jax.Array, idx: int,
+                         metadata_ref: MetadataRef,
+                         cfg: config.KDAConfig) -> None:
+    """Wait, before record idx's flush reads its checkpoint's lo plane, for
+    the tile's lo plane reads (start_state_in with only_flushing)."""
+    # Note (david): the reads share one byte-counting semaphore, so a wait
+    # sized to one record's read could return on another record's bytes; the
+    # tile's first reading record waits for all of them.
+    reads = [
+        reads_state(metadata_ref.get_record(p_id, prev), metadata_ref,
+                    only_flushing=True) for prev in range(idx + 1)
+    ]
+    is_first_read = reads[idx]
+    for prev_reads in reads[:idx]:
+        is_first_read = jnp.logical_and(is_first_read,
+                                        jnp.logical_not(prev_reads))
+
+    @pl.when(is_first_read)
+    def _wait():
+        wait_state_in(buf_ref, sem, p_id, metadata_ref, cfg,
+                      only_flushing=True)
 
 
 def start_flushed_ckpt_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,

@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import config, memory_ref
+from . import compute_gdn, config, memory_ref
 
 
 def split_qkv_heads(
@@ -95,6 +95,7 @@ def load_and_select_states(
     p_id: jax.Array,
     conv_state_slot_ref: jax.Ref,
     recurrent_slot_ref: jax.Ref,
+    recurrent_lo_slot_ref: jax.Ref | None,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
@@ -104,15 +105,16 @@ def load_and_select_states(
     A sequence's first tile starts from the state DMA'd from HBM, or zeros
     without an initial state; later tiles start from the previous tile's
     carry. conv_state_slot_ref is [seq_tile_size, 1, prev_kernel_size,
-    dim_size] and recurrent_slot_ref [seq_tile_size, 1, num_v_heads,
-    kq_head_dim, v_head_dim]; the carries drop the unit axis and are None in
-    BATCHED mode. Returns real_sizes [seq_tile_size], the f32 conv state
-    [seq_tile_size, prev_kernel_size, dim_size] and the recurrent state
-    [seq_tile_size, num_v_heads, kq_head_dim, v_head_dim].
+    dim_size] and recurrent_slot_ref [seq_tile_size, 1, *stored_state_shape];
+    the carries drop the unit axis and are None in BATCHED mode. Returns
+    real_sizes [seq_tile_size], the f32 conv state [seq_tile_size,
+    prev_kernel_size, dim_size] and the f32 recurrent state [seq_tile_size,
+    num_v_heads, kq_head_dim, v_head_dim].
 
-    A replay tile reads its f32 checkpoints straight from recurrent_slot_ref,
-    so the slot of a sequence without an initial state is zeroed in place and
-    the returned recurrent state is None.
+    A replay tile reads its checkpoints straight from the ring slots (the hi
+    planes in recurrent_slot_ref, the flushes' lo planes in
+    recurrent_lo_slot_ref), so both slots of a sequence without an initial
+    state are zeroed in place and the returned recurrent state is None.
     """
     real_size_list = []
     conv_state_list = []
@@ -138,15 +140,23 @@ def load_and_select_states(
         real_size_list.append(r_size)
         conv_state_list.append(conv_state)
         if cfg.is_replay:
-            checkpoint_ref = recurrent_slot_ref.at[idx, 0]
+            plane_refs = (recurrent_slot_ref.at[idx, 0],
+                          recurrent_lo_slot_ref.at[idx, 0])
 
+            # Note (david): zero hi and lo planes are the f32 zero checkpoint.
             @pl.when(jnp.logical_not(has_initial_state))
-            def _zero_checkpoint(checkpoint_ref=checkpoint_ref):
-                checkpoint_ref[...] = jnp.zeros(checkpoint_ref.shape,
-                                                checkpoint_ref.dtype)
+            def _zero_checkpoint(plane_refs=plane_refs):
+                for ref in plane_refs:
+                    ref[...] = jnp.zeros(ref.shape, ref.dtype)
         else:
+            if cfg.split_checkpoint:
+                planes = recurrent_slot_ref[idx, 0]
+                hbm_recurrent_state = compute_gdn.merge_checkpoint(
+                    planes[0], planes[1])
+            else:
+                hbm_recurrent_state = recurrent_slot_ref[idx, 0]
             initial_recurrent_state = jnp.where(has_initial_state,
-                                                recurrent_slot_ref[idx, 0], 0)
+                                                hbm_recurrent_state, 0)
             if carry_recurrent_scratch_ref is None:
                 recurrent_state = initial_recurrent_state
             else:

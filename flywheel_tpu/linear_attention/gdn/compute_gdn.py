@@ -960,6 +960,55 @@ def recurrent_gdn(
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
 
 
+def pack_rows(halves: jax.Array) -> jax.Array:
+    """[..., rows, cols] 16-bit values (in int32) -> [..., rows // 2, cols]
+    int32 words holding row i in the low half and row i + rows / 2 in the
+    high half."""
+    num_rows = halves.shape[-2] // 2
+    return halves[..., :num_rows, :] | (halves[..., num_rows:, :] << 16)
+
+
+def split_checkpoint(state: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The hi and lo planes [..., kq_head_dim // 2, v_head_dim] int32 of an f32
+    checkpoint [..., kq_head_dim, v_head_dim].
+
+    hi holds each value's bf16, rounded half up on its bit pattern, and lo
+    its low 16 bits; pack_rows puts two rows in a word.
+    """
+    # Note (david): only integer ops and same-width bitcasts touch the bits,
+    # so no float op can flush a subnormal or quiet a NaN. Round half up
+    # leaves exactly 2^16 bit patterns per hi value (round to nearest even
+    # leaves 2^16 + 1 per even one), so hi and lo give the f32 back; a carry
+    # into the exponent is correct rounding.
+    bits = jax.lax.bitcast_convert_type(state, jnp.int32)
+    hi = jax.lax.shift_right_logical(bits + 0x8000, jnp.int32(16))
+    return pack_rows(hi), pack_rows(bits & 0xFFFF)
+
+
+def merge_checkpoint(hi_words: jax.Array, lo_words: jax.Array) -> jax.Array:
+    """The f32 checkpoint whose planes split_checkpoint made, bit for bit."""
+    row_halves = []
+    for hi, lo in ((hi_words & 0xFFFF, lo_words & 0xFFFF),
+                   (jax.lax.shift_right_logical(hi_words, jnp.int32(16)),
+                    jax.lax.shift_right_logical(lo_words, jnp.int32(16)))):
+        # Note (david): hi rounded up exactly when lo >= 0x8000.
+        upper = hi - jax.lax.shift_right_logical(lo, jnp.int32(15))
+        row_halves.append((upper << 16) | lo)
+    return jax.lax.bitcast_convert_type(
+        jnp.concatenate(row_halves, axis=-2), jnp.float32)
+
+
+def checkpoint_hi(hi_words: jax.Array) -> jax.Array:
+    """The bf16 checkpoint [..., kq_head_dim, v_head_dim] of a hi plane."""
+    # Note (david): a hi value in the high half of an f32 word is exactly a
+    # bf16, so the cast only repacks it (a subnormal flushes to zero, as in
+    # any dot operand).
+    row_halves = [hi_words << 16, hi_words & -0x10000]
+    return jax.lax.bitcast_convert_type(
+        jnp.concatenate(row_halves, axis=-2),
+        jnp.float32).astype(jnp.bfloat16)
+
+
 def replay_record_parts(
         records: jax.Array, gates: jax.Array, num_records: jax.Array,
         cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -1007,7 +1056,7 @@ def replay_gdn(
     num_records: jax.Array,
     records: jax.Array,
     gates: jax.Array,
-    checkpoint_ref: jax.Ref,
+    checkpoint_hi_ref: jax.Ref,
     a_log: jax.Array,
     dt_bias: jax.Array,
     cfg: config.GDNConfig,
@@ -1019,11 +1068,11 @@ def replay_gdn(
 
         exp(G_t) S + sum_{j < t} exp(G_t - G_j) k_j^T u_j,
 
-    so S, the f32 checkpoint in checkpoint_ref, enters only through
-    [k; q] @ S and the records only through dots with their k and u. Rows
-    from num_tokens on are padding. Returns the packed output [window,
-    num_v_heads * v_head_dim], the new records [window, record_dim] and their
-    gates [window, gate_dim].
+    so S, as the bf16 of the checkpoint's hi plane in checkpoint_hi_ref,
+    enters only through [k; q] @ S and the records only through dots with
+    their k and u. Rows from num_tokens on are padding. Returns the packed
+    output [window, num_v_heads * v_head_dim], the new records [window,
+    record_dim] and their gates [window, gate_dim].
     """
     window = cfg.window_size
     num_v_heads = cfg.num_v_heads
@@ -1071,11 +1120,11 @@ def replay_gdn(
     with profile_scope("replay_ckpt_read"):
         ckpt_scale = jnp.concatenate([decay_ckpt_col, decay_ckpt_col], axis=1)
         # Note (david): a default-precision f32 dot rounds both operands to
-        # bf16 (round to nearest) anyway (v6e), so S is rounded explicitly
-        # and the dot runs on bf16 operands.
+        # bf16 anyway (v6e), so S is read as the hi plane's bf16 and the dot
+        # runs on bf16 operands.
         ckpt_reads = batched_matmul(
             (kq_repeat * ckpt_scale).astype(jnp.bfloat16),
-            checkpoint_ref[...].astype(jnp.bfloat16))
+            checkpoint_hi(checkpoint_hi_ref[...]))
 
     with profile_scope("replay_record_read"):
         kq_dot_records = jax.lax.dot_general(
@@ -1139,11 +1188,17 @@ def replay_flush(
     records: jax.Array,
     gates: jax.Array,
     num_records: jax.Array,
-    checkpoint_ref: jax.Ref,
+    checkpoint_hi_ref: jax.Ref,
+    checkpoint_lo_ref: jax.Ref,
+    wait_checkpoint_lo: Callable[[], None],
     cfg: config.GDNConfig,
 ) -> jax.Array:
-    """Fold one sequence's first num_records records into its f32 checkpoint
-    and return the new checkpoint."""
+    """Fold one sequence's first num_records records into its f32 checkpoint,
+    rebuilt from its hi and lo planes, and return the new checkpoint.
+
+    wait_checkpoint_lo runs right before checkpoint_lo_ref is read, so the
+    caller can wait for its DMA there.
+    """
     num_v_heads = cfg.num_v_heads
     u_records, k_records, g_records = replay_record_parts(
         records, gates, num_records, cfg)
@@ -1160,5 +1215,7 @@ def replay_flush(
                                 u_records,
                                 precision=jax.lax.Precision.HIGHEST)
         decay_total = gate_column(jnp.exp(g_records_total), num_v_heads)
-        return (checkpoint_ref[...].astype(cfg.dtypes.compute) * decay_total +
-                update)
+        wait_checkpoint_lo()
+        checkpoint = merge_checkpoint(checkpoint_hi_ref[...],
+                                      checkpoint_lo_ref[...])
+        return checkpoint.astype(cfg.dtypes.compute) * decay_total + update

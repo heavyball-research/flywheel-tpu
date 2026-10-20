@@ -51,7 +51,8 @@ STREAM_REPLAY_IN = 8
 STREAM_REPLAY_OUT = 9
 STREAM_REPLAY_GATE_IN = 10
 STREAM_REPLAY_GATE_OUT = 11
-NUM_STREAMS = 12
+STREAM_REC_LO_IN = 12
+NUM_STREAMS = 13
 
 
 class KDAMode(enum.StrEnum):
@@ -110,6 +111,16 @@ class KDAConfig:
     # tokens beside the checkpoint, so a decode step writes the state only
     # when they overflow. 0 turns it off.
     replay_window: int = 0
+    # Note (david): the replay API stores each f32 checkpoint as two 16-bit
+    # planes, hi (its bf16, rounded half up on the bits) and lo (its low 16
+    # bits), so a decode step reads only the hi plane and a flush or a PER_SEQ
+    # tile rebuilds the f32 checkpoint exactly from both. A plane packs rows
+    # i and i + kq_head_dim / 2 of a head into one int32 word.
+    split_checkpoint: bool = False
+
+    def __post_init__(self) -> None:
+        assert self.split_checkpoint or not self.is_replay, (
+            "a replay decode reads the hi plane of a split checkpoint")
 
     @property
     def is_replay(self) -> bool:
@@ -192,6 +203,20 @@ class KDAConfig:
         decay per value head."""
         return self.num_v_heads * self.kq_head_dim
 
+    @property
+    def checkpoint_plane_shape(self) -> tuple[int, int, int]:
+        """One plane of a split checkpoint, in int32 words."""
+        return (self.num_v_heads, self.kq_head_dim // 2, self.v_head_dim)
+
+    @property
+    def stored_state_shape(self) -> tuple[int, ...]:
+        """One recurrent state as HBM holds it: f32 [num_v_heads,
+        kq_head_dim, v_head_dim], or the hi and lo planes of a split
+        checkpoint."""
+        if self.split_checkpoint:
+            return (2, *self.checkpoint_plane_shape)
+        return (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
+
     def get_scratch_shape_dict(self) -> dict[str, pl.MemoryRef | None]:
         """VMEM rings, inter-tile carries and DMA semaphores of the pipeline.
 
@@ -220,6 +245,17 @@ class KDAConfig:
         else:
             carry_conv_scratch = None
             carry_recurrent_scratch = None
+
+        # Note (david): a replay tile reads the hi plane of every checkpoint
+        # and, into its own ring, the lo plane of the ones it flushes.
+        if self.is_replay:
+            rec_in_shape = self.checkpoint_plane_shape
+            rec_lo_in_buf = pltpu.VMEM(
+                (slots, tile_seqs, 1, *self.checkpoint_plane_shape),
+                self.dtypes.recurrent_state)
+        else:
+            rec_in_shape = self.stored_state_shape
+            rec_lo_in_buf = None
 
         # Note (david): the record axis is tiled, so record DMAs move whole
         # SUBLANE_ALIGN-row windows and a slot holds the full buffer. The f32
@@ -252,13 +288,14 @@ class KDAConfig:
                 self.dtypes.act_in),
             "conv_in_buf": pltpu.VMEM((slots, tile_seqs, 1, *conv_state_shape),
                                       self.dtypes.conv_state),
-            "rec_in_buf": pltpu.VMEM((slots, tile_seqs, 1, *rec_state_shape),
+            "rec_in_buf": pltpu.VMEM((slots, tile_seqs, 1, *rec_in_shape),
                                      self.dtypes.recurrent_state),
+            "rec_lo_in_buf": rec_lo_in_buf,
             "conv_out_buf": pltpu.VMEM(
                 (slots, tile_seqs, self.window_size, *conv_state_shape),
                 self.dtypes.conv_state),
             "rec_out_buf": pltpu.VMEM(
-                (slots, tile_seqs, num_rec_out, *rec_state_shape),
+                (slots, tile_seqs, num_rec_out, *self.stored_state_shape),
                 self.dtypes.recurrent_state),
             "replay_in_buf": replay_in_buf,
             "replay_out_buf": replay_out_buf,

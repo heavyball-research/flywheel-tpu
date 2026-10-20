@@ -169,9 +169,9 @@ def main() -> None:
                 return (conv, rec, replay, gates, lens), out
 
             replay_ms, _ = time_stateful(
-                _replay, (conv_state, recurrent_state, replay_state,
-                          replay_gates, replay_lens), args.warmup, args.iters,
-                args.repeats)
+                _replay, (conv_state, wrapper.split_checkpoint(recurrent_state),
+                          replay_state, replay_gates, replay_lens), args.warmup,
+                args.iters, args.repeats)
 
             row = dict(kernel=args.kernel, batch=num_seqs, window=window,
                        replay_window=replay_window,
