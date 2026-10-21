@@ -69,10 +69,11 @@ class Cell:
     decode_tokens: int
     page_size: int
     sliding_window: int | None = None
-    # q, k, v and cache dtype. flash_attn_with_kvcache takes bf16 caches only;
-    # every byte count below follows itemsize, so another dtype only needs a
-    # kernel that takes it.
+    # q dtype. Every byte count below follows the cache's itemsize.
     dtype: str = "bfloat16"
+    # k, v and cache dtype: bfloat16, or an fp8 cache both kernels read as
+    # stored (descales of 1, which only move the scores).
+    kv_dtype: str = "bfloat16"
 
     @property
     def key(self):
@@ -80,8 +81,10 @@ class Cell:
             window_tag = ""
         else:
             window_tag = f"-w{self.sliding_window}"
+        kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
         shape = (f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
-                 f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}")
+                 f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}"
+                 f"{kv_tag}")
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
         return f"{shape}-b{self.batch}-n{self.decode_tokens}"
@@ -112,7 +115,7 @@ class Cell:
     def itemsize(self):
         import jax.numpy as jnp
 
-        return jnp.dtype(self.dtype).itemsize
+        return jnp.dtype(self.kv_dtype).itemsize
 
     @property
     def kv_token_bytes(self):
@@ -155,19 +158,21 @@ def make_inputs(cell):
     generator = np.random.default_rng(cell.heads * 1000 + cell.heads_k)
     if cell.scenario == "chunked_prefill":
         q = draw(generator, cell.dtype, cell.seq, cell.heads, cell.head_dim)
-        k = draw(generator, cell.dtype, cell.seq, cell.heads_k, cell.head_dim)
-        v = draw(generator, cell.dtype, cell.seq, cell.heads_k, cell.head_dim)
+        k = draw(generator, cell.kv_dtype, cell.seq, cell.heads_k,
+                 cell.head_dim)
+        v = draw(generator, cell.kv_dtype, cell.seq, cell.heads_k,
+                 cell.head_dim)
         calls = [(q[i * cell.chunk:(i + 1) * cell.chunk],
                   k[i * cell.chunk:(i + 1) * cell.chunk],
                   v[i * cell.chunk:(i + 1) * cell.chunk])
                  for i in range(cell.num_calls)]
     else:
-        def one_token(heads):
-            return draw(generator, cell.dtype, cell.batch, heads,
-                        cell.head_dim)
+        def one_token(heads, dtype):
+            return draw(generator, dtype, cell.batch, heads, cell.head_dim)
 
-        step = (one_token(cell.heads), one_token(cell.heads_k),
-                one_token(cell.heads_k))
+        step = (one_token(cell.heads, cell.dtype),
+                one_token(cell.heads_k, cell.kv_dtype),
+                one_token(cell.heads_k, cell.kv_dtype))
         calls = [step] * cell.num_calls
     pages_per_seq = -(-cell.seq // cell.page_size)
     table = generator.permutation(cell.num_seqs * pages_per_seq)
@@ -201,12 +206,13 @@ def build_flywheel(cell, inputs, args):
     import jax
 
     from flywheel_tpu import flash_attn_with_kvcache
+    from flywheel_tpu.pallas.copy_utils import merged_cache_heads
 
     calls, block_table, starts = inputs
-    # Note (david): 2 * heads_k rows per token because the merged cache
-    # interleaves each kv head's K row and V row.
+    # Note (david): the merged cache interleaves each kv head's K row and V
+    # row (an fp8 cache pads an odd head count).
     shape = (cell.num_seqs * block_table.shape[1], cell.page_size,
-             2 * cell.heads_k, cell.head_dim)
+             merged_cache_heads(cell.heads_k, cell.kv_dtype), cell.head_dim)
     if cell.sliding_window is None:
         window_size = (-1, -1)
     else:
@@ -219,7 +225,8 @@ def build_flywheel(cell, inputs, args):
             q, k, v = q[:, None], k[:, None], v[:, None]
         out, cache = flash_attn_with_kvcache(
             q, cache, None, k, v, cache_seqlens=start,
-            block_table=block_table, causal=True, window_size=window_size)
+            block_table=block_table, causal=True, window_size=window_size,
+            nheads_k=cell.heads_k)
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -231,7 +238,7 @@ def build_flywheel(cell, inputs, args):
         return out, cache
 
     generator = np.random.default_rng(1)
-    return step, (lambda: fill_cache(shape, cell.dtype, generator)), {}
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {}
 
 
 def build_rpa(cell, inputs, args):
@@ -243,7 +250,7 @@ def build_rpa(cell, inputs, args):
     calls, block_table, starts = inputs
     shape = rpa.get_kv_cache_shape(cell.num_seqs * block_table.shape[1],
                                    cell.page_size, cell.heads_k,
-                                   cell.head_dim, jnp.dtype(cell.dtype))
+                                   cell.head_dim, jnp.dtype(cell.kv_dtype))
     page_indices = block_table.reshape(-1)
     if cell.scenario == "chunked_prefill":
         cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
@@ -288,7 +295,7 @@ def build_rpa(cell, inputs, args):
             "block_source": "--rpa-blocks" if blocks else "rpa default",
             "block_case": blocks_arg,
             "mixed_blocks": list(mixed_blocks) if mixed_blocks else None}
-    return step, (lambda: fill_cache(shape, cell.dtype, generator)), info
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
 
 
 BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa}
@@ -388,7 +395,8 @@ def main(argv=None):
     args = parse_args(argv)
     cell = Cell(args.impl, args.scenario, args.heads, args.heads_k,
                 args.head_dim, args.seq, args.chunk, args.batch,
-                args.decode_tokens, args.page_size, args.sliding_window)
+                args.decode_tokens, args.page_size, args.sliding_window,
+                kv_dtype=args.kv_dtype)
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
     if args.output and not args.trace and recorded(args.output, cell.key):
@@ -419,6 +427,9 @@ def parse_args(argv=None):
     parser.add_argument("--decode-tokens", type=int, default=1024,
                         help="decode: steps, the last tokens of --seq")
     parser.add_argument("--page-size", type=int, default=128)
+    parser.add_argument("--kv-dtype", default="bfloat16",
+                        choices=("bfloat16", "float8_e4m3fn", "float8_e5m2"),
+                        help="k, v and KV cache dtype; q stays bfloat16")
     parser.add_argument("--sliding-window", type=int,
                         help="keys each query attends, its own included "
                              "(RPA's sliding_window; flywheel's window_size "

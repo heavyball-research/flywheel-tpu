@@ -1,11 +1,13 @@
 """Write new K/V rows into the merged interleaved paged KV cache.
 
-The cache is (num_pages, page_size, 2 * nheads_k, head_dim) bf16 whose token
-rows interleave each kv head's K and V rows, [k0, v0, k1, v1, ...]. A bf16
-row pair (2h, 2h + 1) shares one u32 word per lane, so K and V cannot be
-written into their rows separately (a size-1 window of the tiled head axis
-does not compile, and a strided one is not expressible); the writer stages
-both in VMEM, interleaves them there and writes whole rows.
+The cache is (num_pages, page_size, cache_heads, head_dim) whose token rows
+interleave the kv heads' K and V rows: bf16 [k0, v0, k1, v1, ...] with
+cache_heads = 2 * nheads_k, fp8 [k0, k1, v0, v1, ...] with nheads_k padded to
+even (copy_utils.merged_cache_heads). K and V rows share one u32 word per
+lane, so they cannot be written into their rows separately (a size-1 window
+of the tiled head axis does not compile, and a strided one is not
+expressible); the writer stages both in VMEM, interleaves them there and
+writes whole rows.
 """
 
 import functools
@@ -15,6 +17,13 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from .copy_utils import (
+    check_merged_kv_dtype,
+    interleave_kv_rows,
+    kv_heads_per_word,
+    merged_cache_heads,
+)
 
 # Note (david): the scoped VMEM the staging is sized against; the compiler
 # gets KV_WRITE_VMEM_HEADROOM_BYTES more for the interleave temporaries.
@@ -29,10 +38,10 @@ INTERLEAVE_STEP_ELEMENTS = 8192
 
 
 def kv_write_pieces_per_block(page_size: int, num_kv_heads: int,
-                              head_dim: int) -> int:
+                              head_dim: int, itemsize: int = 2) -> int:
   """Page pieces one writer program stages: each holds a page of K, of V and
   of interleaved rows, within KV_WRITE_VMEM_LIMIT_BYTES (1 MiB reserved)."""
-  piece_bytes = 2 * page_size * 2 * num_kv_heads * head_dim * 2
+  piece_bytes = 2 * page_size * 2 * num_kv_heads * head_dim * itemsize
   num_fitting_pieces = (KV_WRITE_VMEM_LIMIT_BYTES - 1024 * 1024) // piece_bytes
   if num_fitting_pieces < 1:
     raise ValueError(
@@ -92,15 +101,8 @@ def kv_cache_write_kernel(
     def _interleave_step(step, carry):
       row_window = pl.ds(pl.multiple_of(step * step_rows, step_rows),
                          step_rows)
-      # Note (david): K head h lands in the low and V head h in the high 16
-      # bits of its row pair's u32 word; the halves move as integers, so every
-      # bit pattern (NaN payloads, subnormals) survives.
-      k_bits = lax.bitcast_convert_type(k_vmem[i, row_window],
-                                        jnp.uint16).astype(jnp.uint32)
-      v_bits = lax.bitcast_convert_type(v_vmem[i, row_window],
-                                        jnp.uint16).astype(jnp.uint32)
-      kv_vmem[i, row_window] = pltpu.bitcast(k_bits | (v_bits << 16),
-                                             jnp.bfloat16)
+      kv_vmem[i, row_window] = interleave_kv_rows(k_vmem[i, row_window],
+                                                  v_vmem[i, row_window])
       return carry
 
     return lax.fori_loop(0, pl.cdiv(length, step_rows), _interleave_step,
@@ -135,24 +137,33 @@ def write_kv_cache_pages(
   """Copy new K/V rows into the merged interleaved cache; returns the cache,
   updated in place (it is donated).
 
-  k and v are (T, H, D) and kv_cache is (P, S, 2H, D), all bf16. slices is
+  k and v are (T, H, D) and kv_cache is (P, S, merged_cache_heads(H), D), all
+  of one dtype: bf16, or fp8 already quantized by the caller. slices is
   i32[3, n] and num_slices i32[1]: column j < num_slices[0] of slices is
   (cache_row_start, new_row_start, length) in rows of the flat (P * S) cache
   view and of k / v, each piece inside one page; later columns are ignored.
   """
   _, num_kv_heads, head_dim = k.shape
   num_pages, page_size, cache_heads, cache_head_dim = kv_cache.shape
+  check_merged_kv_dtype(kv_cache.dtype)
+  if k.dtype != kv_cache.dtype or v.dtype != kv_cache.dtype:
+    raise NotImplementedError(
+        f"k, v and the cache must share one dtype; got {k.dtype}, {v.dtype},"
+        f" {kv_cache.dtype}.")
   if v.shape != k.shape or (cache_heads, cache_head_dim) != (
-      2 * num_kv_heads, head_dim):
+      merged_cache_heads(num_kv_heads, kv_cache.dtype), head_dim):
     raise ValueError(
-        f"k and v must be (T, H, D) of a (P, S, 2H, D) cache; got {k.shape=},"
-        f" {v.shape=}, {kv_cache.shape=}.")
+        f"k and v must be (T, H, D) of a (P, S, merged_cache_heads(H), D)"
+        f" cache; got {k.shape=}, {v.shape=}, {kv_cache.shape=}.")
   if head_dim % 128:
     raise ValueError(f"head_dim must be a multiple of 128; got {head_dim}.")
-  if any(operand.dtype != jnp.bfloat16 for operand in (k, v, kv_cache)):
-    raise NotImplementedError("the KV writer takes bfloat16 only.")
+  # Note (david): an fp8 word holds a head pair, so an odd head count is
+  # staged with the zero head the cache pads it with.
+  if num_kv_heads % kv_heads_per_word(kv_cache.dtype):
+    k, v = (jnp.pad(operand, ((0, 0), (0, 1), (0, 0))) for operand in (k, v))
+    num_kv_heads += 1
   pieces_per_block = kv_write_pieces_per_block(
-      page_size, num_kv_heads, head_dim)
+      page_size, num_kv_heads, head_dim, jnp.dtype(kv_cache.dtype).itemsize)
   # Note (david): the kernel indexes every piece of its last block, so the
   # table is padded with empty pieces to a whole number of blocks.
   padded_num_slices = (

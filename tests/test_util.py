@@ -20,6 +20,33 @@ def randn(rng, shape, dtype=jnp.bfloat16):
     return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(dtype)
 
 
+def merge_kv_heads(k, v):
+    """The merged cache rows of K and V (..., nheads_k, d): bf16 holds each KV head's K then
+    its V, [k0, v0, k1, v1, ...]; fp8 each head pair's two K rows then its two V rows, [k0,
+    k1, v0, v1, ...], an odd head count padded with one zero head."""
+    *leading, nheads_k, d = k.shape
+    if k.dtype == jnp.bfloat16:
+        return jnp.stack([k, v], axis=-2).reshape(*leading, 2 * nheads_k, d)
+    if nheads_k % 2:
+        head_pad = [(0, 0)] * len(leading) + [(0, 1), (0, 0)]
+        k, v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)
+        nheads_k += 1
+    pairs = (*leading, nheads_k // 2, 2, d)
+    return jnp.stack([k.reshape(pairs), v.reshape(pairs)], axis=-3).reshape(
+        *leading, 2 * nheads_k, d
+    )
+
+
+def split_kv_heads(kv, nheads_k):
+    """merge_kv_heads' inverse: the (K, V) rows (..., nheads_k, d) of merged cache rows."""
+    *leading, cache_heads, d = kv.shape
+    if kv.dtype == jnp.bfloat16:
+        return kv[..., 0::2, :], kv[..., 1::2, :]
+    quads = kv.reshape(*leading, cache_heads // 4, 2, 2, d)
+    k, v = (quads[..., part, :, :].reshape(*leading, cache_heads // 2, d) for part in range(2))
+    return k[..., :nheads_k, :], v[..., :nheads_k, :]
+
+
 def generate_random_padding_mask(max_seqlen, batch_size, rng):
     """(batch_size, max_seqlen) bool prefix masks whose lengths are drawn from
     [max(1, max_seqlen - 20), max_seqlen]."""

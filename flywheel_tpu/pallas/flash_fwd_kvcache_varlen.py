@@ -10,6 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import vmem_limit_bytes
+from .copy_utils import interleave_kv_rows, kv_heads_per_word
 from .flash_fwd_varlen_paged import flash_attn_varlen_paged
 from .kv_cache_write import INTERLEAVE_STEP_ELEMENTS
 
@@ -70,14 +71,7 @@ def append_kernel(
         # rows go out as whole cache rows in one DMA.
         def _interleave_step(step, carry):
           rows = pl.ds(pl.multiple_of(step * step_rows, step_rows), step_rows)
-          # Note (david): K head h lands in the low and V head h in the high
-          # 16 bits of its row pair's u32 word; the halves move as integers,
-          # so every bit pattern (NaN payloads, subnormals) survives.
-          k_bits = lax.bitcast_convert_type(k_vmem[rows],
-                                            jnp.uint16).astype(jnp.uint32)
-          v_bits = lax.bitcast_convert_type(v_vmem[rows],
-                                            jnp.uint16).astype(jnp.uint32)
-          kv_vmem[rows] = pltpu.bitcast(k_bits | (v_bits << 16), jnp.bfloat16)
+          kv_vmem[rows] = interleave_kv_rows(k_vmem[rows], v_vmem[rows])
           return carry
 
         lax.fori_loop(0, pl.cdiv(num_tokens, step_rows), _interleave_step,
@@ -110,10 +104,15 @@ def append_ragged(
 ) -> jax.Array:
   """Write packed new tokens k, v (total, nheads_k, head_dim) after each
   active request's cache_seqlens into its pages of the merged interleaved
-  (num_pages, page_size, 2 * nheads_k, head_dim) cache; returns the cache."""
+  (num_pages, page_size, merged_cache_heads(nheads_k), head_dim) cache, of
+  k's dtype; returns the cache."""
   # Note (david): a token-row view that leaves the (heads, head_dim) tiling
   # untouched, so XLA emits no copy.
   flat_cache = kv_cache.reshape(-1, *kv_cache.shape[-2:])
+  # Note (david): an fp8 word holds a head pair, so an odd head count is
+  # staged with the zero head the cache pads it with.
+  if k.shape[1] % kv_heads_per_word(kv_cache.dtype):
+    k, v = (jnp.pad(operand, ((0, 0), (0, 1), (0, 0))) for operand in (k, v))
   _, num_kv_heads, head_dim = k.shape
   hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   scalar_prefetches = (cu_seqlens_q, cache_seqlens, block_table, num_active)
@@ -134,7 +133,7 @@ def append_ragged(
           scratch_shapes=(
               pltpu.VMEM((page_size, num_kv_heads, head_dim), k.dtype),
               pltpu.VMEM((page_size, num_kv_heads, head_dim), v.dtype),
-              pltpu.VMEM((page_size, 2 * num_kv_heads, head_dim),
+              pltpu.VMEM((page_size, kv_cache.shape[2], head_dim),
                          kv_cache.dtype),
               pltpu.SemaphoreType.DMA((2,)),
           ),
@@ -165,15 +164,18 @@ def flash_attn_kvcache_varlen(
     softcap: float,
     return_lse: bool,
     interpret: bool,
+    nheads_k: int | None = None,
+    v_scale: float = 1.0,
 ) -> tuple[jax.Array, ...]:
   """Append packed new tokens once, then attend with the paged varlen kernel,
   which reads the updated pages only.
 
   q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
-  merged interleaved (num_pages, page_size, 2 * nheads_k, head_dim) cache and
-  block_table its flat (batch * pages_per_seq,) page table. causal,
-  window_left, softcap and q_scale are flash_attn_varlen_paged's. Returns
-  (out, kv_cache) plus lse (nheads, total_q) float32 when return_lse.
+  merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
+  head_dim) cache and block_table its flat (batch * pages_per_seq,) page
+  table. causal, window_left, softcap, q_scale, nheads_k and v_scale are
+  flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse (nheads,
+  total_q) float32 when return_lse.
   """
   batch = cu_seqlens_q.shape[0] - 1
   num_query_heads = q.shape[1]
@@ -213,6 +215,7 @@ def flash_attn_kvcache_varlen(
         max_seqlen_q=q.shape[0], max_seqlen_k=pages_per_seq * page_size,
         causal=causal, q_scale=q_scale, return_lse=return_lse,
         interpret=interpret, window_left=window_left, softcap=softcap,
+        nheads_k=nheads_k, v_scale=v_scale,
     )
     if return_lse:
       out, lse = outputs

@@ -27,10 +27,12 @@ from .block_sizes import (
 )
 from .copy_utils import (
   advance,
-  bf16_half,
   drain,
   fold_row,
   hbm_window,
+  kv_heads_per_word,
+  kv_word_halves,
+  kv_word_rows,
   load_staged_words,
   staged_words,
 )
@@ -119,6 +121,7 @@ def fwd_body(
     rotary_k: bool = True,
     paged: PagedKVInfo | None = None,
     gqa_fold: int = 1,
+    v_scale: float = 1.0,
 ) -> None:
   """Run the fragment pipeline over every block the schedule yields.
 
@@ -131,7 +134,8 @@ def fwd_body(
   gqa_fold > 1 (paged only) stages gqa_fold consecutive q heads of one kv head
   per group and stacks them over the rows of every score fragment: fragment
   row r holds head r // bq_compute at token r % bq_compute of the q tile, so
-  bq and bq_compute count tokens per head.
+  bq and bq_compute count tokens per head. A paged fp8 cache is widened to
+  bf16 K and V planes, and v_scale multiplies the output.
   """
   is_per_seq = schedule.q_token is not None
   is_paged = paged is not None
@@ -362,17 +366,22 @@ def fwd_body(
         sems.at[SEM_OUT, slot])
 
   # Note (david): a paged group is the gqa_fold q heads of one kv head, which
-  # read its (K, V) row pair; the pair of one page is the 2-row window
-  # [2 * kv_head, 2 * kv_head + 2) of the interleaved cache's head axis, one
-  # DMA.
+  # read its (K, V) rows; those of one page are the u32 word window of the
+  # interleaved cache's head axis that holds them, one DMA: a bf16 head's
+  # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
   assert not is_paged or head_fold == 1, head_fold
+  if is_paged:
+    kv_dtype = kv_pair_buf.dtype
+    word_rows = kv_word_rows(kv_dtype)
+    heads_per_word = kv_heads_per_word(kv_dtype)
 
   def _paged_buffer_tile(slot, token_start, num_tokens):
     return kv_pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
 
   def _paged_kv_source(physical_page, num_tokens, kv_head):
-    head_row = pl.multiple_of(2 * kv_head, 2)
-    return k_hbm.at[physical_page, pl.ds(0, num_tokens), pl.ds(head_row, 2), :]
+    head_row = pl.multiple_of(kv_head // heads_per_word * word_rows, word_rows)
+    return k_hbm.at[
+        physical_page, pl.ds(0, num_tokens), pl.ds(head_row, word_rows), :]
 
   def _paged_load_rows(kv_end, kv):
     # Note (david): each page DMA is clipped to the 8-aligned tokens the
@@ -460,10 +469,11 @@ def fwd_body(
           valid_rows // NUM_SUBLANES, read_rows // NUM_SUBLANES, _zero_tile,
           None)
 
-  def _unpack_pair_planes(slot, num_live_tiles):
-    # Note (david): a staged (K, V) row pair is one u32 word per lane, K in
-    # its low half and V in its high half; each live compute tile is split
-    # into the K and V planes once, not once per q tile.
+  def _unpack_pair_planes(slot, kv_head, num_live_tiles):
+    # Note (david): a staged word holds the kv head's K and V rows (bf16: K in
+    # its low half, V in its high half; fp8: the head pair's K bytes, then its
+    # V bytes); each live compute tile is split into the head's K and V planes
+    # once, not once per q tile.
     for tile in range(num_k_compute_tiles):
       @pl.when(tile < num_live_tiles)
       def _unpack_tile(tile=tile):
@@ -472,12 +482,24 @@ def fwd_body(
           words = load_staged_words(
               staged_words(kv_pair_buf, slot), tile * bkv_compute,
               bkv_compute, 1)
-          for kv_part in range(2):
-            kv_planes[kv_part, tile_rows, :] = bf16_half(words, kv_part)
+          kv_rows = kv_word_halves(words, kv_head, kv_dtype)
         else:
+          kv_rows = []
           for kv_part in range(2):
-            kv_planes[kv_part, tile_rows, :] = kv_pair_buf[
-                slot, tile_rows, 0, kv_part, :]
+            if heads_per_word == 1:
+              word_row = kv_part
+            else:
+              word_row = kv_part * heads_per_word + kv_head % heads_per_word
+            kv_rows.append(kv_pair_buf[slot, tile_rows, 0, word_row, :])
+        # Note (david): an fp8 block is widened to bf16 planes here, once per
+        # staged block, so every q tile runs the bf16 matmuls. Feeding the
+        # fp8 planes to the MXU instead makes Mosaic rescale every f32 score
+        # and output tile for e4m3fn's bias: v6e, h32 k8 d128, 1024-token
+        # chunks over 8K, e4m3fn 0.356 against 0.349 ms a chunk, e5m2 at par
+        # (0.338, 0.339); a bf16 cache runs 0.340.
+        for kv_part, plane_rows in enumerate(kv_rows):
+          kv_planes[kv_part, tile_rows, :] = plane_rows.astype(
+              kv_planes.dtype)
 
   def _block_step(group, si, kv, lo, hi, ctx, next_row_entry, next_row_paged,
                   carry):
@@ -562,7 +584,7 @@ def fwd_body(
       # always, since every q tile's first fragment runs.
       num_live_tiles = jnp.maximum(
           1, pl.cdiv(jnp.clip(ctx.kv_end - kv_tok, 0, bkv), bkv_compute))
-      _unpack_pair_planes(kv_slot, num_live_tiles)
+      _unpack_pair_planes(kv_slot, kv_head, num_live_tiles)
     else:
       kv_loaded, kv_inflight, kv_slot = advance(
           kv_key,
@@ -1067,13 +1089,15 @@ def fwd_body(
         def _finalize_fragment(q_compute_index, carry):
           slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
           row_sum = row_sum_new_ref[slice_q, :]
+          # Note (david): a quantized cache's V descale is one per-tensor
+          # factor, folded into the softmax normalization.
           if transposed_pv:
             tile_index = (slice(None), slice_q)
-            inverse_row_sum = (1.0 / row_sum[:, 0:1]).T
+            inverse_row_sum = (v_scale / row_sum[:, 0:1]).T
           else:
             tile_index = (slice_q, slice(None))
             inverse_row_sum = jnp.tile(
-                1.0 / row_sum, (1, head_dim_v_repeats)
+                v_scale / row_sum, (1, head_dim_v_repeats)
             )[..., :o_scratch.shape[-1]]
           o_normalized = (
               o_new_ref[tile_index] * inverse_row_sum).astype(o_stage.dtype)
@@ -1612,8 +1636,10 @@ def forward_common(
     # unpacks it into one K and one V plane; (2, head_dim) bf16 rows pad to
     # nothing, so the pair staging costs what two dense planes would.
     scratch_shapes = [
-        q_buf, vmem((num_stages, bkv, 1, 2, head_dim_qk), k.dtype),
-        vmem((2, bkv, head_dim_qk), k.dtype)]
+        q_buf,
+        vmem((num_stages, bkv, 1, kv_word_rows(k.dtype), head_dim_qk),
+             k.dtype),
+        vmem((2, bkv, head_dim_qk), q.dtype)]
   if is_per_seq:
     # Note (david): the per-seq kernel synthesizes its bounds rows (the q lower
     # bound, plus the span under a left window) once per block in-kernel, so
@@ -1648,7 +1674,17 @@ def forward_common(
   else:
     q_in, k_in, v_in, *rotary_in = (q, k, v, *rotary_operands)
   if paged is not None:
-    kernel_inputs = [q_in, k_in, *rotary_in]
+    # Note (david): the paged pool is pinned to HBM. Memory space assignment
+    # otherwise moves a pool that fits its VMEM budget there around each
+    # call, the whole pool however few pages the call reads: v6e, h32 k8
+    # d128, 1024-token chunks over 8K, the 16 MB e5m2 pool moved and took
+    # 0.369 ms a chunk against 0.339 pinned. Its spec stays pl.ANY: a layout
+    # copy XLA puts in front of the call escapes the constraint and may land
+    # in VMEM (jax 0.11.2: an in-jit bf16 pool of 6 head rows, laid out
+    # {3,1,2,0}), where DMAs compiled for an HBM operand halt the chip.
+    kernel_inputs = [
+        q_in, pltpu.with_memory_space_constraint(k_in, pltpu.HBM),
+        *rotary_in]
   else:
     kernel_inputs = [q_in, k_in, v_in, *rotary_in]
   smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)

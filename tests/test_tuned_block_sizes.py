@@ -8,8 +8,8 @@ import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache, tuned_block_sizes
 from flywheel_tpu.pallas import flash_fwd_kvcache
-from tests.test_flash_attn import INTERPRET, generate_block_kvcache, interleave_kv
-from tests.test_util import randn
+from tests.test_flash_attn import INTERPRET, generate_block_kvcache
+from tests.test_util import merge_kv_heads, randn
 
 # A TPU v7 decode entry, and the same shape at a batch with no entry.
 TUNED_DECODE = dict(
@@ -82,7 +82,7 @@ def test_tuned_block_kv_not_a_multiple_of_the_page_size_warns(
   q = randn(rng, (2, 1, 16, 128))
   k, v = randn(rng, (2, 1, 4, 128)), randn(rng, (2, 1, 4, 128))
   out, _ = flash_attn_with_kvcache(
-      q, interleave_kv(k_pages, v_pages), None, k, v,
+      q, merge_kv_heads(k_pages, v_pages), None, k, v,
       cache_seqlens=jnp.array([300, 511], jnp.int32), block_table=block_table,
       interpret=INTERPRET)
   assert bool(jnp.all(jnp.isfinite(out.astype(jnp.float32))))

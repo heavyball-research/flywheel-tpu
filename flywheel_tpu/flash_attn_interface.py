@@ -26,6 +26,12 @@ from .pallas.block_sizes import (
   pick_tile,
   round_up,
 )
+from .pallas.copy_utils import (
+  check_merged_kv_dtype,
+  is_fp8_kv,
+  kv_word_rows,
+  merged_cache_heads,
+)
 from .pallas.flash_bwd import flash_attn_bwd
 from .pallas.flash_fwd import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
 from .pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
@@ -904,6 +910,9 @@ def paged_varlen_attn(
     block_table: jax.Array,
     seqused_k: jax.Array | None,
     num_active: jax.Array | int | None,
+    k_descale: float | None = None,
+    v_descale: float | None = None,
+    nheads_k: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn_varlen_func's paged KV cache branch (block_table given)."""
   if token_major:
@@ -1021,6 +1030,14 @@ def paged_varlen_attn(
   softmax_scale = (
       1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
   )
+  if nheads_k is None and is_fp8_kv(k.dtype):
+    raise ValueError(
+        "An fp8 pool pads an odd nheads_k, so its head axis does not give the"
+        " KV head count; pass nheads_k."
+    )
+  # Note (david): the K descale is one per-tensor factor on every score, so it
+  # rides in Q's fused scale.
+  score_scale = softmax_scale * (1.0 if k_descale is None else k_descale)
   kernel = functools.partial(
       flash_attn_varlen_paged,
       max_seqlen_q=int(max_seqlen_q),
@@ -1028,10 +1045,12 @@ def paged_varlen_attn(
       causal=is_right_bounded,
       window_left=window_left,
       softcap=float(softcap),
-      q_scale=float(fused_q_scale(softmax_scale, softcap)),
+      q_scale=float(fused_q_scale(score_scale, softcap)),
       return_lse=bool(return_softmax_lse),
       interpret=bool(interpret),
       block_sizes=paged_block_sizes,
+      nheads_k=nheads_k,
+      v_scale=1.0 if v_descale is None else float(v_descale),
   )
   # Note (david): K and V share the one merged cache operand k.
   return forward_only_attn(
@@ -1070,6 +1089,9 @@ def flash_attn_varlen_func(
     block_table: jax.Array | None = None,
     seqused_k: jax.Array | None = None,
     num_active: jax.Array | int | None = None,
+    k_descale: float | None = None,
+    v_descale: float | None = None,
+    nheads_k: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn.flash_attn_varlen_func on TPU for packed sequences.
 
@@ -1101,10 +1123,11 @@ def flash_attn_varlen_func(
   then pads to a multiple of its own block.
 
   Paged KV cache (block_table given; read-only, as in FlashAttention): k is
-  one merged bf16 (num_pages, page_size, 2 * nheads_k, headdim) cache whose
-  token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
-  ...], and v is None; headdim and page_size are multiples of 128, any
-  nheads_k. block_table: (batch, max_pages_per_seq) int, never read
+  one merged (num_pages, page_size, cache_heads, headdim) pool laid out as
+  flash_attn_with_kvcache's (bf16 [k0, v0, k1, v1, ...], or fp8 with
+  k_descale / v_descale and an explicit nheads_k), and v is None; headdim and
+  page_size are multiples of 128, any nheads_k. block_table: (batch,
+  max_pages_per_seq) int, never read
   past a sequence's own pages. cu_seqlens_k must be None and seqused_k
   ((batch,) int) is each sequence's kv length, its new tokens included,
   which the cache must already hold; max_seqlen_k bounds it. q / out stay
@@ -1147,12 +1170,18 @@ def flash_attn_varlen_func(
         blocks_override=blocks_override, rotary_cos=rotary_cos,
         rotary_sin=rotary_sin, rotary_interleaved=rotary_interleaved,
         rotary_k=rotary_k, block_table=block_table, seqused_k=seqused_k,
-        num_active=num_active,
+        num_active=num_active, k_descale=k_descale, v_descale=v_descale,
+        nheads_k=nheads_k,
     )
   elif seqused_k is not None or num_active is not None:
     raise ValueError(
         "seqused_k and num_active describe a paged KV cache and need"
         " block_table; packed K/V takes cu_seqlens_k."
+    )
+  elif any(arg is not None for arg in (k_descale, v_descale, nheads_k)):
+    raise ValueError(
+        "k_descale, v_descale and nheads_k describe an fp8 paged pool and"
+        " need block_table; packed K/V is bf16."
     )
   else:
     expected_rank = 2 if token_major else 3
@@ -1264,7 +1293,8 @@ def flash_attn_varlen_func(
     jax.jit,
     static_argnames=(
         "softmax_scale", "causal", "window_size", "softcap",
-        "return_softmax_lse", "interpret",
+        "return_softmax_lse", "interpret", "k_descale", "v_descale",
+        "nheads_k",
     ),
     donate_argnames=("k_cache", "v_cache"),
 )
@@ -1286,10 +1316,13 @@ def flash_attn_with_kvcache(
     softcap: float = 0.0,
     return_softmax_lse: bool = False,
     interpret: bool = False,
+    k_descale: float | None = None,
+    v_descale: float | None = None,
+    nheads_k: int | None = None,
 ) -> tuple[jax.Array, ...]:
   """Attention against a contiguous or paged KV cache, with optional append.
 
-  block_table picks one of two bf16 cache layouts; anything else raises
+  block_table picks one of two cache layouts; anything else raises
   ValueError:
 
   - block_table=None, contiguous pair (FlashAttention's layout): k_cache and
@@ -1297,11 +1330,23 @@ def flash_attn_with_kvcache(
     capacity a multiple of 128. cache_batch_idx: optional (batch,) cache row
     per query row, identity by default.
   - block_table given, paged merged: k_cache is one (num_pages, page_size,
-    2 * nheads_k, head_dim) pool whose token rows hold each KV head's K then
-    its V, [k0, v0, k1, v1, ...] (RPA v3's head order), page_size a multiple
-    of 128, and v_cache is None. block_table: (batch, max_pages_per_seq) int
-    mapping each row's positions to pages; cache_batch_idx must be None.
-    Pages an append writes must be private to the request.
+    cache_heads, head_dim) pool whose token rows interleave the KV heads' K
+    and V rows, page_size a multiple of 128, and v_cache is None. A bf16 pool
+    holds each KV head's K then its V, [k0, v0, k1, v1, ...] (RPA v3's head
+    order), cache_heads = 2 * nheads_k. A float8_e4m3fn or float8_e5m2 pool
+    holds each head pair's two K rows then its two V rows, [k0, k1, v0, v1,
+    ...], an odd nheads_k padded with one zero head (cache_heads = 2 *
+    nheads_k rounded up to a multiple of 4). block_table: (batch,
+    max_pages_per_seq) int mapping each row's positions to pages;
+    cache_batch_idx must be None. Pages an append writes must be private to
+    the request.
+
+  An fp8 pool stores K / k_descale and V / v_descale (FlashAttention-3's
+  per-tensor descales, here static floats, default 1) and feeds them to the
+  MXU as stored; q stays bf16, and k / v appends must already be in the
+  pool's dtype. nheads_k (TPU extension) is the pool's KV head count; it
+  defaults to k's heads, else to half the head axis, which an fp8 pool
+  without k must not rely on.
 
   In both, nheads % nheads_k == 0. The contiguous pair needs nheads_k even or
   1 because its cache load packs two bf16 heads into one u32 lane, and it
@@ -1381,11 +1426,11 @@ def flash_attn_with_kvcache(
           "block_table and cache_batch_idx are mutually exclusive: the block"
           " table already maps each query row to its pages."
       )
-    if k_cache.ndim != 4 or k_cache.shape[2] % 2:
+    if k_cache.ndim != 4 or k_cache.shape[2] % kv_word_rows(k_cache.dtype):
       raise ValueError(
           "With block_table, k_cache must be (num_pages, page_size,"
-          " 2 * nheads_k, head_dim), each KV head's K then its V; got"
-          f" {k_cache.shape=}."
+          " cache_heads, head_dim), the KV heads' K and V rows interleaved;"
+          f" got {k_cache.shape=}."
       )
     if k_cache.shape[1] % PAGE_SIZE_MULTIPLE:
       raise ValueError(
@@ -1403,7 +1448,25 @@ def flash_attn_with_kvcache(
           f" {block_table.shape}."
       )
     flat_block_table = block_table.astype(jnp.int32).reshape(-1)
-    cache_shape = (*k_cache.shape[:2], k_cache.shape[2] // 2, k_cache.shape[3])
+    check_merged_kv_dtype(k_cache.dtype)
+    if nheads_k is not None:
+      pool_heads = nheads_k
+    elif k is not None:
+      pool_heads = k.shape[-2]
+    elif is_fp8_kv(k_cache.dtype):
+      raise ValueError(
+          "An fp8 pool pads an odd nheads_k, so its head axis does not give"
+          " the KV head count; pass nheads_k (or the new k / v)."
+      )
+    else:
+      pool_heads = k_cache.shape[2] // 2
+    if merged_cache_heads(pool_heads, k_cache.dtype) != k_cache.shape[2]:
+      raise ValueError(
+          f"A {k_cache.dtype} pool of {pool_heads} KV heads holds"
+          f" {merged_cache_heads(pool_heads, k_cache.dtype)} head rows per"
+          f" token; got {k_cache.shape=}."
+      )
+    cache_shape = (*k_cache.shape[:2], pool_heads, k_cache.shape[3])
     cache_operands = (k_cache,)
   else:
     if v_cache is None:
@@ -1416,6 +1479,10 @@ def flash_attn_with_kvcache(
       raise ValueError(
           "k_cache and v_cache must share the shape (batch_cache, capacity,"
           f" nheads_k, head_dim); got {k_cache.shape=}, {v_cache.shape=}."
+      )
+    if nheads_k is not None and nheads_k != k_cache.shape[2]:
+      raise ValueError(
+          f"{nheads_k=} must match the contiguous caches' {k_cache.shape[2]}."
       )
     flat_block_table = None
     cache_shape = k_cache.shape
@@ -1430,15 +1497,19 @@ def flash_attn_with_kvcache(
   has_new = k is not None
   if has_new != (v is not None):
     raise ValueError("k and v must be passed together, or both left out.")
-  if has_new:
-    bf16_operands = (q, *cache_operands, k, v)
-  else:
-    bf16_operands = (q, *cache_operands)
-  if any(operand.dtype != jnp.bfloat16 for operand in bf16_operands):
+  # Note (david): q is bf16 and the caches are bf16, except a paged pool,
+  # which may be fp8; appended k / v come in the cache's dtype.
+  kv_operands = (*cache_operands, k, v) if has_new else cache_operands
+  if q.dtype != jnp.bfloat16 or any(
+      operand.dtype != k_cache.dtype for operand in kv_operands
+  ) or (not is_paged and k_cache.dtype != jnp.bfloat16):
     raise NotImplementedError(
-        "Only bfloat16 is supported on TPU (v0); got"
-        f" {tuple(str(operand.dtype) for operand in bf16_operands)}."
+        "q must be bfloat16 and the KV operands share one dtype, bfloat16 or"
+        " (paged pool) float8_e4m3fn / float8_e5m2; got"
+        f" q {q.dtype}, KV {tuple(str(operand.dtype) for operand in kv_operands)}."
     )
+  k_descale = 1.0 if k_descale is None else float(k_descale)
+  v_descale = 1.0 if v_descale is None else float(v_descale)
   expected_new_shape = (*q.shape[:-2], nheads_k, head_dim)
   if has_new and (k.shape != expected_new_shape
                   or v.shape != expected_new_shape):
@@ -1467,6 +1538,9 @@ def flash_attn_with_kvcache(
   softmax_scale = (
       1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
   )
+  # Note (david): the K descale is one per-tensor factor on every score, so it
+  # rides in Q's fused scale.
+  score_scale = softmax_scale * k_descale
   if is_extend:
     if is_ragged:
       packed_cu_seqlens_q = cu_seqlens_q
@@ -1482,10 +1556,10 @@ def flash_attn_with_kvcache(
     kernel_outputs = flash_attn_kvcache_varlen(
         packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
         row_cache_seqlens, flat_block_table, num_active,
-        q_scale=float(fused_q_scale(softmax_scale, softcap)),
+        q_scale=float(fused_q_scale(score_scale, softcap)),
         causal=is_right_bounded, window_left=window_left,
         softcap=float(softcap), return_lse=bool(return_softmax_lse),
-        interpret=bool(interpret),
+        interpret=bool(interpret), nheads_k=nheads_k, v_scale=v_descale,
     )
   else:
     # Note (david): the decode kernel runs its softmax in log2 units straight
@@ -1494,7 +1568,7 @@ def flash_attn_with_kvcache(
     # kernels apply per staged Q tile.
     q_scaled = (
         q.reshape(batch, nheads, head_dim).astype(jnp.float32)
-        * fused_q_scale(softmax_scale, softcap)
+        * fused_q_scale(score_scale, softcap)
     ).astype(q.dtype)
     new_token_shape = (batch, nheads_k, head_dim)
     if has_new:
@@ -1521,6 +1595,8 @@ def flash_attn_with_kvcache(
         num_active=num_active,
         merged_cache=is_paged,
         softcap=float(softcap),
+        nheads_k=nheads_k if is_paged else None,
+        v_scale=v_descale,
     )
   out = kernel_outputs[0].reshape(q.shape)
   caches_out = kernel_outputs[1:1 + len(cache_operands)]
