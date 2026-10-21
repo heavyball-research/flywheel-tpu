@@ -19,10 +19,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .copy_utils import (
-    check_merged_kv_dtype,
-    interleave_kv_rows,
-    kv_heads_per_word,
-    merged_cache_heads,
+  check_merged_kv_dtype,
+  interleave_kv_rows,
+  merged_cache_heads,
 )
 
 # Note (david): the scoped VMEM the staging is sized against; the compiler
@@ -38,7 +37,7 @@ INTERLEAVE_STEP_ELEMENTS = 8192
 
 
 def kv_write_pieces_per_block(page_size: int, num_kv_heads: int,
-                              head_dim: int, itemsize: int = 2) -> int:
+                              head_dim: int, itemsize: int) -> int:
   """Page pieces one writer program stages: each holds a page of K, of V and
   of interleaved rows, within KV_WRITE_VMEM_LIMIT_BYTES (1 MiB reserved)."""
   piece_bytes = 2 * page_size * 2 * num_kv_heads * head_dim * itemsize
@@ -159,11 +158,11 @@ def write_kv_cache_pages(
     raise ValueError(f"head_dim must be a multiple of 128; got {head_dim}.")
   # Note (david): an fp8 word holds a head pair, so an odd head count is
   # staged with the zero head the cache pads it with.
-  if num_kv_heads % kv_heads_per_word(kv_cache.dtype):
-    k, v = (jnp.pad(operand, ((0, 0), (0, 1), (0, 0))) for operand in (k, v))
-    num_kv_heads += 1
+  staged_kv_heads = cache_heads // 2
+  head_pad = ((0, 0), (0, staged_kv_heads - num_kv_heads), (0, 0))
+  staged_k, staged_v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)
   pieces_per_block = kv_write_pieces_per_block(
-      page_size, num_kv_heads, head_dim, jnp.dtype(kv_cache.dtype).itemsize)
+      page_size, staged_kv_heads, head_dim, kv_cache.dtype.itemsize)
   # Note (david): the kernel indexes every piece of its last block, so the
   # table is padded with empty pieces to a whole number of blocks.
   padded_num_slices = (
@@ -171,9 +170,10 @@ def write_kv_cache_pages(
   slices = jnp.pad(slices.astype(jnp.int32),
                    ((0, 0), (0, padded_num_slices - slices.shape[1])))
   flat_cache = kv_cache.reshape(num_pages * page_size, cache_heads, head_dim)
-  kv_stage_shape = (pieces_per_block, page_size, num_kv_heads, head_dim)
+  kv_stage_shape = (pieces_per_block, page_size, staged_kv_heads, head_dim)
   any_spec = pl.BlockSpec(memory_space=pl.ANY)
-  max_step_rows = max(1, INTERLEAVE_STEP_ELEMENTS // (num_kv_heads * head_dim))
+  max_step_rows = max(
+      1, INTERLEAVE_STEP_ELEMENTS // (staged_kv_heads * head_dim))
   step_rows = 1 << (max_step_rows.bit_length() - 1)
   if page_size % step_rows:
     raise ValueError(
@@ -204,5 +204,5 @@ def write_kv_cache_pages(
       interpret=pltpu.InterpretParams() if interpret else False,
       name="flash_attn_kv_cache_write",
   )
-  return kv_write_call(slices, num_slices.astype(jnp.int32), k, v,
+  return kv_write_call(slices, num_slices.astype(jnp.int32), staged_k, staged_v,
                        flat_cache).reshape(kv_cache.shape)

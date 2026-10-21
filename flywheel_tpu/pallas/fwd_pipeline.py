@@ -150,9 +150,9 @@ def fwd_body(
   lse_hbm = remaining_refs.pop(0) if return_lse else None
   q_buf = remaining_refs.pop(0)
   if is_paged:
-    # Note (david): a paged block stages its kv head's (K, V) row pair as a
-    # (bkv, 1, 2, head_dim) block and unpacks it once into dense K and V
-    # planes, so every q tile of the block reads plain tiles.
+    # Note (david): a paged block stages its kv head's K and V rows as a
+    # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into dense K
+    # and V planes, so every q tile of the block reads plain tiles.
     kv_pair_buf, kv_planes = remaining_refs.pop(0), remaining_refs.pop(0)
     k_buf = v_buf = None
   else:
@@ -371,9 +371,10 @@ def fwd_body(
   # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
   assert not is_paged or head_fold == 1, head_fold
   if is_paged:
-    kv_dtype = kv_pair_buf.dtype
-    word_rows = kv_word_rows(kv_dtype)
-    heads_per_word = kv_heads_per_word(kv_dtype)
+    word_rows = kv_word_rows(kv_pair_buf.dtype)
+    heads_per_word = kv_heads_per_word(kv_pair_buf.dtype)
+  else:
+    word_rows = heads_per_word = None
 
   def _paged_buffer_tile(slot, token_start, num_tokens):
     return kv_pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
@@ -482,7 +483,7 @@ def fwd_body(
           words = load_staged_words(
               staged_words(kv_pair_buf, slot), tile * bkv_compute,
               bkv_compute, 1)
-          kv_rows = kv_word_halves(words, kv_head, kv_dtype)
+          kv_rows = kv_word_halves(words, kv_head, kv_pair_buf.dtype)
         else:
           kv_rows = []
           for kv_part in range(2):
@@ -1632,9 +1633,10 @@ def forward_common(
     v_buf = vmem(_staged_shape(bkv, head_dim_v, qkv_layout), v.dtype)
     scratch_shapes = [q_buf, k_buf, v_buf]
   else:
-    # Note (david): a paged block stages one kv head's (K, V) row pair, then
-    # unpacks it into one K and one V plane; (2, head_dim) bf16 rows pad to
-    # nothing, so the pair staging costs what two dense planes would.
+    # Note (david): a paged block stages the u32 word rows holding one kv
+    # head's K and V, then unpacks them into one bf16 K and one bf16 V plane;
+    # a word's (kv_word_rows, head_dim) rows pad to nothing, so the staging
+    # costs what two dense planes of the cache dtype would.
     scratch_shapes = [
         q_buf,
         vmem((num_stages, bkv, 1, kv_word_rows(k.dtype), head_dim_qk),

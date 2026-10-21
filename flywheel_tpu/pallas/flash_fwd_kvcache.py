@@ -37,9 +37,8 @@ from .copy_utils import (
   kv_word_rows,
   load_kv_fragment,
   load_staged_words,
-  merge_kv_tokens,
   merged_cache_heads,
-  merged_kv_row,
+  resolve_merged_kv_heads,
   staged_words,
 )
 from .fwd_pipeline import BF16_TILE_ROWS, overflow_guard_threshold
@@ -145,24 +144,27 @@ def load_kv_pair_fragment(
   """
   head_dim = kv_stage.shape[-1]
   dtype = kv_stage.dtype
+  heads_per_word = kv_heads_per_word(dtype)
   compute_start = pl.multiple_of(
       kv_compute_index * block_kv_compute, MIN_BLOCK_KV
   )
   if not is_bitcast_load:
+    key_row = (kv_head // heads_per_word * kv_word_rows(dtype)
+               + kv_head % heads_per_word)
     keys, values = (
         kv_stage[
             slot,
             pl.ds(compute_start, block_kv_compute),
-            pl.ds(merged_kv_row(kv_head, kv_part, dtype), 1),
+            pl.ds(key_row + kv_part * heads_per_word, 1),
             :,
         ].reshape(block_kv_compute, head_dim)
         for kv_part in range(2)
     )
     return keys, values
   else:
-    # Note (david): the pair of KV head h is u32 word row token * word_stride
-    # + h, K in its low half and V in its high half, so one strided word load
-    # yields both. At one KV head this costs 1.4-1.5x the head-major decode of
+    # Note (david): the K and V of KV head h share u32 word row token *
+    # word_stride + h // heads_per_word, so one strided word load yields
+    # both. At one KV head this costs 1.4-1.5x the head-major decode of
     # an unmerged K/V cache (6 query heads, head_dim 256, v6e), yet splitting
     # the pair into dense K/V buffers per block (1.45-2.25x), folding the heads
     # into the row width (6.5-12x) and scoring the pair interleaved
@@ -173,7 +175,7 @@ def load_kv_pair_fragment(
     word_stride = kv_stage.shape[2]
     words = load_staged_words(
         staged_words(kv_stage, slot),
-        compute_start * word_stride + kv_head // kv_heads_per_word(dtype),
+        compute_start * word_stride + kv_head // heads_per_word,
         block_kv_compute,
         word_stride,
     )
@@ -209,8 +211,8 @@ def kvcache_kernel(
   num_active = num_active_ref[0]
   if is_merged_cache:
     # Note (david): a merged build's new token arrives as one
-    # (2 * num_kv_heads, head_dim) row already in the cache's [k0, v0, k1, v1,
-    # ...] head order, so the append writes it as a ready token row.
+    # (staged_kv_heads, head_dim) row already in the cache's head order, so
+    # the append writes it as a ready token row.
     (
         q_ref,
         new_kv_ref,
@@ -969,13 +971,11 @@ def kvcache_kernel(
       _output_copy(local_batch_index - NUM_IO_STAGES, output_slot).wait()
 
     row_sum = row_sum_ref[...]
+    # Note (david): a quantized cache's V descale is one per-tensor factor,
+    # so it rides in the softmax normalization.
     inverse_row_sum = jnp.where(
-        row_sum > 0, pl.reciprocal(row_sum, approx=True), 0.0
+        row_sum > 0, pl.reciprocal(row_sum, approx=True) * v_scale, 0.0
     )
-    if v_scale != 1.0:
-      # Note (david): a quantized cache's V dequantization scale is one
-      # per-tensor factor, applied once with the softmax normalization.
-      inverse_row_sum = inverse_row_sum * v_scale
     out_buffers[output_slot] = (
         accumulator_ref[...].astype(jnp.float32)
         * lane_broadcast(inverse_row_sum, head_dim)
@@ -1047,7 +1047,7 @@ def validate_kvcache_config(
     num_kv_heads: int,
     head_dim: int,
     capacity: int,
-    kv_itemsize: int = BF16_BYTES,
+    kv_itemsize: int,
 ) -> KVCacheConfig:
   """Validate a (block_kv, block_kv_compute, num_kv_stages) config."""
   block_kv, block_kv_compute, num_kv_stages = config
@@ -1121,11 +1121,11 @@ def flash_attn_kvcache_pallas(
   rows hold the KV heads' K and V rows in copy_utils' merged order (bf16
   [k0, v0, k1, v1, ...], RPA v3's; fp8 [k0, k1, v0, v1, ...]), and returns
   (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[, lse]). nheads_k
-  defaults to half the cache's head axis, which an fp8 cache must not rely
-  on, since it pads an odd head count. An fp8 merged cache feeds K and V to
-  the MXU as stored, k and v must be in its dtype, and v_scale multiplies
-  the output (q carries the K scale). lse is (batch, num_query_heads, 128)
-  float32 with each value broadcast over lanes.
+  defaults to half the cache's head axis; an fp8 cache, which pads an odd
+  head count, needs it. An fp8 merged cache feeds K and V to the MXU as
+  stored, k and v must be in its dtype, and v_scale multiplies the output (q
+  carries the K scale). lse is (batch, num_query_heads, 128) float32 with
+  each value broadcast over lanes.
 
   num_active: rows at or past it are padding (RPA's distribution[-1]
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
@@ -1147,13 +1147,8 @@ def flash_attn_kvcache_pallas(
     # heads' K and V: the head count needs no tile alignment or parity.
     check_merged_kv_dtype(k_cache.dtype)
     row_tokens = cache_shape[1]
-    num_kv_heads = cache_shape[2] // 2 if nheads_k is None else nheads_k
-    if cache_shape[2] != merged_cache_heads(num_kv_heads, k_cache.dtype):
-      raise ValueError(
-          f"a merged {k_cache.dtype} cache of {num_kv_heads} KV heads holds"
-          f" {merged_cache_heads(num_kv_heads, k_cache.dtype)} head rows per"
-          f" token; got {cache_shape[2]}."
-      )
+    num_kv_heads = resolve_merged_kv_heads(
+        cache_shape[2], k_cache.dtype, nheads_k)
   elif k_cache.dtype != jnp.bfloat16:
     raise NotImplementedError(
         f"the K/V cache pair is bfloat16 only; got {k_cache.dtype}."
@@ -1237,7 +1232,7 @@ def flash_attn_kvcache_pallas(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         capacity=capacity,
-        kv_itemsize=jnp.dtype(k_cache.dtype).itemsize,
+        kv_itemsize=k_cache.dtype.itemsize,
     )
   else:
     # Note (david): a paged block is whole pages, and capacity is a multiple of
@@ -1332,11 +1327,18 @@ def flash_attn_kvcache_pallas(
   num_prefetch = len(scalar_prefetches)
   if merged_cache:
     # Note (david): the new K and V are interleaved into the cache's head order
-    # here, a (batch, 2 * num_kv_heads, head_dim) op far below one cache read,
+    # here, a (batch, staged_kv_heads, head_dim) op far below one cache read,
     # so the kernel appends a ready token row and writes each appended tile
     # back with one contiguous DMA.
     new_kv_shape = (batch, staged_kv_heads, head_dim)
-    dense_inputs = (q, merge_kv_tokens(k, v))
+    head_pad = ((0, 0), (0, staged_kv_heads // 2 - num_kv_heads), (0, 0))
+    word_heads_shape = (batch, -1, kv_heads_per_word(k_cache.dtype), head_dim)
+    new_kv = jnp.stack(
+        [jnp.pad(new_rows, head_pad).reshape(word_heads_shape)
+         for new_rows in (k, v)],
+        axis=2,
+    ).reshape(new_kv_shape)
+    dense_inputs = (q, new_kv)
     new_token_specs = (pl.BlockSpec(new_kv_shape, lambda *_: (0, 0, 0)),)
   else:
     dense_inputs = (q, k, v)

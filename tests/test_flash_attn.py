@@ -534,8 +534,9 @@ def test_flash_attn_kvcache(
     if new_kv:
         # Note (david): an fp8 pool takes appends already quantized; k / v below are the
         # dequantized values the reference attends.
-        k_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype), FP8_K_DESCALE)
-        v_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype), FP8_V_DESCALE)
+        k_new = randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype)
+        v_new = randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype)
+        k_stored, v_stored = quantize(k_new, FP8_K_DESCALE), quantize(v_new, FP8_V_DESCALE)
         k, v = dequantize(k_stored, FP8_K_DESCALE), dequantize(v_stored, FP8_V_DESCALE)
         if varlen_q:
             key_new_padding_mask = query_padding_mask
@@ -561,8 +562,12 @@ def test_flash_attn_kvcache(
         ) = generate_block_kvcache(seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, rng, dtype)
         k_cache_paged = quantize(k_cache_paged, FP8_K_DESCALE)
         v_cache_paged = quantize(v_cache_paged, FP8_V_DESCALE)
-        k_cache = gather_paged_cache(dequantize(k_cache_paged, FP8_K_DESCALE), page_table)[:, :seqlen_k]
-        v_cache = gather_paged_cache(dequantize(v_cache_paged, FP8_V_DESCALE), page_table)[:, :seqlen_k]
+        k_cache = gather_paged_cache(
+            dequantize(k_cache_paged, FP8_K_DESCALE), page_table
+        )[:, :seqlen_k]
+        v_cache = gather_paged_cache(
+            dequantize(v_cache_paged, FP8_V_DESCALE), page_table
+        )[:, :seqlen_k]
     # Note (david): a multi-token row with no visible key is unspecified, so a causal
     # read-only call keeps every query at or past position 0: cache_seqlens >= seqlen_q.
     cache_seqlens = jnp.asarray(

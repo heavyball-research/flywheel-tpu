@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from .block_sizes import vmem_limit_bytes
-from .copy_utils import interleave_kv_rows, kv_heads_per_word
+from .copy_utils import interleave_kv_rows
 from .flash_fwd_varlen_paged import flash_attn_varlen_paged
 from .kv_cache_write import INTERLEAVE_STEP_ELEMENTS
 
@@ -109,14 +109,16 @@ def append_ragged(
   # Note (david): a token-row view that leaves the (heads, head_dim) tiling
   # untouched, so XLA emits no copy.
   flat_cache = kv_cache.reshape(-1, *kv_cache.shape[-2:])
+  _, num_kv_heads, head_dim = k.shape
   # Note (david): an fp8 word holds a head pair, so an odd head count is
   # staged with the zero head the cache pads it with.
-  if k.shape[1] % kv_heads_per_word(kv_cache.dtype):
-    k, v = (jnp.pad(operand, ((0, 0), (0, 1), (0, 0))) for operand in (k, v))
-  _, num_kv_heads, head_dim = k.shape
+  staged_kv_heads = kv_cache.shape[2] // 2
+  head_pad = ((0, 0), (0, staged_kv_heads - num_kv_heads), (0, 0))
+  staged_k, staged_v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)
   hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
   scalar_prefetches = (cu_seqlens_q, cache_seqlens, block_table, num_active)
-  max_step_rows = max(1, INTERLEAVE_STEP_ELEMENTS // (num_kv_heads * head_dim))
+  max_step_rows = max(
+      1, INTERLEAVE_STEP_ELEMENTS // (staged_kv_heads * head_dim))
   step_rows = 1 << (max_step_rows.bit_length() - 1)
   if page_size % step_rows:
     raise ValueError(
@@ -131,8 +133,8 @@ def append_ragged(
           in_specs=(hbm_spec, hbm_spec, hbm_spec),
           out_specs=hbm_spec,
           scratch_shapes=(
-              pltpu.VMEM((page_size, num_kv_heads, head_dim), k.dtype),
-              pltpu.VMEM((page_size, num_kv_heads, head_dim), v.dtype),
+              pltpu.VMEM((page_size, staged_kv_heads, head_dim), k.dtype),
+              pltpu.VMEM((page_size, staged_kv_heads, head_dim), v.dtype),
               pltpu.VMEM((page_size, kv_cache.shape[2], head_dim),
                          kv_cache.dtype),
               pltpu.SemaphoreType.DMA((2,)),
@@ -145,7 +147,8 @@ def append_ragged(
       interpret=pltpu.InterpretParams() if interpret else False,
       name="flash_attn_ragged_cache_append",
   )
-  return call(*scalar_prefetches, k, v, flat_cache).reshape(kv_cache.shape)
+  return call(*scalar_prefetches, staged_k, staged_v,
+              flat_cache).reshape(kv_cache.shape)
 
 
 def flash_attn_kvcache_varlen(
@@ -164,8 +167,8 @@ def flash_attn_kvcache_varlen(
     softcap: float,
     return_lse: bool,
     interpret: bool,
-    nheads_k: int | None = None,
-    v_scale: float = 1.0,
+    nheads_k: int,
+    v_scale: float,
 ) -> tuple[jax.Array, ...]:
   """Append packed new tokens once, then attend with the paged varlen kernel,
   which reads the updated pages only.

@@ -71,8 +71,8 @@ class Cell:
     sliding_window: int | None = None
     # q dtype. Every byte count below follows the cache's itemsize.
     dtype: str = "bfloat16"
-    # k, v and cache dtype: bfloat16, or an fp8 cache both kernels read as
-    # stored (descales of 1, which only move the scores).
+    # k, v and cache dtype. An fp8 cell keeps the descales at 1: they only
+    # scale the scores and the output, not the work timed.
     kv_dtype: str = "bfloat16"
 
     @property

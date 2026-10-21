@@ -2,10 +2,10 @@
 
 Each sequence attends its own cache prefix [0, seqused_k[r]), staged page by
 page through its block table row. The cache is one merged (num_pages,
-page_size, 2 * nheads_k, head_dim) pool whose token rows interleave each kv
-head's K and V rows, [k0, v0, k1, v1, ...]. Every head group is one kv head,
-which stages only its (K, V) row pair of each page, and whose q heads are
-stacked over the rows of every score fragment.
+page_size, cache_heads, head_dim) pool whose token rows interleave the kv
+heads' K and V rows in copy_utils' merged order. Every head group is one kv
+head, which stages only the u32 word rows of each page that hold its K and
+V, and whose q heads are stacked over the rows of every score fragment.
 """
 
 import math
@@ -31,7 +31,7 @@ from .block_sizes import (
 from .copy_utils import (
   check_merged_kv_dtype,
   kv_word_rows,
-  merged_cache_heads,
+  resolve_merged_kv_heads,
 )
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
@@ -133,7 +133,7 @@ def paged_scratch_shapes(
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
-    kv_dtype: jnp.dtype = jnp.dtype(jnp.bfloat16),
+    kv_dtype: jnp.dtype,
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
@@ -142,7 +142,6 @@ def paged_scratch_shapes(
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
-  kv_dtype = jnp.dtype(kv_dtype)
   if gqa_fold > 1:
     stage_shape = (num_stages, gqa_fold, bq, head_dim)
   else:
@@ -180,7 +179,7 @@ def estimate_vmem_bytes(
     return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
-    kv_dtype: jnp.dtype = jnp.dtype(jnp.bfloat16),
+    kv_dtype: jnp.dtype,
 ) -> int:
   """Scoped VMEM bytes of one paged build: its scratch plus the score
   temporaries of one compute fragment."""
@@ -206,8 +205,8 @@ def resolve_paged_tiles(
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
     has_window: bool,
+    kv_dtype: jnp.dtype,
     block_sizes: BlockSizes | None = None,
-    kv_dtype: jnp.dtype = jnp.dtype(jnp.bfloat16),
 ) -> BlockSizes:
   """block_sizes of one paged build, whose q sizes count tokens per head.
 
@@ -309,19 +308,18 @@ def flash_attn_varlen_paged(
   entry is 0. kv_cache is the merged (num_pages, page_size,
   merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
   interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
-  defaults to half its head axis, which an fp8 pool must not rely on. An fp8
-  pool is widened to bf16 once per staged block, and v_scale multiplies the
-  output (q_scale carries the K scale). seqused_k is each sequence's kv
-  length with its new
-  tokens, which the cache must already hold; block_table entries past those
-  tokens' pages are never dereferenced. Causal rows align to the end of their
-  sequence's keys; window_left (None unbounded) also hides the keys more than
-  window_left positions before that diagonal. softcap > 0 applies Gemma-2's
-  tanh(s / softcap) * softcap to the scaled scores. q_scale is softmax_scale *
-  log2(e), or softmax_scale / softcap with a softcap. Rows past
-  cu_seqlens_q[-1] are out = 0, lse = -inf. max_seqlen_q and max_seqlen_k
-  only pick the tiles, so an underestimate is slow, not wrong.
-  rotary is prepare_rotary's (q coefficients, None) pair.
+  defaults to half its head axis, and an fp8 pool, which pads an odd head
+  count, needs it. An fp8 pool is widened to bf16 once per staged block, and
+  v_scale multiplies the output (q_scale carries the K scale). seqused_k is
+  each sequence's kv length with its new tokens, which the cache must already
+  hold; block_table entries past those tokens' pages are never dereferenced.
+  Causal rows align to the end of their sequence's keys; window_left (None
+  unbounded) also hides the keys more than window_left positions before that
+  diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
+  scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
+  softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
+  max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
+  slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
   """
   num_q_heads, total_q, head_dim = q.shape
   if q.dtype != jnp.bfloat16:
@@ -334,13 +332,7 @@ def flash_attn_varlen_paged(
         f" head_dim) cache; got {kv_cache.shape}."
     )
   _, page_size, cache_heads, cache_head_dim = kv_cache.shape
-  num_kv_heads = cache_heads // 2 if nheads_k is None else nheads_k
-  if merged_cache_heads(num_kv_heads, kv_cache.dtype) != cache_heads:
-    raise ValueError(
-        f"a merged {kv_cache.dtype} cache of {num_kv_heads} kv heads holds"
-        f" {merged_cache_heads(num_kv_heads, kv_cache.dtype)} head rows per"
-        f" token; got {cache_heads}."
-    )
+  num_kv_heads = resolve_merged_kv_heads(cache_heads, kv_cache.dtype, nheads_k)
   if cache_head_dim != head_dim or head_dim % NUM_LANES:
     raise ValueError(
         f"head_dim must be a multiple of {NUM_LANES} shared by q and the"
@@ -410,7 +402,7 @@ def flash_attn_varlen_paged(
       gqa_fold=gqa_fold,
       has_window=window_left is not None,
       block_sizes=block_sizes,
-      kv_dtype=jnp.dtype(kv_cache.dtype),
+      kv_dtype=kv_cache.dtype,
   )
   bq = block_sizes.block_q
   bkv = block_sizes.block_kv
