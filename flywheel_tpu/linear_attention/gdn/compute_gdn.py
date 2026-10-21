@@ -30,6 +30,8 @@ L2_NORM_EPS = 1e-6
 BASE_BLOCK_SIZE = 4
 BLOCKS_PER_LEVEL = 4
 NUM_STATE_PHASES = 3
+HALF_WORD_BITS = 16
+LOW_HALF_MASK = (1 << HALF_WORD_BITS) - 1
 
 
 def profile_scope(name: str) -> contextlib.AbstractContextManager[None]:
@@ -960,53 +962,46 @@ def recurrent_gdn(
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
 
 
-def pack_rows(halves: jax.Array) -> jax.Array:
-    """[..., rows, cols] 16-bit values (in int32) -> [..., rows // 2, cols]
-    int32 words holding row i in the low half and row i + rows / 2 in the
-    high half."""
-    num_rows = halves.shape[-2] // 2
-    return halves[..., :num_rows, :] | (halves[..., num_rows:, :] << 16)
-
-
 def split_checkpoint(state: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The hi and lo planes [..., kq_head_dim // 2, v_head_dim] int32 of an f32
     checkpoint [..., kq_head_dim, v_head_dim].
 
-    hi holds each value's bf16, rounded half up on its bit pattern, and lo
-    its low 16 bits; pack_rows puts two rows in a word.
+    hi holds each value's bf16, rounded half up on its bit pattern, and lo its
+    low 16 bits. A word holds row i in its low half and row
+    i + kq_head_dim / 2 in its high half.
     """
+
+    def _pack_rows(halves):
+        num_rows = halves.shape[-2] // 2
+        return (halves[..., :num_rows, :] |
+                (halves[..., num_rows:, :] << HALF_WORD_BITS))
+
     # Note (david): only integer ops and same-width bitcasts touch the bits,
     # so no float op can flush a subnormal or quiet a NaN. Round half up
     # leaves exactly 2^16 bit patterns per hi value (round to nearest even
     # leaves 2^16 + 1 per even one), so hi and lo give the f32 back; a carry
     # into the exponent is correct rounding.
     bits = jax.lax.bitcast_convert_type(state, jnp.int32)
-    hi = jax.lax.shift_right_logical(bits + 0x8000, jnp.int32(16))
-    return pack_rows(hi), pack_rows(bits & 0xFFFF)
+    hi_rounding_bias = 1 << (HALF_WORD_BITS - 1)
+    hi_halves = jax.lax.shift_right_logical(bits + hi_rounding_bias,
+                                            jnp.int32(HALF_WORD_BITS))
+    return _pack_rows(hi_halves), _pack_rows(bits & LOW_HALF_MASK)
 
 
 def merge_checkpoint(hi_words: jax.Array, lo_words: jax.Array) -> jax.Array:
     """The f32 checkpoint whose planes split_checkpoint made, bit for bit."""
     row_halves = []
-    for hi, lo in ((hi_words & 0xFFFF, lo_words & 0xFFFF),
-                   (jax.lax.shift_right_logical(hi_words, jnp.int32(16)),
-                    jax.lax.shift_right_logical(lo_words, jnp.int32(16)))):
-        # Note (david): hi rounded up exactly when lo >= 0x8000.
-        upper = hi - jax.lax.shift_right_logical(lo, jnp.int32(15))
-        row_halves.append((upper << 16) | lo)
+    for hi_bits, lo_bits in (
+        (hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
+        (jax.lax.shift_right_logical(hi_words, jnp.int32(HALF_WORD_BITS)),
+         jax.lax.shift_right_logical(lo_words, jnp.int32(HALF_WORD_BITS))),
+    ):
+        # Note (david): hi was rounded up exactly when lo has its top bit set.
+        upper_bits = hi_bits - jax.lax.shift_right_logical(
+            lo_bits, jnp.int32(HALF_WORD_BITS - 1))
+        row_halves.append((upper_bits << HALF_WORD_BITS) | lo_bits)
     return jax.lax.bitcast_convert_type(
         jnp.concatenate(row_halves, axis=-2), jnp.float32)
-
-
-def checkpoint_hi(hi_words: jax.Array) -> jax.Array:
-    """The bf16 checkpoint [..., kq_head_dim, v_head_dim] of a hi plane."""
-    # Note (david): a hi value in the high half of an f32 word is exactly a
-    # bf16, so the cast only repacks it (a subnormal flushes to zero, as in
-    # any dot operand).
-    row_halves = [hi_words << 16, hi_words & -0x10000]
-    return jax.lax.bitcast_convert_type(
-        jnp.concatenate(row_halves, axis=-2),
-        jnp.float32).astype(jnp.bfloat16)
 
 
 def replay_record_parts(
@@ -1119,12 +1114,17 @@ def replay_gdn(
 
     with profile_scope("replay_ckpt_read"):
         ckpt_scale = jnp.concatenate([decay_ckpt_col, decay_ckpt_col], axis=1)
+        ckpt_query = (kq_repeat * ckpt_scale).astype(jnp.bfloat16)
         # Note (david): a default-precision f32 dot rounds both operands to
-        # bf16 anyway (v6e), so S is read as the hi plane's bf16 and the dot
-        # runs on bf16 operands.
-        ckpt_reads = batched_matmul(
-            (kq_repeat * ckpt_scale).astype(jnp.bfloat16),
-            checkpoint_hi(checkpoint_hi_ref[...]))
+        # bf16 anyway (v6e), so S is read as the bf16 of its hi plane. A hi
+        # value in the high half of an f32 word is exactly a bf16, so the cast
+        # only repacks it (a subnormal flushes to zero, as in any dot operand).
+        hi_words = checkpoint_hi_ref[...]
+        checkpoint_bf16 = jax.lax.bitcast_convert_type(
+            jnp.concatenate(
+                [hi_words << HALF_WORD_BITS, hi_words & ~LOW_HALF_MASK],
+                axis=-2), jnp.float32).astype(jnp.bfloat16)
+        ckpt_reads = batched_matmul(ckpt_query, checkpoint_bf16)
 
     with profile_scope("replay_record_read"):
         kq_dot_records = jax.lax.dot_general(

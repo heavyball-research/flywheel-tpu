@@ -186,9 +186,9 @@ def inner_kernel(
             qkv_out = compute_kda.silu(qkv_out)
         q, k, v, b, g = vmem_ldst.load_activation_as_chunked(
             qkv_vreg=qkv_out, g_vreg=g_in, b_vmem_ref=b_slot_ref, cfg=cfg)
-        record_rows = lax.broadcasted_iota(
+        record_row_idx = lax.broadcasted_iota(
             jnp.int32, (cfg.replay_window, cfg.record_dim), 0)
-        gate_rows = lax.broadcasted_iota(
+        gate_row_idx = lax.broadcasted_iota(
             jnp.int32, (cfg.replay_window, cfg.gate_dim), 0)
 
         def _num_records(record):
@@ -210,22 +210,25 @@ def inner_kernel(
                         wait_checkpoint_lo=functools.partial(
                             wait_flush_in, idx),
                         cfg=cfg)
-                    hi, lo = compute_kda.split_checkpoint(checkpoint)
-                    recurrent_out_ref[idx, 0, 0] = hi
-                    recurrent_out_ref[idx, 0, 1] = lo
+                    hi_plane, lo_plane = compute_kda.split_checkpoint(
+                        checkpoint)
+                    recurrent_out_ref[idx, 0, 0] = hi_plane
+                    recurrent_out_ref[idx, 0, 1] = lo_plane
                     start_flush_out(idx)
 
-        def _merge_rows(rows, new_rows, rows_in, base, num_new_rows):
+        def _merge_rows(row_idx, new_rows, rows_in, base, num_new_rows):
             """rows_in with new_rows' first num_new_rows rows written from row
             base on."""
-            if cfg.replay_window > cfg.window_size:
-                new_rows = jnp.concatenate([
+            if cfg.replay_window == cfg.window_size:
+                padded_rows = new_rows
+            else:
+                padded_rows = jnp.concatenate([
                     new_rows,
                     jnp.zeros((cfg.replay_window - cfg.window_size,
                                new_rows.shape[-1]), new_rows.dtype)
                 ], axis=0)
-            shifted = pltpu.roll(new_rows, base, 0)
-            is_new_row = (rows >= base) & (rows < base + num_new_rows)
+            shifted = pltpu.roll(padded_rows, base, 0)
+            is_new_row = (row_idx >= base) & (row_idx < base + num_new_rows)
             return jnp.where(is_new_row, shifted, rows_in)
 
         # Note (david): folding mid tile overlaps the flush's lo plane read
@@ -254,13 +257,12 @@ def inner_kernel(
                 # Note (david): the aligned window replay_out_copy writes also
                 # covers committed rows, so the image keeps the rows it read.
                 # The roll and the merge run on unpacked f32 rows; only the
-                # merged image is cast to the storage dtype. The gates are f32
-                # and take the records' rows.
+                # merged image is cast to the storage dtype.
                 replay_out_ref[idx] = _merge_rows(
-                    record_rows, new_records, records_in, base,
+                    record_row_idx, new_records, records_in, base,
                     record.r_size).astype(replay_out_ref.dtype)
                 replay_gate_out_ref[idx] = _merge_rows(
-                    gate_rows, new_gates, gates_in, base, record.r_size)
+                    gate_row_idx, new_gates, gates_in, base, record.r_size)
 
         with profile_scope("store_out"):
             store_out_rows(out_slot_ref, jnp.stack(seq_outs, axis=0), 0,
@@ -500,10 +502,10 @@ def outer_kernel(
                                      sems.at[config.STREAM_CONV_IN, slot],
                                      *tile_args)
             if cfg.is_replay:
-                # Note (david): every decode reads its checkpoint's hi plane,
-                # and the single slot of a replay checkpoint ignores the read
-                # offset. Only the flushes read the lo plane, mid tile, so it
-                # queues behind the inputs the tile waits for at its start.
+                # Note (david): a replay checkpoint has a single slot, so it
+                # ignores the read offset. Only the flushes read the lo plane,
+                # mid tile, so it queues behind the inputs the tile waits for
+                # at its start.
                 memory_ref.start_state_in(
                     recurrent_state_ref, rec_in_buf.at[slot],
                     sems.at[config.STREAM_REC_IN, slot], *tile_args,
@@ -815,9 +817,12 @@ def split_checkpoint(recurrent_state: jax.Array) -> jax.Array:
 def merge_checkpoint(checkpoint: jax.Array) -> jax.Array:
     """The f32 recurrent states [..., n_v, d_k, d_v] of an int32 replay
     checkpoint [..., 2, n_v, d_k // 2, d_v], bit for bit."""
-    if checkpoint.dtype != jnp.int32 or checkpoint.shape[-4] != 2:
-        raise TypeError("merge_checkpoint takes int32 [..., 2, n_v, d_k // 2, "
-                        f"d_v], got {checkpoint.dtype} {checkpoint.shape}")
+    if checkpoint.dtype != jnp.int32:
+        raise TypeError("merge_checkpoint takes int32 checkpoints, got "
+                        f"{checkpoint.dtype}")
+    if checkpoint.shape[-4] != 2:
+        raise ValueError("merge_checkpoint takes [..., 2, n_v, d_k // 2, "
+                         f"d_v], got {checkpoint.shape}")
     return compute_kda.merge_checkpoint(checkpoint[..., 0, :, :, :],
                                         checkpoint[..., 1, :, :, :])
 
@@ -1177,11 +1182,13 @@ def launch_fused_conv1d_kda(
             raise ValueError("replay_lens must have one entry per sequence")
         checkpoint_shape = (recurrent_state.shape[0],
                             *replay_checkpoint_shape(n_kq, n_v, d_k, d_v))
-        if (recurrent_state.dtype != jnp.int32
-                or recurrent_state.shape != checkpoint_shape):
-            raise TypeError(
-                f"a replay checkpoint must be int32 {checkpoint_shape}, got "
-                f"{recurrent_state.dtype} {recurrent_state.shape}")
+        if recurrent_state.shape != checkpoint_shape:
+            raise ValueError(
+                f"a replay checkpoint must be {checkpoint_shape}, got "
+                f"{recurrent_state.shape}")
+        if recurrent_state.dtype != jnp.int32:
+            raise TypeError("a replay checkpoint must be int32, got "
+                            f"{recurrent_state.dtype}")
 
     tpu_info = pltpu.get_tpu_info()
     num_lanes = tpu_info.num_lanes
@@ -1450,7 +1457,8 @@ def launch_fused_conv1d_kda(
         )(*operands)
         if in_replay_state is None:
             return *results, None, None
-        return tuple(results)
+        else:
+            return tuple(results)
 
     (out, conv_state_out, recurrent_state_out, replay_state_out,
      replay_gates_out) = _call_kernel(conv_state, recurrent_state, None,

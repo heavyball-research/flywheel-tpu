@@ -114,8 +114,7 @@ class KDAConfig:
     # Note (david): the replay API stores each f32 checkpoint as two 16-bit
     # planes, hi (its bf16, rounded half up on the bits) and lo (its low 16
     # bits), so a decode step reads only the hi plane and a flush or a PER_SEQ
-    # tile rebuilds the f32 checkpoint exactly from both. A plane packs rows
-    # i and i + kq_head_dim / 2 of a head into one int32 word.
+    # tile rebuilds the f32 checkpoint exactly from both.
     split_checkpoint: bool = False
 
     def __post_init__(self) -> None:
@@ -215,7 +214,8 @@ class KDAConfig:
         checkpoint."""
         if self.split_checkpoint:
             return (2, *self.checkpoint_plane_shape)
-        return (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
+        else:
+            return (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
 
     def get_scratch_shape_dict(self) -> dict[str, pl.MemoryRef | None]:
         """VMEM rings, inter-tile carries and DMA semaphores of the pipeline.
@@ -247,20 +247,14 @@ class KDAConfig:
             carry_recurrent_scratch = None
 
         # Note (david): a replay tile reads the hi plane of every checkpoint
-        # and, into its own ring, the lo plane of the ones it flushes.
+        # and, into its own ring, the lo plane of the ones it flushes. The
+        # record axis is tiled, so record and gate DMAs move whole
+        # SUBLANE_ALIGN-row windows and a slot holds the full buffer.
         if self.is_replay:
             rec_in_shape = self.checkpoint_plane_shape
             rec_lo_in_buf = pltpu.VMEM(
                 (slots, tile_seqs, 1, *self.checkpoint_plane_shape),
                 self.dtypes.recurrent_state)
-        else:
-            rec_in_shape = self.stored_state_shape
-            rec_lo_in_buf = None
-
-        # Note (david): the record axis is tiled, so record DMAs move whole
-        # SUBLANE_ALIGN-row windows and a slot holds the full buffer. The f32
-        # gates move in the same row windows as the records.
-        if self.is_replay:
             replay_shape = (slots, tile_seqs, self.replay_window,
                             self.record_dim)
             gate_shape = (slots, tile_seqs, self.replay_window, self.gate_dim)
@@ -270,6 +264,8 @@ class KDAConfig:
             replay_gate_in_buf = pltpu.VMEM(gate_shape, jnp.float32)
             replay_gate_out_buf = pltpu.VMEM(gate_shape, jnp.float32)
         else:
+            rec_in_shape = self.stored_state_shape
+            rec_lo_in_buf = None
             replay_in_buf = None
             replay_out_buf = None
             replay_gate_in_buf = None
