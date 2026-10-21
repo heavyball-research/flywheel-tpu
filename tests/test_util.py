@@ -21,29 +21,26 @@ def randn(rng, shape, dtype=jnp.bfloat16):
 
 
 def merge_kv_heads(k, v):
-    """The merged cache rows of K and V (..., nheads_k, d): bf16 holds each KV head's K then
-    its V, [k0, v0, k1, v1, ...]; fp8 each head pair's two K rows then its two V rows, [k0,
-    k1, v0, v1, ...], an odd head count padded with one zero head."""
+    """The merged cache rows of K and V (..., nheads_k, d): per u32 word, its KV heads' K
+    then V; bf16 [k0, v0, k1, v1, ...], fp8 [k0, k1, v0, v1, ...] with an odd nheads_k
+    padded by one zero head."""
     *leading, nheads_k, d = k.shape
-    if k.dtype == jnp.bfloat16:
-        return jnp.stack([k, v], axis=-2).reshape(*leading, 2 * nheads_k, d)
-    else:
-        head_pad = [(0, 0)] * len(leading) + [(0, nheads_k % 2), (0, 0)]
-        pairs = (*leading, -1, 2, d)
-        return jnp.stack(
-            [jnp.pad(k, head_pad).reshape(pairs), jnp.pad(v, head_pad).reshape(pairs)], axis=-3
-        ).reshape(*leading, -1, d)
+    heads_per_word = 2 // k.dtype.itemsize
+    head_pad = [(0, 0)] * len(leading) + [(0, -nheads_k % heads_per_word), (0, 0)]
+    k_words, v_words = (
+        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d) for x in (k, v)
+    )
+    return jnp.stack([k_words, v_words], axis=-3).reshape(*leading, -1, d)
 
 
 def split_kv_heads(kv, nheads_k):
     """merge_kv_heads' inverse: the (K, V) rows (..., nheads_k, d) of merged cache rows."""
     *leading, _, d = kv.shape
-    if kv.dtype == jnp.bfloat16:
-        return kv[..., 0::2, :], kv[..., 1::2, :]
-    else:
-        pair_rows = kv.reshape(*leading, -1, 2, 2, d)
-        k, v = (pair_rows[..., part, :, :].reshape(*leading, -1, d) for part in range(2))
-        return k[..., :nheads_k, :], v[..., :nheads_k, :]
+    heads_per_word = 2 // kv.dtype.itemsize
+    words = kv.reshape(*leading, -1, 2, heads_per_word, d)
+    return tuple(
+        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :] for part in range(2)
+    )
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, rng):
