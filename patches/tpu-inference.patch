@@ -2637,10 +2637,10 @@ index 000000000..eff712b9d
 +    call.assert_called_once()
 diff --git a/tests/layers/common/test_flywheel_tpu_attention.py b/tests/layers/common/test_flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..826f8589f
+index 000000000..fc59479e9
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_attention.py
-@@ -0,0 +1,1341 @@
+@@ -0,0 +1,1139 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""CPU tests for the flywheel_tpu backend glue and its dispatch."""
 +
@@ -3207,12 +3207,9 @@ index 000000000..826f8589f
 +        seen = {}
 +
 +        def _fake_kernel(q, cache, v_cache, k, v, *, cache_seqlens,
-+                         block_table, num_active, softmax_scale, k_descale,
-+                         v_descale, nheads_k):
++                         block_table, num_active, softmax_scale):
 +            # Note (david): the paged merged cache is the one k_cache operand.
 +            assert v_cache is None
-+            assert (k_descale, v_descale, nheads_k) == (1.0, 1.0,
-+                                                        num_kv_heads)
 +            seen.update(k=np.asarray(k),
 +                        v=np.asarray(v),
 +                        cache_seqlens=np.asarray(cache_seqlens),
@@ -3258,9 +3255,8 @@ index 000000000..826f8589f
 +        seen = {}
 +
 +        def _fake_decode(q, k, v, kv_cache, kv_lens, page_indices, num_active,
-+                         *, sm_scale, k_scale, v_scale):
++                         *, sm_scale):
 +            seen["num_active"] = int(num_active)
-+            assert (k_scale, v_scale) == (1.0, 1.0)
 +            return q, kv_cache
 +
 +        monkeypatch.setattr(fa, "flywheel_tpu_decode", _fake_decode)
@@ -3543,21 +3539,10 @@ index 000000000..826f8589f
 +            "dense_batch_size": -1,
 +            "dense_seq_len": -1,
 +            "fused_q_rope_theta": None,
-+            "k_scale": None,
-+            "v_scale": None,
 +        }
 +        assert output.shape == (TOTAL_TOKENS, NUM_HEADS, HEAD_DIM)
 +        assert kv_cache.shape == (NUM_BLOCKS, BLOCK_SIZE, 2 * NUM_KV_HEADS,
 +                                  HEAD_DIM)
-+
-+    def test_passes_the_kv_scales_through(self, mesh, flywheel_flag,
-+                                          monkeypatch):
-+        wrapper, _ = self.run_attention(mesh,
-+                                        monkeypatch,
-+                                        k_scale=0.25,
-+                                        v_scale=0.5)
-+        kwargs = wrapper.call_args.kwargs
-+        assert (kwargs["k_scale"], kwargs["v_scale"]) == (0.25, 0.5)
 +
 +    def test_passes_decode_phase_through(self, mesh, flywheel_flag, monkeypatch):
 +        wrapper, _ = self.run_attention(mesh,
@@ -3579,6 +3564,8 @@ index 000000000..826f8589f
 +        ("attention_chunk_size", 512, "attention_chunk_size"),
 +        ("attn_logits_soft_cap", 30.0, "logits soft cap"),
 +        ("q_scale", 0.5, "q_scale"),
++        ("k_scale", 0.5, "k_scale"),
++        ("v_scale", 0.5, "v_scale"),
 +        ("update_kv_cache", False, "update_kv_cache=False"),
 +        ("decode_query_size", 2, "decode_query_size != 1"),
 +        ("use_causal_mask", False, "use_causal_mask=False"),
@@ -3613,195 +3600,6 @@ index 000000000..826f8589f
 +        with pytest.raises(NotImplementedError, match="context parallel"):
 +            check_supported_defaults(cp_mesh,
 +                                     jnp.ones((4, 8, 256), jnp.bfloat16))
-+
-+
-+FP8_KV_DTYPES = [jnp.float8_e4m3fn, jnp.float8_e5m2]
-+K_SCALE, V_SCALE = 0.25, 0.5
-+
-+
-+def fp8_merged_rows(k: np.ndarray, v: np.ndarray) -> np.ndarray:
-+    """The fp8 cache rows of (..., H, D) K and V: each head pair's two K rows,
-+    then its two V rows, an odd H padded with one zero head."""
-+    *leading, num_kv_heads, head_dim = k.shape
-+    if num_kv_heads % 2:
-+        pad = [(0, 0)] * len(leading) + [(0, 1), (0, 0)]
-+        k, v = np.pad(k, pad), np.pad(v, pad)
-+    pairs = (*leading, -1, 2, head_dim)
-+    merged = np.stack([k.reshape(pairs), v.reshape(pairs)], axis=-3)
-+    return merged.reshape(*leading, -1, head_dim)
-+
-+
-+class TestFp8KvCache:
-+
-+    @pytest.mark.parametrize("kv_dtype", FP8_KV_DTYPES)
-+    @pytest.mark.parametrize(("num_kv_heads", "cache_heads"), [(4, 8), (3, 8),
-+                                                               (1, 4)])
-+    def test_shape_pads_to_whole_head_pairs(self, mesh, flywheel_flag, kv_dtype,
-+                                            num_kv_heads, cache_heads):
-+        assert fa.get_kv_cache_shape(64, 128, num_kv_heads, 256,
-+                                     kv_dtype) == (64, 128, cache_heads, 256)
-+        assert kv_cache_mod.get_kv_cache_shape_with_mesh(
-+            mesh, 64, 128, num_kv_heads, 256,
-+            kv_dtype) == (64, 128, cache_heads, 256)
-+
-+    @pytest.mark.parametrize("kv_dtype", FP8_KV_DTYPES)
-+    @pytest.mark.parametrize("num_kv_heads", [1, 3, 8])
-+    def test_writes_head_pair_rows(self, monkeypatch, kv_dtype, num_kv_heads):
-+        monkeypatch.setattr(
-+            fa, "write_kv_cache_pages",
-+            functools.partial(fa.write_kv_cache_pages, interpret=True))
-+        rng = np.random.default_rng(num_kv_heads)
-+        k = jnp.asarray(rng.normal(size=(16, num_kv_heads, 128)), kv_dtype)
-+        v = jnp.asarray(rng.normal(size=k.shape), kv_dtype)
-+        cache_shape = fa.get_kv_cache_shape(4, 128, num_kv_heads, 128,
-+                                            kv_dtype)
-+        cache = jnp.asarray(rng.normal(size=cache_shape), kv_dtype)
-+        slice_table = np.zeros((3, 10), np.int32)
-+        slice_table[:, 0] = (2 * 128 + 5, 0, 10)
-+        slice_table[:, 1] = (0, 10, 6)
-+        expected = np.asarray(cache).view(np.uint8).reshape(
-+            4 * 128, *cache_shape[2:]).copy()
-+        merged = fp8_merged_rows(
-+            np.asarray(k).view(np.uint8), np.asarray(v).view(np.uint8))
-+        for cache_row, new_row, length in slice_table[:, :2].T:
-+            expected[cache_row:cache_row + length] = merged[new_row:new_row +
-+                                                            length]
-+        updated = fa.write_kv_cache(k, v, cache, jnp.asarray(slice_table),
-+                                    jnp.array([2], jnp.int32))
-+        np.testing.assert_array_equal(
-+            np.asarray(updated).view(np.uint8).reshape(expected.shape),
-+            expected)
-+
-+    @pytest.mark.parametrize("dense", [True, False])
-+    def test_prefill_attends_the_quantized_kv_as_bf16(self, monkeypatch,
-+                                                      dense):
-+        rng = np.random.default_rng(0)
-+        q = jnp.asarray(rng.normal(size=(6, 4, 8)), jnp.bfloat16)
-+        k = jnp.asarray(rng.normal(size=(6, 2, 8)), jnp.float8_e4m3fn)
-+        v = jnp.asarray(rng.normal(size=(6, 2, 8)), jnp.float8_e4m3fn)
-+        cache = jnp.zeros((4, 128, 4, 8), jnp.float8_e4m3fn)
-+        seen = {}
-+
-+        def _identity_kernel(q_in, k_in, v_in, *args, **kwargs):
-+            seen.update(k_dtype=k_in.dtype,
-+                        v_dtype=v_in.dtype,
-+                        softmax_scale=kwargs["softmax_scale"])
-+            return q_in
-+
-+        monkeypatch.setattr(fa, "flash_attn_func", _identity_kernel)
-+        monkeypatch.setattr(fa, "flash_attn_varlen_func", _identity_kernel)
-+        written = {}
-+
-+        def _record_writer(k_rows, v_rows, kv_cache, *args):
-+            written.update(k=k_rows, v=v_rows)
-+            return kv_cache
-+
-+        monkeypatch.setattr(fa, "write_kv_cache", _record_writer)
-+        output, _ = fa.flywheel_tpu_varlen_prefill(
-+            q,
-+            k,
-+            v,
-+            cache,
-+            jnp.array([0, 3, 6], jnp.int32),
-+            jnp.zeros((3, 8), jnp.int32),
-+            jnp.zeros((1, ), jnp.int32),
-+            sm_scale=0.5,
-+            varlen_block_span=-1 if dense else 3,
-+            dense_batch_size=2 if dense else -1,
-+            dense_seq_len=3 if dense else -1,
-+            k_scale=K_SCALE,
-+            v_scale=V_SCALE)
-+        assert seen["k_dtype"] == seen["v_dtype"] == jnp.bfloat16
-+        assert seen["softmax_scale"] == 0.5 * K_SCALE
-+        assert written["k"].dtype == jnp.float8_e4m3fn
-+        np.testing.assert_array_equal(
-+            np.asarray(output, np.float32),
-+            np.asarray((q.astype(jnp.float32) * V_SCALE).astype(jnp.bfloat16),
-+                       np.float32))
-+
-+    def test_decode_passes_the_scales_and_head_count(self, monkeypatch):
-+        seen = {}
-+
-+        def _fake_kernel(q, cache, v_cache, k, v, **kwargs):
-+            seen.update(kwargs, k_dtype=k.dtype)
-+            return jnp.zeros(q.shape, q.dtype), cache
-+
-+        monkeypatch.setattr(fa, "flash_attn_with_kvcache", _fake_kernel)
-+        q = jnp.zeros((8, 6, 128), jnp.bfloat16)
-+        k = jnp.zeros((8, 3, 128), jnp.float8_e5m2)
-+        fa.flywheel_tpu_attention(q,
-+                                  k,
-+                                  k,
-+                                  jnp.zeros(
-+                                      fa.get_kv_cache_shape(
-+                                          4, 128, 3, 128, jnp.float8_e5m2),
-+                                      jnp.float8_e5m2),
-+                                  jnp.zeros((8, ), jnp.int32),
-+                                  jnp.zeros((8 * 2, ), jnp.int32),
-+                                  jnp.zeros((9, ), jnp.int32),
-+                                  jnp.zeros((3 * 4, ), jnp.int32),
-+                                  jnp.zeros((1, ), jnp.int32),
-+                                  jnp.array([8, 8, 8], jnp.int32),
-+                                  phase=fa.DECODE_PHASE,
-+                                  sm_scale=1.0,
-+                                  k_scale=K_SCALE,
-+                                  v_scale=V_SCALE)
-+        assert seen["k_dtype"] == jnp.float8_e5m2
-+        assert (seen["k_descale"], seen["v_descale"],
-+                seen["nheads_k"]) == (K_SCALE, V_SCALE, 3)
-+
-+    @pytest.mark.parametrize(("k_dtype", "cache_dtype", "scales", "expected"), [
-+        pytest.param(jnp.bfloat16,
-+                     jnp.float8_e4m3fn, (K_SCALE, V_SCALE),
-+                     "must come in the cache",
-+                     id="unquantized_k"),
-+        pytest.param(jnp.bfloat16,
-+                     jnp.bfloat16, (K_SCALE, V_SCALE),
-+                     "describe an fp8 cache",
-+                     id="scales_on_bf16"),
-+    ])
-+    def test_rejects_inconsistent_quantization(self, k_dtype, cache_dtype,
-+                                               scales, expected):
-+        q = jnp.zeros((4, 4, 128), jnp.bfloat16)
-+        k = jnp.zeros((4, 2, 128), k_dtype)
-+        cache = jnp.zeros(fa.get_kv_cache_shape(2, 128, 2, 128, cache_dtype),
-+                          cache_dtype)
-+        with pytest.raises(ValueError, match=expected):
-+            fa.flywheel_tpu_attention(q,
-+                                      k,
-+                                      k,
-+                                      cache,
-+                                      jnp.zeros((2, ), jnp.int32),
-+                                      jnp.zeros((4, ), jnp.int32),
-+                                      jnp.zeros((3, ), jnp.int32),
-+                                      jnp.zeros((12, ), jnp.int32),
-+                                      jnp.zeros((1, ), jnp.int32),
-+                                      jnp.zeros((3, ), jnp.int32),
-+                                      phase=fa.PREFILL_PHASE,
-+                                      sm_scale=1.0,
-+                                      k_scale=scales[0],
-+                                      v_scale=scales[1])
-+
-+    def test_check_supported_takes_kv_scales_not_q_scale(self, mesh):
-+        q = jnp.ones((4, 8, 128), jnp.bfloat16)
-+        kwargs = dict(sinks=None,
-+                      attention_chunk_size=None,
-+                      attn_logits_soft_cap=None,
-+                      update_kv_cache=True,
-+                      decode_query_size=1)
-+        fa.check_supported(mesh,
-+                           q,
-+                           q_scale=None,
-+                           k_scale=K_SCALE,
-+                           v_scale=V_SCALE,
-+                           **kwargs)
-+        with pytest.raises(NotImplementedError, match="q_scale"):
-+            fa.check_supported(mesh,
-+                               q,
-+                               q_scale=1.0,
-+                               k_scale=K_SCALE,
-+                               v_scale=V_SCALE,
-+                               **kwargs)
 +
 +
 +class TestFusedQRope:
@@ -3984,10 +3782,10 @@ index 000000000..826f8589f
 +        assert seen["attention"]["fused_q_rope_theta"] is None
 diff --git a/tests/layers/common/test_flywheel_tpu_extend.py b/tests/layers/common/test_flywheel_tpu_extend.py
 new file mode 100644
-index 000000000..dc4e363b8
+index 000000000..93d3534f0
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_extend.py
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,715 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Cached-prefix dispatch and paged extend numerics, mixed batches included."""
 +
@@ -4397,16 +4195,11 @@ index 000000000..dc4e363b8
 +                        block_table,
 +                        num_active,
 +                        softmax_scale,
-+                        k_descale,
-+                        v_descale,
-+                        nheads_k,
 +                        cu_seqlens_q=None,
 +                        causal=False):
 +        # Note (david): only the decode rows reach flash_attn_with_kvcache,
 +        # with the paged merged cache as the one k_cache operand.
 +        assert v_cache is None and cu_seqlens_q is None and not causal
-+        assert (k_descale, v_descale, nheads_k) == (1.0, 1.0,
-+                                                    batch.k.shape[1])
 +        seen.update(k=k_rows,
 +                    v=v_rows,
 +                    rows=q_rows.shape[0],
@@ -4416,10 +4209,7 @@ index 000000000..dc4e363b8
 +
 +    def _paged_varlen(q_heads, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k, *,
 +                      max_seqlen_q, max_seqlen_k, softmax_scale, causal,
-+                      token_major, block_table, seqused_k, num_active,
-+                      k_descale, v_descale, nheads_k):
-+        assert (k_descale, v_descale, nheads_k) == (1.0, 1.0,
-+                                                    batch.k.shape[1])
++                      token_major, block_table, seqused_k, num_active):
 +        assert q_heads.shape == (QUERY_HEADS, batch.q.shape[0], HEAD_DIM)
 +        assert k_cache.shape == batch.kv_cache.shape
 +        assert v_cache is None and cu_seqlens_k is None
@@ -5628,10 +5418,10 @@ index 000000000..b775d64a0
 +                                  v.reshape(output.shape))
 diff --git a/tests/platforms/test_flywheel_tpu_config.py b/tests/platforms/test_flywheel_tpu_config.py
 new file mode 100644
-index 000000000..35dedc65c
+index 000000000..25fa7d213
 --- /dev/null
 +++ b/tests/platforms/test_flywheel_tpu_config.py
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,133 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Startup config check for USE_FLYWHEEL_TPU_KERNEL."""
 +
@@ -5693,11 +5483,6 @@ index 000000000..35dedc65c
 +                    max_num_batched_tokens=max_num_batched_tokens))
 +
 +
-+@pytest.mark.parametrize("cache_dtype", ["fp8", "fp8_e4m3", "fp8_e5m2"])
-+def test_accepts_fp8_kv_cache(cache_dtype):
-+    TpuPlatform._check_flywheel_tpu_config(make_config(cache_dtype=cache_dtype))
-+
-+
 +def test_flag_off_skips_check(monkeypatch):
 +    monkeypatch.setenv("USE_FLYWHEEL_TPU_KERNEL", "0")
 +    TpuPlatform._check_flywheel_tpu_config(make_config(block_size=16))
@@ -5711,12 +5496,8 @@ index 000000000..35dedc65c
 +        "block_size": 64
 +    }, "block-size"),
 +    ({
-+        "cache_dtype": "fp8_inc"
-+    }, "bfloat16 or fp8"),
-+    ({
-+        "cache_dtype": "fp8",
-+        "pcp_size": 2
-+    }, "prefill context parallel"),
++        "cache_dtype": "fp8"
++    }, "bfloat16"),
 +    ({
 +        "model_dtype": "float16"
 +    }, "bfloat16"),
@@ -7052,7 +6833,7 @@ index f03d7539e..396c7b82e 100644
          )
          async_copy.start()
 diff --git a/tpu_inference/layers/common/attention_interface.py b/tpu_inference/layers/common/attention_interface.py
-index fee282e5f..cd74157fe 100644
+index fee282e5f..e9cc89e2b 100644
 --- a/tpu_inference/layers/common/attention_interface.py
 +++ b/tpu_inference/layers/common/attention_interface.py
 @@ -37,6 +37,14 @@ from tpu_inference.kernels.mla.v2.tuned_params import (TuningKey,
@@ -7115,7 +6896,7 @@ index fee282e5f..cd74157fe 100644
  ) -> Tuple[jax.Array, jax.Array]:
      # T: seq_len
      # N: num_heads
-@@ -546,6 +578,70 @@ def attention(
+@@ -546,6 +578,68 @@ def attention(
      # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
      shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
  
@@ -7178,8 +6959,6 @@ index fee282e5f..cd74157fe 100644
 +            dense_batch_size=md.dense_batch_size,
 +            dense_seq_len=md.dense_seq_len,
 +            fused_q_rope_theta=fused_q_rope_theta,
-+            k_scale=k_scale,
-+            v_scale=v_scale,
 +        )
 +        return kv_cache, output
 +
@@ -7694,10 +7473,10 @@ index 000000000..c41c23333
 +                         write_slices, write_counts)
 diff --git a/tpu_inference/layers/common/flywheel_tpu_attention.py b/tpu_inference/layers/common/flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..59e5c88ac
+index 000000000..ba93df62e
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_tpu_attention.py
-@@ -0,0 +1,1132 @@
+@@ -0,0 +1,1063 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Dense FlyWheel TPU attention backend (USE_FLYWHEEL_TPU_KERNEL=1)."""
 +
@@ -7716,7 +7495,6 @@ index 000000000..59e5c88ac
 +from flywheel_tpu import \
 +    flash_attn_varlen_func as _flash_attn_varlen_func
 +from flywheel_tpu import flash_attn_with_kvcache
-+from flywheel_tpu.pallas.copy_utils import is_fp8_kv, merged_cache_heads
 +from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
 +from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 +from tpu_inference.layers.common.sharding import ShardingAxisName
@@ -7733,22 +7511,17 @@ index 000000000..59e5c88ac
 +flash_attn_varlen_func = jax.jit(
 +    _flash_attn_varlen_func,
 +    static_argnames=("max_seqlen_q", "max_seqlen_k", "softmax_scale", "causal",
-+                     "interpret", "token_major", "k_descale", "v_descale",
-+                     "nheads_k"),
++                     "interpret", "token_major"),
 +)
 +
 +# Note (david): one KV cache layout, the merged (num_pages, page_size,
-+# cache_heads, head_dim) whose token rows interleave the KV heads' K and V
-+# rows: bf16 [k0, v0, k1, v1, ...] (RPA v3's head order), cache_heads =
-+# 2 * kv_heads; fp8 [k0, k1, v0, v1, ...] with an odd kv_heads padded by one
-+# zero head (flywheel_tpu.pallas.copy_utils.merged_cache_heads). It has no
-+# singleton axis at one KV head per chip (a stacked (2, ..., 1, head_dim) one
-+# did, which XLA laid out so that every written layer paid two whole-cache
-+# copies), and its leading axis is the page axis. A head's K and V rows share
-+# one u32 word window of the head axis, so the paged prefill kernel stages
-+# only the window each q head reads. An fp8 cache holds what the model's
-+# quantize_kv wrote, K / k_scale and V / v_scale, and the kernels read it as
-+# stored, folding the two per-tensor scales into the softmax.
++# 2 * kv_heads, head_dim) whose token rows interleave each KV head's K row and
++# V row, [k0, v0, k1, v1, ...] (RPA v3's head order). It has no singleton axis
++# at one KV head per chip (a stacked (2, ..., 1, head_dim) one did, which XLA
++# laid out so that every written layer paid two whole-cache copies), and its
++# leading axis is the page axis. One head's (K, V) row pair is a 2-row window
++# of the head axis, so the paged prefill kernel stages only the KV head each
++# q head reads.
 +
 +
 +def _padded_head_dim(head_dim: int) -> int:
@@ -7780,16 +7553,15 @@ index 000000000..59e5c88ac
 +    kv_dtype: jnp.dtype,
 +) -> tuple[int, ...]:
 +    """Shape of one shard's merged K/V page pool for actual_num_kv_heads KV
-+    heads of kv_dtype (bf16, float8_e4m3fn or float8_e5m2)."""
++    heads. bf16 only, so kv_dtype does not size it."""
 +    head_dim = _padded_head_dim(actual_head_dim)
-+    # Note (david): the kernels read a KV head's K and V rows from one u32
++    # Note (david): the kernels read a KV head's (K, V) row pair as one u32
 +    # word per lane, so any KV head count per chip works.
 +    if actual_num_kv_heads < 1:
 +        raise ValueError(
 +            "USE_FLYWHEEL_TPU_KERNEL needs at least one KV head per chip; "
 +            f"got {actual_num_kv_heads}.")
-+    return (total_num_pages, page_size,
-+            merged_cache_heads(actual_num_kv_heads, kv_dtype), head_dim)
++    return (total_num_pages, page_size, 2 * actual_num_kv_heads, head_dim)
 +
 +
 +def kv_write_slice_bound(num_tokens: int, max_num_seqs: int,
@@ -8249,13 +8021,10 @@ index 000000000..59e5c88ac
 +    seq_len: int,
 +    sm_scale: float,
 +    fused_q_rope_theta: float | None = None,
-+    k_scale: float = 1.0,
-+    v_scale: float = 1.0,
 +) -> tuple[jax.Array, jax.Array]:
 +    """Dense batched prefill on a static (batch_size, seq_len) with the
 +    head-major FlyWheel kernel, which rotates Q itself when
-+    fused_q_rope_theta is given. An fp8 step attends its quantized K/V,
-+    k_scale and v_scale applied as softmax and output factors."""
++    fused_q_rope_theta is given."""
 +    total_tokens, _, head_dim = q.shape
 +    if (total_tokens != batch_size * seq_len or k.shape[0] != total_tokens
 +            or v.shape != k.shape):
@@ -8279,23 +8048,19 @@ index 000000000..59e5c88ac
 +            "rotary_interleaved": False,
 +            "rotary_k": False,
 +        }
-+    # Note (david): the dense and ragged kernels take bf16 K/V. Every fp8
-+    # value is exact in bf16, so the cast loses nothing, and the step attends
-+    # the very values the cache keeps for later steps.
 +    output = flash_attn_func(
 +        fold_heads_outer(q, batch_size, seq_len),
-+        fold_heads_outer(k.astype(q.dtype), batch_size, seq_len),
-+        fold_heads_outer(v.astype(q.dtype), batch_size, seq_len),
++        fold_heads_outer(k, batch_size, seq_len),
++        fold_heads_outer(v, batch_size, seq_len),
 +        causal=True,
-+        softmax_scale=sm_scale * k_scale,
++        softmax_scale=sm_scale,
 +        token_major=False,
 +        heads_outer_fold=True,
 +        **rope_kwargs,
 +    )
 +    cache = write_kv_cache(k, v, kv_cache, kv_write_slices,
 +                           kv_write_num_slices)
-+    output = unfold_heads_outer(output).astype(jnp.float32) * v_scale
-+    return output.astype(q.dtype), cache
++    return unfold_heads_outer(output), cache
 +
 +
 +def flywheel_tpu_varlen_prefill(
@@ -8312,8 +8077,6 @@ index 000000000..59e5c88ac
 +    dense_batch_size: int = -1,
 +    dense_seq_len: int = -1,
 +    fused_q_rope_theta: float | None = None,
-+    k_scale: float = 1.0,
-+    v_scale: float = 1.0,
 +) -> tuple[jax.Array, jax.Array]:
 +    """Prefill with the dense kernel on a static (batch, seq_len), otherwise
 +    with the ragged one at the host-chosen block span.
@@ -8334,8 +8097,6 @@ index 000000000..59e5c88ac
 +            seq_len=dense_seq_len,
 +            sm_scale=sm_scale,
 +            fused_q_rope_theta=fused_q_rope_theta,
-+            k_scale=k_scale,
-+            v_scale=v_scale,
 +        )
 +    if fused_q_rope_theta is not None:
 +        raise ValueError(
@@ -8356,18 +8117,17 @@ index 000000000..59e5c88ac
 +    # (N, T, D).
 +    output = flash_attn_varlen_func(
 +        q.transpose(1, 0, 2),
-+        k.astype(q.dtype).transpose(1, 0, 2),
-+        v.astype(q.dtype).transpose(1, 0, 2),
++        k.transpose(1, 0, 2),
++        v.transpose(1, 0, 2),
 +        cu_q_lens,
 +        cu_q_lens,
 +        max_seqlen_q=varlen_block_span,
 +        max_seqlen_k=varlen_block_span,
 +        causal=True,
-+        softmax_scale=sm_scale * k_scale,
++        softmax_scale=sm_scale,
 +        token_major=False,
 +    )
-+    output = output.transpose(1, 0, 2).astype(jnp.float32) * v_scale
-+    return output.astype(q.dtype), cache
++    return output.transpose(1, 0, 2), cache
 +
 +
 +def paged_cache_decode(
@@ -8380,18 +8140,13 @@ index 000000000..59e5c88ac
 +    num_active: jax.Array,  # i32 scalar: leading rows that are requests
 +    *,
 +    sm_scale: float,
-+    num_kv_heads: int,
-+    k_scale: float = 1.0,
-+    v_scale: float = 1.0,
 +) -> tuple[jax.Array, jax.Array]:
 +    """One query token per row against the paged cache, for the leading
 +    min(max_num_seqs, T) rows of the token bucket; returns those rows, NOT
 +    padded back to T, and the cache the kernel aliased through.
 +
 +    Passing k/v lets the kernel append them to the pages itself; None means
-+    the DMA writer has already copied this step's tokens there. num_kv_heads
-+    is the shard's head count, which an fp8 cache's padded head axis does not
-+    give.
++    the DMA writer has already copied this step's tokens there.
 +    """
 +    page_size = kv_cache.shape[1]
 +    max_num_seqs = kv_lens.shape[0]
@@ -8422,9 +8177,6 @@ index 000000000..59e5c88ac
 +        block_table=block_table,
 +        num_active=num_active,
 +        softmax_scale=sm_scale,
-+        k_descale=k_scale,
-+        v_descale=v_scale,
-+        nheads_k=num_kv_heads,
 +    )
 +    return output[:, 0], cache
 +
@@ -8439,8 +8191,6 @@ index 000000000..59e5c88ac
 +    num_active: jax.Array,  # i32 scalar: leading rows that are requests
 +    *,
 +    sm_scale: float,
-+    k_scale: float = 1.0,
-+    v_scale: float = 1.0,
 +) -> tuple[jax.Array, jax.Array]:
 +    """Paged decode attention for a decode-only batch, zero-filling the rows
 +    of the token bucket that no request slot covers.
@@ -8455,10 +8205,7 @@ index 000000000..59e5c88ac
 +                                       kv_lens,
 +                                       page_indices,
 +                                       num_active,
-+                                       sm_scale=sm_scale,
-+                                       num_kv_heads=k.shape[1],
-+                                       k_scale=k_scale,
-+                                       v_scale=v_scale)
++                                       sm_scale=sm_scale)
 +    padding_rows = q.shape[0] - output.shape[0]
 +    if padding_rows == 0:
 +        return output, cache
@@ -8480,8 +8227,6 @@ index 000000000..59e5c88ac
 +    num_active: jax.Array,  # i32 scalar: leading rows that are requests
 +    *,
 +    sm_scale: float,
-+    k_scale: float = 1.0,
-+    v_scale: float = 1.0,
 +) -> tuple[jax.Array, jax.Array]:
 +    """Append only the scheduled tokens, then attend to their entire cached
 +    prefix; the phase for a prefill request whose keys are partly in the pages.
@@ -8514,10 +8259,7 @@ index 000000000..59e5c88ac
 +                                           kv_lens,
 +                                           page_indices,
 +                                           num_decode,
-+                                           sm_scale=sm_scale,
-+                                           num_kv_heads=k.shape[1],
-+                                           k_scale=k_scale,
-+                                           v_scale=v_scale)
++                                           sm_scale=sm_scale)
 +    page_size = cache.shape[1]
 +    max_num_seqs = kv_lens.shape[0]
 +    block_table = page_indices.reshape(max_num_seqs, -1)
@@ -8554,9 +8296,6 @@ index 000000000..59e5c88ac
 +        block_table=block_table_window,
 +        seqused_k=kv_lens_window,
 +        num_active=num_active - num_decode,
-+        k_descale=k_scale,
-+        v_descale=v_scale,
-+        nheads_k=k.shape[1],
 +    ).transpose(1, 0, 2)
 +    # Note (david): the varlen kernel does not own the rows below its first
 +    # request (row num_decode): its first q block may start anywhere below it,
@@ -8583,7 +8322,7 @@ index 000000000..59e5c88ac
 +    q: jax.Array,  # [T, N, D]
 +    k: jax.Array,  # [T, H, D]
 +    v: jax.Array,  # [T, H, D]
-+    kv_cache: jax.Array,  # [num_pages, page_size, merged_cache_heads(H), D]
++    kv_cache: jax.Array,  # [num_pages, page_size, 2 * H, D]
 +    kv_lens: jax.Array,  # i32[max_num_seqs]
 +    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
 +    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
@@ -8597,17 +8336,13 @@ index 000000000..59e5c88ac
 +    dense_batch_size: int = -1,
 +    dense_seq_len: int = -1,
 +    fused_q_rope_theta: float | None = None,
-+    k_scale: float | None = None,
-+    v_scale: float | None = None,
 +) -> tuple[jax.Array, jax.Array]:
 +    """One shard's attention for a fresh prefill, cached extend, or decode
 +    step, dispatched on the host-decided phase and prefill kernel choice.
 +
 +    distribution is this rank's request_distribution: its last entry bounds
 +    the decode kernel's active rows and its first splits a mixed batch
-+    between the decode kernel and the paged varlen kernel. An fp8 cache takes
-+    k and v already quantized (quantize_kv) and their per-tensor k_scale and
-+    v_scale.
++    between the decode kernel and the paged varlen kernel.
 +    """
 +    # Note (david): the phase is static, so each step traces only its selected
 +    # kernel and the in-place cache update sits in the entry computation,
@@ -8636,21 +8371,10 @@ index 000000000..59e5c88ac
 +    num_kv_heads = k.shape[1]
 +    if kv_cache.ndim != 4:
 +        raise ValueError(
-+            "flywheel_tpu expects a (pages, page_size, cache_heads, "
++            "flywheel_tpu expects a (pages, page_size, 2 * kv_heads, "
 +            f"head_dim) cache; got {kv_cache.shape}.")
-+    if k.dtype != kv_cache.dtype or v.dtype != kv_cache.dtype:
-+        raise ValueError(
-+            f"k/v ({k.dtype}, {v.dtype}) must come in the cache's "
-+            f"{kv_cache.dtype}; an fp8 cache takes quantize_kv's output.")
-+    if not is_fp8_kv(kv_cache.dtype) and (k_scale is not None
-+                                          or v_scale is not None):
-+        raise ValueError(
-+            f"k_scale / v_scale describe an fp8 cache; got {kv_cache.dtype}.")
-+    k_scale = 1.0 if k_scale is None else float(k_scale)
-+    v_scale = 1.0 if v_scale is None else float(v_scale)
 +    page_size, cache_head_shape = kv_cache.shape[1], kv_cache.shape[2:]
-+    expected_head_shape = (merged_cache_heads(num_kv_heads, kv_cache.dtype),
-+                           padded_head_dim)
++    expected_head_shape = (2 * num_kv_heads, padded_head_dim)
 +    if cache_head_shape != expected_head_shape:
 +        raise ValueError(
 +            f"cache heads/head_dim {cache_head_shape} do not match k/v "
@@ -8678,9 +8402,7 @@ index 000000000..59e5c88ac
 +                                                 kv_lens,
 +                                                 page_indices,
 +                                                 distribution[2],
-+                                                 sm_scale=sm_scale,
-+                                                 k_scale=k_scale,
-+                                                 v_scale=v_scale)
++                                                 sm_scale=sm_scale)
 +    elif phase == EXTEND_PHASE:
 +        output, kv_cache = flywheel_tpu_extend(padded_q,
 +                                                 padded_k,
@@ -8693,9 +8415,7 @@ index 000000000..59e5c88ac
 +                                                 kv_write_num_slices,
 +                                                 distribution[0],
 +                                                 distribution[2],
-+                                                 sm_scale=sm_scale,
-+                                                 k_scale=k_scale,
-+                                                 v_scale=v_scale)
++                                                 sm_scale=sm_scale)
 +    else:
 +        output, kv_cache = flywheel_tpu_varlen_prefill(
 +            padded_q,
@@ -8709,9 +8429,7 @@ index 000000000..59e5c88ac
 +            varlen_block_span=varlen_block_span,
 +            dense_batch_size=dense_batch_size,
 +            dense_seq_len=dense_seq_len,
-+            fused_q_rope_theta=fused_q_rope_theta,
-+            k_scale=k_scale,
-+            v_scale=v_scale)
++            fused_q_rope_theta=fused_q_rope_theta)
 +    return output[..., :head_dim], kv_cache
 +
 +
@@ -8734,8 +8452,6 @@ index 000000000..59e5c88ac
 +    dense_batch_size: int = -1,
 +    dense_seq_len: int = -1,
 +    fused_q_rope_theta: float | None = None,
-+    k_scale: float | None = None,
-+    v_scale: float | None = None,
 +) -> tuple[jax.Array, jax.Array]:
 +    """Shards along KV heads, mirroring sharded_ragged_paged_attention."""
 +    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
@@ -8768,9 +8484,7 @@ index 000000000..59e5c88ac
 +                                        varlen_block_span=varlen_block_span,
 +                                        dense_batch_size=dense_batch_size,
 +                                        dense_seq_len=dense_seq_len,
-+                                        fused_q_rope_theta=fused_q_rope_theta,
-+                                        k_scale=k_scale,
-+                                        v_scale=v_scale)
++                                        fused_q_rope_theta=fused_q_rope_theta)
 +
 +    return jax.shard_map(
 +        _attention,
@@ -8801,7 +8515,6 @@ index 000000000..59e5c88ac
 +        raise NotImplementedError(
 +            "USE_FLYWHEEL_TPU_KERNEL does not support decode context "
 +            f"parallel meshes (axis 'dcp' has size {mesh.shape['dcp']}).")
-+    is_quantized_kv = k_scale is not None or v_scale is not None
 +    unsupported = {
 +        "sinks":
 +        sinks is not None,
@@ -8809,11 +8522,8 @@ index 000000000..59e5c88ac
 +        attention_chunk_size is not None,
 +        "logits soft cap":
 +        attn_logits_soft_cap is not None,
-+        "q_scale (quantized Q)":
-+        q_scale is not None,
-+        "an fp8 KV cache (k_scale/v_scale) under prefill context parallel":
-+        is_quantized_kv and get_mesh_shape_product(
-+            mesh, ShardingAxisName.PREFILL_CONTEXT) > 1,
++        "q_scale/k_scale/v_scale (quantized KV)":
++        any(s is not None for s in (q_scale, k_scale, v_scale)),
 +        "update_kv_cache=False (KV-share layers)":
 +        not update_kv_cache,
 +        "decode_query_size != 1 (speculative decoding)":
@@ -9953,7 +9663,7 @@ index d53ebe9c1..eb0e923b5 100644
      # 6. Force HAS_TRITON to False to prevent JAX/Triton active driver crash on TPU
      qwen3_vl_mod.HAS_TRITON = False
 diff --git a/tpu_inference/platforms/tpu_platform.py b/tpu_inference/platforms/tpu_platform.py
-index c23b3c7aa..d9369de58 100644
+index c23b3c7aa..8ca3ef6da 100644
 --- a/tpu_inference/platforms/tpu_platform.py
 +++ b/tpu_inference/platforms/tpu_platform.py
 @@ -80,6 +80,7 @@ if hasattr(torch, "accelerator") and hasattr(torch.accelerator, "synchronize"):
@@ -10035,7 +9745,7 @@ index c23b3c7aa..d9369de58 100644
          parallel_config = vllm_config.parallel_config
          scheduler_config = vllm_config.scheduler_config
          parallel_config.worker_cls = \
-@@ -504,6 +550,88 @@ class TpuPlatform(Platform):
+@@ -504,6 +550,77 @@ class TpuPlatform(Platform):
                  patch_vllm_scheduler_for_continue_decode
              patch_vllm_scheduler_for_continue_decode()
  
@@ -10099,20 +9809,9 @@ index c23b3c7aa..d9369de58 100644
 +            problems.append(
 +                f"head_dim {model_config.get_head_size()} is not one of the "
 +                f"decode kernel's {decode_head_dims}")
-+        # Note (david): an fp8 cache ("fp8" and "fp8_e4m3" are float8_e4m3fn,
-+        # "fp8_e5m2" float8_e5m2) holds quantize_kv's output, which the
-+        # kernels read as stored with the layer's per-tensor scales.
-+        if cache_config.cache_dtype not in ("auto", "bfloat16", "fp8",
-+                                            "fp8_e4m3", "fp8_e5m2"):
++        if cache_config.cache_dtype not in ("auto", "bfloat16"):
 +            problems.append(
-+                f"kv cache dtype {cache_config.cache_dtype!r} is not bfloat16 "
-+                "or fp8")
-+        if (cache_config.cache_dtype.startswith("fp8")
-+                and vllm_config.parallel_config.prefill_context_parallel_size
-+                > 1):
-+            problems.append(
-+                "an fp8 kv cache is not supported with prefill context "
-+                "parallel")
++                f"kv cache dtype {cache_config.cache_dtype!r} is not bfloat16")
 +        if str(model_config.dtype).removeprefix("torch.") != "bfloat16":
 +            problems.append(
 +                f"model dtype {model_config.dtype} is not bfloat16")
