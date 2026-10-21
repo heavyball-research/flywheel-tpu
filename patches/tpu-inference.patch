@@ -2637,10 +2637,10 @@ index 000000000..eff712b9d
 +    call.assert_called_once()
 diff --git a/tests/layers/common/test_flywheel_tpu_attention.py b/tests/layers/common/test_flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..864ff7cb1
+index 000000000..826f8589f
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_tpu_attention.py
-@@ -0,0 +1,1344 @@
+@@ -0,0 +1,1341 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""CPU tests for the flywheel_tpu backend glue and its dispatch."""
 +
@@ -3711,9 +3711,6 @@ index 000000000..864ff7cb1
 +            dense_seq_len=3 if dense else -1,
 +            k_scale=K_SCALE,
 +            v_scale=V_SCALE)
-+        # Note (david): the kernels attend the exact bf16 cast of the stored
-+        # fp8 K/V, with k_scale in the softmax scale and v_scale on the
-+        # output, while the cache gets the fp8 rows as they came.
 +        assert seen["k_dtype"] == seen["v_dtype"] == jnp.bfloat16
 +        assert seen["softmax_scale"] == 0.5 * K_SCALE
 +        assert written["k"].dtype == jnp.float8_e4m3fn
@@ -7697,10 +7694,10 @@ index 000000000..c41c23333
 +                         write_slices, write_counts)
 diff --git a/tpu_inference/layers/common/flywheel_tpu_attention.py b/tpu_inference/layers/common/flywheel_tpu_attention.py
 new file mode 100644
-index 000000000..1ed8642fe
+index 000000000..59e5c88ac
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_tpu_attention.py
-@@ -0,0 +1,1148 @@
+@@ -0,0 +1,1132 @@
 +# SPDX-License-Identifier: Apache-2.0
 +"""Dense FlyWheel TPU attention backend (USE_FLYWHEEL_TPU_KERNEL=1)."""
 +
@@ -8182,25 +8179,6 @@ index 000000000..1ed8642fe
 +                                kv_write_num_slices)
 +
 +
-+def prefill_kv_operands(q: jax.Array, k: jax.Array,
-+                        v: jax.Array) -> tuple[jax.Array, jax.Array]:
-+    """The K/V a fresh-prefill kernel attends: k and v, or an fp8 step's
-+    quantized values cast to q's dtype."""
-+    # Note (david): the dense and ragged kernels take bf16 K/V. Every fp8
-+    # value is exact in bf16, so the cast loses nothing, and the step attends
-+    # the very values the cache keeps for later steps.
-+    if k.dtype == q.dtype:
-+        return k, v
-+    return k.astype(q.dtype), v.astype(q.dtype)
-+
-+
-+def scale_output(output: jax.Array, v_scale: float) -> jax.Array:
-+    """output times a quantized cache's per-tensor V scale."""
-+    if v_scale == 1.0:
-+        return output
-+    return (output.astype(jnp.float32) * v_scale).astype(output.dtype)
-+
-+
 +def is_q_rope_fused(attention_metadata: AttentionMetadata) -> bool:
 +    """Whether this step can rotate Q inside the prefill kernel, which only
 +    the FlyWheel backend's dense prefill does. A model that sees True and has
@@ -8301,11 +8279,13 @@ index 000000000..1ed8642fe
 +            "rotary_interleaved": False,
 +            "rotary_k": False,
 +        }
-+    attend_k, attend_v = prefill_kv_operands(q, k, v)
++    # Note (david): the dense and ragged kernels take bf16 K/V. Every fp8
++    # value is exact in bf16, so the cast loses nothing, and the step attends
++    # the very values the cache keeps for later steps.
 +    output = flash_attn_func(
 +        fold_heads_outer(q, batch_size, seq_len),
-+        fold_heads_outer(attend_k, batch_size, seq_len),
-+        fold_heads_outer(attend_v, batch_size, seq_len),
++        fold_heads_outer(k.astype(q.dtype), batch_size, seq_len),
++        fold_heads_outer(v.astype(q.dtype), batch_size, seq_len),
 +        causal=True,
 +        softmax_scale=sm_scale * k_scale,
 +        token_major=False,
@@ -8314,7 +8294,8 @@ index 000000000..1ed8642fe
 +    )
 +    cache = write_kv_cache(k, v, kv_cache, kv_write_slices,
 +                           kv_write_num_slices)
-+    return scale_output(unfold_heads_outer(output), v_scale), cache
++    output = unfold_heads_outer(output).astype(jnp.float32) * v_scale
++    return output.astype(q.dtype), cache
 +
 +
 +def flywheel_tpu_varlen_prefill(
@@ -8373,11 +8354,10 @@ index 000000000..1ed8642fe
 +    # XLA answers with a second [T, N, D] copy per layer; see
 +    # select_attention_phase for what that copy cost. The head-major API takes
 +    # (N, T, D).
-+    attend_k, attend_v = prefill_kv_operands(q, k, v)
 +    output = flash_attn_varlen_func(
 +        q.transpose(1, 0, 2),
-+        attend_k.transpose(1, 0, 2),
-+        attend_v.transpose(1, 0, 2),
++        k.astype(q.dtype).transpose(1, 0, 2),
++        v.astype(q.dtype).transpose(1, 0, 2),
 +        cu_q_lens,
 +        cu_q_lens,
 +        max_seqlen_q=varlen_block_span,
@@ -8386,7 +8366,8 @@ index 000000000..1ed8642fe
 +        softmax_scale=sm_scale * k_scale,
 +        token_major=False,
 +    )
-+    return scale_output(output.transpose(1, 0, 2), v_scale), cache
++    output = output.transpose(1, 0, 2).astype(jnp.float32) * v_scale
++    return output.astype(q.dtype), cache
 +
 +
 +def paged_cache_decode(
