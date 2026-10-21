@@ -14,15 +14,16 @@ MIN_BLOCK_KV = 128
 BF16_BITS = 16
 FP8_BITS = 8
 KV_WORD_BYTES = 4
-FP8_KV_DTYPES = (jnp.dtype(jnp.float8_e4m3fn), jnp.dtype(jnp.float8_e5m2))
-MERGED_KV_DTYPES = (jnp.dtype(jnp.bfloat16), *FP8_KV_DTYPES)
+MERGED_KV_DTYPES = (
+    jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float8_e4m3fn),
+    jnp.dtype(jnp.float8_e5m2))
 
-# Note (david): the merged cache keeps every KV head's K and V rows in one u32
-# word per lane, so a staged token's words yield both with one load. A bf16
-# word is one head's (K, V) pair, rows [k0, v0, k1, v1, ...]. An fp8 word is
-# one head pair's (K, K, V, V), rows [k0, k1, v0, v1, k2, k3, v2, v3, ...],
-# so the interleave is the bf16 one at 16-bit head-pair granularity and needs
-# no cross-sublane shuffle; an odd head count takes one zero head.
+# Note (david): a merged-cache token keeps each KV head's K and V in one u32
+# word per lane, so one load yields both. A bf16 word is one head's (K, V),
+# rows [k0, v0, k1, v1, ...]; an fp8 word is a head pair's (K, K, V, V), rows
+# [k0, k1, v0, v1, ...], the bf16 interleave at 16-bit granularity, so the
+# fp8 pack needs no cross-sublane shuffle. An odd fp8 head count pads one zero
+# head.
 
 
 def check_merged_kv_dtype(dtype: jnp.dtype) -> None:
@@ -30,10 +31,6 @@ def check_merged_kv_dtype(dtype: jnp.dtype) -> None:
     raise NotImplementedError(
         "the merged KV cache holds bfloat16, float8_e4m3fn or float8_e5m2;"
         f" got {jnp.dtype(dtype)}.")
-
-
-def is_fp8_kv(dtype: jnp.dtype) -> bool:
-  return jnp.dtype(dtype) in FP8_KV_DTYPES
 
 
 def kv_word_rows(dtype: jnp.dtype) -> int:
@@ -56,10 +53,12 @@ def resolve_merged_kv_heads(
     cache_heads: int, dtype: jnp.dtype, nheads_k: int | None
 ) -> int:
   """KV heads of a merged cache whose tokens hold cache_heads head rows:
-  nheads_k, else half the rows of a bf16 cache."""
+  nheads_k, else half the rows of a bf16 cache. Checks the dtype and that
+  cache_heads is that head count's merged_cache_heads."""
+  check_merged_kv_dtype(dtype)
   if nheads_k is not None:
     num_kv_heads = nheads_k
-  elif is_fp8_kv(dtype):
+  elif kv_heads_per_word(dtype) > 1:
     raise ValueError(
         "an fp8 cache pads an odd nheads_k, so its head axis does not give"
         " the KV head count; pass nheads_k.")
@@ -77,13 +76,9 @@ def interleave_kv_rows(k_rows: jax.Array, v_rows: jax.Array) -> jax.Array:
   """(..., heads, head_dim) K and V rows -> (..., 2 * heads, head_dim) merged
   cache rows; an fp8 operand needs an even head count."""
   # Note (david): the halves move as integers, so every bit pattern (NaN
-  # payloads, subnormals) survives.
-  if k_rows.dtype == jnp.bfloat16:
-    k_bits = lax.bitcast_convert_type(k_rows, jnp.uint16).astype(jnp.uint32)
-    v_bits = lax.bitcast_convert_type(v_rows, jnp.uint16).astype(jnp.uint32)
-  else:
-    k_bits = pltpu.bitcast(k_rows, jnp.uint16).astype(jnp.uint32)
-    v_bits = pltpu.bitcast(v_rows, jnp.uint16).astype(jnp.uint32)
+  # payloads, subnormals) survives; an fp8 pair packs into the 16-bit half.
+  k_bits = pltpu.bitcast(k_rows, jnp.uint16).astype(jnp.uint32)
+  v_bits = pltpu.bitcast(v_rows, jnp.uint16).astype(jnp.uint32)
   return pltpu.bitcast(k_bits | (v_bits << BF16_BITS), k_rows.dtype)
 
 

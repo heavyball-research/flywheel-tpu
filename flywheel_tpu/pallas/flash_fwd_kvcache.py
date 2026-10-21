@@ -31,7 +31,6 @@ from .block_sizes import (
 from .copy_utils import (
   MIN_BLOCK_KV,
   bank_safe_word_stride,
-  check_merged_kv_dtype,
   kv_heads_per_word,
   kv_word_halves,
   kv_word_rows,
@@ -258,9 +257,6 @@ def kvcache_kernel(
   else:
     staged_kv_heads = num_kv_heads
   word_rows = kv_word_rows(cache_dtype)
-  # Note (david): K and V reach the MXU in the cache dtype; an fp8 tile is
-  # the matmul's latched operand, which the MXU widens to bf16 itself.
-  is_mixed_dot = cache_dtype != q_ref.dtype
   num_kv_compute_fragments = block_kv // block_kv_compute
   # Note (david): a bitcast head-pair tile interleaves its two heads per token,
   # so both heads' query groups ride one MXU pass with the off-parity columns
@@ -592,15 +588,11 @@ def kvcache_kernel(
               kv_compute_index,
           )
           values.append(value)
-          if is_mixed_dot:
-            member_scores = lax.dot_general(
-                query, key, NT_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-          else:
-            member_scores = jnp.dot(
-                query, key.T, preferred_element_type=jnp.float32
-            )
+          # Note (david): K and V stay in the cache dtype; the MXU widens an
+          # fp8 latched operand to bf16 itself.
+          member_scores = lax.dot_general(
+              query, key, NT_DIM_NUMBERS, preferred_element_type=jnp.float32
+          )
           if scores is None:
             scores = member_scores
           else:
@@ -679,15 +671,10 @@ def kvcache_kernel(
       if is_merged_cache:
         weighted_values = None
         for group_member, value in enumerate(merged_values):
-          if is_mixed_dot:
-            member_values = lax.dot_general(
-                probabilities, value, NN_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-          else:
-            member_values = jnp.dot(
-                probabilities, value, preferred_element_type=jnp.float32
-            )
+          member_values = lax.dot_general(
+              probabilities, value, NN_DIM_NUMBERS,
+              preferred_element_type=jnp.float32,
+          )
           if weighted_values is None:
             weighted_values = member_values
           else:
@@ -1145,7 +1132,6 @@ def flash_attn_kvcache_pallas(
     # Note (david): a merged build stages, appends and writes back whole token
     # rows, so no DMA cuts the head axis, and a staged u32 word holds whole
     # heads' K and V: the head count needs no tile alignment or parity.
-    check_merged_kv_dtype(k_cache.dtype)
     row_tokens = cache_shape[1]
     num_kv_heads = resolve_merged_kv_heads(
         cache_shape[2], k_cache.dtype, nheads_k)

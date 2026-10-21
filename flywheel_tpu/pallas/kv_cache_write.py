@@ -156,8 +156,8 @@ def write_kv_cache_pages(
         f" cache; got {k.shape=}, {v.shape=}, {kv_cache.shape=}.")
   if head_dim % 128:
     raise ValueError(f"head_dim must be a multiple of 128; got {head_dim}.")
-  # Note (david): an fp8 word holds a head pair, so an odd head count is
-  # staged with the zero head the cache pads it with.
+  # Note (david): an odd fp8 head count is staged with the cache's zero pad
+  # head, so the interleave writes whole u32 words.
   staged_kv_heads = cache_heads // 2
   head_pad = ((0, 0), (0, staged_kv_heads - num_kv_heads), (0, 0))
   staged_k, staged_v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)

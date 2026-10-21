@@ -110,8 +110,8 @@ def append_ragged(
   # untouched, so XLA emits no copy.
   flat_cache = kv_cache.reshape(-1, *kv_cache.shape[-2:])
   _, num_kv_heads, head_dim = k.shape
-  # Note (david): an fp8 word holds a head pair, so an odd head count is
-  # staged with the zero head the cache pads it with.
+  # Note (david): an odd fp8 head count is staged with the cache's zero pad
+  # head, so the interleave writes whole u32 words.
   staged_kv_heads = kv_cache.shape[2] // 2
   head_pad = ((0, 0), (0, staged_kv_heads - num_kv_heads), (0, 0))
   staged_k, staged_v = jnp.pad(k, head_pad), jnp.pad(v, head_pad)

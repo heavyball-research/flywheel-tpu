@@ -26,11 +26,7 @@ from .pallas.block_sizes import (
   pick_tile,
   round_up,
 )
-from .pallas.copy_utils import (
-  check_merged_kv_dtype,
-  kv_word_rows,
-  resolve_merged_kv_heads,
-)
+from .pallas.copy_utils import resolve_merged_kv_heads
 from .pallas.flash_bwd import flash_attn_bwd
 from .pallas.flash_fwd import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
 from .pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
@@ -1420,13 +1416,16 @@ def flash_attn_with_kvcache(
           "block_table and cache_batch_idx are mutually exclusive: the block"
           " table already maps each query row to its pages."
       )
-    check_merged_kv_dtype(k_cache.dtype)
-    if k_cache.ndim != 4 or k_cache.shape[2] % kv_word_rows(k_cache.dtype):
+    if k_cache.ndim != 4:
       raise ValueError(
           "With block_table, k_cache must be (num_pages, page_size,"
           " cache_heads, head_dim), the KV heads' K and V rows interleaved;"
           f" got {k_cache.shape=}."
       )
+    if nheads_k is None and k is not None:
+      nheads_k = k.shape[-2]
+    pool_heads = resolve_merged_kv_heads(
+        k_cache.shape[2], k_cache.dtype, nheads_k)
     if k_cache.shape[1] % PAGE_SIZE_MULTIPLE:
       raise ValueError(
           "page_size (k_cache.shape[1]) must be a multiple of"
@@ -1443,12 +1442,6 @@ def flash_attn_with_kvcache(
           f" {block_table.shape}."
       )
     flat_block_table = block_table.astype(jnp.int32).reshape(-1)
-    if nheads_k is None and k is not None:
-      pool_heads = resolve_merged_kv_heads(
-          k_cache.shape[2], k_cache.dtype, k.shape[-2])
-    else:
-      pool_heads = resolve_merged_kv_heads(
-          k_cache.shape[2], k_cache.dtype, nheads_k)
     cache_shape = (*k_cache.shape[:2], pool_heads, k_cache.shape[3])
     cache_operands = (k_cache,)
   else:

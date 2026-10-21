@@ -487,17 +487,12 @@ def fwd_body(
         else:
           kv_rows = []
           for kv_part in range(2):
-            if heads_per_word == 1:
-              word_row = kv_part
-            else:
-              word_row = kv_part * heads_per_word + kv_head % heads_per_word
+            word_row = kv_part * heads_per_word + kv_head % heads_per_word
             kv_rows.append(kv_pair_buf[slot, tile_rows, 0, word_row, :])
-        # Note (david): an fp8 block is widened to bf16 planes here, once per
-        # staged block, so every q tile runs the bf16 matmuls. Feeding the
-        # fp8 planes to the MXU instead makes Mosaic rescale every f32 score
-        # and output tile for e4m3fn's bias: v6e, h32 k8 d128, 1024-token
-        # chunks over 8K, e4m3fn 0.356 against 0.349 ms a chunk, e5m2 at par
-        # (0.338, 0.339); a bf16 cache runs 0.340.
+        # Note (david): an fp8 block is widened to bf16 once per staged block
+        # rather than fed to the MXU as fp8, which makes Mosaic rescale every
+        # f32 score and output tile for e4m3fn's bias (v6e: 0.356 against
+        # 0.349 ms a 1024-token chunk).
         for kv_part, plane_rows in enumerate(kv_rows):
           kv_planes[kv_part, tile_rows, :] = plane_rows.astype(
               kv_planes.dtype)
@@ -1676,14 +1671,12 @@ def forward_common(
   else:
     q_in, k_in, v_in, *rotary_in = (q, k, v, *rotary_operands)
   if paged is not None:
-    # Note (david): the paged pool is pinned to HBM. Memory space assignment
-    # otherwise moves a pool that fits its VMEM budget there around each
-    # call, the whole pool however few pages the call reads: v6e, h32 k8
-    # d128, 1024-token chunks over 8K, the 16 MB e5m2 pool moved and took
-    # 0.369 ms a chunk against 0.339 pinned. Its spec stays pl.ANY: a layout
-    # copy XLA puts in front of the call escapes the constraint and may land
-    # in VMEM (jax 0.11.2: an in-jit bf16 pool of 6 head rows, laid out
-    # {3,1,2,0}), where DMAs compiled for an HBM operand halt the chip.
+    # Note (david): the pool is pinned to HBM because memory space assignment
+    # otherwise moves a pool that fits its VMEM budget there and back around
+    # every call, the whole pool however few pages the call reads (v6e, 16 MB
+    # e5m2 pool: 0.369 against 0.339 ms a chunk). The spec stays pl.ANY: a
+    # layout copy XLA inserts before the call escapes the constraint and can
+    # land in VMEM, where DMAs compiled for an HBM operand halt the chip.
     kernel_inputs = [
         q_in, pltpu.with_memory_space_constraint(k_in, pltpu.HBM),
         *rotary_in]

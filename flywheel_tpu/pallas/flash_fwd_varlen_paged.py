@@ -28,11 +28,7 @@ from .block_sizes import (
   round_up,
   vmem_limit_bytes,
 )
-from .copy_utils import (
-  check_merged_kv_dtype,
-  kv_word_rows,
-  resolve_merged_kv_heads,
-)
+from .copy_utils import kv_word_rows, resolve_merged_kv_heads
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
   BF16_TILE_ROWS,
@@ -325,8 +321,7 @@ def flash_attn_varlen_paged(
   if q.dtype != jnp.bfloat16:
     raise NotImplementedError(
         f"paged attention takes a bfloat16 q; got {q.dtype}.")
-  check_merged_kv_dtype(kv_cache.dtype)
-  if kv_cache.ndim != 4 or kv_cache.shape[2] % kv_word_rows(kv_cache.dtype):
+  if kv_cache.ndim != 4:
     raise ValueError(
         "kv_cache must be one merged (num_pages, page_size, cache_heads,"
         f" head_dim) cache; got {kv_cache.shape}."
