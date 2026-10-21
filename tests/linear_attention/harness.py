@@ -51,8 +51,9 @@ class Ops:
     shape of its gate."""
     fused: Callable[..., tuple]
     replay: Callable[..., tuple]
-    record_dim: Callable[..., int]
-    gate_dim: Callable[..., int]
+    replay_layout: Callable[
+        [int, int, int, int],
+        gdn_wrapper.ReplayLayout | kda_wrapper.ReplayLayout]
     split_checkpoint: Callable[[jax.Array], jax.Array]
     merge_checkpoint: Callable[[jax.Array], jax.Array]
     next_replay_lens: Callable[..., jax.Array]
@@ -61,13 +62,13 @@ class Ops:
 
 
 GDN = Ops(gdn_wrapper.fused_conv1d_gdn, gdn_wrapper.fused_conv1d_gdn_replay,
-          gdn_wrapper.replay_record_dim, gdn_wrapper.replay_gate_dim,
-          gdn_wrapper.split_checkpoint, gdn_wrapper.merge_checkpoint,
+          gdn_wrapper.replay_layout, gdn_wrapper.split_checkpoint,
+          gdn_wrapper.merge_checkpoint,
           gdn_wrapper.next_replay_lens, per_channel_gate=False,
           gate_dtype=jnp.float32)
 KDA = Ops(kda_wrapper.fused_conv1d_kda, kda_wrapper.fused_conv1d_kda_replay,
-          kda_wrapper.replay_record_dim, kda_wrapper.replay_gate_dim,
-          kda_wrapper.split_checkpoint, kda_wrapper.merge_checkpoint,
+          kda_wrapper.replay_layout, kda_wrapper.split_checkpoint,
+          kda_wrapper.merge_checkpoint,
           kda_wrapper.next_replay_lens, per_channel_gate=True,
           gate_dtype=jnp.bfloat16)
 
@@ -280,13 +281,14 @@ class Fused:
             state_pool = self.ops.split_checkpoint(state_pool)
             # Note (david): NaN records and gates catch any read past the
             # committed ones.
-            record_dims = (self.n_kq, self.n_v, self.d_k, self.d_v)
+            layout = self.ops.replay_layout(self.n_kq, self.n_v, self.d_k,
+                                            self.d_v)
             replay_state = jnp.full(
-                (state_pool.shape[0], REPLAY_WINDOW,
-                 self.ops.record_dim(*record_dims)), jnp.nan, record_dtype)
+                (state_pool.shape[0], REPLAY_WINDOW, layout.record_dim),
+                jnp.nan, record_dtype)
             replay_gates = jnp.full(
-                (state_pool.shape[0], REPLAY_WINDOW,
-                 self.ops.gate_dim(*record_dims)), jnp.nan, jnp.float32)
+                (state_pool.shape[0], REPLAY_WINDOW, layout.gate_dim),
+                jnp.nan, jnp.float32)
             replay_lens = jnp.zeros((num_seqs, ), jnp.int32)
 
         out_rows, outs = [], []

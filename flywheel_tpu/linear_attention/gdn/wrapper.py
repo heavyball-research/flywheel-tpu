@@ -161,7 +161,8 @@ def inner_kernel(
             conv_out_ref[...] = new_conv_state
             if cfg.split_checkpoint:
                 recurrent_out_ref[...] = jnp.stack(
-                    compute_gdn.split_checkpoint(new_recurrent_state), axis=-4)
+                    compute_gdn.split_checkpoint_planes(
+                        new_recurrent_state), axis=-4)
             else:
                 recurrent_out_ref[...] = new_recurrent_state.astype(
                     recurrent_out_ref.dtype)
@@ -208,7 +209,7 @@ def inner_kernel(
                         wait_checkpoint_lo=functools.partial(
                             wait_flush_in, idx),
                         cfg=cfg)
-                    hi_plane, lo_plane = compute_gdn.split_checkpoint(
+                    hi_plane, lo_plane = compute_gdn.split_checkpoint_planes(
                         checkpoint)
                     recurrent_out_ref[idx, 0, 0] = hi_plane
                     recurrent_out_ref[idx, 0, 1] = lo_plane
@@ -770,33 +771,36 @@ STATIC_ARGNAMES = (
 )
 
 
-def replay_record_dim(n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
-    """Lanes of one replay record [u | k], the last axis of the replay
-    state."""
-    return n_v * d_v + n_kq * d_k
+@dataclasses.dataclass(frozen=True)
+class ReplayLayout:
+    """One slot of the ReplaySSM state of fused_conv1d_gdn_replay in HBM.
+
+    record_dim: lanes of one replay record [u | k], the last axis of the
+        replay state.
+    gate_dim: lanes of one replay gate row, the last axis of the replay
+        gates: the log decay per value head, padded to whole lane tiles as
+        the f32 HBM layout pads it anyway.
+    checkpoint_shape: the int32 checkpoint, the hi and lo planes of an f32
+        [n_v, d_k, d_v] checkpoint with two 16-bit values per word (rows i
+        and i + d_k / 2).
+    """
+    record_dim: int
+    gate_dim: int
+    checkpoint_shape: tuple[int, int, int, int]
 
 
-def replay_gate_dim(n_kq: int, n_v: int, d_k: int, d_v: int) -> int:
-    """Lanes of one replay gate row, the last axis of the replay gates: the
-    log decay per value head, padded to whole lane tiles as the f32 HBM
-    layout pads it anyway. Takes replay_record_dim's arguments."""
-    del n_kq, d_k, d_v
-    num_lanes = pltpu.get_tpu_info().num_lanes
-    return pl.cdiv(n_v, num_lanes) * num_lanes
-
-
-def replay_checkpoint_shape(n_kq: int, n_v: int, d_k: int,
-                            d_v: int) -> tuple[int, int, int, int]:
-    """Shape of one slot of the int32 replay checkpoint: the hi and lo planes
-    of an f32 [n_v, d_k, d_v] checkpoint, two 16-bit values per word (rows i
-    and i + d_k / 2). Takes replay_record_dim's arguments."""
-    del n_kq
+def replay_layout(n_kq: int, n_v: int, d_k: int, d_v: int) -> ReplayLayout:
+    """The ReplayLayout of a model with n_kq kq heads of d_k and n_v value
+    heads of d_v."""
     # Note (david): a decode unpacks the two row halves of a word onto whole
     # f32 sublane tiles.
     if d_k % (2 * config.SUBLANE_ALIGN):
         raise ValueError("a replay checkpoint needs d_k divisible by "
                          f"{2 * config.SUBLANE_ALIGN}, got {d_k}")
-    return (2, n_v, d_k // 2, d_v)
+    num_lanes = pltpu.get_tpu_info().num_lanes
+    return ReplayLayout(record_dim=n_v * d_v + n_kq * d_k,
+                        gate_dim=pl.cdiv(n_v, num_lanes) * num_lanes,
+                        checkpoint_shape=(2, n_v, d_k // 2, d_v))
 
 
 def split_checkpoint(recurrent_state: jax.Array) -> jax.Array:
@@ -806,7 +810,8 @@ def split_checkpoint(recurrent_state: jax.Array) -> jax.Array:
     if recurrent_state.dtype != jnp.float32:
         raise TypeError("split_checkpoint takes float32 states, got "
                         f"{recurrent_state.dtype}")
-    return jnp.stack(compute_gdn.split_checkpoint(recurrent_state), axis=-4)
+    return jnp.stack(compute_gdn.split_checkpoint_planes(recurrent_state),
+                     axis=-4)
 
 
 def merge_checkpoint(checkpoint: jax.Array) -> jax.Array:
@@ -818,8 +823,8 @@ def merge_checkpoint(checkpoint: jax.Array) -> jax.Array:
     if checkpoint.shape[-4] != 2:
         raise ValueError("merge_checkpoint takes [..., 2, n_v, d_k // 2, "
                          f"d_v], got {checkpoint.shape}")
-    return compute_gdn.merge_checkpoint(checkpoint[..., 0, :, :, :],
-                                        checkpoint[..., 1, :, :, :])
+    return compute_gdn.merge_checkpoint_planes(
+        checkpoint[..., 0, :, :, :], checkpoint[..., 1, :, :, :])
 
 
 @jax.jit(donate_argnames=("conv_state", "recurrent_state"),
@@ -986,15 +991,18 @@ def fused_conv1d_gdn_replay(
     mixed sequences run as in fused_conv1d_gdn and must have no committed
     records.
 
+    replay_layout(n_kq, n_v, d_k, d_v) gives checkpoint_shape, record_dim and
+    gate_dim below.
+
     Args:
         recurrent_state: int32 checkpoint cache [num_slots,
-            *replay_checkpoint_shape(n_kq, n_v, d_k, d_v)], each f32
-            checkpoint as a hi and a lo plane; split_checkpoint and
-            merge_checkpoint convert. All-zero planes are the zero state.
+            *checkpoint_shape], each f32 checkpoint as a hi and a lo plane;
+            split_checkpoint and merge_checkpoint convert. All-zero planes
+            are the zero state.
         replay_state: f32 or bf16 record buffer [num_slots, replay_window,
-            replay_record_dim(n_kq, n_v, d_k, d_v)].
+            record_dim].
         replay_gates: f32 gates of the records [num_slots, replay_window,
-            replay_gate_dim(n_kq, n_v, d_k, d_v)].
+            gate_dim].
         replay_lens: int32 committed records of each sequence [num_seqs],
             0 <= replay_lens[s] <= replay_window.
         replay_window: Records a sequence keeps before it flushes; a multiple
@@ -1115,16 +1123,16 @@ def launch_fused_conv1d_gdn(
         if num_spec_tokens + 1 > replay_window:
             raise ValueError("replay_window must hold a verify window of "
                              f"{num_spec_tokens + 1} tokens")
-        record_shape = (recurrent_state.shape[0], replay_window,
-                        replay_record_dim(n_kq, n_v, d_k, d_v))
+        layout = replay_layout(n_kq, n_v, d_k, d_v)
+        num_slots = recurrent_state.shape[0]
+        record_shape = (num_slots, replay_window, layout.record_dim)
         if replay_state.shape != record_shape:
             raise ValueError(f"replay_state must be {record_shape}, got "
                              f"{replay_state.shape}")
         if replay_state.dtype not in (jnp.float32, jnp.bfloat16):
             raise TypeError("replay_state must be float32 or bfloat16, got "
                             f"{replay_state.dtype}")
-        gate_shape = (recurrent_state.shape[0], replay_window,
-                      replay_gate_dim(n_kq, n_v, d_k, d_v))
+        gate_shape = (num_slots, replay_window, layout.gate_dim)
         if replay_gates.shape != gate_shape:
             raise ValueError(f"replay_gates must be {gate_shape}, got "
                              f"{replay_gates.shape}")
@@ -1133,8 +1141,7 @@ def launch_fused_conv1d_gdn(
                             f"{replay_gates.dtype}")
         if replay_lens.shape != state_indices.shape:
             raise ValueError("replay_lens must have one entry per sequence")
-        checkpoint_shape = (recurrent_state.shape[0],
-                            *replay_checkpoint_shape(n_kq, n_v, d_k, d_v))
+        checkpoint_shape = (num_slots, *layout.checkpoint_shape)
         if recurrent_state.shape != checkpoint_shape:
             raise ValueError(
                 f"a replay checkpoint must be {checkpoint_shape}, got "
@@ -1188,10 +1195,8 @@ def launch_fused_conv1d_gdn(
         # Note (david): a replay tile reads a checkpoint's hi plane, and its
         # lo plane on a flush, and writes at most one checkpoint per sequence
         # whatever its window: two f32 checkpoints' bytes per sequence and
-        # ring slot. Only the conv state keeps a checkpoint per window
-        # position. Each sequence also leaves one more checkpoint for the
-        # compiler's temporaries. The tile is not shrunk to fit: a caller
-        # whose shape does not fit picks a smaller one.
+        # ring slot, plus one for the compiler's temporaries. Only the conv
+        # state keeps a checkpoint per window position.
         decode_tile_size = min(decode_tile_size, batch_size)
         state_bytes = n_v * d_k * d_v * F32_BYTES
         record_bytes = replay_window * (
@@ -1387,14 +1392,12 @@ def launch_fused_conv1d_gdn(
             else:
                 kernel_metadata[key] = str(leaf)
 
-        # Note (david): unpinned, XLA may place a small conv state in VMEM,
-        # where the one-slot DMAs through the slot-minor view move the wrong
-        # rows (v6e, jax 0.11.2, 5 slots). Every state is pinned: memory space
-        # assignment otherwise moves any that fits its VMEM budget there and
-        # back around each call, the whole buffer however few slots the call
-        # touches. Qwen3.5-4B in tpu-inference (v6e, 65 slots, 32 decoding
-        # sequences): the 12.8 MB bf16 records of 22-24 of the 24 GDN layers,
-        # a 9.55 ms decode step against 9.08 ms pinned.
+        # Note (david): unpinned, XLA moves any state that fits its VMEM
+        # budget there and back around each call, the whole buffer however
+        # few slots the call touches (v6e, 65 slots, 32 decoding sequences:
+        # 0.47 ms of a 9.55 ms step on the bf16 records of 24 GDN layers),
+        # and a small conv state placed in VMEM makes the one-slot DMAs
+        # through the slot-minor view move the wrong rows (jax 0.11.2).
         def _pin(state):
             return pltpu.with_memory_space_constraint(state, pltpu.HBM)
 

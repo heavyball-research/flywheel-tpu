@@ -107,13 +107,12 @@ def main() -> None:
     replay_window = args.replay_window
     record_dtype = jnp.dtype(args.record_dtype)
     state_bytes = n_v * d_k * d_v * F32_BYTES
-    record_dim = wrapper.replay_record_dim(n_kq, n_v, d_k, d_v)
-    gate_dim = wrapper.replay_gate_dim(n_kq, n_v, d_k, d_v)
+    layout = wrapper.replay_layout(n_kq, n_v, d_k, d_v)
     print(f"device: {jax.devices()[0].device_kind} kernel: {args.kernel}")
     print(f"n_kq={n_kq} n_v={n_v} d={d_k} state/seq={state_bytes >> 20} MiB "
           f"replay_window={replay_window} "
-          f"record={record_dim * record_dtype.itemsize} B {record_dtype} "
-          f"gate={gate_dim * F32_BYTES} B float32")
+          f"record={layout.record_dim * record_dtype.itemsize} B "
+          f"{record_dtype} gate={layout.gate_dim * F32_BYTES} B float32")
     model_dims = dict(n_kq=n_kq, n_v=n_v, d_k=d_k, d_v=d_v,
                       kernel_size=args.kernel_size,
                       decode_tile_size=args.decode_tile_size)
@@ -141,10 +140,10 @@ def main() -> None:
                 args.warmup, args.iters, args.repeats)
 
             num_slots = recurrent_state.shape[0]
-            replay_state = jnp.zeros((num_slots, replay_window, record_dim),
-                                     record_dtype)
-            replay_gates = jnp.zeros((num_slots, replay_window, gate_dim),
-                                     jnp.float32)
+            replay_state = jnp.zeros(
+                (num_slots, replay_window, layout.record_dim), record_dtype)
+            replay_gates = jnp.zeros(
+                (num_slots, replay_window, layout.gate_dim), jnp.float32)
             replay_lens = (jnp.arange(num_seqs, dtype=jnp.int32) %
                            (replay_window - window + 1))
             num_accepted = jnp.full((num_seqs, ), window, jnp.int32)

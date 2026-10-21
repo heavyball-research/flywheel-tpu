@@ -962,7 +962,7 @@ def recurrent_gdn(
     return jnp.stack(seq_outs, axis=0), jnp.stack(seq_states, axis=0)
 
 
-def split_checkpoint(state: jax.Array) -> tuple[jax.Array, jax.Array]:
+def split_checkpoint_planes(state: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The hi and lo planes [..., kq_head_dim // 2, v_head_dim] int32 of an f32
     checkpoint [..., kq_head_dim, v_head_dim].
 
@@ -988,20 +988,24 @@ def split_checkpoint(state: jax.Array) -> tuple[jax.Array, jax.Array]:
     return _pack_rows(hi_halves), _pack_rows(bits & LOW_HALF_MASK)
 
 
-def merge_checkpoint(hi_words: jax.Array, lo_words: jax.Array) -> jax.Array:
-    """The f32 checkpoint whose planes split_checkpoint made, bit for bit."""
-    row_halves = []
-    for hi_bits, lo_bits in (
-        (hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
-        (jax.lax.shift_right_logical(hi_words, jnp.int32(HALF_WORD_BITS)),
-         jax.lax.shift_right_logical(lo_words, jnp.int32(HALF_WORD_BITS))),
-    ):
+def merge_checkpoint_planes(hi_words: jax.Array,
+                            lo_words: jax.Array) -> jax.Array:
+    """The f32 checkpoint whose planes split_checkpoint_planes made, bit for
+    bit."""
+
+    def _unpack_rows(hi_bits, lo_bits):
         # Note (david): hi was rounded up exactly when lo has its top bit set.
         upper_bits = hi_bits - jax.lax.shift_right_logical(
             lo_bits, jnp.int32(HALF_WORD_BITS - 1))
-        row_halves.append((upper_bits << HALF_WORD_BITS) | lo_bits)
-    return jax.lax.bitcast_convert_type(
-        jnp.concatenate(row_halves, axis=-2), jnp.float32)
+        return (upper_bits << HALF_WORD_BITS) | lo_bits
+
+    half_shift = jnp.int32(HALF_WORD_BITS)
+    rows = jnp.concatenate([
+        _unpack_rows(hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
+        _unpack_rows(jax.lax.shift_right_logical(hi_words, half_shift),
+                     jax.lax.shift_right_logical(lo_words, half_shift)),
+    ], axis=-2)
+    return jax.lax.bitcast_convert_type(rows, jnp.float32)
 
 
 def replay_record_parts(
@@ -1216,6 +1220,6 @@ def replay_flush(
                                 precision=jax.lax.Precision.HIGHEST)
         decay_total = gate_column(jnp.exp(g_records_total), num_v_heads)
         wait_checkpoint_lo()
-        checkpoint = merge_checkpoint(checkpoint_hi_ref[...],
-                                      checkpoint_lo_ref[...])
+        checkpoint = merge_checkpoint_planes(checkpoint_hi_ref[...],
+                                             checkpoint_lo_ref[...])
         return checkpoint.astype(cfg.dtypes.compute) * decay_total + update

@@ -151,7 +151,7 @@ def load_and_select_states(
         else:
             if cfg.split_checkpoint:
                 planes = recurrent_slot_ref[idx, 0]
-                hbm_recurrent_state = compute_gdn.merge_checkpoint(
+                hbm_recurrent_state = compute_gdn.merge_checkpoint_planes(
                     planes[0], planes[1])
             else:
                 hbm_recurrent_state = recurrent_slot_ref[idx, 0]
