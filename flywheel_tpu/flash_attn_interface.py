@@ -310,6 +310,18 @@ def fused_q_scale(softmax_scale: float, softcap: float) -> float:
     return softmax_scale / softcap
 
 
+def descale_scalar(descale: float | jax.Array | None,
+                   arg_name: str) -> jax.Array:
+  """One per-tensor KV descale as an f32 scalar, possibly traced; None
+  is 1."""
+  descale = jnp.asarray(1.0 if descale is None else descale, jnp.float32)
+  if descale.size != 1:
+    raise ValueError(
+        f"{arg_name} must be one per-tensor value; got shape"
+        f" {descale.shape}.")
+  return descale.reshape(())
+
+
 def attn_with_vjp(
     q: jax.Array,
     k: jax.Array,
@@ -905,8 +917,8 @@ def paged_varlen_attn(
     block_table: jax.Array,
     seqused_k: jax.Array | None,
     num_active: jax.Array | int | None,
-    k_descale: float | None,
-    v_descale: float | None,
+    k_descale: float | jax.Array | None,
+    v_descale: float | jax.Array | None,
     nheads_k: int | None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn_varlen_func's paged KV cache branch (block_table given)."""
@@ -1025,9 +1037,6 @@ def paged_varlen_attn(
   softmax_scale = (
       1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
   )
-  # Note (david): the K descale is one per-tensor factor on every score, so it
-  # rides in Q's fused scale.
-  score_scale = softmax_scale * (1.0 if k_descale is None else k_descale)
   kernel = functools.partial(
       flash_attn_varlen_paged,
       max_seqlen_q=int(max_seqlen_q),
@@ -1035,12 +1044,13 @@ def paged_varlen_attn(
       causal=is_right_bounded,
       window_left=window_left,
       softcap=float(softcap),
-      q_scale=float(fused_q_scale(score_scale, softcap)),
+      q_scale=float(fused_q_scale(softmax_scale, softcap)),
       return_lse=bool(return_softmax_lse),
       interpret=bool(interpret),
       block_sizes=paged_block_sizes,
       nheads_k=nheads_k,
-      v_scale=1.0 if v_descale is None else float(v_descale),
+      k_scale=descale_scalar(k_descale, "k_descale"),
+      v_scale=descale_scalar(v_descale, "v_descale"),
   )
   # Note (david): K and V share the one merged cache operand k.
   return forward_only_attn(
@@ -1079,8 +1089,8 @@ def flash_attn_varlen_func(
     block_table: jax.Array | None = None,
     seqused_k: jax.Array | None = None,
     num_active: jax.Array | int | None = None,
-    k_descale: float | None = None,
-    v_descale: float | None = None,
+    k_descale: float | jax.Array | None = None,
+    v_descale: float | jax.Array | None = None,
     nheads_k: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn.flash_attn_varlen_func on TPU for packed sequences.
@@ -1283,8 +1293,7 @@ def flash_attn_varlen_func(
     jax.jit,
     static_argnames=(
         "softmax_scale", "causal", "window_size", "softcap",
-        "return_softmax_lse", "interpret", "k_descale", "v_descale",
-        "nheads_k",
+        "return_softmax_lse", "interpret", "nheads_k",
     ),
     donate_argnames=("k_cache", "v_cache"),
 )
@@ -1306,8 +1315,8 @@ def flash_attn_with_kvcache(
     softcap: float = 0.0,
     return_softmax_lse: bool = False,
     interpret: bool = False,
-    k_descale: float | None = None,
-    v_descale: float | None = None,
+    k_descale: float | jax.Array | None = None,
+    v_descale: float | jax.Array | None = None,
     nheads_k: int | None = None,
 ) -> tuple[jax.Array, ...]:
   """Attention against a contiguous or paged KV cache, with optional append.
@@ -1332,11 +1341,12 @@ def flash_attn_with_kvcache(
     the request.
 
   An fp8 pool stores K / k_descale and V / v_descale (FlashAttention-3's
-  per-tensor descales, here static floats, default 1) and feeds them to the
-  MXU as stored; q stays bf16, and k / v appends must already be in the
-  pool's dtype. nheads_k (TPU extension) is the pool's KV head count; it
-  defaults to k's heads, else to half the head axis, so an fp8 pool, which
-  pads an odd count, needs it without k.
+  descales, here one per-tensor scalar each, default 1, which may be traced:
+  a new value compiles no new kernel) and feeds them to the MXU as stored; q
+  stays bf16, and k / v appends must already be in the pool's dtype. nheads_k
+  (TPU extension) is the pool's KV head count; it defaults to k's heads, else
+  to half the head axis, so an fp8 pool, which pads an odd count, needs it
+  without k.
 
   In both, nheads % nheads_k == 0. The contiguous pair needs nheads_k even or
   1 because its cache load packs two bf16 heads into one u32 lane, and it
@@ -1483,8 +1493,8 @@ def flash_attn_with_kvcache(
         f" (paged pool) float8_e4m3fn / float8_e5m2; got q {q.dtype}, KV"
         f" {kv_dtypes}."
     )
-  k_descale = 1.0 if k_descale is None else float(k_descale)
-  v_descale = 1.0 if v_descale is None else float(v_descale)
+  k_descale = descale_scalar(k_descale, "k_descale")
+  v_descale = descale_scalar(v_descale, "v_descale")
   expected_new_shape = (*q.shape[:-2], nheads_k, head_dim)
   if has_new and (k.shape != expected_new_shape
                   or v.shape != expected_new_shape):
@@ -1513,9 +1523,6 @@ def flash_attn_with_kvcache(
   softmax_scale = (
       1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
   )
-  # Note (david): the K descale is one per-tensor factor on every score, so it
-  # rides in Q's fused scale.
-  score_scale = softmax_scale * k_descale
   if is_extend:
     if is_ragged:
       packed_cu_seqlens_q = cu_seqlens_q
@@ -1531,19 +1538,21 @@ def flash_attn_with_kvcache(
     kernel_outputs = flash_attn_kvcache_varlen(
         packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
         row_cache_seqlens, flat_block_table, num_active,
-        q_scale=float(fused_q_scale(score_scale, softcap)),
+        q_scale=float(fused_q_scale(softmax_scale, softcap)),
         causal=is_right_bounded, window_left=window_left,
         softcap=float(softcap), return_lse=bool(return_softmax_lse),
-        interpret=bool(interpret), nheads_k=nheads_k, v_scale=v_descale,
+        interpret=bool(interpret), nheads_k=nheads_k, k_scale=k_descale,
+        v_scale=v_descale,
     )
   else:
     # Note (david): the decode kernel runs its softmax in log2 units straight
     # off q @ k^T, so softmax_scale * log2(e) (softmax_scale / softcap with a
     # softcap) is folded into Q here, with the same bf16 rounding the dense
-    # kernels apply per staged Q tile.
+    # kernels apply per staged Q tile. The K descale is one per-tensor
+    # factor on every score, so it rides in the same scale.
     q_scaled = (
         q.reshape(batch, nheads, head_dim).astype(jnp.float32)
-        * fused_q_scale(score_scale, softcap)
+        * fused_q_scale(softmax_scale * k_descale, softcap)
     ).astype(q.dtype)
     new_token_shape = (batch, nheads_k, head_dim)
     if has_new:

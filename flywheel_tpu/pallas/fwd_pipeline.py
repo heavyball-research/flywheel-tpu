@@ -111,7 +111,7 @@ def fwd_body(
     softcap: float,
     return_lse: bool,
     token_major: TokenMajorInfo | None,
-    q_scale: float,
+    q_scale: float | jax.Array,
     rotary_dim: int = 0,
     rotary_interleaved: bool = False,
     rotary_batch: int = 1,
@@ -121,7 +121,7 @@ def fwd_body(
     rotary_k: bool = True,
     paged: PagedKVInfo | None = None,
     gqa_fold: int = 1,
-    v_scale: float = 1.0,
+    v_scale: float | jax.Array = 1.0,
 ) -> None:
   """Run the fragment pipeline over every block the schedule yields.
 
@@ -135,7 +135,8 @@ def fwd_body(
   per group and stacks them over the rows of every score fragment: fragment
   row r holds head r // bq_compute at token r % bq_compute of the q tile, so
   bq and bq_compute count tokens per head. A paged fp8 cache is widened to
-  bf16 K and V planes, and v_scale multiplies the output.
+  bf16 K and V planes, and v_scale multiplies the output. q_scale and v_scale
+  are static floats, or (paged) f32 scalars the kernel read from SMEM.
   """
   is_per_seq = schedule.q_token is not None
   is_paged = paged is not None
@@ -318,7 +319,7 @@ def fwd_body(
         _rotate_gqa_folded_q(slot)
       else:
         _rotate_staged(q_buf, rotary_q_buf, slot, bq)
-    if q_scale != 1.0:
+    if isinstance(q_scale, jax.Array) or q_scale != 1.0:
       # Note (david): each staged Q tile is waited on exactly once per row, so
       # scaling it here replaces an HBM pre-scaled Q copy with the same f32
       # multiply and cast, leaving the logits unchanged.

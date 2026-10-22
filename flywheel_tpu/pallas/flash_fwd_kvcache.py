@@ -185,6 +185,7 @@ def kvcache_kernel(
     cache_seqlens_ref: jax.Array,
     cache_batch_idx_ref: jax.Array,
     num_active_ref: jax.Array,
+    v_scale_ref: jax.Array,
     *refs: jax.Array,
     batch: int,
     num_query_heads: int,
@@ -203,7 +204,6 @@ def kvcache_kernel(
     page_size: int | None,
     pages_per_seq: int | None,
     is_merged_cache: bool,
-    v_scale: float,
 ) -> None:
   remaining_refs = list(refs)
   block_table_ref = remaining_refs.pop(0) if page_size is not None else None
@@ -959,9 +959,11 @@ def kvcache_kernel(
 
     row_sum = row_sum_ref[...]
     # Note (david): a quantized cache's V descale is one per-tensor factor,
-    # so it rides in the softmax normalization.
+    # so it rides in the softmax normalization. It arrives in SMEM, so a
+    # new descale value compiles no new kernel.
     inverse_row_sum = jnp.where(
-        row_sum > 0, pl.reciprocal(row_sum, approx=True) * v_scale, 0.0
+        row_sum > 0, pl.reciprocal(row_sum, approx=True) * v_scale_ref[0],
+        0.0
     )
     out_buffers[output_slot] = (
         accumulator_ref[...].astype(jnp.float32)
@@ -1090,7 +1092,7 @@ def flash_attn_kvcache_pallas(
     merged_cache: bool = False,
     softcap: float = 0.0,
     nheads_k: int | None = None,
-    v_scale: float = 1.0,
+    v_scale: float | jax.Array = 1.0,
 ) -> tuple[jax.Array, ...]:
   """One-token cache append and decode attention for every row in one call.
 
@@ -1110,9 +1112,9 @@ def flash_attn_kvcache_pallas(
   (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[, lse]). nheads_k
   defaults to half the cache's head axis; an fp8 cache, which pads an odd
   head count, needs it. An fp8 merged cache feeds K and V to the MXU as
-  stored, k and v must be in its dtype, and v_scale multiplies the output (q
-  carries the K scale). lse is (batch, num_query_heads, 128) float32 with
-  each value broadcast over lanes.
+  stored, k and v must be in its dtype, and v_scale, a scalar that may be
+  traced, multiplies the output (q carries the K scale). lse is (batch,
+  num_query_heads, 128) float32 with each value broadcast over lanes.
 
   num_active: rows at or past it are padding (RPA's distribution[-1]
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
@@ -1304,11 +1306,15 @@ def flash_attn_kvcache_pallas(
     num_active_array = jnp.full((1,), batch, jnp.int32)
   else:
     num_active_array = jnp.asarray(num_active, jnp.int32).reshape(1)
+  v_scale_array = jnp.asarray(v_scale, jnp.float32).reshape(1)
   if page_size is None:
-    scalar_prefetches = (cache_seqlens, cache_batch_idx, num_active_array)
+    scalar_prefetches = (
+        cache_seqlens, cache_batch_idx, num_active_array, v_scale_array
+    )
   else:
     scalar_prefetches = (
-        cache_seqlens, cache_batch_idx, num_active_array, block_table
+        cache_seqlens, cache_batch_idx, num_active_array, v_scale_array,
+        block_table,
     )
   num_prefetch = len(scalar_prefetches)
   if merged_cache:
@@ -1354,7 +1360,6 @@ def flash_attn_kvcache_pallas(
       page_size=page_size,
       pages_per_seq=pages_per_seq,
       is_merged_cache=merged_cache,
-      v_scale=float(v_scale),
   )
   call = pl.pallas_call(
       kernel,

@@ -77,6 +77,7 @@ def flash_fwd_varlen_paged_kernel(
     seqused_k_ref: jax.Array,
     cu_qblk_ref: jax.Array,
     block_table_ref: jax.Array,
+    kv_scales_ref: jax.Array,
     q_hbm: jax.Array,
     kv_hbm: jax.Array,
     *refs: jax.Array,
@@ -87,6 +88,7 @@ def flash_fwd_varlen_paged_kernel(
     q_heads_per_kv_head: int,
     bq: int,
     bkv: int,
+    q_scale: float,
     **body,
 ) -> None:
   schedule = make_paged_fwd_schedule(
@@ -99,8 +101,10 @@ def flash_fwd_varlen_paged_kernel(
       causal=causal, left=window_left,
       num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
-  # Note (david): K and V share the one merged cache operand.
+  # Note (david): K and V share the one merged cache operand. The K and V
+  # descales arrive in SMEM, so a new descale value compiles no new kernel.
   fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
+           q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
            **body)
 
 
@@ -296,7 +300,8 @@ def flash_attn_varlen_paged(
     window_left: int | None = None,
     softcap: float = 0.0,
     nheads_k: int | None = None,
-    v_scale: float = 1.0,
+    k_scale: float | jax.Array = 1.0,
+    v_scale: float | jax.Array = 1.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """Packed head-major attention over a paged KV cache, read-only.
 
@@ -305,10 +310,11 @@ def flash_attn_varlen_paged(
   merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
   interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
   defaults to half its head axis, and an fp8 pool, which pads an odd head
-  count, needs it. An fp8 pool is widened to bf16 once per staged block, and
-  v_scale multiplies the output (q_scale carries the K scale). seqused_k is
-  each sequence's kv length with its new tokens, which the cache must already
-  hold; block_table entries past those tokens' pages are never dereferenced.
+  count, needs it. An fp8 pool is widened to bf16 once per staged block;
+  k_scale multiplies every score and v_scale the output, both scalars that
+  may be traced. seqused_k is each sequence's kv length with its new tokens,
+  which the cache must already hold; block_table entries past those tokens'
+  pages are never dereferenced.
   Causal rows align to the end of their sequence's keys; window_left (None
   unbounded) also hides the keys more than window_left positions before that
   diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
@@ -430,6 +436,8 @@ def flash_attn_varlen_paged(
       seqused_k.astype(jnp.int32),
       per_seq_qblk_prefix(cu_q, bq),
       block_table.astype(jnp.int32).reshape(-1),
+      jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
+                 for scale in (k_scale, v_scale)]),
   ]
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
@@ -460,7 +468,6 @@ def flash_attn_varlen_paged(
       # softcap, so log2(e) rides in the tanh output scale.
       softcap=softcap * LOG2E,
       q_scale=q_scale,
-      v_scale=float(v_scale),
   )
   if return_lse:
     out, lse = outputs

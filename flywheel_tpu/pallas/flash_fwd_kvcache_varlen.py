@@ -168,7 +168,8 @@ def flash_attn_kvcache_varlen(
     return_lse: bool,
     interpret: bool,
     nheads_k: int,
-    v_scale: float,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
 ) -> tuple[jax.Array, ...]:
   """Append packed new tokens once, then attend with the paged varlen kernel,
   which reads the updated pages only.
@@ -176,9 +177,9 @@ def flash_attn_kvcache_varlen(
   q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
   merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
   head_dim) cache and block_table its flat (batch * pages_per_seq,) page
-  table. causal, window_left, softcap, q_scale, nheads_k and v_scale are
-  flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse (nheads,
-  total_q) float32 when return_lse.
+  table. causal, window_left, softcap, q_scale, nheads_k, k_scale and
+  v_scale are flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse
+  (nheads, total_q) float32 when return_lse.
   """
   batch = cu_seqlens_q.shape[0] - 1
   num_query_heads = q.shape[1]
@@ -218,7 +219,7 @@ def flash_attn_kvcache_varlen(
         max_seqlen_q=q.shape[0], max_seqlen_k=pages_per_seq * page_size,
         causal=causal, q_scale=q_scale, return_lse=return_lse,
         interpret=interpret, window_left=window_left, softcap=softcap,
-        nheads_k=nheads_k, v_scale=v_scale,
+        nheads_k=nheads_k, k_scale=k_scale, v_scale=v_scale,
     )
     if return_lse:
       out, lse = outputs
