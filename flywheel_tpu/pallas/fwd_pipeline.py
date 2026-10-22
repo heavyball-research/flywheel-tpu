@@ -1147,7 +1147,11 @@ def fwd_body(
       # are one whole (8, 128) tile.
       num_blend_rows = schedule.blend_start(ctx) - q_tok
 
-      @pl.when(jnp.logical_and(is_last, num_blend_rows > 0))
+      # Note (david): rows below a head group's first block belong to no
+      # sequence, and the previous output block is the last group's, so the
+      # first block never blends.
+      @pl.when(jnp.logical_and(jnp.logical_and(is_last, num_blend_rows > 0),
+                               si > 0))
       def _blend_head_rows():
         prev_slot = (num_out_copies - 1) % num_stages
         src_row_offset = q_tok - prev_out_tok
