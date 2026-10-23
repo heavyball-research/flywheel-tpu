@@ -11,7 +11,8 @@
 #
 # Environment:
 #     PYTHON          interpreter (default: .venv/bin/python)
-#     IMPLS           default "flywheel rpa"
+#     IMPLS           default "flywheel rpa"; batched_rpa adds vLLM
+#                     TorchTPU's batched RPA
 #     HEADS_K         default "4 32"
 #     DECODE_BATCHES  default "256 128"; empty skips decode
 #     RPA_K32_BLOCKS  RPA blocks at 32 KV heads (default 128,256,128,256);

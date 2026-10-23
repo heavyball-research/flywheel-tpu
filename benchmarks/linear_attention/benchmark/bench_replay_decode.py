@@ -10,6 +10,11 @@ would, every window fully accepted (the most frequent flushes), and the
 sequences start at staggered record counts so their flushes spread over the
 steps as under continuous batching.
 
+--pkg times another package's fused_conv1d_<kernel> as the conventional
+kernel instead of flywheel's, on the same inputs; ReplaySSM is flywheel's own,
+so such a run has no replay column. vllm_torchtpu_kda, from
+baseline_kernel/, is vLLM TorchTPU's KDA.
+
     PYTHONPATH=. uv run --no-sync python \
         benchmarks/linear_attention/benchmark/bench_replay_decode.py \
         --kernel gdn
@@ -19,13 +24,15 @@ from __future__ import annotations
 
 import argparse
 import functools
+import importlib
 import json
+import sys
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 
-from benchmarks.common.linear_attention import PARAM_SCALE
+from benchmarks.common.linear_attention import BASELINE_KERNEL_DIR, PARAM_SCALE
 from benchmarks.common.timing import time_stateful
 from flywheel_tpu.linear_attention.gdn import wrapper as gdn_wrapper
 from flywheel_tpu.linear_attention.kda import wrapper as kda_wrapper
@@ -91,6 +98,10 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=32)
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--pkg",
+                        help="package whose wrapper's fused_conv1d_<kernel> "
+                             "is the conventional kernel; default: "
+                             "flywheel's, with ReplaySSM")
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
@@ -102,6 +113,13 @@ def main() -> None:
         wrapper = kda_wrapper
         conventional_fn = kda_wrapper.fused_conv1d_kda
         replay_fn = kda_wrapper.fused_conv1d_kda_replay
+    if args.pkg is not None:
+        # Note (david): imported before JAX starts its backend, which
+        # vllm_torchtpu_kda needs for vLLM TorchTPU's libtpu flag defaults.
+        sys.path.insert(0, str(BASELINE_KERNEL_DIR))
+        module = importlib.import_module(f"{args.pkg}.wrapper")
+        conventional_fn = getattr(module, f"fused_conv1d_{args.kernel}")
+        replay_fn = None
     n_kq, n_v = args.kq_heads, args.v_heads
     d_k = d_v = args.head_dim
     replay_window = args.replay_window
@@ -138,6 +156,17 @@ def main() -> None:
             base_ms, _ = time_stateful(
                 _conventional, (conv_state.copy(), recurrent_state.copy()),
                 args.warmup, args.iters, args.repeats)
+            conventional_gbps = (num_seqs * state_bytes * (1 + window)
+                                 / base_ms / 1e6)
+            if replay_fn is None:
+                rows.append(dict(kernel=args.kernel, pkg=args.pkg,
+                                 batch=num_seqs, window=window,
+                                 conventional_ms=base_ms,
+                                 conventional_state_gbps=conventional_gbps))
+                print(f"B={num_seqs:4d} window={window} {args.pkg} "
+                      f"{base_ms:7.3f} ms ({conventional_gbps:6.0f} GB/s)",
+                      flush=True)
+                continue
 
             num_slots = recurrent_state.shape[0]
             replay_state = jnp.zeros(
@@ -176,8 +205,7 @@ def main() -> None:
                        replay_window=replay_window,
                        record_dtype=args.record_dtype, conventional_ms=base_ms,
                        replay_ms=replay_ms, speedup=base_ms / replay_ms,
-                       conventional_state_gbps=num_seqs * state_bytes *
-                       (1 + window) / base_ms / 1e6)
+                       conventional_state_gbps=conventional_gbps)
             rows.append(row)
             print(f"B={num_seqs:4d} window={window} conventional "
                   f"{base_ms:7.3f} ms ({row['conventional_state_gbps']:6.0f} "

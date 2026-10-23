@@ -16,14 +16,17 @@ decode           --batch sequences each hold seq - decode_tokens tokens of KV
                  per sequence that appends its K/V and attends to the whole
                  cache. One timed call is all the steps.
 
-Both kernels read and write a paged cache of --page-size token pages (128,
+Every kernel reads and writes a paged cache of --page-size token pages (128,
 the page flywheel's vLLM backend allocates), with pages shuffled across
 sequences; flywheel's is the merged cache whose token rows interleave each kv
 head's K and V rows. flywheel runs flash_attn_with_kvcache: its decode kernel
 for decode, and for chunked prefill its ragged append plus the paged varlen
 kernel. RPA v3 runs ragged_paged_attention with the request distribution
 vLLM's TPU runner sends, mixed for chunked prefill and decode for decode, and
-its own default block sizes unless --rpa-blocks names some.
+its own default block sizes unless --rpa-blocks names some. batched_rpa is
+vLLM TorchTPU's batched RPA (its --attention-backend CUSTOM kernel), with the
+same request distribution, vLLM's default NHD cache layout and its own block
+sizes.
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -41,6 +44,11 @@ import sys
 
 import numpy as np
 
+from benchmarks.common.vllm_torchtpu import (
+    DEFAULT_VLLM_TORCHTPU_SOURCE,
+    chip_version,
+    load_batched_rpa,
+)
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
@@ -51,7 +59,7 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "rpa")
+IMPLS = ("flywheel", "rpa", "batched_rpa")
 SCENARIOS = ("chunked_prefill", "decode")
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
@@ -298,7 +306,52 @@ def build_rpa(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
 
 
-BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa}
+def build_batched_rpa(cell, inputs, args):
+    """(step, fresh_state, info) running vLLM TorchTPU's batched RPA."""
+    import jax
+    import jax.numpy as jnp
+
+    wrapper, configs = args.batched_rpa
+    calls, block_table, starts = inputs
+    kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    shape = wrapper.get_kv_cache_shape(
+        cell.num_seqs * block_table.shape[1], cell.page_size, cell.heads_k,
+        cell.head_dim, jnp.dtype(cell.dtype), kv_layout=kv_layout,
+        chip_version=chip_version(jax.devices()[0].device_kind))
+    page_indices = block_table.reshape(-1)
+    if cell.scenario == "chunked_prefill":
+        cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
+        distribution = request_distribution(num_decode=0, num_seqs=1)
+        new_tokens = cell.chunk
+    else:
+        cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32)
+        distribution = request_distribution(
+            num_decode=cell.batch, num_seqs=cell.batch)
+        new_tokens = 1
+    scale = 1.0 / math.sqrt(cell.head_dim)
+
+    def call(cache, q, k, v, start):
+        out, cache = wrapper.ragged_paged_attention(
+            q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
+            distribution, sm_scale=scale, sliding_window=cell.sliding_window,
+            use_causal_mask=True, kv_layout=kv_layout)
+        return out, cache
+
+    kernel = jax.jit(call, donate_argnums=(0,))
+
+    def step(cache):
+        out = None
+        for (q, k, v), start in zip(calls, starts):
+            out, cache = kernel(cache, q, k, v, start)
+        return out, cache
+
+    generator = np.random.default_rng(1)
+    info = {"block_source": "kernel default", "kv_layout": kv_layout.name}
+    return step, (lambda: fill_cache(shape, cell.dtype, generator)), info
+
+
+BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa,
+            "batched_rpa": build_batched_rpa}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -402,6 +455,9 @@ def main(argv=None):
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
+    if cell.impl == "batched_rpa":
+        # Before run() starts the JAX backend.
+        args.batched_rpa = load_batched_rpa(args.vllm_torchtpu_source)
     record = run(cell, args)
     if args.output:
         write_record(args.output, record)
@@ -442,6 +498,8 @@ def parse_args(argv=None):
                              "compiles alongside; default: RPA's formula")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
+    parser.add_argument("--vllm-torchtpu-source", type=pathlib.Path,
+                        default=DEFAULT_VLLM_TORCHTPU_SOURCE)
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trace", type=pathlib.Path,
                         help="also trace one scenario into this directory")

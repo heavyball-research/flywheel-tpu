@@ -17,6 +17,9 @@ projection are all inside the clock:
             -> splash attention
   rpa       einsum -> (batch * seq, heads, head_dim) -> ragged_paged_attention,
             which also writes the paged KV cache
+  batched_rpa
+            the same as rpa, with vLLM TorchTPU's batched RPA (its
+            --attention-backend CUSTOM kernel) on 256-token pages
 
 Each projection is one einsum against a (d_model, heads, head_dim) weight that
 emits the shape its kernel takes, as vLLM's attention layer projects, so any
@@ -33,8 +36,9 @@ file (v6e or v7x; tune_blocks.py searches them), flywheel from flywheel_tpu's
 own lookup. No chip stands in for another: on one with no tables, splash and
 RPA cells are an error until --splash-table / --rpa-table name a table. A cell
 its table does not hold runs the impl's own default: RPA's formula or Tokamax's
-heuristic. A cell already recorded as ok in --output is skipped unless --trace
-is given.
+heuristic. Batched RPA has no table; it always runs its own block sizes, as
+vLLM TorchTPU serves it. A cell already recorded as ok in --output is skipped
+unless --trace is given.
 """
 
 from __future__ import annotations
@@ -48,6 +52,12 @@ import sys
 
 import numpy as np
 
+from benchmarks.common.vllm_torchtpu import (
+    CUSTOM_PAGE_SIZE,
+    DEFAULT_VLLM_TORCHTPU_SOURCE,
+    chip_version,
+    load_batched_rpa,
+)
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
@@ -71,7 +81,7 @@ SPLASH_TABLE = pathlib.Path(__file__).with_name("splash_tuned_v6e.json")
 # Chip, as flywheel_tpu names it, -> the suffix of the tables searched on it.
 # There is no default: a chip missing here has no tables.
 TABLE_TAGS = {"TPU v6e": "v6e", "TPU v7": "v7x"}
-IMPLS = ("flywheel", "splash", "rpa")
+IMPLS = ("flywheel", "splash", "rpa", "batched_rpa")
 TRACE_CALLS = 3
 
 
@@ -299,8 +309,60 @@ def build_rpa(cell, w, args):
             (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), info)
 
 
+def build_batched_rpa(cell, w, args):
+    """(step, fresh_state, info) for vLLM TorchTPU's batched RPA on a paged
+    cache in vLLM's default NHD layout."""
+    import jax
+    import jax.numpy as jnp
+
+    wrapper, configs = args.batched_rpa
+    total = cell.batch * cell.seq
+    page_size = CUSTOM_PAGE_SIZE
+    pages_per_seq = -(-cell.seq // page_size)
+    num_pages = cell.batch * pages_per_seq
+    kv_layout = configs.KVLayout.HEAD_ALONG_SUBLANE
+    cache_shape = wrapper.get_kv_cache_shape(
+        num_pages, page_size, cell.heads_k, cell.head_dim, jnp.bfloat16,
+        kv_layout=kv_layout,
+        chip_version=chip_version(jax.devices()[0].device_kind))
+    metadata = (
+        jnp.full((cell.batch,), cell.seq, jnp.int32),
+        jnp.arange(num_pages, dtype=jnp.int32),
+        jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.seq,
+        request_distribution(num_decode=0, num_seqs=cell.batch),
+    )
+    scale = 1.0 / math.sqrt(cell.head_dim)
+
+    def block(x, wq, wk, wv, wo, cache):
+        with jax.named_scope("qkv_proj"):
+            q = jnp.einsum("btd,dnh->btnh", x, wq).reshape(
+                total, cell.heads, cell.head_dim)
+            k = jnp.einsum("btd,dnh->btnh", x, wk).reshape(
+                total, cell.heads_k, cell.head_dim)
+            v = jnp.einsum("btd,dnh->btnh", x, wv).reshape(
+                total, cell.heads_k, cell.head_dim)
+        with jax.named_scope("attn"):
+            out, cache = wrapper.ragged_paged_attention(
+                q, k, v, cache, *metadata, sm_scale=scale,
+                use_causal_mask=cell.causal, kv_layout=kv_layout)
+        with jax.named_scope("out_proj"):
+            out = jnp.einsum(
+                "btnh,nhd->btd",
+                out.reshape(cell.batch, cell.seq, cell.heads, cell.head_dim),
+                wo)
+        return out, cache
+
+    # The call donates the cache, so every timing run starts from a fresh one.
+    call = jax.jit(block, donate_argnums=(5,))
+    operands = (w["x"], w["wq"], w["wk"], w["wv"], w["wo"])
+    info = {"block_source": "kernel default", "page_size": page_size,
+            "kv_layout": kv_layout.name}
+    return ((lambda state: call(*operands, state)),
+            (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), info)
+
+
 BUILDERS = {"flywheel": build_flywheel, "splash": build_splash,
-            "rpa": build_rpa}
+            "rpa": build_rpa, "batched_rpa": build_batched_rpa}
 
 
 def trace_cell(cell, step, state, directory):
@@ -368,6 +430,9 @@ def main(argv=None):
     if not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded, skipped", flush=True)
         return 0
+    if cell.impl == "batched_rpa":
+        # Before jax.default_backend() below starts the backend.
+        args.batched_rpa = load_batched_rpa(args.vllm_torchtpu_source)
 
     import jax
 
@@ -419,6 +484,8 @@ def parse_args(argv=None):
                         default=DEFAULT_RPA_SOURCE)
     parser.add_argument("--splash-source", type=pathlib.Path,
                         default=DEFAULT_SPLASH_SOURCE)
+    parser.add_argument("--vllm-torchtpu-source", type=pathlib.Path,
+                        default=DEFAULT_VLLM_TORCHTPU_SOURCE)
     return parser.parse_args(argv)
 
 

@@ -5,3 +5,7 @@
 [submodule "third_party/tokamax"]
 	path = third_party/tokamax
 	url = https://github.com/openxla/tokamax.git
+[submodule "third_party/vllm-torchtpu"]
+	path = third_party/vllm-torchtpu
+	url = https://github.com/vllm-project/vllm-torchtpu.git
+	ignore = dirty

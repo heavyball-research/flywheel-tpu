@@ -21,7 +21,7 @@ import json
 import pathlib
 from collections import defaultdict
 
-IMPLS = ("rpa", "splash", "flywheel")
+IMPLS = ("rpa", "batched_rpa", "splash", "flywheel")
 SEGMENTS = ("qkv_proj", "layout", "attn_kernel", "out_proj")
 
 
@@ -58,17 +58,17 @@ def kernel_table(shape, by_seq):
              if any(impl in row for row in by_seq.values())]
     rivals = [impl for impl in impls if impl != "flywheel"]
     print(f"\nkernel level, TFLOP/s  {describe(shape)}")
-    header = f"{'seq':>7} " + "".join(f"{impl:>10}" for impl in impls)
-    header += "".join(f"{'vs ' + impl:>12}" for impl in rivals)
+    header = f"{'seq':>7} " + "".join(f"{impl:>12}" for impl in impls)
+    header += "".join(f"{'vs ' + impl:>15}" for impl in rivals)
     print(header)
     for seq in sorted(by_seq):
         row = by_seq[seq]
         tflops = {impl: row[impl].get("kernel_tflops")
                   for impl in impls if impl in row}
         line = f"{seq:>7} " + "".join(
-            f"{tflops[impl]:>10.0f}" if tflops.get(impl) else f"{'-':>10}"
+            f"{tflops[impl]:>12.0f}" if tflops.get(impl) else f"{'-':>12}"
             for impl in impls)
-        line += "".join(f"{ratio(tflops.get('flywheel'), tflops.get(impl)):>12}"
+        line += "".join(f"{ratio(tflops.get('flywheel'), tflops.get(impl)):>15}"
                         for impl in rivals)
         print(line)
 
@@ -78,9 +78,9 @@ def block_table(shape, by_seq):
              if any(impl in row for row in by_seq.values())]
     rivals = [impl for impl in impls if impl != "flywheel"]
     print(f"\nblock level, ms  {describe(shape)}")
-    print(f"{'seq':>7} {'impl':>9} "
+    print(f"{'seq':>7} {'impl':>11} "
           + "".join(f"{name:>12}" for name in SEGMENTS)
-          + f"{'total':>11}" + "".join(f"{'vs ' + impl:>12}"
+          + f"{'total':>11}" + "".join(f"{'vs ' + impl:>15}"
                                         for impl in rivals))
     for seq in sorted(by_seq):
         row = by_seq[seq]
@@ -90,13 +90,13 @@ def block_table(shape, by_seq):
                 continue
             record = row[impl]
             parts = record.get("segments_ms", {})
-            line = f"{seq:>7} {impl:>9} " + "".join(
+            line = f"{seq:>7} {impl:>11} " + "".join(
                 f"{parts[name]:>12.3f}" if name in parts else f"{'-':>12}"
                 for name in SEGMENTS)
             line += f"{record['median_ms']:>11.3f}"
             if impl == "flywheel":
                 line += "".join(
-                    f"{ratio(row.get(rival, {}).get('median_ms'), ours):>12}"
+                    f"{ratio(row.get(rival, {}).get('median_ms'), ours):>15}"
                     for rival in rivals)
             print(line)
 

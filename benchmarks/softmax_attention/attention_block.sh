@@ -13,7 +13,8 @@
 #
 # Environment:
 #     PYTHON        interpreter (default: .venv/bin/python)
-#     IMPLS         default "rpa splash flywheel"
+#     IMPLS         default "rpa splash flywheel"; batched_rpa adds vLLM
+#                   TorchTPU's batched RPA
 #     HEADS         default 32
 #     HEADS_K       default "32 4"
 #     HEAD_DIM      default 256

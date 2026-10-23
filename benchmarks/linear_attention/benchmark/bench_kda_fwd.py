@@ -272,6 +272,11 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args()
 
+    if args.pkgs is not None:
+        # Note (david): imported before JAX starts its backend, which
+        # vllm_torchtpu_kda needs for vLLM TorchTPU's libtpu flag defaults.
+        for pkg in args.pkgs.split(","):
+            importlib.import_module(f"{pkg}.wrapper")
     device = jax.devices()[0].device_kind
     print(f"device: {device}")
     if args.pkgs is None:
