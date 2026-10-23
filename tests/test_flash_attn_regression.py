@@ -372,3 +372,35 @@ def test_flash_attn_with_kvcache_block_table_changes_under_one_executable():
     np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
   assert float(jnp.abs(kv_pages).sum()) == 4 * float(
       jnp.abs(k[0, 0]).sum() + jnp.abs(v[0, 0]).sum())
+
+
+def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
+  # Note (david): 9 pages of 128 tokens divide only into 384-token blocks, so
+  # the kernel takes 1024-token blocks over a table padded to 16 pages. The
+  # rows end inside the first block, on it, one token past it and on the last
+  # real page, so second blocks read padded entries next to real ones.
+  batch, page_size, pages_per_seq = 4, 128, 9
+  heads, heads_k, head_dim = 4, 2, 128
+  num_pages = batch * pages_per_seq
+  keys = jax.random.split(jax.random.PRNGKey(0), 5)
+  q = jax.random.normal(keys[0], (batch, 1, heads, head_dim), jnp.bfloat16)
+  kv_pages = jax.random.normal(
+      keys[1], (num_pages, page_size, 2 * heads_k, head_dim), jnp.bfloat16)
+  k = jax.random.normal(keys[2], (batch, 1, heads_k, head_dim), jnp.bfloat16)
+  v = jax.random.normal(keys[3], (batch, 1, heads_k, head_dim), jnp.bfloat16)
+  table = jax.random.permutation(keys[4], num_pages).astype(
+      jnp.int32).reshape(batch, pages_per_seq)
+  cache_seqlens = jnp.array([129, 1023, 1024, 1151], jnp.int32)
+  rows = jnp.arange(batch)
+  row_kv = kv_pages[table].reshape(
+      batch, pages_per_seq * page_size, 2 * heads_k, head_dim)
+  k_cache = row_kv[..., 0::2, :].at[rows, cache_seqlens].set(k[:, 0])
+  v_cache = row_kv[..., 1::2, :].at[rows, cache_seqlens].set(v[:, 0])
+  out, lse, kv_pages = flash_attn_with_kvcache(
+      q, kv_pages, None, k, v, cache_seqlens=cache_seqlens, block_table=table,
+      return_softmax_lse=True, interpret=INTERPRET)
+  assert_decode_matches(out, lse, q, k_cache, v_cache, cache_seqlens + 1, rows)
+  slot_kv = kv_pages[table[rows, cache_seqlens // page_size],
+                     cache_seqlens % page_size]
+  np.testing.assert_array_equal(slot_kv[..., 0::2, :], k[:, 0])
+  np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])

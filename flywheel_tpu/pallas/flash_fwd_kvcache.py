@@ -24,6 +24,7 @@ from .block_sizes import (
   NUM_SUBLANES,
   STAGES,
   next_pow2,
+  round_up,
   vmem_limit_bytes,
 )
 from .copy_utils import (
@@ -376,7 +377,7 @@ def kvcache_kernel(
     # Note (david): a paged block is one piece per page, each a full page
     # except the clipped last one (RPA sizing; zero-length tails are issued
     # as-is). block_index * pages_per_block + page never leaves the row's table
-    # entries because capacity % block_kv == 0 and the caller keeps
+    # entries because the table is padded to whole blocks and the caller keeps
     # cache_len + has_new <= capacity.
     if page_size is None:
       return [(cache_row, block_index * block_kv, load_size, 0)]
@@ -1184,8 +1185,6 @@ def flash_attn_kvcache_pallas(
         capacity=capacity,
     )
   else:
-    # Note (david): a paged block is whole pages, and capacity is a multiple of
-    # granule either way, so the divisor search always ends.
     granule = MIN_BLOCK_KV if page_size is None else page_size
     target_block_kv = min(
         capacity,
@@ -1193,13 +1192,32 @@ def flash_attn_kvcache_pallas(
         MAX_BLOCK_KV,
     )
     aligned_target = max(target_block_kv // granule * granule, granule)
-    block_kv = next(
-        block for block in range(aligned_target, 0, -granule)
-        if capacity % block == 0
-    )
+    if page_size is None:
+      # Note (david): capacity is a multiple of granule, so the divisor search
+      # always ends.
+      block_kv = next(
+          block for block in range(aligned_target, 0, -granule)
+          if capacity % block == 0
+      )
+    else:
+      # Note (david): the table is padded to whole blocks below, so a page
+      # count with few factors (37 pages of 256 tokens) keeps the target block
+      # instead of one page per pipeline step.
+      block_kv = aligned_target
     block_kv_compute = resolve_block_kv_compute(block_kv)
     num_kv_stages = DEFAULT_NUM_KV_STAGES
+  # Note (david): a row's keys stay within the caller's capacity, which the
+  # padded table does not raise, so the guard is sized on it.
   guard_threshold = overflow_guard_threshold(capacity)
+  if page_size is not None:
+    # Note (david): the padded entries lie past every row's length and each
+    # page's load is clipped to it, so page 0 stands in and is never read.
+    padded_pages_per_seq = round_up(pages_per_seq, block_kv // page_size)
+    block_table = jnp.pad(
+        block_table.reshape(batch, pages_per_seq),
+        ((0, 0), (0, padded_pages_per_seq - pages_per_seq)),
+    ).reshape(-1)
+    pages_per_seq = padded_pages_per_seq
   kv_spec = pl.BlockSpec(
       (batch, num_kv_heads, head_dim), lambda *_: (0, 0, 0)
   )
