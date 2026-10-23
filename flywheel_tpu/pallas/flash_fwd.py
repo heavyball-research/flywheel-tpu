@@ -307,8 +307,8 @@ def make_flash_attn_mha(
   if is_varlen:
     forward = flash_attn_forward_varlen
     schedule_kwargs = {"varlen_sched": VarlenSchedule(
-        num_q_blocks=seqlen_q // block_sizes.block_q,
-        num_kv_blocks=seqlen_kv // block_sizes.block_kv,
+        padded_total_q=seqlen_q,
+        padded_total_k=seqlen_kv,
         q_heads_per_kv_head=q_heads_per_kv_head,
         left=left,
         right=right,

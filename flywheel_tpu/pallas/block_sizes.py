@@ -92,7 +92,11 @@ def pick_tile(candidates: Sequence[int], block: int) -> int:
 
 
 def default_block(
-    seqlen: int, candidates: Sequence[int], max_seqlen: int | None = None
+    seqlen: int,
+    candidates: Sequence[int],
+    max_seqlen: int | None = None,
+    *,
+    must_divide: bool = True,
 ) -> int:
   """Analytic physical block for a sequence axis, shared by fwd and bwd.
 
@@ -101,21 +105,27 @@ def default_block(
   block cap) caps the block at max(candidates[-1], next_pow2(max_seqlen)),
   relaxed to the largest candidate under the cap that divides the axis, since
   a block spanning several sequences leaves the block-diagonal schedule
-  nothing to skip.
+  nothing to skip. must_divide=False (the per-seq schedule, which clamps its
+  last window to the axis end) drops the divisibility: an axis of 128 times an
+  odd count would otherwise fall to the smallest candidate.
   """
   if seqlen <= candidates[0]:
     block = seqlen
-  else:
+  elif must_divide:
     block = pick_tile(candidates, seqlen)
+  else:
+    block = candidates[0]
   if max_seqlen is None:
     return block
   else:
     block_cap = max(candidates[-1], next_pow2(max_seqlen))
+    capped_candidates = [tile for tile in candidates if tile <= block_cap]
     if block <= block_cap:
       return block
+    elif must_divide:
+      return pick_tile(capped_candidates, seqlen)
     else:
-      return pick_tile(
-          [tile for tile in candidates if tile <= block_cap], seqlen)
+      return capped_candidates[0]
 
 
 class QKVLayout(enum.IntEnum):

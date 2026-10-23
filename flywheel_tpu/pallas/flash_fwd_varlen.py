@@ -38,8 +38,8 @@ def flash_fwd_varlen_kernel(
       cu_q_ref, cu_k_ref, cu_qblk_ref,
       num_head_groups=num_head_groups,
       q_heads_per_kv_head=varlen_sched.q_heads_per_kv_head,
-      padded_total_q=varlen_sched.num_q_blocks * bq,
-      padded_total_k=varlen_sched.num_kv_blocks * bkv,
+      padded_total_q=varlen_sched.padded_total_q,
+      padded_total_k=varlen_sched.padded_total_k,
       bq=bq, bkv=bkv, left=varlen_sched.left, right=varlen_sched.right,
       num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )

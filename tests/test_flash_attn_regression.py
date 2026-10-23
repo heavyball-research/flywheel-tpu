@@ -11,7 +11,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.flash_attn_interface import fused_q_scale
+from flywheel_tpu.flash_attn_interface import (
+    default_block_sizes,
+    fused_q_scale,
+    pad_seqlen,
+)
+from flywheel_tpu.pallas.block_sizes import next_pow2
 from tests.test_util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -170,6 +175,54 @@ def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
   for index, segment in enumerate(segments):
     rows = slice(int(cu[index]), int(cu[index + 1]))
     assert_output_close(out[rows][None], *segment, causal=causal)
+
+
+@pytest.mark.parametrize("seqlens", [
+    pytest.param([200, 184], id="two_seqs"),
+    pytest.param([250, 6, 3, 125], id="short_seqs_in_clamped_window"),
+    pytest.param([3000, 5000], id="long_two_seqs", marks=pytest.mark.skipif(
+        INTERPRET, reason="interpret mode affords short sequences only")),
+    pytest.param([5500], id="long_one_seq", marks=pytest.mark.skipif(
+        INTERPRET, reason="interpret mode affords short sequences only")),
+    pytest.param([2500, 100, 50, 30], id="long_short_tail",
+                 marks=pytest.mark.skipif(
+                     INTERPRET,
+                     reason="interpret mode affords short sequences only")),
+])
+@pytest.mark.parametrize("causal,window_size", [
+    (False, (-1, -1)),
+    (True, (-1, -1)),
+    (True, (96, 0)),
+])
+def test_flash_attn_varlen_ragged_last_block(seqlens, causal, window_size):
+  # Note (david): a packed total of 128 times an odd count keeps the
+  # max_seqlen-capped block, which then does not divide it, so the last
+  # sequence's last q and kv windows clamp to the padded end and recompute rows
+  # and columns the previous block already covered. Short sequences inside the
+  # clamped window chain the head blend over several identical windows, and
+  # one 5500-token sequence (5504 padded, divisible by neither 2048 nor the
+  # window's 1024 cap) needs the ragged last kv block that a floored block
+  # count would drop.
+  max_seqlen = max(seqlens)
+  padded_total = pad_seqlen(sum(seqlens))
+  bucket = min(padded_total, next_pow2(max_seqlen))
+  blocks = default_block_sizes(padded_total, padded_total, bucket, bucket,
+                               window_size=window_size, head_dim=128)
+  assert padded_total % blocks.block_q and padded_total % blocks.block_kv
+  q, k, v, segments = packed_qkv(seqlens, 4, 2, 128)
+  cu = cu_seqlens_of(seqlens)
+  out, lse = varlen_attn(q, k, v, cu, cu, max_seqlen, max_seqlen,
+                         causal=causal, window_size=window_size,
+                         return_softmax_lse=True)
+  for index, segment in enumerate(segments):
+    rows = slice(int(cu[index]), int(cu[index + 1]))
+    mask_kwargs = {"causal": causal, "window_size": window_size}
+    assert_output_close(out[rows][None], *segment, **mask_kwargs)
+    _, lse_ref = attention_ref(*segment, **mask_kwargs)
+    _, lse_bf16 = attention_ref(*segment, upcast=False, reorder_ops=True,
+                                **mask_kwargs)
+    lse_error = max_abs(lse[:, rows] - lse_ref[0])
+    assert lse_error <= 2 * max_abs(lse_bf16 - lse_ref) + 1e-3
 
 
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,

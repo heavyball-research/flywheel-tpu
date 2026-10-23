@@ -1520,7 +1520,9 @@ def forward_common(
   if bkv_compute % NUM_LANES:
     raise ValueError(f"{bkv_compute=} must be a multiple of {NUM_LANES}.")
 
-  if q_seq_len % bq or kv_seq_len % bkv:
+  # Note (david): a per-seq schedule clamps its windows to the axis end and
+  # checks that each block fits, so only the dense grid needs the divisibility.
+  if not is_per_seq and (q_seq_len % bq or kv_seq_len % bkv):
     raise ValueError(f"{bq=} and {bkv=} must divide the sequence lengths.")
   if rotary is None:
     rotary_dim, rotary_batch, rotary_groups = 0, 1, 1
