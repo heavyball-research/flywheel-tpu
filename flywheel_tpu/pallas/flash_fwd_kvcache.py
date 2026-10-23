@@ -485,10 +485,20 @@ def kvcache_kernel(
 
   # Note (david): staged V rows a block never loads keep whatever VMEM held;
   # start them finite so a zero probability times a stale row stays zero.
-  value_words = (
-      value_buffers.bitcast(jnp.uint32) if is_bitcast_load else value_buffers
-  )
-  value_words[...] = jnp.zeros(value_words.shape, value_words.dtype)
+  if is_merged_cache and is_bitcast_load:
+    # Note: through its (tokens * word_stride, head_dim) word view a slot
+    # zeroes in whole 8-row stores; the 5-D view's one-word token rows took
+    # one store per row. v7x, 32:8 heads, two 2048-token stages: 18450 ->
+    # 2322 bundles a call.
+    for zero_slot in range(num_kv_stages):
+      slot_words = staged_words(value_buffers, zero_slot)
+      slot_words[...] = jnp.zeros(slot_words.shape, jnp.uint32)
+  else:
+    value_words = (
+        value_buffers.bitcast(jnp.uint32) if is_bitcast_load
+        else value_buffers
+    )
+    value_words[...] = jnp.zeros(value_words.shape, value_words.dtype)
 
   def _block_range(cache_len):
     total_len = cache_len + int(has_new)
