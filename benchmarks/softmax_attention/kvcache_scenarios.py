@@ -15,6 +15,12 @@ decode           --batch sequences each hold seq - decode_tokens tokens of KV
                  cache, then run --decode-tokens decode steps: one query token
                  per sequence that appends its K/V and attends to the whole
                  cache. One timed call is all the steps.
+verify           --batch sequences each hold seq - verify_tokens tokens of KV
+                 cache, then run --decode-tokens speculative verify steps:
+                 --verify-tokens query tokens per sequence that append their
+                 K/V and attend causally (bottom-right) to the whole cache.
+                 Every step rewrites the same slots, as a step whose drafts
+                 are all rejected does, so each attends seq keys.
 
 Both kernels read and write a paged cache of --page-size token pages (128,
 the page flywheel's vLLM backend allocates), with pages shuffled across
@@ -24,6 +30,16 @@ for decode, and for chunked prefill its ragged append plus the paged varlen
 kernel. RPA v3 runs ragged_paged_attention with the request distribution
 vLLM's TPU runner sends, mixed for chunked prefill and decode for decode, and
 its own default block sizes unless --rpa-blocks names some.
+
+On verify, flywheel's flash_attn_with_kvcache folds a window of at most
+MAX_FOLDED_QUERY_ROWS query rows per KV head into the query heads of its
+decode kernel, causal through the kernel's query_tokens, and runs a longer
+one on the ragged append plus the paged varlen kernel. rpa sends verify
+windows to the mixed case, as tpu-inference does (max_decode_tokens is 1).
+batched_rpa runs vllm-torchtpu's batched RPA (--torchtpu-source) with every
+window in its decode case and decode_query_size = --verify-tokens, as that
+backend serves K + 1 verify tokens; its cache is RPA v3's, its blocks its own
+default. With --verify-tokens 1 every impl runs its decode path.
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -44,6 +60,7 @@ import numpy as np
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
+    load_batched_rpa,
     load_rpa_v3,
     request_distribution,
     unjitted_kernel,
@@ -51,8 +68,8 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "rpa")
-SCENARIOS = ("chunked_prefill", "decode")
+IMPLS = ("flywheel", "rpa", "batched_rpa")
+SCENARIOS = ("chunked_prefill", "decode", "verify")
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
 
@@ -69,6 +86,8 @@ class Cell:
     decode_tokens: int
     page_size: int
     sliding_window: int | None = None
+    # verify: query tokens per sequence per step (num_spec_tokens + 1).
+    verify_tokens: int = 1
     # q dtype. Every byte count below follows the cache's itemsize.
     dtype: str = "bfloat16"
     # k, v and cache dtype. An fp8 cell keeps the descales at 1: they only
@@ -87,6 +106,9 @@ class Cell:
                  f"{kv_tag}")
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
+        elif self.scenario == "verify":
+            return (f"{shape}-b{self.batch}-t{self.verify_tokens}"
+                    f"-n{self.decode_tokens}")
         return f"{shape}-b{self.batch}-n{self.decode_tokens}"
 
     @property
@@ -94,6 +116,8 @@ class Cell:
         """Cached tokens per sequence before the first call."""
         if self.scenario == "chunked_prefill":
             return 0
+        elif self.scenario == "verify":
+            return self.seq - self.verify_tokens
         return self.seq - self.decode_tokens
 
     @property
@@ -109,7 +133,11 @@ class Cell:
     @property
     def query_tokens(self):
         """Query tokens of one kernel call."""
-        return self.chunk if self.scenario == "chunked_prefill" else self.batch
+        if self.scenario == "chunked_prefill":
+            return self.chunk
+        elif self.scenario == "verify":
+            return self.batch * self.verify_tokens
+        return self.batch
 
     @property
     def itemsize(self):
@@ -129,6 +157,11 @@ class Cell:
 
 def attention_pairs(cell):
     """(query, key) pairs the whole scenario attends."""
+    if cell.scenario == "verify":
+        # Note (david): window token t sees the context and t + 1 new tokens.
+        tokens = cell.verify_tokens
+        per_step = tokens * cell.context + tokens * (tokens + 1) // 2
+        return cell.num_calls * cell.batch * per_step
     if cell.scenario == "chunked_prefill":
         first_query, num_queries = 0, cell.seq
     else:
@@ -166,6 +199,15 @@ def make_inputs(cell):
                   k[i * cell.chunk:(i + 1) * cell.chunk],
                   v[i * cell.chunk:(i + 1) * cell.chunk])
                  for i in range(cell.num_calls)]
+    elif cell.scenario == "verify":
+        def window_tokens(heads, dtype):
+            return draw(generator, dtype, cell.query_tokens, heads,
+                        cell.head_dim)
+
+        step = (window_tokens(cell.heads, cell.dtype),
+                window_tokens(cell.heads_k, cell.kv_dtype),
+                window_tokens(cell.heads_k, cell.kv_dtype))
+        calls = [step] * cell.num_calls
     else:
         def one_token(heads, dtype):
             return draw(generator, dtype, cell.batch, heads, cell.head_dim)
@@ -179,8 +221,14 @@ def make_inputs(cell):
     block_table = jnp.asarray(
         table.reshape(cell.num_seqs, pages_per_seq).astype(np.int32))
     # Cached tokens per sequence before each call.
-    starts = [jnp.full((cell.num_seqs,), cell.context + i * (
-        cell.chunk if cell.scenario == "chunked_prefill" else 1), jnp.int32)
+    if cell.scenario == "chunked_prefill":
+        advance = cell.chunk
+    elif cell.scenario == "verify":
+        advance = 0
+    else:
+        advance = 1
+    starts = [jnp.full((cell.num_seqs,), cell.context + i * advance,
+                       jnp.int32)
               for i in range(cell.num_calls)]
     return jax.block_until_ready((calls, block_table, starts))
 
@@ -221,6 +269,9 @@ def build_flywheel(cell, inputs, args):
     def call(cache, q, k, v, start):
         if cell.scenario == "chunked_prefill":
             q, k, v = q[None], k[None], v[None]
+        elif cell.scenario == "verify":
+            q, k, v = (x.reshape(cell.batch, cell.verify_tokens, *x.shape[1:])
+                       for x in (q, k, v))
         else:
             q, k, v = q[:, None], k[:, None], v[:, None]
         out, cache = flash_attn_with_kvcache(
@@ -241,6 +292,8 @@ def build_flywheel(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {}
 
 
+
+
 def build_rpa(cell, inputs, args):
     """(step, fresh_state, info) running ragged_paged_attention."""
     import jax
@@ -257,6 +310,16 @@ def build_rpa(cell, inputs, args):
         distribution = request_distribution(num_decode=0, num_seqs=1)
         new_tokens = cell.chunk
         blocks_arg = "m_block_sizes"
+    elif cell.scenario == "verify" and cell.verify_tokens > 1:
+        # Note (david): tpu-inference's runner counts a request as decode only
+        # at num_scheduled_tokens <= max_decode_tokens, which is 1, so a
+        # verify window is mixed.
+        cu_q_lens = (jnp.arange(cell.batch + 1, dtype=jnp.int32)
+                     * cell.verify_tokens)
+        distribution = request_distribution(
+            num_decode=0, num_seqs=cell.batch)
+        new_tokens = cell.verify_tokens
+        blocks_arg = "m_block_sizes"
     else:
         cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32)
         distribution = request_distribution(
@@ -270,7 +333,7 @@ def build_rpa(cell, inputs, args):
     mixed_blocks = (tuple(int(b) for b in args.rpa_mixed_blocks.split(","))
                     if args.rpa_mixed_blocks else None)
     block_kwargs = {blocks_arg: blocks}
-    if cell.scenario == "decode":
+    if blocks_arg == "d_block_sizes":
         block_kwargs["m_block_sizes"] = mixed_blocks
     kernel_fn = unjitted_kernel(rpa)
     scale = 1.0 / math.sqrt(cell.head_dim)
@@ -298,7 +361,57 @@ def build_rpa(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
 
 
-BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa}
+def build_batched_rpa(cell, inputs, args):
+    """(step, fresh_state, info) running vllm-torchtpu's batched RPA."""
+    import jax
+    import jax.numpy as jnp
+
+    if args.torchtpu_source is None:
+        raise ValueError("--impl batched_rpa needs --torchtpu-source.")
+    wrapper = load_batched_rpa(args.torchtpu_source)
+    calls, block_table, starts = inputs
+    shape = wrapper.get_kv_cache_shape(
+        cell.num_seqs * block_table.shape[1], cell.page_size, cell.heads_k,
+        cell.head_dim, jnp.dtype(cell.kv_dtype))
+    page_indices = block_table.reshape(-1)
+    if cell.scenario == "chunked_prefill":
+        cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
+        distribution = request_distribution(num_decode=0, num_seqs=1)
+        new_tokens = cell.chunk
+        decode_query_size = 1
+    else:
+        new_tokens = (cell.verify_tokens if cell.scenario == "verify"
+                      else 1)
+        cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32) * new_tokens
+        distribution = request_distribution(
+            num_decode=cell.batch, num_seqs=cell.batch)
+        decode_query_size = new_tokens
+    kernel_fn = unjitted_kernel(wrapper)
+    scale = 1.0 / math.sqrt(cell.head_dim)
+
+    def call(cache, q, k, v, start):
+        out, cache = kernel_fn(
+            q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
+            distribution, sm_scale=scale, sliding_window=cell.sliding_window,
+            decode_query_size=decode_query_size)
+        return out, cache
+
+    kernel = jax.jit(call, donate_argnums=(0,))
+
+    def step(cache):
+        out = None
+        for (q, k, v), start in zip(calls, starts):
+            out, cache = kernel(cache, q, k, v, start)
+        return out, cache
+
+    generator = np.random.default_rng(1)
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {
+        "block_source": "batched rpa default",
+        "decode_query_size": decode_query_size}
+
+
+BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa,
+            "batched_rpa": build_batched_rpa}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -336,6 +449,8 @@ def run(cell, args):
     # Every call reads each sequence's whole visible cache once.
     if cell.scenario == "decode":
         kv_tokens_read = pairs
+    elif cell.scenario == "verify":
+        kv_tokens_read = cell.num_calls * cell.batch * cell.seq
     elif cell.sliding_window is None:
         kv_tokens_read = sum(
             (i + 1) * cell.chunk for i in range(cell.num_calls))
@@ -372,8 +487,9 @@ def run(cell, args):
                   ms_per_call=ms / cell.num_calls,
                   tflops=attn_flops / (ms * 1e9),
                   kv_read_gbps=kv_bytes_read / (ms * 1e6))
-    if cell.scenario == "decode":
-        record["tokens_per_s"] = cell.batch * cell.decode_tokens / (ms / 1e3)
+    if cell.scenario in ("decode", "verify"):
+        record["tokens_per_s"] = (cell.num_calls * cell.query_tokens
+                                  / (ms / 1e3))
     if args.trace:
         per_op = trace_scenario(cell, step, fresh(), args.trace)
         if per_op is None:
@@ -396,7 +512,7 @@ def main(argv=None):
     cell = Cell(args.impl, args.scenario, args.heads, args.heads_k,
                 args.head_dim, args.seq, args.chunk, args.batch,
                 args.decode_tokens, args.page_size, args.sliding_window,
-                kv_dtype=args.kv_dtype)
+                args.verify_tokens, kv_dtype=args.kv_dtype)
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
     if args.output and not args.trace and recorded(args.output, cell.key):
@@ -425,7 +541,10 @@ def parse_args(argv=None):
     parser.add_argument("--batch", type=int, default=256,
                         help="decode: concurrent sequences")
     parser.add_argument("--decode-tokens", type=int, default=1024,
-                        help="decode: steps, the last tokens of --seq")
+                        help="decode: steps, the last tokens of --seq; "
+                             "verify: steps")
+    parser.add_argument("--verify-tokens", type=int, default=1,
+                        help="verify: query tokens per sequence per step")
     parser.add_argument("--page-size", type=int, default=128)
     parser.add_argument("--kv-dtype", default="bfloat16",
                         choices=("bfloat16", "float8_e4m3fn", "float8_e5m2"),
@@ -442,6 +561,8 @@ def parse_args(argv=None):
                              "compiles alongside; default: RPA's formula")
     parser.add_argument("--rpa-source", type=pathlib.Path,
                         default=DEFAULT_RPA_SOURCE)
+    parser.add_argument("--torchtpu-source", type=pathlib.Path,
+                        help="batched_rpa: a vllm-torchtpu checkout")
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument("--trace", type=pathlib.Path,
                         help="also trace one scenario into this directory")

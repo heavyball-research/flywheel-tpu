@@ -232,6 +232,8 @@ def kvcache_kernel(
     return_lse: bool,
     has_new: bool,
     left: int | None,
+    query_tokens: int,
+    causal: bool,
     log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
@@ -349,6 +351,18 @@ def kvcache_kernel(
     pv_row_head = lax.broadcasted_iota(
         jnp.int32, (rows_per_fragment, head_dim), 0
     ) // query_heads_per_kv_head
+  # Note (david): a folded window lays a KV head's rows out token by token, so
+  # row r is window token t = r // group, which causal stops
+  # query_tokens - 1 - t keys short of total_len.
+  if causal and query_tokens > 1:
+    row_key_offset = (
+        lax.broadcasted_iota(jnp.int32, (rows_per_fragment, fragment_keys), 0)
+        % query_heads_per_kv_head
+        // (query_heads_per_kv_head // query_tokens)
+        - (query_tokens - 1)
+    )
+  else:
+    row_key_offset = None
   if kv_heads_per_fragment == 1:
     parity_mask = None
   else:
@@ -855,11 +869,15 @@ def kvcache_kernel(
         key_position = key_start + lax.broadcasted_iota(
             jnp.int32, (rows_per_fragment, fragment_keys), 1
         ) // kv_heads_per_fragment
+        if row_key_offset is None:
+          key_end = total_len
+        else:
+          key_end = total_len + row_key_offset
         if left is None:
-          is_in_window = key_position < total_len
+          is_in_window = key_position < key_end
         else:
           is_in_window = (
-              (key_position < total_len) & (key_position >= first_key)
+              (key_position < key_end) & (key_position >= first_key)
           )
         if parity_mask is None:
           is_valid = is_in_window
@@ -1146,6 +1164,7 @@ def flash_attn_kvcache_pallas(
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
     softcap: float = 0.0,
+    causal: bool = False,
     nheads_k: int | None = None,
     v_scale: float | jax.Array = 1.0,
 ) -> tuple[jax.Array, ...]:
@@ -1153,7 +1172,10 @@ def flash_attn_kvcache_pallas(
 
   q: (batch, num_query_heads, head_dim), already scaled into log2 units, or
   by softmax_scale / softcap when softcap > 0, which applies Gemma-2's
-  tanh(s / softcap) * softcap to the scaled scores.
+  tanh(s / softcap) * softcap to the scaled scores. A (batch, window,
+  num_query_heads, head_dim) q is a window already in the cache, folded into
+  the query heads so each row's cache is read once; out and lse keep q's
+  layout, and causal bounds window token t at cache_seqlens - window + 1 + t.
   k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim), or head-major
   (rows, num_kv_heads, capacity, head_dim) with cache_head_major. With
   block_table, the flat (batch * pages_per_seq,) int32 page table, the caches
@@ -1169,7 +1191,8 @@ def flash_attn_kvcache_pallas(
   head count, needs it. An fp8 merged cache feeds K and V to the MXU as
   stored, k and v must be in its dtype, and v_scale, a scalar that may be
   traced, multiplies the output (q carries the K scale). lse is (batch,
-  num_query_heads, 128) float32 with each value broadcast over lanes.
+  num_query_heads, 128) float32, (batch, window, num_query_heads, 128) for a
+  window, with each value broadcast over lanes.
 
   num_active: rows at or past it are padding (RPA's distribution[-1]
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
@@ -1184,7 +1207,12 @@ def flash_attn_kvcache_pallas(
   ), "merged_cache takes one token-major cache with an even head axis."
   cache_operands = (k_cache,) if merged_cache else (k_cache, v_cache)
   cache_shape = k_cache.shape
-  batch, num_query_heads, head_dim = q.shape
+  is_window = q.ndim == 4
+  if is_window:
+    batch, query_tokens, window_heads, head_dim = q.shape
+  else:
+    batch, num_query_heads, head_dim = q.shape
+    query_tokens = 1
   if merged_cache:
     # Note (david): a merged build stages, appends and writes back whole token
     # rows, so no DMA cuts the head axis, and a staged u32 word holds whole
@@ -1235,6 +1263,19 @@ def flash_attn_kvcache_pallas(
   if head_dim not in SUPPORTED_HEAD_DIMS:
     raise ValueError(
         f"head_dim must be one of {SUPPORTED_HEAD_DIMS}; got {head_dim}."
+    )
+  if is_window:
+    assert window_heads % num_kv_heads == 0
+    assert not has_new and left is None, "a window is already in the cache"
+    # Note (david): putting window token t of query head h * group + j at
+    # folded head (h * query_tokens + t) * group + j lets KV head h's rows
+    # share one read of its keys.
+    group = window_heads // num_kv_heads
+    num_query_heads = num_kv_heads * query_tokens * group
+    q = (
+        q.reshape(batch, query_tokens, num_kv_heads, group, head_dim)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, num_query_heads, head_dim)
     )
   if capacity % MIN_BLOCK_KV:
     raise ValueError(
@@ -1427,6 +1468,8 @@ def flash_attn_kvcache_pallas(
       return_lse=return_lse,
       has_new=has_new,
       left=left,
+      query_tokens=query_tokens,
+      causal=causal,
       log2_softcap=softcap * LOG2E,
       guard_threshold=guard_threshold,
       page_size=page_size,
@@ -1455,16 +1498,30 @@ def flash_attn_kvcache_pallas(
       interpret=pltpu.InterpretParams() if interpret else False,
   )
   kernel_outputs = call(*scalar_prefetches, *dense_inputs, *kernel_caches)
+  num_caches = len(cache_operands)
   if is_token_major_mqa:
-    num_caches = len(cache_operands)
-    restored_caches = tuple(
+    caches_out = tuple(
         out_cache.reshape(operand.shape)
         for out_cache, operand in zip(
             kernel_outputs[1:1 + num_caches], cache_operands
         )
     )
-    return (
-        kernel_outputs[0], *restored_caches, *kernel_outputs[1 + num_caches:]
+  else:
+    caches_out = tuple(kernel_outputs[1:1 + num_caches])
+  if is_window:
+    out = (
+        kernel_outputs[0]
+        .reshape(batch, num_kv_heads, query_tokens, group, head_dim)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, query_tokens, window_heads, head_dim)
+    )
+    lse_out = tuple(
+        lse.reshape(batch, num_kv_heads, query_tokens, group, NUM_LANES)
+        .transpose(0, 2, 1, 3, 4)
+        .reshape(batch, query_tokens, window_heads, NUM_LANES)
+        for lse in kernel_outputs[1 + num_caches:]
     )
   else:
-    return kernel_outputs
+    out = kernel_outputs[0]
+    lse_out = tuple(kernel_outputs[1 + num_caches:])
+  return (out, *caches_out, *lse_out)

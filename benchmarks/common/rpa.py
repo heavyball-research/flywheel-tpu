@@ -1,4 +1,5 @@
-"""SHA-pinned loader for the tpu-inference RPA v3 kernel, the RPA baseline.
+"""SHA-pinned loaders for the RPA baselines: tpu-inference's RPA v3 kernel and
+vllm-torchtpu's batched RPA.
 
 --rpa-source defaults to the third_party/tpu-inference submodule
 (git submodule update --init third_party/tpu-inference). Only
@@ -7,6 +8,10 @@ and both are verified against their SHA-256 at RPA_V3_GIT_SHA, the submodule
 pin. Those two files and the vLLM backend's flash_attn.py are unchanged from
 1bd693780c5f, the revision softmax_attention/rpa_tuned_v6e.json was searched
 on.
+
+load_batched_rpa takes a vllm-torchtpu checkout (--torchtpu-source) and loads
+src/vllm_torchtpu/kernels/experimental/batched_rpa, every file verified
+against its SHA-256 at BATCHED_RPA_GIT_SHA.
 
     PYTHONPATH=. uv run --no-sync python benchmarks/common/rpa.py   # host-only self-test
 """
@@ -30,6 +35,34 @@ RPA_V3_SOURCE_SHA256 = {
         "f9a1c1f189ef0b5d9e9babaa9d221faf01f12bc9bb809fe227d17901867b56c0",
 }
 FIELDS = ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz")
+# vllm-torchtpu's batched RPA, the kernel its CUSTOM attention backend serves
+# with, speculative verify windows in the decode case.
+BATCHED_RPA_GIT_SHA = "6f66b7babaec12e98e241320c7f46ff406d3f7de"
+BATCHED_RPA_PACKAGE = "vllm_torchtpu.kernels.experimental.batched_rpa"
+BATCHED_RPA_SOURCE_SHA256 = {
+    "__init__.py":
+        "dae715a4f8e5c127d40a795ddf630d294563ac44234e333077f4aa9cbeae3e05",
+    "bref_override.py":
+        "447be6f37e5b2bf5632a0bd9f8e9724e4b9373c2f6bf452fa9165e8dccb5b380",
+    "configs.py":
+        "dfa7df3e22eda2ae12d93b56a02facef4d7c0c0bfbeff03af4c9dc6253b408fd",
+    "flash_attention.py":
+        "b490517cfc503ccc298d5d511469370730fbe50c82288048337810f54dedb804",
+    "kernel.py":
+        "522246e55347638f05aa060722612294ca54bc63631c78d5aa74a53cc93718e7",
+    "pipeline.py":
+        "ee702226a72f5db5eab4bdbe90fefef1ec43a4cb027105b8923276880a53ef34",
+    "schedule_cp.py":
+        "fab697e2e4af64f58704f8056431140a527c418bd99e43b40c0f2e843e35b577",
+    "schedule.py":
+        "3e77d06c7669ea83869f3fa19cacc98608c891357517b91a736551335c2a429b",
+    "stitch_utils.py":
+        "221b32d923a22dd12dd5d2a268defceb62936d237cc035bd0f3962e988d3e9ce",
+    "utils.py":
+        "1c917940957aef3c04f24e6125b78a31e1229c2221dbf6ad6dd2c519947858d5",
+    "wrapper.py":
+        "67380581df5ac1bdc67e403e36b264c9248fcc7946814653a2c099eafdb782ff",
+}
 
 
 def validate_rpa_source(source_root: Path) -> Path:
@@ -72,6 +105,39 @@ def load_rpa_v3(source_root: Path):
         package.__package__ = name
         sys.modules[name] = package
     return importlib.import_module(f"{RPA_V3_PACKAGE}.kernel")
+
+
+def load_batched_rpa(source_root: Path):
+    """The pinned batched RPA wrapper module (ragged_paged_attention,
+    get_kv_cache_shape) from a vllm-torchtpu checkout, loaded like load_rpa_v3:
+    the package imports only jax and itself, so stub parents suffice and no
+    torch_tpu or vLLM is needed."""
+    source_root = Path(source_root).expanduser().resolve()
+    parts = BATCHED_RPA_PACKAGE.split(".")
+    module_root = source_root.joinpath("src", *parts)
+    for name, expected in BATCHED_RPA_SOURCE_SHA256.items():
+        path = module_root / name
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"{path} is missing; --torchtpu-source must be a "
+                f"vllm-torchtpu checkout at {BATCHED_RPA_GIT_SHA}.")
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected:
+            raise ValueError(
+                f"{path} does not match vllm-torchtpu {BATCHED_RPA_GIT_SHA}; "
+                f"got sha256 {digest}.")
+    if "vllm_torchtpu" in sys.modules:
+        raise RuntimeError(
+            "vllm_torchtpu was imported before the pinned batched RPA source; "
+            "refusing to benchmark an ambiguous baseline.")
+
+    for depth in range(1, len(parts) + 1):
+        name = ".".join(parts[:depth])
+        package = types.ModuleType(name)
+        package.__path__ = [str(source_root.joinpath("src", *parts[:depth]))]
+        package.__package__ = name
+        sys.modules[name] = package
+    return importlib.import_module(f"{BATCHED_RPA_PACKAGE}.wrapper")
 
 
 def vllm_page_size(max_model_len: int, max_num_seqs: int) -> int:

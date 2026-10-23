@@ -30,7 +30,10 @@ from .pallas.copy_utils import resolve_merged_kv_heads
 from .pallas.flash_bwd import flash_attn_bwd
 from .pallas.flash_fwd import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
 from .pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
-from .pallas.flash_fwd_kvcache_varlen import flash_attn_kvcache_varlen
+from .pallas.flash_fwd_kvcache_varlen import (
+    append_ragged,
+    flash_attn_kvcache_varlen,
+)
 from .pallas.flash_fwd_varlen_paged import flash_attn_varlen_paged
 from .pallas.rotary import prepare_rotary
 from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
@@ -38,6 +41,11 @@ from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # decode kernel descriptor-bound.
 PAGE_SIZE_MULTIPLE = 128
+# Note (david): the paged varlen kernel pads every request to a 128-token q
+# block, so a short window folded into the decode kernel's query heads reads
+# the cache once instead; the decode kernel keeps all of a row's query heads
+# in VMEM, which caps the fold at this many rows per KV head.
+MAX_FOLDED_QUERY_ROWS = 128
 # Note (david): a packed (or right-only) window caps both physical forward
 # blocks. A q block row loads the window plus bq + bkv keys of partial blocks,
 # all through the masked fragment pipeline, so large blocks waste about
@@ -1361,6 +1369,9 @@ def flash_attn_with_kvcache(
   serves single-token decode only; the paged merged cache takes any nheads_k,
   and multi-token and packed calls (chunked prefill) need it: they append the
   new tokens, then run flash_attn_varlen_func's paged kernel over the pages.
+  A (batch, seqlen_q, ...) call with no left window and at most
+  MAX_FOLDED_QUERY_ROWS query rows per KV head (a speculative verify window)
+  runs the decode kernel instead, the window folded into the query heads.
 
   q: (batch, seqlen_q, nheads, head_dim), or packed (total_q, nheads,
   head_dim) with cu_seqlens_q, (batch + 1,) nondecreasing int boundaries from
@@ -1532,6 +1543,15 @@ def flash_attn_with_kvcache(
       1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
   )
   if is_extend:
+    is_right_bounded, window_left = paged_window(causal, window_size)
+    is_folded = (
+        not is_ragged and window_left is None
+        and seqlen_q * (nheads // nheads_k) <= MAX_FOLDED_QUERY_ROWS
+    )
+  else:
+    is_folded = False
+  is_varlen = is_extend and not is_folded
+  if is_varlen:
     if is_ragged:
       packed_cu_seqlens_q = cu_seqlens_q
     else:
@@ -1542,7 +1562,6 @@ def flash_attn_with_kvcache(
       packed_v = v.reshape(-1, nheads_k, head_dim)
     else:
       packed_k = packed_v = None
-    is_right_bounded, window_left = paged_window(causal, window_size)
     kernel_outputs = flash_attn_kvcache_varlen(
         packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
         row_cache_seqlens, flat_block_table, num_active,
@@ -1559,11 +1578,32 @@ def flash_attn_with_kvcache(
     # kernels apply per staged Q tile. The K descale is one per-tensor
     # factor on every score, so it rides in the same scale.
     q_scaled = (
-        q.reshape(batch, nheads, head_dim).astype(jnp.float32)
+        q.astype(jnp.float32)
         * fused_q_scale(softmax_scale * k_descale, softcap)
     ).astype(q.dtype)
     new_token_shape = (batch, nheads_k, head_dim)
-    if has_new:
+    num_active_array = jnp.asarray(
+        batch if num_active is None else num_active, jnp.int32).reshape(1)
+    if is_folded:
+      # Note (david): the decode kernel appends one token per row, so a
+      # window's K/V go in by the ragged append.
+      if has_new:
+        k_cache = append_ragged(
+            k_cache, k.reshape(-1, nheads_k, head_dim),
+            v.reshape(-1, nheads_k, head_dim),
+            jnp.arange(batch + 1, dtype=jnp.int32) * seqlen_q,
+            row_cache_seqlens, flat_block_table, num_active_array,
+            page_size=k_cache.shape[1],
+            pages_per_seq=flat_block_table.shape[0] // batch,
+            interpret=bool(interpret),
+        )
+        row_cache_seqlens = row_cache_seqlens + seqlen_q
+      kernel_q = q_scaled
+      kernel_has_new = False
+    else:
+      kernel_q = q_scaled.reshape(batch, nheads, head_dim)
+      kernel_has_new = has_new
+    if kernel_has_new:
       k_new, v_new = k.reshape(new_token_shape), v.reshape(new_token_shape)
     else:
       # Note (david): without has_new the kernel never touches these, but it
@@ -1571,7 +1611,7 @@ def flash_attn_with_kvcache(
       k_new = v_new = jnp.zeros(new_token_shape, k_cache.dtype)
     window_left = None if window_size[0] == -1 else window_size[0]
     kernel_outputs = flash_attn_kvcache_pallas(
-        q_scaled,
+        kernel_q,
         k_cache,
         v_cache,
         k_new,
@@ -1579,29 +1619,43 @@ def flash_attn_with_kvcache(
         row_cache_seqlens,
         cache_batch_idx,
         cache_head_major=False,
-        has_new=has_new,
+        has_new=kernel_has_new,
         left=window_left,
         return_lse=bool(return_softmax_lse),
         interpret=bool(interpret),
         block_table=flat_block_table,
-        num_active=num_active,
+        num_active=num_active_array,
         merged_cache=is_paged,
         softcap=float(softcap),
+        causal=is_folded and is_right_bounded,
         nheads_k=nheads_k if is_paged else None,
         v_scale=v_descale,
     )
-  out = kernel_outputs[0].reshape(q.shape)
   caches_out = kernel_outputs[1:1 + len(cache_operands)]
+  if is_folded:
+    # Note (david): a window is a multi-token call, whose rows past
+    # num_active return out = 0 and lse = -inf, as on the varlen path.
+    is_active = jnp.arange(batch) < num_active_array[0]
+    out = jnp.where(is_active[:, None, None, None], kernel_outputs[0], 0)
+  else:
+    out = kernel_outputs[0].reshape(q.shape)
   if return_softmax_lse:
     kernel_lse = kernel_outputs[1 + len(cache_operands)]
     if is_ragged:
       lse = kernel_lse
-    elif is_extend:
+    elif is_varlen:
       lse = kernel_lse.reshape(nheads, batch, seqlen_q).transpose(1, 0, 2)
     else:
       # Note (david): the decode kernel broadcasts each row's lse across a
       # full 128-lane tile; the first column is the lse.
-      lse = kernel_lse[:, :, :1]
+      decode_lse = (
+          kernel_lse[..., 0].reshape(batch, seqlen_q, nheads)
+          .transpose(0, 2, 1)
+      )
+      if is_folded:
+        lse = jnp.where(is_active[:, None, None], decode_lse, -jnp.inf)
+      else:
+        lse = decode_lse
     return (out, lse, *caches_out)
   else:
     return (out, *caches_out)

@@ -362,6 +362,47 @@ def test_ragged_cache_prefill_gqa_regression():
   assert_extend_matches(actual, expected, case[5], case[6])
 
 
+@pytest.mark.parametrize("append", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("heads,kv_heads,seqlen_q",
+                         [(32, 8, 4), (32, 8, 16), (8, 1, 16), (6, 3, 3)])
+def test_verify_window_on_the_decode_kernel(heads, kv_heads, seqlen_q, causal,
+                                            append):
+  # Note (david): the prefixes put windows on, before and across page edges,
+  # and the last request is past num_active, so its rows must come back out =
+  # 0 and lse = -inf with nothing appended.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(seqlen_q,) * 4, prefixes=(128, 256 - seqlen_q + 1, 127, 200),
+      heads=heads, kv_heads=kv_heads, padding=0)
+  batch = table.shape[0]
+  num_active = 3
+  active_rows = num_active * seqlen_q
+  if append:
+    reference_k, reference_v = k[:active_rows], v[:active_rows]
+    window_k, window_v = (
+        rows.reshape(batch, seqlen_q, *rows.shape[1:]) for rows in (k, v))
+  else:
+    reference_k = reference_v = window_k = window_v = None
+  expected = ragged_reference(
+      q[:active_rows], kc, vc, reference_k, reference_v, cu[:num_active + 1],
+      lengths[:num_active], table, causal=causal)
+
+  def _window_attention(kv_cache):
+    return flash_attn_with_kvcache(
+        q.reshape(batch, seqlen_q, *q.shape[1:]), kv_cache, None, window_k,
+        window_v, block_table=table, cache_seqlens=lengths,
+        num_active=num_active, causal=causal, return_softmax_lse=True,
+        interpret=INTERPRET)
+
+  jaxpr = str(jax.make_jaxpr(_window_attention)(interleave(kc, vc)))
+  assert "flash_attn_varlen_paged_fwd" not in jaxpr
+  out, lse, kv_cache = _window_attention(interleave(kc, vc))
+  actual = (out.reshape(q.shape), lse.transpose(1, 0, 2).reshape(heads, -1),
+            *deinterleave(kv_cache))
+  assert_extend_matches(actual, expected, cu[:num_active + 1],
+                        lengths[:num_active])
+
+
 def test_multitoken_replays_when_later_block_raises_anchor():
   # Note (david): the cached keys jump from 0 to 32 at position 1024, so the
   # later blocks' scores sit hundreds of log2 units above the anchor the first
