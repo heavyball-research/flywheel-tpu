@@ -779,14 +779,7 @@ def flash_attn_func(
     kernel_q, kernel_k, kernel_v = (
         operand.reshape(-1, *operand.shape[2:]) for operand in (q, k, v))
   sinks = check_sinks(learnable_sink, nheads)
-  if sinks is None:
-    sink_args = ()
-  elif heads_outer_fold:
-    # Note (deepolar): the kernel indexes its sinks by flat q head, which
-    # runs (head, batch) heads-outer and (batch, head) in either other layout.
-    sink_args = (jnp.repeat(sinks, batch),)
-  else:
-    sink_args = (jnp.tile(sinks, batch),)
+  sink_args = () if sinks is None else (sinks,)
   if heads_outer_fold:
     # Note (david): flash_attn_bwd has no heads-outer kv map, so this layout
     # is forward-only. Q-only RoPE stays valid: the dense coefficients carry a

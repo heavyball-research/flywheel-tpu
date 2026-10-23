@@ -84,6 +84,14 @@ def flash_attn_forward_varlen(
   smem_operands = [cu_q, jnp.asarray(cu_seqlens_k, jnp.int32),
                    per_seq_qblk_prefix(cu_q, block_sizes.block_q)]
   if sinks is not None:
+    # Note (deepolar): packed rows carry no batch, so the flat q head is the
+    # sequence head itself.
+    num_seq_heads = (q.shape[0] if token_major is None
+                     else token_major.num_q_heads)
+    if sinks.shape != (num_seq_heads,):
+      raise ValueError(
+          f"sinks must be ({num_seq_heads},), one per q head; got"
+          f" {sinks.shape}.")
     smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
 
   kernel = partial(

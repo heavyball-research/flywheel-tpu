@@ -41,7 +41,7 @@ from .copy_utils import (
   resolve_merged_kv_heads,
   staged_words,
 )
-from .fwd_pipeline import BF16_TILE_ROWS, overflow_guard_threshold
+from .fwd_pipeline import BF16_TILE_ROWS, fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2
@@ -580,6 +580,9 @@ def kvcache_kernel(
       first_key = jnp.maximum(0, total_len - 1 - left)
     return first_key, first_key // block_kv, pl.cdiv(total_len, block_kv)
 
+  # Note (deepolar): every sequence folds the same sinks, so they load once.
+  sinks = sinks_ref[...] if has_sinks else None
+
   def _process_sequence(local_batch_index, sequence_carry):
     initial_slot, is_first_prefetched = sequence_carry
     cache_row = cache_batch_idx_ref[local_batch_index]
@@ -1029,23 +1032,19 @@ def kvcache_kernel(
 
     row_max = row_max_ref[...]
     row_sum = row_sum_ref[...]
-    if has_sinks:
-      # Note (deepolar): a sink is one more softmax term with no value row, so
-      # it only joins the denominator: row_sum gains exp2(sink - row_max). A
-      # row with nothing to attend is re-anchored at its sink, so it returns
-      # out = 0 and lse = sink.
-      sinks = sinks_ref[...]
-      has_keys = row_sum > 0
-      row_max = jnp.where(has_keys, row_max, sinks)
-      row_sum = (
-          jnp.where(has_keys, row_sum, 0.0) + jnp.exp2(sinks - row_max))
     # Note (david): a quantized cache's V descale is one per-tensor factor,
     # so it rides in the softmax normalization. It arrives in SMEM, so a
     # new descale value compiles no new kernel.
-    inverse_row_sum = jnp.where(
-        row_sum > 0, pl.reciprocal(row_sum, approx=True) * v_scale_ref[0],
-        0.0
-    )
+    if sinks is None:
+      inverse_row_sum = jnp.where(
+          row_sum > 0, pl.reciprocal(row_sum, approx=True) * v_scale_ref[0],
+          0.0
+      )
+    else:
+      # Note (deepolar): fold_sink is the prefill and extend kernels' fold;
+      # a row with nothing to attend returns out = 0 and lse = sink.
+      row_max, row_sum, out_scale = fold_sink(row_max, row_sum, sinks)
+      inverse_row_sum = out_scale * v_scale_ref[0]
     out_buffers[output_slot] = (
         accumulator_ref[...].astype(jnp.float32)
         * lane_broadcast(inverse_row_sum, head_dim)

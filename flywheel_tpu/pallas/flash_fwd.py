@@ -45,6 +45,29 @@ def flash_fwd_kernel(
       sinks_ref=sinks_ref, **body)
 
 
+def check_dense_sinks(
+    sinks: jax.Array,
+    num_flat_heads: int,
+    heads_outer_batch: int | None,
+    token_major: TokenMajorInfo | None,
+) -> None:
+  """Raise unless sinks is (nheads,), one logit per sequence head."""
+  # Note (deepolar): a head-major kernel sees batch * nheads flat heads, so
+  # only heads-outer and token-major pin nheads; batch-outer needs nheads to
+  # divide them. Every flat head then reads inside the sinks.
+  if token_major is not None:
+    is_valid = sinks.shape == (token_major.num_q_heads,)
+  elif heads_outer_batch is not None:
+    is_valid = sinks.shape == (num_flat_heads // heads_outer_batch,)
+  else:
+    is_valid = (sinks.ndim == 1 and sinks.shape[0] > 0
+                and num_flat_heads % sinks.shape[0] == 0)
+  if not is_valid:
+    raise ValueError(
+        "sinks must be (nheads,), one logit per sequence head, for"
+        f" {num_flat_heads} flat q heads; got {sinks.shape}.")
+
+
 def flash_attn_forward(
     q: jax.Array,
     k: jax.Array,
@@ -54,6 +77,9 @@ def flash_attn_forward(
     dense_params: DenseFwdParams,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
+  if sinks is not None:
+    check_dense_sinks(sinks, q.shape[0], dense_params.heads_outer_batch,
+                      body.get("token_major"))
   smem_operands = [] if sinks is None else [sinks.astype(jnp.float32) * LOG2E]
   return forward_common(
       partial(flash_fwd_kernel, has_sinks=sinks is not None,
@@ -127,8 +153,9 @@ def make_flash_attn_mha(
   cu_seqlens_k) when varlen_max_seqlen_kv is set, or (q, k, v, causal_offset)
   under runtime_causal_offset, plus optional rotary and rotary_interleaved
   kwargs, and returns o, or (o, lse) under return_lse. Except under
-  runtime_causal_offset, an optional sinks argument after those, (num_q_heads,)
-  float sink logits indexed by flat q head, joins each head's softmax
+  runtime_causal_offset, an optional sinks argument after those, (nheads,)
+  float sink logits, one per sequence head (flat q head f reads f % nheads,
+  or f // heads_outer_batch heads-outer), joins each head's softmax
   denominator.
 
   num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;

@@ -17,6 +17,7 @@ from flywheel_tpu.flash_attn_interface import (
     pad_seqlen,
 )
 from flywheel_tpu.pallas.block_sizes import next_pow2
+from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
 from tests.test_util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -248,9 +249,9 @@ def assert_lse_close(lse, q, k, v, **mask_kwargs):
 def test_flash_attn_func_attention_sinks(layout, nheads, nheads_k,
                                          mask_kwargs):
   # Note (deepolar): q 384 against kv 256 leaves the first 128 causal rows
-  # with no key, so they attend only their sink: out = 0, lse = sink. The
-  # kernel reads one sink per flat q head, which tiles the heads per batch
-  # row and, heads-outer, repeats each over the batch.
+  # with no key, so they attend only their sink: out = 0, lse = sink. Batch
+  # 2 checks that the kernel maps each flat q head back to its sequence head
+  # in every layout, batch-outer and heads-outer.
   seqlen_k = 256 if mask_kwargs["causal"] else 384
   q, k, v = random_qkv(0, 2, 384, nheads, nheads_k, 128, seqlen_k=seqlen_k)
   sinks = random_sinks(nheads)
@@ -335,6 +336,113 @@ def test_attention_sinks_are_forward_only(entry):
                                  causal=True, learnable_sink=sinks).sum()
   with pytest.raises(NotImplementedError, match="forward-only"):
     jax.grad(loss)(q)
+
+
+@pytest.mark.parametrize("entry", ["dense", "varlen", "decode"])
+def test_attention_sinks_far_above_the_scores(entry):
+  # Note (deepolar): q = -2.5 against k = +2.5 scores about -70.7 at d 128, so
+  # sinks of 20 and 40 sit more than 128 log2 units above the static anchor;
+  # folded against that anchor, exp2(sink - anchor) overflowed and lse came
+  # back +inf.
+  sinks = jnp.array([20.0, 40.0, 20.0, 40.0], jnp.float32)
+  if entry == "decode":
+    q, k_cache, v_cache, _, _ = random_decode_inputs(
+        29, 2, 2, 256, 4, 2, 128)
+    q, k_cache = jnp.full_like(q, -2.5), jnp.full_like(k_cache, 2.5)
+    cache_seqlens = jnp.array([100, 256], jnp.int32)
+    out, lse, _, _ = decode_with_cache_copies(
+        q, k_cache, v_cache, cache_seqlens=cache_seqlens,
+        return_softmax_lse=True, interpret=INTERPRET, learnable_sink=sinks)
+    assert_decode_matches(out, lse, q, k_cache, v_cache, cache_seqlens,
+                          jnp.arange(2, dtype=jnp.int32), sinks=sinks)
+    return
+  q, k, v = random_qkv(0, 1, 256, 4, 2, 128)
+  q, k = jnp.full_like(q, -2.5), jnp.full_like(k, 2.5)
+  if entry == "dense":
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)), causal=True, learnable_sink=sinks,
+        return_softmax_lse=True, interpret=INTERPRET)
+    out = to_head_major(out)
+  else:
+    cu = cu_seqlens_of([256])
+    out, lse = varlen_attn(q[0], k[0], v[0], cu, cu, 256, 256, causal=True,
+                           learnable_sink=sinks, return_softmax_lse=True)
+    out, lse = out[None], lse[None]
+  assert jnp.all(jnp.isfinite(lse))
+  assert_output_close(out, q, k, v, causal=True, sinks=sinks)
+  assert_lse_close(lse, q, k, v, causal=True, sinks=sinks)
+
+
+@pytest.mark.parametrize("entry", ["varlen", "decode"])
+def test_attention_minus_inf_sinks_are_no_sink(entry):
+  # Note (deepolar): a -inf sink adds nothing, so its head matches a call
+  # without sinks, and a row with no key returns out = 0, lse = -inf, not
+  # NaN. The finite heads' empty rows return lse = sink. Packed causal rows
+  # end on their bottom-right diagonal, so a 64-row query against 16 keys
+  # leaves its first 48 rows with no key.
+  sinks = jnp.array([-jnp.inf, 2.0, -jnp.inf, 4.0], jnp.float32)
+  none_heads, sink_heads = np.array([0, 2]), np.array([1, 3])
+  if entry == "decode":
+    q, k_cache, v_cache, _, _ = random_decode_inputs(
+        29, 2, 2, 256, 4, 2, 128)
+    kwargs = dict(cache_seqlens=jnp.array([0, 200], jnp.int32),
+                  return_softmax_lse=True, interpret=INTERPRET)
+    out, lse, _, _ = decode_with_cache_copies(
+        q, k_cache, v_cache, learnable_sink=sinks, **kwargs)
+    plain_out, plain_lse, _, _ = decode_with_cache_copies(
+        q, k_cache, v_cache, **kwargs)
+    out, plain_out = out[:, 0].swapaxes(0, 1), plain_out[:, 0].swapaxes(0, 1)
+    lse, plain_lse = lse[..., 0].T, plain_lse[..., 0].T
+    empty, keyed = np.array([0]), np.array([1])
+  else:
+    q, k, v = random_qkv(0, 1, 128, 4, 2, 128, seqlen_k=80)
+    cu_q, cu_k = cu_seqlens_of([64, 64]), cu_seqlens_of([16, 64])
+    kwargs = dict(causal=True, return_softmax_lse=True)
+    out, lse = varlen_attn(q[0], k[0], v[0], cu_q, cu_k, 64, 64,
+                           learnable_sink=sinks, **kwargs)
+    plain_out, plain_lse = varlen_attn(q[0], k[0], v[0], cu_q, cu_k, 64, 64,
+                                       **kwargs)
+    out, plain_out = out.swapaxes(0, 1), plain_out.swapaxes(0, 1)
+    empty, keyed = np.arange(48), np.arange(48, 128)
+  out, plain_out = np.asarray(out, np.float32), np.asarray(plain_out,
+                                                           np.float32)
+  lse, plain_lse = np.asarray(lse), np.asarray(plain_lse)
+  assert not np.isnan(out).any() and not np.isnan(lse).any()
+  assert np.all(out[:, empty] == 0)
+  assert np.all(lse[np.ix_(none_heads, empty)] == -np.inf)
+  np.testing.assert_allclose(
+      lse[np.ix_(sink_heads, empty)],
+      np.broadcast_to(np.asarray(sinks)[sink_heads, None],
+                      (len(sink_heads), len(empty))))
+  np.testing.assert_allclose(out[np.ix_(none_heads, keyed)],
+                             plain_out[np.ix_(none_heads, keyed)],
+                             atol=1e-2)
+  np.testing.assert_allclose(lse[np.ix_(none_heads, keyed)],
+                             plain_lse[np.ix_(none_heads, keyed)],
+                             atol=1e-3)
+
+
+@pytest.mark.parametrize("entry", ["dense", "varlen"])
+def test_kernel_rejects_misshaped_sinks(entry):
+  # Note (deepolar): a direct make_flash_attn_mha caller skips the API's
+  # check, and a sinks array that does not cover the flat q heads would read
+  # SMEM past its end.
+  batch, nheads, seqlen = 2, 4, 128
+  blocks = default_block_sizes(seqlen, seqlen, head_dim=128)
+  if entry == "dense":
+    kernel = make_flash_attn_mha(batch * nheads, seqlen, seqlen, causal=True,
+                                 block_sizes=blocks, interpret=INTERPRET)
+    q = jnp.zeros((batch * nheads, seqlen, 128), jnp.bfloat16)
+    args = (q, q, q)
+  else:
+    kernel = make_flash_attn_mha(nheads, seqlen, seqlen, causal=True,
+                                 block_sizes=blocks, interpret=INTERPRET,
+                                 varlen_max_seqlen_kv=seqlen)
+    q = jnp.zeros((nheads, seqlen, 128), jnp.bfloat16)
+    cu = cu_seqlens_of([seqlen])
+    args = (q, q, q, cu, cu)
+  with pytest.raises(ValueError, match="sinks must be"):
+    kernel(*args, jnp.zeros((3,), jnp.float32))
 
 
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
