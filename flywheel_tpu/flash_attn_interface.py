@@ -418,6 +418,19 @@ def forward_only_attn(
   return _forward(q, k, v, rotary)
 
 
+def check_sinks(sinks: jax.Array | None, nheads: int) -> jax.Array | None:
+  """sinks as a (nheads,) float32 array, or None."""
+  if sinks is None:
+    return None
+  sinks = jnp.asarray(sinks)
+  if sinks.shape != (nheads,) or not jnp.issubdtype(sinks.dtype, jnp.floating):
+    raise ValueError(
+        f"learnable_sink must be a ({nheads},) float array, one logit per"
+        f" query head; got {sinks.shape} {sinks.dtype}."
+    )
+  return sinks.astype(jnp.float32)
+
+
 def parse_token_major(
     q: jax.Array,
     k: jax.Array,
@@ -622,6 +635,7 @@ def flash_attn_func(
     rotary_interleaved: bool = False,
     rotary_k: bool = True,
     heads_outer_fold: bool = False,
+    learnable_sink: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn.flash_attn_func on TPU, JAX arrays in and out.
 
@@ -653,8 +667,14 @@ def flash_attn_func(
   lse. attention_chunk is not implemented. interpret runs the Pallas TPU
   interpreter.
 
+  learnable_sink: None or (nheads,) float sink logits, on the scale of the
+  softcapped scores (gpt-oss attention sinks, FlashAttention's
+  learnable_sink): exp(learnable_sink[h]) joins head h's softmax denominator
+  with no value row, and lse includes it. A row with no reachable key then
+  returns out = 0 and lse = learnable_sink[h].
+
   Gradients cover MHA and GQA/MQA with causal or full masks; window_size,
-  softcap, RoPE and heads_outer_fold are forward-only.
+  softcap, RoPE, heads_outer_fold and learnable_sink are forward-only.
   """
   window_size = check_common_kwargs(
       window_size, dropout_p=dropout_p, softcap=softcap,
@@ -758,6 +778,15 @@ def flash_attn_func(
   else:
     kernel_q, kernel_k, kernel_v = (
         operand.reshape(-1, *operand.shape[2:]) for operand in (q, k, v))
+  sinks = check_sinks(learnable_sink, nheads)
+  if sinks is None:
+    sink_args = ()
+  elif heads_outer_fold:
+    # Note (deepolar): the kernel indexes its sinks by flat q head, which
+    # runs (head, batch) heads-outer and (batch, head) in either other layout.
+    sink_args = (jnp.repeat(sinks, batch),)
+  else:
+    sink_args = (jnp.tile(sinks, batch),)
   if heads_outer_fold:
     # Note (david): flash_attn_bwd has no heads-outer kv map, so this layout
     # is forward-only. Q-only RoPE stays valid: the dense coefficients carry a
@@ -766,12 +795,14 @@ def flash_attn_func(
     reason = "heads_outer_fold" if rotary_coeffs is None else "Fused RoPE"
     kernel_output = forward_only_attn(
         build_kernel(return_lse=False, heads_outer_batch=batch),
-        reason, kernel_q, kernel_k, kernel_v, (), rotary_coeffs,
+        reason, kernel_q, kernel_k, kernel_v, sink_args, rotary_coeffs,
         rotary_interleaved)
-  elif rotary_coeffs is not None:
+  elif rotary_coeffs is not None or sinks is not None:
+    reason = "learnable_sink" if rotary_coeffs is None else "Fused RoPE"
     kernel_output = forward_only_attn(
-        build_kernel(return_lse=bool(return_softmax_lse)), "Fused RoPE",
-        kernel_q, kernel_k, kernel_v, (), rotary_coeffs, rotary_interleaved)
+        build_kernel(return_lse=bool(return_softmax_lse)), reason,
+        kernel_q, kernel_k, kernel_v, sink_args, rotary_coeffs,
+        rotary_interleaved)
   elif return_softmax_lse:
     # Note (david): lse has no gradient of its own, so this path stays the
     # bare kernel call.
@@ -826,7 +857,9 @@ def flash_attn_func(
     # batch-major in both layouts.
     lse = kernel_lse.reshape(batch, nheads, padded_seqlen_q)[:, :, :seqlen_q]
     if num_masked_rows > 0:
-      return out, jnp.where(is_valid_row[None, None, :], lse, -jnp.inf)
+      # Note (deepolar): a masked row's only softmax term is its sink.
+      empty_lse = -jnp.inf if sinks is None else sinks[None, :, None]
+      return out, jnp.where(is_valid_row[None, None, :], lse, empty_lse)
     else:
       return out, lse
   else:
@@ -936,6 +969,7 @@ def paged_varlen_attn(
     k_descale: float | jax.Array | None,
     v_descale: float | jax.Array | None,
     nheads_k: int | None,
+    sinks: jax.Array | None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn_varlen_func's paged KV cache branch (block_table given)."""
   if token_major:
@@ -1073,7 +1107,8 @@ def paged_varlen_attn(
       lambda q, kv_cache, unused_v, *kernel_args, **rotary_kwargs: kernel(
           q, kv_cache, *kernel_args, **rotary_kwargs),
       "flash_attn_varlen_func", q, k, None,
-      (cu_seqlens_q, seqused_k, block_table), rotary, rotary_interleaved)
+      (cu_seqlens_q, seqused_k, block_table, check_sinks(sinks, q.shape[0])),
+      rotary, rotary_interleaved)
 
 
 def flash_attn_varlen_func(
@@ -1108,6 +1143,7 @@ def flash_attn_varlen_func(
     k_descale: float | jax.Array | None = None,
     v_descale: float | jax.Array | None = None,
     nheads_k: int | None = None,
+    learnable_sink: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
   """flash_attn.flash_attn_varlen_func on TPU for packed sequences.
 
@@ -1155,6 +1191,10 @@ def flash_attn_varlen_func(
   num_active sequences; rows past the last kept one return out = 0 and lse =
   -inf. A concrete num_active outside [0, batch] raises; a traced one must
   lie in that range, which is not checked on device.
+  learnable_sink: None or (nheads,) float sink logits, on the scale of the
+  softcapped scores; exp(learnable_sink[h]) joins head h's softmax
+  denominator with no value row (gpt-oss attention sinks), and lse includes
+  it.
   """
   window_size = check_common_kwargs(
       window_size, dropout_p=dropout_p, softcap=softcap,
@@ -1187,7 +1227,7 @@ def flash_attn_varlen_func(
         rotary_sin=rotary_sin, rotary_interleaved=rotary_interleaved,
         rotary_k=rotary_k, block_table=block_table, seqused_k=seqused_k,
         num_active=num_active, k_descale=k_descale, v_descale=v_descale,
-        nheads_k=nheads_k,
+        nheads_k=nheads_k, sinks=learnable_sink,
     )
   elif seqused_k is not None or num_active is not None:
     raise ValueError(
@@ -1286,12 +1326,15 @@ def flash_attn_varlen_func(
         q_scale=float(fused_q_scale(softmax_scale, softcap)),
         blocks_override=blocks_override,
     )
+    sinks = check_sinks(learnable_sink, nheads)
+    sink_args = () if sinks is None else (sinks,)
     # Note (david): varlen has no backward kernel, so every path, lse included,
     # is forward-only and jax.grad names it instead of failing in the tracer.
     kernel_output = forward_only_attn(
         build_kernel(return_lse=bool(return_softmax_lse)),
         "flash_attn_varlen_func", q, k, v,
-        (cu_seqlens_q, cu_seqlens_k), rotary_coeffs, rotary_interleaved)
+        (cu_seqlens_q, cu_seqlens_k, *sink_args), rotary_coeffs,
+        rotary_interleaved)
     if return_softmax_lse:
       out, kernel_lse = kernel_output
     else:
@@ -1334,6 +1377,7 @@ def flash_attn_with_kvcache(
     k_descale: float | jax.Array | None = None,
     v_descale: float | jax.Array | None = None,
     nheads_k: int | None = None,
+    learnable_sink: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
   """Attention against a contiguous or paged KV cache, with optional append.
 
@@ -1391,6 +1435,12 @@ def flash_attn_with_kvcache(
   decode row with nothing to attend returns out = 0 and lse = -inf; on
   multi-token and packed calls, as in flash_attn_varlen_func, a row with no
   visible key is unspecified. Forward-only.
+
+  learnable_sink: None or (nheads,) float sink logits, on the scale of the
+  softcapped scores (gpt-oss attention sinks): exp(learnable_sink[h]) joins
+  head h's softmax denominator with no value row, and lse includes it. A
+  decode row with nothing to attend then returns out = 0 and lse =
+  learnable_sink[h].
 
   Returns (out, k_cache, v_cache) for the contiguous pair and (out, kv_cache)
   for the paged merged cache, with lse after out when return_softmax_lse:
@@ -1542,6 +1592,7 @@ def flash_attn_with_kvcache(
   softmax_scale = (
       1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
   )
+  sinks = check_sinks(learnable_sink, nheads)
   if is_extend:
     is_right_bounded, window_left = paged_window(causal, window_size)
     is_folded = (
@@ -1569,7 +1620,7 @@ def flash_attn_with_kvcache(
         causal=is_right_bounded, window_left=window_left,
         softcap=float(softcap), return_lse=bool(return_softmax_lse),
         interpret=bool(interpret), nheads_k=nheads_k, k_scale=k_descale,
-        v_scale=v_descale,
+        v_scale=v_descale, sinks=sinks,
     )
   else:
     # Note (david): the decode kernel runs its softmax in log2 units straight
@@ -1630,6 +1681,7 @@ def flash_attn_with_kvcache(
         causal=is_folded and is_right_bounded,
         nheads_k=nheads_k if is_paged else None,
         v_scale=v_descale,
+        sinks=sinks,
     )
   caches_out = kernel_outputs[1:1 + len(cache_operands)]
   if is_folded:

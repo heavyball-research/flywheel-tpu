@@ -122,6 +122,7 @@ def fwd_body(
     paged: PagedKVInfo | None = None,
     gqa_fold: int = 1,
     v_scale: float | jax.Array = 1.0,
+    sinks_ref: jax.Array | None = None,
 ) -> None:
   """Run the fragment pipeline over every block the schedule yields.
 
@@ -137,6 +138,10 @@ def fwd_body(
   bq and bq_compute count tokens per head. A paged fp8 cache is widened to
   bf16 K and V planes, and v_scale multiplies the output. q_scale and v_scale
   are static floats, or (paged) f32 scalars the kernel read from SMEM.
+
+  sinks_ref is None or an SMEM (num_q_heads,) float32 of per-head sink logits
+  in log2 units, indexed by flat q head, each added to its head's softmax
+  denominator.
   """
   is_per_seq = schedule.q_token is not None
   is_paged = paged is not None
@@ -1042,7 +1047,7 @@ def fwd_body(
               apply_bounds=is_masked and is_per_seq,
           )
 
-    def _stage_gqa_folded_lse(row_sum_ref):
+    def _stage_gqa_folded_lse(g, row_sum_ref):
       # Note (david): lse is row_max + log2(row_sum) as below. Every lane of a
       # row state holds the row's value, and the rows of a q tile run (folded
       # head, token), so each head's token rows reach its own lse lane through
@@ -1051,9 +1056,12 @@ def fwd_body(
           jnp.int32, (bq_compute, NUM_LANES), 1)
       for q_compute_index in range(num_q_compute_tiles):
         tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
+        row_max = row_max_scratch[tile_rows, :]
+        row_sum = row_sum_ref[tile_rows, :]
+        if sinks_ref is not None:
+          row_max, row_sum = _sink_state(g, row_max, row_sum)
         tile_lse = (
-            (row_max_scratch[tile_rows, :]
-             + jnp.log2(row_sum_ref[tile_rows, :])) * math.log(2.0)
+            (row_max + jnp.log2(row_sum)) * math.log(2.0)
         ).reshape(gqa_fold, bq_compute, NUM_LANES)
         head_lanes = tile_lse[0]
         for h in range(1, gqa_fold):
@@ -1061,6 +1069,27 @@ def fwd_body(
         lse_stage[out_slot,
                   pl.ds(q_compute_index * bq_compute, bq_compute), :] = (
                       head_lanes)
+
+    def _sink_state(g, row_max, row_sum):
+      # Note (deepolar): a sink is one more softmax term with no value row, so
+      # it only joins the denominator: row_sum gains exp2(sink - row_max). A
+      # row that never saw a key is re-anchored at its sink, so its
+      # denominator is 1. The row state in VMEM stays sink-free: every
+      # finalize read (the output and both lse paths) passes its loaded
+      # row_max and row_sum through here, as FA4 adds the sink to its register
+      # row state, so no extra store pass runs. Pipeline head g is q head
+      # base_head + g * gqa_fold, and the rows of a q tile run (folded head,
+      # token), so each folded head's rows take its own sink.
+      first_head = base_head + g * gqa_fold
+      rows, lanes = row_max.shape
+      sink = jnp.concatenate(
+          [jnp.full((rows // gqa_fold, lanes), sinks_ref[first_head + h],
+                    jnp.float32)
+           for h in range(gqa_fold)])
+      has_keys = row_sum > 0
+      anchor = jnp.where(has_keys, row_max, sink)
+      return anchor, (
+          jnp.where(has_keys, row_sum, 0.0) + jnp.exp2(sink - anchor))
 
     @pl.when(is_last)
     def _finalize():
@@ -1086,6 +1115,9 @@ def fwd_body(
         def _finalize_fragment(q_compute_index, carry):
           slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
           row_sum = row_sum_new_ref[slice_q, :]
+          if sinks_ref is not None:
+            _, row_sum = _sink_state(
+                g, row_max_scratch.at[head_rows][slice_q, :], row_sum)
           # Note (david): a quantized cache's V descale is one per-tensor
           # factor, folded into the softmax normalization.
           if transposed_pv:
@@ -1121,14 +1153,16 @@ def fwd_body(
         )
 
         if return_lse and gqa_fold > 1:
-          _stage_gqa_folded_lse(row_sum_new_ref)
+          _stage_gqa_folded_lse(g, row_sum_new_ref)
         elif return_lse:
           # Note (david): the static anchor keeps sum_j exp2(logit_j) ==
           # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
           # units; scale by ln(2) for the natural-log lse that is returned.
           row_max = row_max_scratch.at[head_rows][:, 0:1]
-          lse_row = (
-              (row_max + jnp.log2(row_sum_new_ref[:, 0:1])) * math.log(2.0))
+          row_sum = row_sum_new_ref[:, 0:1]
+          if sinks_ref is not None:
+            row_max, row_sum = _sink_state(g, row_max, row_sum)
+          lse_row = (row_max + jnp.log2(row_sum)) * math.log(2.0)
           if is_per_seq:
             lse_stage[out_slot, :, g] = lse_row[:, 0]
           else:

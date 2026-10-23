@@ -239,6 +239,7 @@ def kvcache_kernel(
     page_size: int | None,
     pages_per_seq: int | None,
     is_merged_cache: bool,
+    has_sinks: bool,
 ) -> None:
   remaining_refs = list(refs)
   block_table_ref = remaining_refs.pop(0) if page_size is not None else None
@@ -247,15 +248,8 @@ def kvcache_kernel(
     # Note (david): a merged build's new token arrives as one
     # (staged_kv_heads, head_dim) row already in the cache's head order, so
     # the append writes it as a ready token row.
-    (
-        q_ref,
-        new_kv_ref,
-        k_cache_ref,
-        out_ref,
-        k_out_ref,
-        *remaining_refs,
-    ) = remaining_refs
-    k_ref = v_ref = v_cache_ref = v_out_ref = None
+    q_ref, new_kv_ref, k_cache_ref, *remaining_refs = remaining_refs
+    k_ref = v_ref = v_cache_ref = None
   else:
     (
         q_ref,
@@ -263,12 +257,15 @@ def kvcache_kernel(
         v_ref,
         k_cache_ref,
         v_cache_ref,
-        out_ref,
-        k_out_ref,
-        v_out_ref,
         *remaining_refs,
     ) = remaining_refs
     new_kv_ref = None
+  sinks_ref = remaining_refs.pop(0) if has_sinks else None
+  if is_merged_cache:
+    out_ref, k_out_ref, *remaining_refs = remaining_refs
+    v_out_ref = None
+  else:
+    out_ref, k_out_ref, v_out_ref, *remaining_refs = remaining_refs
   lse_ref = remaining_refs.pop(0) if return_lse else None
   (
       k_buffers,
@@ -1030,7 +1027,18 @@ def kvcache_kernel(
     def _wait_previous_output():
       _output_copy(local_batch_index - NUM_IO_STAGES, output_slot).wait()
 
+    row_max = row_max_ref[...]
     row_sum = row_sum_ref[...]
+    if has_sinks:
+      # Note (deepolar): a sink is one more softmax term with no value row, so
+      # it only joins the denominator: row_sum gains exp2(sink - row_max). A
+      # row with nothing to attend is re-anchored at its sink, so it returns
+      # out = 0 and lse = sink.
+      sinks = sinks_ref[...]
+      has_keys = row_sum > 0
+      row_max = jnp.where(has_keys, row_max, sinks)
+      row_sum = (
+          jnp.where(has_keys, row_sum, 0.0) + jnp.exp2(sinks - row_max))
     # Note (david): a quantized cache's V descale is one per-tensor factor,
     # so it rides in the softmax normalization. It arrives in SMEM, so a
     # new descale value compiles no new kernel.
@@ -1043,7 +1051,7 @@ def kvcache_kernel(
         * lane_broadcast(inverse_row_sum, head_dim)
     ).astype(q_ref.dtype)
     if return_lse:
-      lse_log2 = row_max_ref[...] + jnp.log2(row_sum)
+      lse_log2 = row_max + jnp.log2(row_sum)
       lse = jnp.where(
           row_sum > 0, lse_log2 * math.log(2.0), -jnp.inf
       ).astype(jnp.float32)
@@ -1167,6 +1175,7 @@ def flash_attn_kvcache_pallas(
     causal: bool = False,
     nheads_k: int | None = None,
     v_scale: float | jax.Array = 1.0,
+    sinks: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
   """One-token cache append and decode attention for every row in one call.
 
@@ -1198,6 +1207,9 @@ def flash_attn_kvcache_pallas(
   contract); the kernel never reads their cache_seqlens, cache_batch_idx or
   block_table entries, appends nothing for them and leaves their out and lse
   rows unspecified. None means every row is active.
+
+  sinks: None or (num_query_heads,) float sink logits, on the scale of the
+  softcapped scores; exp(sinks[h]) joins head h's softmax denominator.
   """
   assert (v_cache is None) == merged_cache, (
       "merged_cache takes one cache operand and v_cache=None, a pair both."
@@ -1210,9 +1222,15 @@ def flash_attn_kvcache_pallas(
   is_window = q.ndim == 4
   if is_window:
     batch, query_tokens, window_heads, head_dim = q.shape
+    sink_heads = window_heads
   else:
     batch, num_query_heads, head_dim = q.shape
     query_tokens = 1
+    sink_heads = num_query_heads
+  if sinks is not None and sinks.shape != (sink_heads,):
+    raise ValueError(
+        f"sinks must be ({sink_heads},), one per query head; got"
+        f" {sinks.shape}.")
   if merged_cache:
     # Note (david): a merged build stages, appends and writes back whole token
     # rows, so no DMA cuts the head axis, and a staged u32 word holds whole
@@ -1277,6 +1295,13 @@ def flash_attn_kvcache_pallas(
         .transpose(0, 2, 1, 3, 4)
         .reshape(batch, num_query_heads, head_dim)
     )
+    if sinks is not None:
+      # Note (deepolar): folded head (h * query_tokens + t) * group + j is
+      # query head h * group + j, so every window token takes that head's sink.
+      sinks = jnp.broadcast_to(
+          sinks.reshape(num_kv_heads, 1, group),
+          (num_kv_heads, query_tokens, group),
+      ).reshape(num_query_heads)
   if capacity % MIN_BLOCK_KV:
     raise ValueError(
         f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
@@ -1475,14 +1500,24 @@ def flash_attn_kvcache_pallas(
       page_size=page_size,
       pages_per_seq=pages_per_seq,
       is_merged_cache=merged_cache,
+      has_sinks=sinks is not None,
   )
+  # Note (deepolar): the sinks follow the caches, so the alias indices above
+  # stay put; they arrive in log2 units, broadcast over the row-state lanes.
+  if sinks is None:
+    sink_inputs, sink_specs = (), ()
+  else:
+    sink_shape = (num_query_heads, NUM_LANES)
+    sink_inputs = (jnp.broadcast_to(
+        (sinks.astype(jnp.float32) * LOG2E)[:, None], sink_shape),)
+    sink_specs = (pl.BlockSpec(sink_shape, lambda *_: (0, 0)),)
   call = pl.pallas_call(
       kernel,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=num_prefetch,
           grid=(1,),
           in_specs=(hbm_spec, *new_token_specs)
-          + (hbm_spec,) * len(kernel_caches),
+          + (hbm_spec,) * len(kernel_caches) + sink_specs,
           out_specs=out_specs,
           scratch_shapes=scratch_shapes,
       ),
@@ -1497,7 +1532,8 @@ def flash_attn_kvcache_pallas(
       name="flash_attn_with_kvcache",
       interpret=pltpu.InterpretParams() if interpret else False,
   )
-  kernel_outputs = call(*scalar_prefetches, *dense_inputs, *kernel_caches)
+  kernel_outputs = call(
+      *scalar_prefetches, *dense_inputs, *kernel_caches, *sink_inputs)
   num_caches = len(cache_operands)
   if is_token_major_mqa:
     caches_out = tuple(

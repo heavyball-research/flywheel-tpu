@@ -10,7 +10,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from .block_sizes import BlockSizes, QKVLayout, TokenMajorInfo
+from .block_sizes import LOG2E, BlockSizes, QKVLayout, TokenMajorInfo
 from .fwd_pipeline import forward_common, fwd_body
 from .loop_schedule import (
   VarlenSchedule,
@@ -24,16 +24,19 @@ def flash_fwd_varlen_kernel(
     cu_q_ref: jax.Array,
     cu_k_ref: jax.Array,
     cu_qblk_ref: jax.Array,
-    q_hbm: jax.Array,
-    k_hbm: jax.Array,
-    v_hbm: jax.Array,
     *refs: jax.Array,
+    has_sinks: bool,
     varlen_sched: VarlenSchedule,
     num_head_groups: int,
     bq: int,
     bkv: int,
     **body,
 ) -> None:
+  if has_sinks:
+    sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
+  else:
+    sinks_ref = None
+    q_hbm, k_hbm, v_hbm, *refs = refs
   schedule = make_per_seq_fwd_schedule(
       cu_q_ref, cu_k_ref, cu_qblk_ref,
       num_head_groups=num_head_groups,
@@ -43,7 +46,8 @@ def flash_fwd_varlen_kernel(
       bq=bq, bkv=bkv, left=varlen_sched.left, right=varlen_sched.right,
       num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
-  fwd_body(schedule, q_hbm, k_hbm, v_hbm, refs, bq=bq, bkv=bkv, **body)
+  fwd_body(schedule, q_hbm, k_hbm, v_hbm, refs, bq=bq, bkv=bkv,
+           sinks_ref=sinks_ref, **body)
 
 
 def flash_attn_forward_varlen(
@@ -52,6 +56,7 @@ def flash_attn_forward_varlen(
     v: jax.Array,
     cu_seqlens_q: jax.Array,
     cu_seqlens_k: jax.Array,
+    sinks: jax.Array | None = None,
     *,
     varlen_sched: VarlenSchedule,
     block_sizes: BlockSizes,
@@ -78,9 +83,12 @@ def flash_attn_forward_varlen(
   cu_q = jnp.asarray(cu_seqlens_q, jnp.int32)
   smem_operands = [cu_q, jnp.asarray(cu_seqlens_k, jnp.int32),
                    per_seq_qblk_prefix(cu_q, block_sizes.block_q)]
+  if sinks is not None:
+    smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
 
   kernel = partial(
       flash_fwd_varlen_kernel,
+      has_sinks=sinks is not None,
       varlen_sched=varlen_sched,
       num_head_groups=num_q_heads // head_fold,
   )

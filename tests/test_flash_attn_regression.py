@@ -224,11 +224,126 @@ def test_flash_attn_varlen_ragged_last_block(seqlens, causal, window_size):
     assert lse_error <= 2 * max_abs(lse_bf16 - lse_ref) + 1e-3
 
 
+def random_sinks(nheads):
+  return jax.random.uniform(
+      jax.random.PRNGKey(5), (nheads,), jnp.float32, -2.0, 8.0)
+
+
+def assert_lse_close(lse, q, k, v, **mask_kwargs):
+  """lse (batch, nheads, seqlen_q) against the f32 reference, by the out rule
+  plus test_flash_attn.py's fixed 1e-2."""
+  _, lse_ref = attention_ref(q, k, v, **mask_kwargs)
+  _, lse_bf16 = attention_ref(q, k, v, upcast=False, reorder_ops=True,
+                              **mask_kwargs)
+  assert max_abs(lse - lse_ref) <= 2 * max_abs(lse_bf16 - lse_ref) + 1e-2
+
+
+@pytest.mark.parametrize("layout", ["head_major", "token_major", "heads_outer"])
+@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
+@pytest.mark.parametrize("mask_kwargs", [
+    pytest.param(dict(causal=True), id="causal"),
+    pytest.param(dict(causal=True, window_size=(127, 0)), id="window"),
+    pytest.param(dict(causal=False, softcap=30.0), id="softcap"),
+])
+def test_flash_attn_func_attention_sinks(layout, nheads, nheads_k,
+                                         mask_kwargs):
+  # Note (deepolar): q 384 against kv 256 leaves the first 128 causal rows
+  # with no key, so they attend only their sink: out = 0, lse = sink. The
+  # kernel reads one sink per flat q head, which tiles the heads per batch
+  # row and, heads-outer, repeats each over the batch.
+  seqlen_k = 256 if mask_kwargs["causal"] else 384
+  q, k, v = random_qkv(0, 2, 384, nheads, nheads_k, 128, seqlen_k=seqlen_k)
+  sinks = random_sinks(nheads)
+  if layout == "head_major":
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)), learnable_sink=sinks,
+        return_softmax_lse=True, interpret=INTERPRET, **mask_kwargs)
+    out = to_head_major(out)
+  elif layout == "token_major":
+    out, lse = flash_attn_func(
+        *(x.reshape(*x.shape[:2], -1) for x in (q, k, v)), learnable_sink=sinks,
+        token_major=True, head_dim=128, return_softmax_lse=True,
+        interpret=INTERPRET, **mask_kwargs)
+    out = out.reshape(q.shape)
+  else:
+    out = flash_attn_func(
+        *(x.transpose(2, 0, 1, 3) for x in (q, k, v)), learnable_sink=sinks,
+        heads_outer_fold=True, interpret=INTERPRET, **mask_kwargs)
+    out, lse = out.transpose(1, 2, 0, 3), None
+  assert_output_close(out, q, k, v, sinks=sinks, **mask_kwargs)
+  if lse is not None:
+    assert_lse_close(lse, q, k, v, sinks=sinks, **mask_kwargs)
+  if mask_kwargs["causal"]:
+    assert jnp.all(out[:, :128] == 0)
+    if lse is not None:
+      np.testing.assert_allclose(
+          lse[:, :, :128], jnp.broadcast_to(sinks[None, :, None],
+                                            lse[:, :, :128].shape))
+
+
+@pytest.mark.parametrize("mask_kwargs", [
+    pytest.param(dict(causal=True), id="causal"),
+    pytest.param(dict(causal=True, window_size=(127, 0)), id="window"),
+])
+def test_flash_attn_func_attention_sinks_head_pairs(mask_kwargs):
+  # Note (deepolar): token-major head_dim 64 pairs two heads per block on
+  # every backend, so the second pipeline head must read its own sink.
+  q, k, v = random_qkv(0, 2, 256, 4, 4, 64)
+  sinks = random_sinks(4)
+  out, lse = flash_attn_func(
+      *(x.reshape(*x.shape[:2], -1) for x in (q, k, v)), learnable_sink=sinks,
+      token_major=True, head_dim=64, return_softmax_lse=True,
+      interpret=INTERPRET, **mask_kwargs)
+  assert_output_close(out.reshape(q.shape), q, k, v, sinks=sinks,
+                      **mask_kwargs)
+  assert_lse_close(lse, q, k, v, sinks=sinks, **mask_kwargs)
+
+
+@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
+@pytest.mark.parametrize("mask_kwargs", [
+    pytest.param(dict(causal=True), id="causal"),
+    pytest.param(dict(causal=True, window_size=(127, 0)), id="window"),
+    pytest.param(dict(causal=False, softcap=30.0), id="softcap"),
+])
+def test_flash_attn_varlen_attention_sinks(nheads, nheads_k, mask_kwargs):
+  # Note (deepolar): MHA with no window folds several heads per block, so a
+  # pipeline head past the first reads its own sink.
+  seqlens = [37, 300, 128, 1]
+  q, k, v, segments = packed_qkv(seqlens, nheads, nheads_k, 128)
+  cu = cu_seqlens_of(seqlens)
+  sinks = random_sinks(nheads)
+  out, lse = varlen_attn(q, k, v, cu, cu, max(seqlens), max(seqlens),
+                         learnable_sink=sinks, return_softmax_lse=True,
+                         **mask_kwargs)
+  for index, segment in enumerate(segments):
+    rows = slice(int(cu[index]), int(cu[index + 1]))
+    assert_output_close(out[rows][None], *segment, sinks=sinks,
+                        **mask_kwargs)
+    assert_lse_close(lse[None, :, rows], *segment, sinks=sinks, **mask_kwargs)
+
+
+@pytest.mark.parametrize("entry", ["dense", "varlen"])
+def test_attention_sinks_are_forward_only(entry):
+  q, k, v = random_qkv(0, 1, 128, 4, 2, 128)
+  sinks = random_sinks(4)
+  if entry == "dense":
+    loss = lambda q: dense_attn(
+        q, k, v, causal=True, learnable_sink=sinks).sum()
+  else:
+    cu = cu_seqlens_of([128])
+    loss = lambda q: varlen_attn(q[0], k[0], v[0], cu, cu, 128, 128,
+                                 causal=True, learnable_sink=sinks).sum()
+  with pytest.raises(NotImplementedError, match="forward-only"):
+    jax.grad(loss)(q)
+
+
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
-                     window_size=(-1, -1), softcap=0.0):
+                     window_size=(-1, -1), softcap=0.0, sinks=None):
   """(out, lse) of one decode step over the mapped contiguous cache rows.
 
-  softcap > 0 caps the scaled scores at tanh(s / softcap) * softcap.
+  softcap > 0 caps the scaled scores at tanh(s / softcap) * softcap. sinks
+  (num_query_heads,) joins each head's softmax as one more logit with no
+  value row.
   """
   scale = 1.0 / math.sqrt(q.shape[-1])
   keys = k_cache[cache_batch_idx].astype(jnp.float32)
@@ -260,20 +375,26 @@ def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
   visible = (
       (key_positions < cache_seqlens[:, None]) & left_visible & right_visible)
   scores = jnp.where(visible[:, None, None, :], scores, -jnp.inf)
+  if sinks is not None:
+    sink_logits = jnp.broadcast_to(
+        sinks.astype(jnp.float32)[None, :, None, None], (*scores.shape[:3], 1))
+    scores = jnp.concatenate([scores, sink_logits], axis=-1)
   probabilities = jnp.where(
       (cache_seqlens > 0)[:, None, None, None],
       jax.nn.softmax(scores, axis=-1), 0.0)
-  out = jnp.einsum("bhqk,bkhd->bqhd", probabilities, values)
   lse = jax.scipy.special.logsumexp(scores, axis=-1)
+  if sinks is not None:
+    probabilities = probabilities[..., :-1]
+  out = jnp.einsum("bhqk,bkhd->bqhd", probabilities, values)
   return out.astype(q.dtype), lse
 
 
 def assert_decode_matches(out, lse, q, k_cache, v_cache, total_seqlens,
                           cache_batch_idx, window_size=(-1, -1),
-                          out_tol=(2e-2, 3e-2), softcap=0.0):
+                          out_tol=(2e-2, 3e-2), softcap=0.0, sinks=None):
   out_ref, lse_ref = decode_reference(
       q, k_cache, v_cache, total_seqlens, cache_batch_idx, window_size,
-      softcap)
+      softcap, sinks)
   np.testing.assert_allclose(
       out.astype(jnp.float32), out_ref.astype(jnp.float32),
       rtol=out_tol[0], atol=out_tol[1])
@@ -361,6 +482,30 @@ def test_kvcache_contiguous_cache_across_compute_fragments(
   np.testing.assert_array_equal(updated_v, v_cache)
   assert_decode_matches(out, lse, q, k_cache, v_cache, cache_seqlens,
                         jnp.array([0], jnp.int32), out_tol=(3e-2, 4e-2))
+
+
+@pytest.mark.parametrize("window_size", [(-1, -1), (255, 0)])
+@pytest.mark.parametrize(("num_query_heads", "num_kv_heads", "head_dim"),
+                         [(8, 1, 128), (8, 2, 128), (16, 2, 64)])
+def test_kvcache_contiguous_cache_attention_sinks(
+    window_size, num_query_heads, num_kv_heads, head_dim):
+  # Note (deepolar): one KV head stages head-major, two pack a head pair per
+  # u32 lane and 8 query heads per KV head unpack one head per fragment. The
+  # empty row attends only its sink: out = 0, lse = sink.
+  q, k_cache, v_cache, _, _ = random_decode_inputs(
+      29, 3, 3, 1024, num_query_heads, num_kv_heads, head_dim)
+  sinks = jax.random.uniform(
+      jax.random.PRNGKey(5), (num_query_heads,), jnp.float32, -2.0, 8.0)
+  cache_seqlens = jnp.array([0, 517, 1024], jnp.int32)
+  rows = jnp.arange(3, dtype=jnp.int32)
+  out, lse, _, _ = decode_with_cache_copies(
+      q, k_cache, v_cache, cache_seqlens=cache_seqlens,
+      window_size=window_size, return_softmax_lse=True, interpret=INTERPRET,
+      learnable_sink=sinks)
+  assert_decode_matches(out, lse, q, k_cache, v_cache, cache_seqlens, rows,
+                        window_size, sinks=sinks)
+  np.testing.assert_array_equal(out[0], 0.0)
+  np.testing.assert_allclose(lse[0, :, 0], sinks, rtol=1e-6)
 
 
 @pytest.mark.parametrize(("num_query_heads", "num_kv_heads", "head_dim"),

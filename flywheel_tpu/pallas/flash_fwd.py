@@ -30,28 +30,35 @@ MIN_Q_TILES_PER_BLOCK = 2
 
 
 def flash_fwd_kernel(
-    q_hbm: jax.Array,
-    k_hbm: jax.Array,
-    v_hbm: jax.Array,
     *refs: jax.Array,
+    has_sinks: bool,
     dense_params: DenseFwdParams,
     **body,
 ) -> None:
+  if has_sinks:
+    sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
+  else:
+    sinks_ref = None
+    q_hbm, k_hbm, v_hbm, *refs = refs
   fwd_body(
-      make_dense_fwd_schedule(dense_params), q_hbm, k_hbm, v_hbm, refs, **body)
+      make_dense_fwd_schedule(dense_params), q_hbm, k_hbm, v_hbm, refs,
+      sinks_ref=sinks_ref, **body)
 
 
 def flash_attn_forward(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
+    sinks: jax.Array | None = None,
     *,
     dense_params: DenseFwdParams,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
+  smem_operands = [] if sinks is None else [sinks.astype(jnp.float32) * LOG2E]
   return forward_common(
-      partial(flash_fwd_kernel, dense_params=dense_params),
-      [], q, k, v,
+      partial(flash_fwd_kernel, has_sinks=sinks is not None,
+              dense_params=dense_params),
+      smem_operands, q, k, v,
       kernel_name="flash_attn_mha_static_t1_guarded_fwd",
       **body,
   )
@@ -119,7 +126,10 @@ def make_flash_attn_mha(
   The returned callable takes (q, k, v), or (q, k, v, cu_seqlens_q,
   cu_seqlens_k) when varlen_max_seqlen_kv is set, or (q, k, v, causal_offset)
   under runtime_causal_offset, plus optional rotary and rotary_interleaved
-  kwargs, and returns o, or (o, lse) under return_lse.
+  kwargs, and returns o, or (o, lse) under return_lse. Except under
+  runtime_causal_offset, an optional sinks argument after those, (num_q_heads,)
+  float sink logits indexed by flat q head, joins each head's softmax
+  denominator.
 
   num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;
     num_kv_heads=None is MHA and MQA is num_kv_heads=1.
