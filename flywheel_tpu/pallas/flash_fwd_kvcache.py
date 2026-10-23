@@ -132,9 +132,14 @@ def load_kv_pair_fragment(
     *,
     block_kv_compute: int,
     is_bitcast_load: bool,
+    kv_heads_per_fragment: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
   """(keys, values) of kv_head, each (block_kv_compute, head_dim) in the
   cache dtype, read from a merged-cache staging slot.
+
+  With kv_heads_per_fragment 2 (an fp8 cache), kv_head starts a u32 word's
+  head pair and each of keys and values is (2 * block_kv_compute, head_dim):
+  row 2 * t holds token t of kv_head, row 2 * t + 1 token t of kv_head + 1.
 
   A staged token row holds every KV head's K and V rows: (stages, block_kv,
   word_stride, kv_word_rows, head_dim) with is_bitcast_load, its first
@@ -147,6 +152,33 @@ def load_kv_pair_fragment(
   compute_start = pl.multiple_of(
       kv_compute_index * block_kv_compute, MIN_BLOCK_KV
   )
+  if kv_heads_per_fragment == 2:
+    if not is_bitcast_load:
+      pair_row = kv_head // heads_per_word * kv_word_rows(dtype)
+      return tuple(
+          kv_stage[
+              slot,
+              pl.ds(compute_start, block_kv_compute),
+              pl.ds(pair_row + kv_part * heads_per_word, heads_per_word),
+              :,
+          ].reshape(2 * block_kv_compute, head_dim)
+          for kv_part in range(2)
+      )
+    # Note: a word's low 16 bits are the pair's two K bytes and its high 16
+    # bits their two V bytes, so one u32 -> u16 pack per half yields a
+    # head-interleaved fp8 tile, as the bf16 head-pair bitcast does; no byte
+    # unpacking per head.
+    word_stride = kv_stage.shape[2]
+    words = load_staged_words(
+        staged_words(kv_stage, slot),
+        compute_start * word_stride + kv_head // heads_per_word,
+        block_kv_compute,
+        word_stride,
+    )
+    return (
+        pltpu.bitcast(words.astype(jnp.uint16), dtype),
+        pltpu.bitcast((words >> 16).astype(jnp.uint16), dtype),
+    )
   if not is_bitcast_load:
     key_row = (kv_head // heads_per_word * kv_word_rows(dtype)
                + kv_head % heads_per_word)
@@ -265,11 +297,20 @@ def kvcache_kernel(
   # unpack one head per fragment. A merged row's u32 word pairs a head's K
   # with its V instead, so a merged build always unpacks one head per
   # fragment.
+  # Note: an fp8 merged word holds a head pair's K bytes in its low half and
+  # V bytes in its high half, so the pair rides one fragment like the bf16
+  # head-pair bitcast.
+  is_pair_word_fragment = (
+      is_merged_cache
+      and kv_heads_per_word(cache_dtype) == 2
+      and NUM_SUBLANES // 2 < 2 * query_heads_per_kv_head <= NUM_SUBLANES
+      and num_kv_heads % 2 == 0
+  )
   if (
       is_bitcast_load
       and 2 * query_heads_per_kv_head <= NUM_SUBLANES
       and not is_merged_cache
-  ):
+  ) or is_pair_word_fragment:
     kv_heads_per_fragment = 2
   else:
     kv_heads_per_fragment = 1
@@ -284,6 +325,7 @@ def kvcache_kernel(
   # broadcasts, sublane rotates and single-row state stores.
   if (
       is_merged_cache
+      and not is_pair_word_fragment
       and NUM_SUBLANES % query_heads_per_kv_head == 0
       and num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head) == 0
   ):
@@ -322,6 +364,7 @@ def kvcache_kernel(
         load_kv_pair_fragment,
         block_kv_compute=block_kv_compute,
         is_bitcast_load=is_bitcast_load,
+        kv_heads_per_fragment=kv_heads_per_fragment,
     )
   else:
     kv_fragment = functools.partial(
@@ -584,7 +627,8 @@ def kvcache_kernel(
           key, value = kv_pair_fragment(
               k_buffers,
               slot,
-              head_group * kv_heads_per_group + group_member,
+              (head_group * kv_heads_per_group + group_member)
+              * kv_heads_per_fragment,
               kv_compute_index,
           )
           values.append(value)
