@@ -2876,6 +2876,326 @@
       2048,
       2048,
       2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b128|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b128|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b16|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b16|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b16|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b16|s8192|d128|a1|w-|l0": [
+      4096,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b32|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b32|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b32|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b32|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b64|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b64|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h16|k4|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b128|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b128|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b16|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b16|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b32|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b32|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b64|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b64|s5120|d128|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h32|k8|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b128|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b128|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b16|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b16|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b16|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b32|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b32|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b32|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b32|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b64|s5120|d128|a0|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b64|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h16|k4|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      8192,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b128|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b128|s5120|d128|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b128|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b128|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b16|s5120|d128|a0|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b16|s5120|d128|a1|w-|l0": [
+      2560,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b16|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b16|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b32|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b32|s5120|d128|a1|w-|l0": [
+      5120,
+      5120,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b32|s8192|d128|a0|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b32|s8192|d128|a1|w-|l0": [
+      2048,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b64|s5120|d128|a0|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b64|s5120|d128|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b64|s8192|d128|a0|w-|l0": [
+      8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e5m2|h32|k8|b64|s8192|d128|a1|w-|l0": [
+      8192,
+      2048,
+      2
     ]
   }
 }
