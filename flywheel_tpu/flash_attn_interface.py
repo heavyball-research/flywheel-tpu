@@ -89,10 +89,9 @@ def default_block_sizes(
   # max_seqlen_q caps the q axis on its own.
   seq_q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
   is_dense_band = max_seqlen is None and window_size[0] != -1
-  # Note (david): the dense grid needs blocks that divide both axes, while the
-  # per-seq (varlen) schedule clamps every window to the padded end, so a
-  # packed total of 128 times an odd count keeps blocks of the max_seqlen cap
-  # instead of 128-row ones.
+  # Note (david): only the dense grid needs blocks that divide both axes. The
+  # per-seq schedule clamps every window to the padded end, so a packed total
+  # of 128 times an odd count keeps the max_seqlen-capped block, not 128 rows.
   must_divide = max_seqlen is None
   if is_dense_band:
     # Note (david): the band copies need bq % bkv == 0.

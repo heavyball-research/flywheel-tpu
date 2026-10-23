@@ -196,27 +196,26 @@ def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
 ])
 def test_flash_attn_varlen_ragged_last_block(seqlens, causal, window_size):
   # Note (david): a packed total of 128 times an odd count keeps the
-  # max_seqlen-capped block, which then does not divide it, so the last
-  # sequence's last q and kv windows clamp to the padded end and recompute rows
-  # and columns the previous block already covered. Short sequences inside the
-  # clamped window chain the head blend over several identical windows, and
-  # one 5500-token sequence (5504 padded, divisible by neither 2048 nor the
-  # window's 1024 cap) needs the ragged last kv block that a floored block
-  # count would drop.
+  # max_seqlen-capped block, which does not divide it, so the last q and kv
+  # windows clamp to the padded end and overlap the previous block. Short
+  # sequences inside the clamped window chain the head blend over several
+  # identical windows, and one 5500-token sequence needs the ragged last kv
+  # block that a floored block count would drop.
   max_seqlen = max(seqlens)
   padded_total = pad_seqlen(sum(seqlens))
-  bucket = min(padded_total, next_pow2(max_seqlen))
-  blocks = default_block_sizes(padded_total, padded_total, bucket, bucket,
-                               window_size=window_size, head_dim=128)
+  max_seqlen_bucket = min(padded_total, next_pow2(max_seqlen))
+  blocks = default_block_sizes(padded_total, padded_total, max_seqlen_bucket,
+                               max_seqlen_bucket, window_size=window_size,
+                               head_dim=128)
   assert padded_total % blocks.block_q and padded_total % blocks.block_kv
   q, k, v, segments = packed_qkv(seqlens, 4, 2, 128)
   cu = cu_seqlens_of(seqlens)
   out, lse = varlen_attn(q, k, v, cu, cu, max_seqlen, max_seqlen,
                          causal=causal, window_size=window_size,
                          return_softmax_lse=True)
+  mask_kwargs = {"causal": causal, "window_size": window_size}
   for index, segment in enumerate(segments):
     rows = slice(int(cu[index]), int(cu[index + 1]))
-    mask_kwargs = {"causal": causal, "window_size": window_size}
     assert_output_close(out[rows][None], *segment, **mask_kwargs)
     _, lse_ref = attention_ref(*segment, **mask_kwargs)
     _, lse_bf16 = attention_ref(*segment, upcast=False, reorder_ops=True,

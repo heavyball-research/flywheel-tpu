@@ -310,10 +310,8 @@ class VarlenSchedule(NamedTuple):
   """Build-time shape of the runtime (cu_seqlens-driven) per-seq schedule.
 
   Attributes:
-    padded_total_q: rows of the padded packed q axis; a block need not divide
-      it.
-    padded_total_k: rows of the padded packed kv axis; a block need not divide
-      it.
+    padded_total_q: padded packed q rows, which a block need not divide.
+    padded_total_k: padded packed kv rows, which a block need not divide.
     q_heads_per_kv_head: maps a q head to its kv head.
     left/right: the window around each sequence's own bottom-right diagonal;
       None is unbounded, and causal is (None, 0).
@@ -422,15 +420,14 @@ def make_per_seq_fwd_schedule(
         f"{bq=}, {bkv=}, {padded_total_q=} and {padded_total_k=} must be"
         f" multiples of {tile_rows}."
     )
-  # Note (david): every window clamps to padded_total - block, so a block need
-  # not divide its axis, only fit in it. The ceil keeps the clip on hi from
-  # dropping the ragged last kv block of a sequence ending past the last whole
-  # block.
+  # Note (david): every window clamps to padded_total - block, so a block only
+  # has to fit in its axis, not divide it.
   if bq > padded_total_q or bkv > padded_total_k:
     raise ValueError(
         f"{bq=} and {bkv=} must fit in {padded_total_q=} and"
         f" {padded_total_k=}."
     )
+  # Note (david): a floored count would clip hi below the ragged last kv block.
   num_kv_blocks = -(-padded_total_k // bkv)
 
   def _row_interval(si):
