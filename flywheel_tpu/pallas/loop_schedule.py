@@ -591,7 +591,8 @@ def make_paged_fwd_schedule(
     last_valid_q = jnp.minimum(q_block_start + bq, q_end) - 1
     kv_end = _kv_frontier(kv_used_end, bottom_right_offset, last_valid_q)
     # Note (david): kv_len == 0 still gets one kv block, as on the per-seq
-    # schedule; its page DMAs clip to zero tokens.
+    # schedule; its page DMAs move one sublane tile of a clamped page each,
+    # which fwd_body discards.
     hi = jnp.clip((kv_end - 1) // bkv, 0, num_kv_blocks - 1)
     if left is None:
       lo = jnp.int32(0)
@@ -609,8 +610,8 @@ def make_paged_fwd_schedule(
     return lo, hi, ctx
 
   def _kv_page(seq_idx, kv, page):
-    # Note (david): a lookup past the row's last page clamps into the row; its
-    # DMA clips to zero tokens, so the entry is never dereferenced.
+    # Note (david): a lookup past the row's last page clamps into the row;
+    # fwd_body clamps the entry into the pool and discards the rows it reads.
     table_index = jnp.minimum(kv * pages_per_block + page, pages_per_seq - 1)
     return block_table_ref[seq_idx * pages_per_seq + table_index]
 

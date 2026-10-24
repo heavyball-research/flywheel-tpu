@@ -32,6 +32,8 @@ from .copy_utils import kv_word_rows, resolve_merged_kv_heads
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
   BF16_TILE_ROWS,
+  NUM_KV_STAGES,
+  NUM_O_SLOTS,
   forward_common,
   fwd_body,
   overflow_guard_threshold,
@@ -138,7 +140,7 @@ def paged_scratch_shapes(
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
   bounds rows, Q rotary coefficients, out stage, row max, row sum, f32
-  accumulator, lse."""
+  accumulator, pending probs, pending V tile, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
@@ -160,14 +162,17 @@ def paged_scratch_shapes(
     lse_shapes = []
   return [
       (stage_shape, bf16),
-      ((num_stages, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
+      ((NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
       ((2, bkv, head_dim), bf16),
       ((1, 2, bkv), jnp.dtype(jnp.int32)),
       *rotary_shapes,
       (stage_shape, bf16),
       ((group_bq, NUM_LANES), f32),
       ((2, group_bq, NUM_LANES), f32),
-      ((2, group_bq, head_dim), f32),
+      ((NUM_O_SLOTS, group_bq, head_dim), f32),
+      ((gqa_fold * block_sizes.block_q_compute, block_sizes.block_kv_compute),
+       f32),
+      ((block_sizes.block_kv_compute, head_dim), bf16),
       *lse_shapes,
   ]
 
@@ -313,8 +318,9 @@ def flash_attn_varlen_paged(
   count, needs it. An fp8 pool is widened to bf16 once per staged block;
   k_scale multiplies every score and v_scale the output, both scalars that
   may be traced. seqused_k is each sequence's kv length with its new tokens,
-  which the cache must already hold; block_table entries past those tokens'
-  pages are never dereferenced.
+  which the cache must already hold; a block_table entry past those tokens'
+  pages is only read through a clamp into the pool, and the rows it names are
+  discarded.
   Causal rows align to the end of their sequence's keys; window_left (None
   unbounded) also hides the keys more than window_left positions before that
   diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
@@ -406,17 +412,6 @@ def flash_attn_varlen_paged(
       kv_dtype=kv_cache.dtype,
   )
   bq = block_sizes.block_q
-  bkv = block_sizes.block_kv
-  # Note (david): fwd_body keys a staged block by (sequence, kv head, kv
-  # block, loaded 8-row tiles) in one int32.
-  num_kv_keys = (batch * num_kv_heads * -(-capacity // bkv)
-                 * (bkv // NUM_SUBLANES + 1))
-  if num_kv_keys > 2**31 - 1:
-    raise ValueError(
-        f"{batch=} sequences of {num_kv_heads} kv heads and capacity"
-        f" {capacity} tokens in {bkv}-token blocks need {num_kv_keys} staging"
-        " keys, past int32."
-    )
   paged = PagedKVInfo(
       num_kv_heads=num_kv_heads, page_size=page_size,
       pages_per_seq=pages_per_seq, is_bitcast_load=not interpret)
