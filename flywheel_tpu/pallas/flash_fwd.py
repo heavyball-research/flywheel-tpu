@@ -53,8 +53,10 @@ def check_dense_sinks(
 ) -> None:
   """Raise unless sinks is (nheads,), one logit per sequence head."""
   # Note (deepolar): a head-major kernel sees batch * nheads flat heads, so
-  # only heads-outer and token-major pin nheads; batch-outer needs nheads to
-  # divide them. Every flat head then reads inside the sinks.
+  # only heads-outer and token-major pin nheads. Batch-outer cannot tell
+  # nheads from batch, so it only checks that the length divides the flat
+  # heads: every flat head then reads inside the sinks, but a wrong length
+  # that divides them passes.
   if token_major is not None:
     is_valid = sinks.shape == (token_major.num_q_heads,)
   elif heads_outer_batch is not None:
@@ -156,7 +158,8 @@ def make_flash_attn_mha(
   runtime_causal_offset, an optional sinks argument after those, (nheads,)
   float sink logits, one per sequence head (flat q head f reads f % nheads,
   or f // heads_outer_batch heads-outer), joins each head's softmax
-  denominator.
+  denominator. Batch-outer only checks that the sinks' length divides the
+  flat q heads, so the caller must pass exactly nheads logits.
 
   num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;
     num_kv_heads=None is MHA and MQA is num_kv_heads=1.

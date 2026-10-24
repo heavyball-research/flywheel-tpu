@@ -101,10 +101,9 @@ def fold_sink(
   # Note (deepolar): a sink is one more softmax term with no value row, so it
   # only joins the denominator. The output scale 1 / (row_sum + exp2(sink -
   # row_max)) needs no new anchor: an overflowed term gives 0, the output's
-  # limit. lse re-anchors at max(row_max, sink), as FA4's apply_learnable_sink
-  # does, so exp2(sink - anchor) stays finite when the sink sits far above the
-  # static anchor. A caller that reads out_scale alone traces one exp2. A row
-  # that saw no key has row_sum 0 (decode) or a masked-score anchor (the
+  # limit. lse re-anchors at max(row_max, sink), so exp2(sink - anchor) stays
+  # finite when the sink sits far above the static anchor. A row that saw no
+  # key has row_sum 0 (decode) or a masked-score anchor (the
   # fragment pipeline counts its masked scores against themselves); it
   # returns out = 0 and lse = sink. A -inf sink is no sink: MASKED_ROW_BOUND
   # keeps an empty row's anchor finite, so that row returns lse = -inf rather

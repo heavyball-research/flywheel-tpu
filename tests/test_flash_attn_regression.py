@@ -445,6 +445,86 @@ def test_kernel_rejects_misshaped_sinks(entry):
     kernel(*args, jnp.zeros((3,), jnp.float32))
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_attention_sinks_after_guard_recovery(causal):
+  # Note (deepolar): the last quarter of the keys scores far above the first
+  # block's anchor, so the guard replays and rebases the row state before the
+  # sink fold reads it; the sinks span below, near and far above the rebased
+  # row max.
+  q, k, v = random_qkv(0, 2, 1024, 4, 4, 64)
+  k = k.at[:, 768:].multiply(40.0)
+  sinks = jnp.array([0.0, 30.0, 300.0, -5.0], jnp.float32)
+  out, lse = flash_attn_func(*map(to_head_major, (q, k, v)), causal=causal,
+                             learnable_sink=sinks, return_softmax_lse=True,
+                             interpret=INTERPRET)
+  assert_output_close(to_head_major(out), q, k, v, causal=causal, sinks=sinks)
+  assert_lse_close(lse, q, k, v, causal=causal, sinks=sinks)
+
+
+def test_decode_attention_sinks_after_guard_recovery():
+  # Note (deepolar): the second half of the cache scores 2048 against the
+  # first half's 0, so decode's anchor rebases before the sinks join.
+  capacity, heads, head_dim = 4096, 2, 64
+  q = jnp.ones((1, 1, heads, head_dim), jnp.bfloat16)
+  half = (1, capacity // 2, heads, head_dim)
+  k_cache = jnp.concatenate((jnp.zeros(half, jnp.bfloat16),
+                             jnp.full(half, 32.0, jnp.bfloat16)), axis=1)
+  v_cache = jnp.concatenate((jnp.ones(half, jnp.bfloat16),
+                             jnp.full(half, 3.0, jnp.bfloat16)), axis=1)
+  sinks = jnp.array([260.0, 100.0], jnp.float32)
+  out, lse, _, _ = decode_with_cache_copies(
+      q, k_cache, v_cache, cache_seqlens=capacity, return_softmax_lse=True,
+      interpret=INTERPRET, learnable_sink=sinks)
+  assert_decode_matches(out, lse, q, k_cache, v_cache,
+                        jnp.array([capacity], jnp.int32),
+                        jnp.array([0], jnp.int32), sinks=sinks)
+
+
+@pytest.mark.parametrize("window_size", [(127, 0), (-1, 0)])
+def test_flash_attn_varlen_attention_sinks_gpt_oss(window_size):
+  # Note (deepolar): gpt-oss attention is 64 q heads on 8 kv heads at
+  # head_dim 64, with a 128-token window on the sliding layers.
+  seqlens = [37, 300, 128, 1]
+  q, k, v, segments = packed_qkv(seqlens, 64, 8, 64)
+  cu = cu_seqlens_of(seqlens)
+  sinks = random_sinks(64)
+  mask_kwargs = dict(causal=True, window_size=window_size)
+  out, lse = varlen_attn(q, k, v, cu, cu, max(seqlens), max(seqlens),
+                         learnable_sink=sinks, return_softmax_lse=True,
+                         **mask_kwargs)
+  for index, segment in enumerate(segments):
+    rows = slice(int(cu[index]), int(cu[index + 1]))
+    assert_output_close(out[rows][None], *segment, sinks=sinks,
+                        **mask_kwargs)
+    assert_lse_close(lse[None, :, rows], *segment, sinks=sinks, **mask_kwargs)
+
+
+def test_varlen_padding_rows_ignore_sinks():
+  # Note (deepolar): padding rows past cu_seqlens[-1] never attend, so they
+  # keep out = 0 and lse = -inf with sinks, even when their q is NaN.
+  seqlens = [17, 40]
+  q, k, v, _ = packed_qkv(seqlens, 4, 2, 128)
+  pad_q, pad_k, pad_v = random_qkv(99, 1, 23, 4, 2, 128)
+  q = jnp.concatenate([q, jnp.full_like(pad_q[0], jnp.nan)])
+  k = jnp.concatenate([k, pad_k[0]])
+  v = jnp.concatenate([v, pad_v[0]])
+  cu = cu_seqlens_of(seqlens)
+  out, lse = varlen_attn(q, k, v, cu, cu, 40, 40, causal=True,
+                         learnable_sink=random_sinks(4),
+                         return_softmax_lse=True)
+  assert jnp.all(out[57:] == 0)
+  assert jnp.all(lse[:, 57:] == -jnp.inf)
+
+
+def test_traced_sinks_compile_once():
+  q, k, v = map(to_head_major, random_qkv(0, 1, 256, 4, 2, 128))
+  attend = jax.jit(lambda sinks: flash_attn_func(
+      q, k, v, causal=True, learnable_sink=sinks, interpret=INTERPRET))
+  attend(random_sinks(4)).block_until_ready()
+  attend(random_sinks(4) + 1.0).block_until_ready()
+  assert attend._cache_size() == 1
+
+
 def decode_reference(q, k_cache, v_cache, cache_seqlens, cache_batch_idx,
                      window_size=(-1, -1), softcap=0.0, sinks=None):
   """(out, lse) of one decode step over the mapped contiguous cache rows.

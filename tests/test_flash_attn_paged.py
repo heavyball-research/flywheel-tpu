@@ -721,3 +721,54 @@ def test_paged_attention_sinks(entry, heads, kv_heads, window_left, softcap):
   else:
     actual = run_decode(*case, **kwargs)
   assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@pytest.mark.parametrize("window_left", [127, None])
+def test_paged_decode_attention_sinks_gpt_oss(window_left):
+  # Note (deepolar): gpt-oss decodes 64 q heads on 8 kv heads at head_dim 64;
+  # the paged extend kernel still needs head_dim 128, so decode alone runs it.
+  case = random_ragged_case(lengths=(1, 1, 1), prefixes=(0, 300, 900),
+                            heads=64, kv_heads=8, head_dim=64, capacity=1024,
+                            padding=0)
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, 64), jnp.float32)
+  expected = ragged_reference(*case, causal=True, window_left=window_left,
+                              sinks=sinks)
+  actual = run_decode(
+      *case, causal=True, learnable_sink=sinks,
+      window_size=(-1 if window_left is None else window_left, 0))
+  assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
+@pytest.mark.parametrize("entry", ["kvcache", "decode"])
+@pytest.mark.parametrize("heads,kv_heads,window_left", [
+    (8, 2, None), (64, 8, 127), (4, 4, None)])
+def test_paged_fp8_attention_sinks(dtype, entry, heads, kv_heads, window_left):
+  # Note (deepolar): a sink joins after the descales, so it must not take the
+  # K descale and the V descale must still scale the output. A sink call then
+  # equals the plain call exactly: out_s = out * sigmoid(lse - sink) and
+  # lse_s = logaddexp(lse, sink).
+  if entry == "decode":
+    lengths, prefixes, padding = (1, 1, 1), (0, 300, 900), 0
+  else:
+    lengths, prefixes, padding = (131, 17, 0), (123, 900, 64), 5
+  q, kc, vc, k, v, cu, lens, table = random_ragged_case(
+      lengths=lengths, prefixes=prefixes, heads=heads, kv_heads=kv_heads,
+      capacity=1024, padding=padding)
+  kc, vc, k, v = (x.astype(dtype) for x in (kc, vc, k, v))
+  case = (q, kc, vc, k, v, cu, lens, table)
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, heads), jnp.float32)
+  kwargs = dict(causal=True, k_descale=0.5, v_descale=2.0,
+                window_size=(-1 if window_left is None else window_left, 0))
+  run = run_decode if entry == "decode" else run_extend
+  out, lse, *_ = run(*case, **kwargs)
+  sink_out, sink_lse, *_ = run(*case, learnable_sink=sinks, **kwargs)
+  rows = np.arange(int(np.asarray(cu)[0]), int(np.asarray(cu)[-1]))
+  out, sink_out = (np.asarray(x, np.float32)[rows] for x in (out, sink_out))
+  lse, sink_lse = (np.asarray(x, np.float32)[:, rows] for x in (lse, sink_lse))
+  head_sinks = np.asarray(sinks)[:, None]
+  keep = 1 / (1 + np.exp(head_sinks - lse))
+  assert np.abs(sink_lse - np.logaddexp(lse, head_sinks)).max() < 1e-2
+  assert np.abs(sink_out - out * keep.T[:, :, None]).max() < 2e-2

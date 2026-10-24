@@ -671,7 +671,8 @@ def flash_attn_func(
   softcapped scores (gpt-oss attention sinks, FlashAttention's
   learnable_sink): exp(learnable_sink[h]) joins head h's softmax denominator
   with no value row, and lse includes it. A row with no reachable key then
-  returns out = 0 and lse = learnable_sink[h].
+  returns out = 0 and lse = learnable_sink[h]. Each logit must be finite or
+  -inf (no sink); +inf and NaN are not checked and give undefined results.
 
   Gradients cover MHA and GQA/MQA with causal or full masks; window_size,
   softcap, RoPE, heads_outer_fold and learnable_sink are forward-only.
@@ -1187,7 +1188,9 @@ def flash_attn_varlen_func(
   learnable_sink: None or (nheads,) float sink logits, on the scale of the
   softcapped scores; exp(learnable_sink[h]) joins head h's softmax
   denominator with no value row (gpt-oss attention sinks), and lse includes
-  it.
+  it. Each logit must be finite or -inf (no sink); +inf and NaN are not
+  checked and give undefined results. Padding rows and rows past num_active
+  still return out = 0 and lse = -inf.
   """
   window_size = check_common_kwargs(
       window_size, dropout_p=dropout_p, softcap=softcap,
@@ -1433,7 +1436,8 @@ def flash_attn_with_kvcache(
   softcapped scores (gpt-oss attention sinks): exp(learnable_sink[h]) joins
   head h's softmax denominator with no value row, and lse includes it. A
   decode row with nothing to attend then returns out = 0 and lse =
-  learnable_sink[h].
+  learnable_sink[h]. Each logit must be finite or -inf (no sink); +inf and
+  NaN are not checked and give undefined results.
 
   Returns (out, k_cache, v_cache) for the contiguous pair and (out, kv_cache)
   for the paged merged cache, with lse after out when return_softmax_lse:
