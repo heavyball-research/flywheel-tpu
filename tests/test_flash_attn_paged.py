@@ -68,12 +68,14 @@ def append_to_pages(kc, vc, k, v, cu, lengths, table):
 
 
 def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
-                     window_left=None, softcap=0.0):
+                     window_left=None, softcap=0.0, sinks=None):
   """Appends k/v to the paged caches, then attends each request's rows.
 
   window_left hides the keys more than window_left positions before a row's
   bottom-right diagonal; softcap > 0 maps each scaled score s to
-  softcap * tanh(s / softcap) before masking.
+  softcap * tanh(s / softcap) before masking. sinks (heads,) adds exp(sinks[h])
+  to head h's softmax denominator; a row that sees no key then has lse
+  sinks[h].
 
   Returns (out, lse, k_pages, v_pages, top2), where top2 is the attention mass
   on the two heaviest keys of every attending (row, head).
@@ -85,6 +87,8 @@ def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
   page_size, kv_heads = kc.shape[1:3]
   repeats = heads // kv_heads
   scale = 1 / math.sqrt(head_dim)
+  if sinks is not None:
+    head_sinks = np.asarray(sinks, np.float32).reshape(kv_heads, repeats, 1)
   out = np.zeros_like(q)
   lse = np.full((heads, q.shape[0]), -np.inf, np.float32)
   top2 = [np.empty(0)]
@@ -123,15 +127,22 @@ def ragged_reference(q, kc, vc, k, v, cu, lengths, table, *, causal,
       scores = np.where(visible[:, None, None], scores, -np.inf)
       anchor = np.where(seen[:, None, None, None],
                         scores.max(axis=-1, keepdims=True, initial=-np.inf), 0)
+      if sinks is not None:
+        anchor = np.where(seen[:, None, None, None],
+                          np.maximum(anchor, head_sinks), head_sinks)
       weights = np.exp(scores - anchor)
       denom = weights.sum(axis=-1, keepdims=True)
+      if sinks is not None:
+        denom = denom + np.exp(head_sinks - anchor)
       probs = weights / np.where(denom > 0, denom, 1)
       result = (probs[..., None, :] @ values)[..., 0, :].reshape(
           len(rows), heads, head_dim)
       out[start + rows] = np.where(seen[:, None, None], result, 0)
       with np.errstate(divide="ignore"):
         row_lse = (anchor + np.log(denom)).reshape(len(rows), heads)
-      lse[:, start + rows] = np.where(seen[:, None], row_lse, -np.inf).T
+      if sinks is None:
+        row_lse = np.where(seen[:, None], row_lse, -np.inf)
+      lse[:, start + rows] = row_lse.T
       heavy = (np.partition(probs, total - 2, axis=-1)[..., -2:].sum(axis=-1)
                if total > 1 else probs.sum(axis=-1))
       top2.append(heavy.reshape(len(rows), heads)[seen].ravel())
@@ -622,3 +633,101 @@ def test_paged_overflow_guard_checks_last_live_kv_tile():
   actual = run_paged(*case, causal=True, max_seqlen_k=num_pages * page_size)
   assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
   assert_extend_matches(actual, expected, case[5], case[6])
+
+
+def run_decode(q, kc, vc, k, v, cu, lengths, table, **kwargs):
+  """flash_attn_with_kvcache's single-token decode on the merged pool, one q, k
+  and v row per request; returns run_extend's (out, lse, updated_k,
+  updated_v), out and lse in packed row order."""
+  del cu
+  out, lse, kv_cache = flash_attn_with_kvcache(
+      q[:, None], interleave(kc, vc), None, k[:, None], v[:, None],
+      block_table=table, cache_seqlens=lengths, return_softmax_lse=True,
+      interpret=INTERPRET, **kwargs)
+  return (out[:, 0], lse[:, :, 0].T, *deinterleave(kv_cache))
+
+
+@pytest.mark.parametrize("entry", ["varlen", "kvcache", "decode"])
+@pytest.mark.parametrize("heads,kv_heads,window_left,softcap", [
+    (8, 2, None, 0.0),
+    (8, 2, 127, 0.0),
+    (4, 4, None, 30.0),
+    (64, 8, 127, 0.0),
+])
+def test_paged_attention_sinks(entry, heads, kv_heads, window_left, softcap):
+  # Note (deepolar): sinks near the rows' lse move a large share of each
+  # head's mass off the keys, so a sink dropped from either the output or the
+  # lse fails the check. 64:8 heads with a 128-token window are gpt-oss's
+  # sliding layers. A request with no new tokens owns no rows, so it checks
+  # that the sinks stay with their heads across requests.
+  if entry == "decode":
+    lengths, prefixes, padding = (1, 1, 1), (0, 300, 900), 0
+  else:
+    lengths, prefixes, padding = (131, 17, 0), (123, 900, 64), 5
+  case = random_ragged_case(lengths=lengths, prefixes=prefixes, heads=heads,
+                            kv_heads=kv_heads, capacity=1024, padding=padding)
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, heads), jnp.float32)
+  expected = ragged_reference(*case, causal=True, window_left=window_left,
+                              softcap=softcap, sinks=sinks)
+  kwargs = dict(causal=True,
+                window_size=(-1 if window_left is None else window_left, 0),
+                softcap=softcap, learnable_sink=sinks)
+  if entry == "varlen":
+    actual = run_paged(*case, **kwargs)
+  elif entry == "kvcache":
+    actual = run_extend(*case, **kwargs)
+  else:
+    actual = run_decode(*case, **kwargs)
+  assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@pytest.mark.parametrize("window_left", [127, None])
+def test_paged_decode_attention_sinks_gpt_oss(window_left):
+  # Note (deepolar): gpt-oss decodes 64 q heads on 8 kv heads at head_dim 64;
+  # the paged extend kernel still needs head_dim 128, so decode alone runs it.
+  case = random_ragged_case(lengths=(1, 1, 1), prefixes=(0, 300, 900),
+                            heads=64, kv_heads=8, head_dim=64, capacity=1024,
+                            padding=0)
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, 64), jnp.float32)
+  expected = ragged_reference(*case, causal=True, window_left=window_left,
+                              sinks=sinks)
+  actual = run_decode(
+      *case, causal=True, learnable_sink=sinks,
+      window_size=(-1 if window_left is None else window_left, 0))
+  assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
+@pytest.mark.parametrize("entry", ["kvcache", "decode"])
+@pytest.mark.parametrize("heads,kv_heads,window_left", [
+    (8, 2, None), (64, 8, 127), (4, 4, None)])
+def test_paged_fp8_attention_sinks(dtype, entry, heads, kv_heads, window_left):
+  # Note (deepolar): a sink joins after the descales, so it must not take the
+  # K descale and the V descale must still scale the output. A sink call then
+  # equals the plain call exactly: out_s = out * sigmoid(lse - sink) and
+  # lse_s = logaddexp(lse, sink).
+  if entry == "decode":
+    lengths, prefixes, padding = (1, 1, 1), (0, 300, 900), 0
+  else:
+    lengths, prefixes, padding = (131, 17, 0), (123, 900, 64), 5
+  q, kc, vc, k, v, cu, lens, table = random_ragged_case(
+      lengths=lengths, prefixes=prefixes, heads=heads, kv_heads=kv_heads,
+      capacity=1024, padding=padding)
+  kc, vc, k, v = (x.astype(dtype) for x in (kc, vc, k, v))
+  case = (q, kc, vc, k, v, cu, lens, table)
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, heads), jnp.float32)
+  kwargs = dict(causal=True, k_descale=0.5, v_descale=2.0,
+                window_size=(-1 if window_left is None else window_left, 0))
+  run = run_decode if entry == "decode" else run_extend
+  out, lse, *_ = run(*case, **kwargs)
+  sink_out, sink_lse, *_ = run(*case, learnable_sink=sinks, **kwargs)
+  rows = np.arange(int(np.asarray(cu)[0]), int(np.asarray(cu)[-1]))
+  out, sink_out = (np.asarray(x, np.float32)[rows] for x in (out, sink_out))
+  lse, sink_lse = (np.asarray(x, np.float32)[:, rows] for x in (lse, sink_lse))
+  head_sinks = np.asarray(sinks)[:, None]
+  keep = 1 / (1 + np.exp(head_sinks - lse))
+  assert np.abs(sink_lse - np.logaddexp(lse, head_sinks)).max() < 1e-2
+  assert np.abs(sink_out - out * keep.T[:, :, None]).max() < 2e-2

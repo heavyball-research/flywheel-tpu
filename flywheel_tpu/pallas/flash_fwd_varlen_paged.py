@@ -78,9 +78,8 @@ def flash_fwd_varlen_paged_kernel(
     cu_qblk_ref: jax.Array,
     block_table_ref: jax.Array,
     kv_scales_ref: jax.Array,
-    q_hbm: jax.Array,
-    kv_hbm: jax.Array,
     *refs: jax.Array,
+    has_sinks: bool,
     paged: PagedKVInfo,
     causal: bool,
     window_left: int | None,
@@ -91,6 +90,11 @@ def flash_fwd_varlen_paged_kernel(
     q_scale: float,
     **body,
 ) -> None:
+  if has_sinks:
+    sinks_ref, q_hbm, kv_hbm, *refs = refs
+  else:
+    sinks_ref = None
+    q_hbm, kv_hbm, *refs = refs
   schedule = make_paged_fwd_schedule(
       cu_q_ref, seqused_k_ref, cu_qblk_ref, block_table_ref,
       num_head_groups=num_head_groups,
@@ -105,7 +109,7 @@ def flash_fwd_varlen_paged_kernel(
   # descales arrive in SMEM, so a new descale value compiles no new kernel.
   fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
            q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
-           **body)
+           sinks_ref=sinks_ref, **body)
 
 
 def vmem_buffer_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
@@ -287,6 +291,7 @@ def flash_attn_varlen_paged(
     cu_seqlens_q: jax.Array,
     seqused_k: jax.Array,
     block_table: jax.Array,
+    sinks: jax.Array | None = None,
     *,
     max_seqlen_q: int,
     max_seqlen_k: int,
@@ -322,6 +327,9 @@ def flash_attn_varlen_paged(
   softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
   max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
   slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
+  sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
+  denominator, sink logits on the scale of the softcapped scores (gpt-oss
+  attention sinks).
   """
   num_q_heads, total_q, head_dim = q.shape
   if q.dtype != jnp.bfloat16:
@@ -350,6 +358,9 @@ def flash_attn_varlen_paged(
     )
   if total_q == 0:
     raise ValueError("q needs at least one token row.")
+  if sinks is not None and sinks.shape != (num_q_heads,):
+    raise ValueError(
+        f"sinks must be ({num_q_heads},), one per q head; got {sinks.shape}.")
 
   cu_seqlens_q = jnp.asarray(cu_seqlens_q)
   seqused_k = jnp.asarray(seqused_k)
@@ -439,8 +450,11 @@ def flash_attn_varlen_paged(
       jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
                  for scale in (k_scale, v_scale)]),
   ]
+  if sinks is not None:
+    smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
+      has_sinks=sinks is not None,
       causal=causal,
       window_left=window_left,
       num_head_groups=num_kv_heads,
