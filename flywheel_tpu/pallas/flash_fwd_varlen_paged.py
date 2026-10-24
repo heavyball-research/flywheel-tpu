@@ -36,7 +36,12 @@ from .fwd_pipeline import (
   fwd_body,
   overflow_guard_threshold,
 )
-from .loop_schedule import make_paged_fwd_schedule, per_seq_qblk_prefix
+from .loop_schedule import (
+  ScheduleTableLayout,
+  make_paged_fwd_schedule,
+  paged_num_kv_blocks,
+  paged_schedule_table,
+)
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # kv stream descriptor-bound.
@@ -73,37 +78,37 @@ PAGED_WINDOW_BLOCK = 512
 
 
 def flash_fwd_varlen_paged_kernel(
-    cu_q_ref: jax.Array,
-    seqused_k_ref: jax.Array,
-    cu_qblk_ref: jax.Array,
+    table_ref: jax.Array,
     block_table_ref: jax.Array,
     kv_scales_ref: jax.Array,
     q_hbm: jax.Array,
     kv_hbm: jax.Array,
     *refs: jax.Array,
     paged: PagedKVInfo,
+    layout: ScheduleTableLayout,
     causal: bool,
     window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
     bq: int,
     bkv: int,
+    bkv_compute: int,
     q_scale: float,
     **body,
 ) -> None:
   schedule = make_paged_fwd_schedule(
-      cu_q_ref, seqused_k_ref, cu_qblk_ref, block_table_ref,
+      table_ref, block_table_ref,
+      layout=layout,
       num_head_groups=num_head_groups,
       q_heads_per_kv_head=q_heads_per_kv_head,
-      padded_total_q=q_hbm.shape[1],
-      bq=bq, bkv=bkv,
+      bq=bq, bkv=bkv, bkv_compute=bkv_compute,
       page_size=paged.page_size, pages_per_seq=paged.pages_per_seq,
       causal=causal, left=window_left,
-      num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
   # Note (david): K and V share the one merged cache operand. The K and V
   # descales arrive in SMEM, so a new descale value compiles no new kernel.
-  fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
+  fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv,
+           bkv_compute=bkv_compute, paged=paged,
            q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
            **body)
 
@@ -137,9 +142,10 @@ def paged_scratch_shapes(
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
-  bounds rows, Q rotary coefficients, out stage, row max, row sum, f32
-  accumulator, lse."""
+  bounds rows per kv compute tile, Q rotary coefficients, out stage, row max,
+  row sum, f32 accumulator, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
+  bkv_compute = block_sizes.block_kv_compute
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
   if gqa_fold > 1:
@@ -162,7 +168,7 @@ def paged_scratch_shapes(
       (stage_shape, bf16),
       ((num_stages, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
       ((2, bkv, head_dim), bf16),
-      ((1, 2, bkv), jnp.dtype(jnp.int32)),
+      ((bkv // bkv_compute, 2, bkv_compute), jnp.dtype(jnp.int32)),
       *rotary_shapes,
       (stage_shape, bf16),
       ((group_bq, NUM_LANES), f32),
@@ -409,7 +415,8 @@ def flash_attn_varlen_paged(
   bkv = block_sizes.block_kv
   # Note (david): fwd_body keys a staged block by (sequence, kv head, kv
   # block, loaded 8-row tiles) in one int32.
-  num_kv_keys = (batch * num_kv_heads * -(-capacity // bkv)
+  num_kv_keys = (batch * num_kv_heads
+                 * paged_num_kv_blocks(pages_per_seq, page_size, bkv)
                  * (bkv // NUM_SUBLANES + 1))
   if num_kv_keys > 2**31 - 1:
     raise ValueError(
@@ -430,17 +437,27 @@ def flash_attn_varlen_paged(
     padded_rotary = (
         jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))), None)
 
-  cu_q = cu_seqlens_q.astype(jnp.int32)
+  # Note (david): the schedule is resolved here, once per call, into one table
+  # row per q block (window, kv frontier, interval, flags, page and staging
+  # bases), so the kernel reads its block's row instead of searching the
+  # cu_seqlens and redoing the arithmetic in every q block.
+  table, layout = paged_schedule_table(
+      cu_seqlens_q, seqused_k,
+      num_kv_heads=num_kv_heads,
+      padded_total_q=padded_total_q,
+      bq=bq, bkv=bkv, bkv_compute=block_sizes.block_kv_compute,
+      page_size=page_size, pages_per_seq=pages_per_seq,
+      causal=causal, left=window_left,
+  )
   smem_operands = [
-      cu_q,
-      seqused_k.astype(jnp.int32),
-      per_seq_qblk_prefix(cu_q, bq),
+      table,
       block_table.astype(jnp.int32).reshape(-1),
       jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
                  for scale in (k_scale, v_scale)]),
   ]
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
+      layout=layout,
       causal=causal,
       window_left=window_left,
       num_head_groups=num_kv_heads,

@@ -36,7 +36,11 @@ from .copy_utils import (
   load_staged_words,
   staged_words,
 )
-from .loop_schedule import FwdSchedule, window_fragment_plans
+from .loop_schedule import (
+  FwdSchedule,
+  paged_kv_key_strides,
+  window_fragment_plans,
+)
 from .mask import apply_packed_bounds_mask
 from .rotary import ROTARY_DIM_MULTIPLE, rotate_tile
 
@@ -215,10 +219,16 @@ def fwd_body(
         left=window[0], right=window[1], causal_offset=causal_offset)
   else:
     window_plans = None
-  # Note (david): a paged q block's frontier is a runtime scalar, so its masked
-  # blocks skip each kv compute tile past the frontier of the q tile's last row.
-  # Unmasked blocks lie below every row's frontier and skip nothing.
-  skips_past_frontier = schedule.kv_frontier is not None
+  # Note (david): a per-seq q block's kv frontier is a runtime scalar, so a
+  # masked block whose frontier leaves trailing kv compute tiles dead runs
+  # the live ones in a tile loop and skips the rest. Unmasked blocks lie below
+  # every row's frontier and skip nothing. The tile loop indexes the kv tile
+  # at runtime, which only a sublane (HEAD_DIM_MINOR) token axis and a
+  # leading-axis bounds slot allow.
+  skips_past_frontier = schedule.num_live_tiles is not None
+  assert skips_past_frontier == is_per_seq, (skips_past_frontier, is_per_seq)
+  assert not skips_past_frontier or (
+      is_head_dim_minor and not transposed_pv), (qkv_layout, transposed_pv)
   # Note (david): only a left window can mask a row's whole first fragment
   # while later keys stay visible; anchoring on that masked score would push
   # the row's first visible key past the guard into a replay.
@@ -385,27 +395,30 @@ def fwd_body(
     return k_hbm.at[
         physical_page, pl.ds(0, num_tokens), pl.ds(head_row, word_rows), :]
 
-  def _paged_load_rows(kv_end, kv):
-    # Note (david): each page DMA is clipped to the 8-aligned tokens the
-    # sequence owns in that page, so a block table entry past the sequence's
-    # pages is never dereferenced, and kv_end <= pages_per_seq * page_size
-    # keeps every dereferenced entry inside the sequence's own table row.
-    return jnp.clip(
-        (kv_end + NUM_SUBLANES - 1) // NUM_SUBLANES * NUM_SUBLANES - kv * bkv,
-        0, bkv)
+  if is_paged:
+    block_key_stride, head_key_stride = paged_kv_key_strides(
+        schedule.num_kv_blocks, bkv)
+  else:
+    block_key_stride = head_key_stride = None
 
-  def _paged_kv_key(seq_idx, kv_head, kv_end, kv):
+  def _paged_load_rows(kv_load_end, kv):
+    # Note (david): each page DMA is clipped to the 8-aligned tokens below the
+    # q block's frontier (the schedule's kv_load_end) in that page, so a block
+    # table entry past the sequence's pages is never dereferenced.
+    return jnp.clip(kv_load_end - kv * bkv, 0, bkv)
+
+  def _paged_kv_key(key_base, kv_head, kv_load_end, kv):
     # Note (david): a block's staged content is one kv head of its sequence's
-    # kv block, cut at the q block's frontier kv_end, so the key carries the
-    # head and the loaded extent; consecutive q blocks of one sequence reuse a
-    # staged block only when they load the same rows of the same head.
-    # flash_attn_varlen_paged bounds the key below 2**31.
-    return (((seq_idx * paged.num_kv_heads + kv_head) * schedule.num_kv_blocks
-             + kv) * (bkv // NUM_SUBLANES + 1)
-            + _paged_load_rows(kv_end, kv) // NUM_SUBLANES)
+    # kv block, cut at the q block's frontier, so the key carries the head and
+    # the loaded extent; consecutive q blocks of one sequence reuse a staged
+    # block only when they load the same rows of the same head. key_base is
+    # the sequence's term, and flash_attn_varlen_paged bounds the key below
+    # 2**31.
+    return (key_base + kv_head * head_key_stride + kv * block_key_stride
+            + _paged_load_rows(kv_load_end, kv) // NUM_SUBLANES)
 
-  def _paged_page_tokens(kv_end, kv):
-    num_load_rows = _paged_load_rows(kv_end, kv)
+  def _paged_page_tokens(kv_load_end, kv):
+    num_load_rows = _paged_load_rows(kv_load_end, kv)
     return [
         pl.multiple_of(
             jnp.clip(num_load_rows - page * paged.page_size, 0,
@@ -414,11 +427,11 @@ def fwd_body(
         for page in range(bkv // paged.page_size)
     ]
 
-  def _start_paged_kv(seq_idx, kv_head, kv_end, kv, slot):
-    for page, num_tokens in enumerate(_paged_page_tokens(kv_end, kv)):
+  def _start_paged_kv(page_base, kv_head, kv_load_end, kv, slot):
+    for page, num_tokens in enumerate(_paged_page_tokens(kv_load_end, kv)):
       @pl.when(num_tokens > 0)
       def _start_page(page=page, num_tokens=num_tokens):
-        physical_page = schedule.kv_page(seq_idx, kv, page)
+        physical_page = schedule.kv_page(page_base, kv, page)
         pltpu.make_async_copy(
             _paged_kv_source(physical_page, num_tokens, kv_head),
             _paged_buffer_tile(slot, page * paged.page_size, num_tokens),
@@ -428,7 +441,8 @@ def fwd_body(
     # Note (david): every page of a block signals the one semaphore, and a
     # DMA wait only needs the destination size, so each page is waited with
     # its own staged window as both ends.
-    for page, num_tokens in enumerate(_paged_page_tokens(ctx.kv_end, kv)):
+    kv_load_end = ctx.kv_load_end
+    for page, num_tokens in enumerate(_paged_page_tokens(kv_load_end, kv)):
       @pl.when(num_tokens > 0)
       def _wait_page(page=page, num_tokens=num_tokens):
         staged_window = _paged_buffer_tile(
@@ -445,7 +459,7 @@ def fwd_body(
     # tiles past it.
     valid_rows = jnp.clip(
         jnp.minimum(ctx.kv_used_end - kv * bkv,
-                    _paged_load_rows(ctx.kv_end, kv)),
+                    _paged_load_rows(kv_load_end, kv)),
         0, bkv)
     read_rows = jnp.minimum(
         bkv,
@@ -527,7 +541,7 @@ def fwd_body(
       )
     row_key = group * num_rows + si
     if is_paged:
-      kv_key = _paged_kv_key(ctx.seq_idx, kv_head, ctx.kv_end, kv)
+      kv_key = _paged_kv_key(ctx.key_base, kv_head, ctx.kv_load_end, kv)
     else:
       # Note (david): stream keys must be unique per DMA content, which on the
       # per-seq schedule only the token offset is, not the kv block index.
@@ -536,6 +550,12 @@ def fwd_body(
     is_first = kv == lo
     is_last = kv == hi
     is_partial, needs_bounds = schedule.block_flags(si, kv, ctx)
+    # Note (david): the block's compute tiles below the q block's frontier,
+    # and tile 0 always, since every q tile's first fragment runs.
+    if skips_past_frontier:
+      num_live_tiles = schedule.num_live_tiles(kv, ctx)
+    else:
+      num_live_tiles = None
     out_slot = num_out_copies % num_stages
     # Note (david): at the row end the lookahead is the next row's first block;
     # at the very last block that entry equals the current one, so no key
@@ -548,12 +568,15 @@ def fwd_body(
     lookahead_kv_tok = jnp.where(is_last, next_row_kv_tok, next_block_kv_tok)
     lookahead_row_key = jnp.where(is_last, next_row_key, row_key)
     if is_paged:
-      next_row_kv, next_row_seq, next_row_kv_end = next_row_paged
+      next_row_kv, next_ctx = next_row_paged
       lookahead_kv = jnp.where(is_last, next_row_kv, kv + 1)
-      lookahead_seq = jnp.where(is_last, next_row_seq, ctx.seq_idx)
-      lookahead_kv_end = jnp.where(is_last, next_row_kv_end, ctx.kv_end)
+      lookahead_page_base = jnp.where(
+          is_last, next_ctx.page_base, ctx.page_base)
+      lookahead_load_end = jnp.where(
+          is_last, next_ctx.kv_load_end, ctx.kv_load_end)
       lookahead_kv_key = _paged_kv_key(
-          lookahead_seq, lookahead_kv_head, lookahead_kv_end, lookahead_kv)
+          jnp.where(is_last, next_ctx.key_base, ctx.key_base),
+          lookahead_kv_head, lookahead_load_end, lookahead_kv)
     else:
       lookahead_kv_key = lookahead_kv_head * kv_axis_len + lookahead_kv_tok
 
@@ -570,17 +593,13 @@ def fwd_body(
           kv_key,
           lookahead_kv_key,
           lambda slot: _start_paged_kv(
-              ctx.seq_idx, kv_head, ctx.kv_end, kv, slot),
+              ctx.page_base, kv_head, ctx.kv_load_end, kv, slot),
           lambda slot: _start_paged_kv(
-              lookahead_seq, lookahead_kv_head, lookahead_kv_end,
+              lookahead_page_base, lookahead_kv_head, lookahead_load_end,
               lookahead_kv, slot),
           lambda slot: _wait_paged_kv(ctx, kv, slot),
           kv_loaded, kv_inflight, kv_slot, num_stages,
       )
-      # Note (david): the block's compute tiles below the frontier, and tile 0
-      # always, since every q tile's first fragment runs.
-      num_live_tiles = jnp.maximum(
-          1, pl.cdiv(jnp.clip(ctx.kv_end - kv_tok, 0, bkv), bkv_compute))
       _unpack_pair_planes(kv_slot, kv_head, num_live_tiles)
     else:
       kv_loaded, kv_inflight, kv_slot = advance(
@@ -611,17 +630,6 @@ def fwd_body(
     def _head_parities(g):
       new_parity = parity_smem[g]
       return new_parity, 1 - new_parity
-
-    def _is_kv_tile_live(kv_compute_index, q_compute_index):
-      # Note (david): a kv tile at or past the frontier of a q tile's last row
-      # is masked for every row of it, so it is skipped. Tile 0 always runs: it
-      # carries a head's row state from the old parity to the new one, which
-      # the later tiles of the block then read.
-      q_last = q_tok + (q_compute_index + 1) * bq_compute - 1
-      return jnp.logical_or(
-          kv_compute_index == 0,
-          kv_tok + kv_compute_index * bkv_compute
-          < schedule.kv_frontier(ctx, q_last))
 
     def _paged_fragment(kv_compute_index, kv_part):
       """The block's (bkv_compute, head_dim) K (kv_part 0) or V (kv_part 1)
@@ -699,36 +707,64 @@ def fwd_body(
 
       if apply_bounds:
         # Note (david): apply_bounds is static so interior blocks never trace
-        # these VPU ops per score tile. The per-seq bounds rows cover the whole
-        # block, so they sit in slot 0; the span row exists only under a left
-        # window, so every other build keeps a single comparison.
+        # these VPU ops per score tile. The per-seq bounds rows sit in one slot
+        # per kv compute tile, since the tile loop indexes the tile at runtime
+        # and Mosaic slices lanes only at static offsets; the span row exists
+        # only under a left window, so every other build keeps a single
+        # comparison.
         q_ids = q_unshifted + lax.broadcasted_iota(
             jnp.int32, token_tile_shape, 0)
-        slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-        staged_bounds = bounds_buf.at[0]
+        staged_bounds = bounds_buf.at[kv_compute_index]
         if schedule.has_q_span:
           scores = apply_packed_bounds_mask(
               window_masked,
               DEFAULT_MASK_VALUE,
               q_ids,
-              staged_bounds[0:1, slice_k],
-              staged_bounds[1:2, slice_k],
+              staged_bounds[0:1, :],
+              staged_bounds[1:2, :],
           )
         else:
           scores = jnp.where(
-              q_ids >= staged_bounds[0:1, slice_k], window_masked,
+              q_ids >= staged_bounds[0:1, :], window_masked,
               DEFAULT_MASK_VALUE,
           )
       else:
         scores = window_masked
       return scores.reshape(logits.shape)
 
+    def _tile_parity(kv_compute_index, is_tile_zero, new_parity, old_parity):
+      # Note (david): a kv tile reads the head's row state from the old parity
+      # at tile 0 and from the new one after; is_tile_zero is a static bool
+      # where the caller knows, else None.
+      if is_tile_zero is None:
+        return jnp.where(kv_compute_index == 0, old_parity, new_parity)
+      else:
+        return old_parity if is_tile_zero else new_parity
+
+    def _flag_overflow_risk(g, row_sum, is_checked):
+      # Note (david): row_sum upper-bounds every single score of the row, so
+      # this detector may request a needless replay but never misses a score
+      # above the guard bound. Check once the row has consumed the block, at
+      # the block's last live tile when tiles past the frontier are skipped:
+      # a live tile past a q tile's own frontier adds exactly 0 to the row
+      # sum of every row that has attended a key.
+      has_overflow_risk = jnp.any(
+          jnp.logical_not(row_sum <= guard_detect_bound))
+      guard_smem[g] = jnp.maximum(
+          guard_smem[g],
+          jnp.where(is_checked, has_overflow_risk.astype(jnp.int32), 0),
+      )
+
     def _online_softmax(
         g, kv_compute_index, q_compute_index, logits, needs_mask,
         guard_recovery, apply_bounds, window_fragment=None,
+        is_tile_zero=None, last_kv_tile=num_k_compute_tiles - 1,
     ):
       """window_fragment is the fragment's static plan entry on a window
-      block copy, None on the generic copies."""
+      block copy, None on the generic copies. is_tile_zero is a static bool
+      when the caller knows whether kv_compute_index is 0, else None.
+      last_kv_tile is the block's last kv compute tile that runs, where the
+      ordinary pass checks the guard; None leaves the check to the caller."""
       head_rows = pl.ds(g * group_bq, group_bq)
       new_parity, old_parity = _head_parities(g)
       row_sum_new_ref = row_sum_scratch.at[new_parity, head_rows]
@@ -738,14 +774,17 @@ def fwd_body(
       scores = _masked_scores(kv_compute_index, q_compute_index, logits,
                               needs_mask, apply_bounds)
 
-      read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
+      read_parity = _tile_parity(
+          kv_compute_index, is_tile_zero, new_parity, old_parity)
       row_sum_read_ref = row_sum_scratch.at[read_parity, head_rows]
 
       state_shape = row_max_scratch_g[slice_q, :].shape
       frag_row_max = lax.broadcast_in_dim(
           scores.max(axis=-1), state_shape, (0,))
       if window_fragment is None:
-        is_row_start = jnp.logical_and(is_first, kv_compute_index == 0)
+        is_row_start = jnp.logical_and(
+            is_first,
+            kv_compute_index == 0 if is_tile_zero is None else is_tile_zero)
       else:
         # Note (david): a band clipped at kv 0 starts at the row's first block.
         is_row_start = jnp.logical_or(
@@ -807,34 +846,18 @@ def fwd_body(
         # fragments of one q tile adjacent, the later softmax overwrites it
         # before the earlier fragment's PV reads it.
         rescale = jnp.where(is_row_start, 1.0, rescale)
-      else:
-        # Note (david): row_sum upper-bounds every single score of the row, so
-        # this detector may request a needless replay but never misses a score
-        # above the guard bound. Check once the row has consumed the block, at
-        # its last live tile when tiles past the frontier are skipped.
-        is_block_last_tile = kv_compute_index == num_k_compute_tiles - 1
-        if skips_past_frontier and apply_bounds:
-          is_last_kv_tile = jnp.logical_or(
-              is_block_last_tile,
-              jnp.logical_not(
-                  _is_kv_tile_live(kv_compute_index + 1, q_compute_index)))
-        elif window_fragment is not None:
-          is_last_kv_tile = window_fragment.checks_guard
-        else:
-          is_last_kv_tile = is_block_last_tile
-        has_overflow_risk = jnp.any(
-            jnp.logical_not(row_sum_new <= guard_detect_bound))
-        guard_smem[g] = jnp.maximum(
-            guard_smem[g],
-            jnp.where(is_last_kv_tile, has_overflow_risk.astype(jnp.int32), 0),
-        )
+      elif window_fragment is not None:
+        _flag_overflow_risk(g, row_sum_new, window_fragment.checks_guard)
+      elif last_kv_tile is not None:
+        _flag_overflow_risk(g, row_sum_new, kv_compute_index == last_kv_tile)
       return probs, is_row_start, rescale
 
     def _pv(
         g, kv_compute_index, q_compute_index, probs, is_row_start, rescale,
+        is_tile_zero=None,
     ):
       """rescale is the fragment's recovery rescale, None on the ordinary
-      pass."""
+      pass; is_tile_zero as in _online_softmax."""
       head_rows = pl.ds(g * group_bq, group_bq)
       new_parity, old_parity = _head_parities(g)
 
@@ -862,7 +885,8 @@ def fwd_body(
               preferred_element_type=jnp.float32)
 
       slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
-      read_parity = jnp.where(kv_compute_index == 0, old_parity, new_parity)
+      read_parity = _tile_parity(
+          kv_compute_index, is_tile_zero, new_parity, old_parity)
       if transposed_pv:
         # Note (david): q is the lane axis of the transposed o scratch, and
         # Mosaic only slices lanes dynamically at an offset that is static per
@@ -888,12 +912,79 @@ def fwd_body(
         )[..., :o_scratch.shape[-1]] * o_read
       o_new_ref[tile_index] = jnp.where(is_row_start, o_curr, o_prev + o_curr)
 
+    def _run_live_tiles(is_causal, guard_recovery, static_g):
+      # Note (david): a block whose kv frontier leaves trailing kv compute
+      # tiles dead runs only its live ones, in a loop whose body is the q
+      # tiles of one kv tile, straight-line; the distance-1 pending PV crosses
+      # iterations in the loop carry, so no branch splits a tile's fragments
+      # (a traced cond around every fragment ran 1.67x slower; v6e, 32:8 d128,
+      # 8 ragged rows over 16K, paged (512, 2048, 128, 512): 3.78 ms here
+      # against 17.4 with a cond skipping each dead fragment). A live tile
+      # past a q tile's own frontier then scores fully masked fragments, which
+      # leave every anchored row's state exactly as it was. Tile 0 is peeled,
+      # so the carry always holds a pending PV, and each head compiles at most
+      # two tile bodies whatever bkv / bkv_compute is. Fewer tiles than the
+      # block's run here, so with two tiles per block only tile 0 does and no
+      # loop is built. The pending PV also crosses from one head to the next,
+      # as on the fused pipeline.
+      heads = range(head_fold) if static_g is None else (static_g,)
+      last_q_tile = num_q_compute_tiles - 1
+      has_tile_loop = num_k_compute_tiles > 2
+      last_live_tile = num_live_tiles - 1 if has_tile_loop else 0
+
+      def _tile_fragments(g, kv_compute_index, is_tile_zero, pending_pv):
+        for q_compute_index in range(num_q_compute_tiles):
+          logits = _qk(g, kv_compute_index, q_compute_index)
+          probs, is_row_start, rescale = _online_softmax(
+              g, kv_compute_index, q_compute_index, logits, is_causal,
+              guard_recovery=guard_recovery, apply_bounds=True,
+              is_tile_zero=is_tile_zero,
+              last_kv_tile=None if has_tile_loop else 0,
+          )
+          if pending_pv is not None:
+            _pv(*pending_pv)
+          pending_pv = (g, kv_compute_index, q_compute_index, probs,
+                        is_row_start, rescale, is_tile_zero)
+        return pending_pv
+
+      pending_pv = None
+      for g in heads:
+        pending_pv = _tile_fragments(g, 0, True, pending_pv)
+        if has_tile_loop:
+          def _tile_step(kv_compute_index, carry, g=g):
+            # Note (david): the carried PV is the previous tile's, which is
+            # tile 0 on the first iteration, so its parity stays runtime.
+            pending = (g, kv_compute_index - 1, last_q_tile, *carry, None)
+            *_, probs, is_row_start, rescale, _ = _tile_fragments(
+                g, kv_compute_index, False, pending)
+            return probs, is_row_start, rescale
+
+          carry = lax.fori_loop(
+              1, num_live_tiles, _tile_step, tuple(pending_pv[3:6]))
+          pending_pv = (g, last_live_tile, last_q_tile, *carry, None)
+      _pv(*pending_pv)
+      if has_tile_loop and not guard_recovery:
+        # Note (david): every tile step scores all q tiles, so once the loop
+        # ends each head's new-parity row sums are its last live tile's; one
+        # check of them replaces a check per fragment with a runtime tile
+        # compare.
+        for g in heads:
+          new_parity, _ = _head_parities(g)
+          _flag_overflow_risk(
+              g, row_sum_scratch[new_parity, pl.ds(g * group_bq, group_bq), :],
+              True)
+
     def _run_schedule(is_causal, guard_recovery, static_g, apply_bounds,
-                      window_fragments=None):
+                      window_fragments=None, skips_dead_tiles=False):
       # Note (david): static_g None is the fast path, one distance-1 pipeline
       # across every folded head so head g + 1's first QK overlaps head g's
       # last PV. An int static_g is the rare per-head overflow replay, kept
-      # simple on purpose.
+      # simple on purpose. skips_dead_tiles runs a bounds-masked block's live
+      # tiles alone.
+      if skips_dead_tiles:
+        _run_live_tiles(is_causal, guard_recovery, static_g)
+        return
+
       if window_fragments is not None:
         heads = range(head_fold) if static_g is None else (static_g,)
         pending_pv = None
@@ -944,25 +1035,17 @@ def fwd_body(
         (probs_prev, is_row_start_prev, rescale_prev, prev_g, prev_k,
          prev_q) = carry
         current_g, current_k, current_q = _fragment_coords(frag_idx)
-        if skips_past_frontier and apply_bounds:
-          is_active = _is_kv_tile_live(current_k, current_q)
-        else:
-          is_active = True
-
-        def _process_active(_):
-          logits = _qk(_resolve_g(current_g), current_k, current_q)
-          probs_curr, is_row_start_curr, rescale_curr = _online_softmax(
-              _resolve_g(current_g), current_k, current_q, logits, is_causal,
-              guard_recovery=guard_recovery, apply_bounds=apply_bounds,
-          )
-          _pv(
-              _resolve_g(prev_g), prev_k, prev_q, probs_prev,
-              is_row_start_prev, rescale_prev,
-          )
-          return (probs_curr, is_row_start_curr, rescale_curr, current_g,
-                  current_k, current_q)
-
-        return lax.cond(is_active, _process_active, lambda _: carry, operand=None)
+        logits = _qk(_resolve_g(current_g), current_k, current_q)
+        probs_curr, is_row_start_curr, rescale_curr = _online_softmax(
+            _resolve_g(current_g), current_k, current_q, logits, is_causal,
+            guard_recovery=guard_recovery, apply_bounds=apply_bounds,
+        )
+        _pv(
+            _resolve_g(prev_g), prev_k, prev_q, probs_prev,
+            is_row_start_prev, rescale_prev,
+        )
+        return (probs_curr, is_row_start_curr, rescale_curr, current_g,
+                current_k, current_q)
 
       (probs_last, is_row_start_last, rescale_last, last_g, last_k,
        last_q) = lax.fori_loop(
@@ -978,7 +1061,8 @@ def fwd_body(
           rescale_last,
       )
 
-    def _run_group(is_causal, apply_bounds, window_fragments=None):
+    def _run_group(is_causal, apply_bounds, window_fragments=None,
+                   skips_dead_tiles=False):
       if is_lane_paired:
         # Note (david): one static-g pipeline per head, since the fused
         # pipeline's loop-carried g would make the 64-lane window offsets
@@ -987,11 +1071,13 @@ def fwd_body(
           _run_schedule(
               is_causal, guard_recovery=False, static_g=g,
               apply_bounds=apply_bounds, window_fragments=window_fragments,
+              skips_dead_tiles=skips_dead_tiles,
           )
       else:
         _run_schedule(
             is_causal, guard_recovery=False, static_g=None,
             apply_bounds=apply_bounds, window_fragments=window_fragments,
+            skips_dead_tiles=skips_dead_tiles,
         )
 
       for g in range(head_fold):
@@ -1000,7 +1086,21 @@ def fwd_body(
           _run_schedule(
               is_causal, guard_recovery=True, static_g=g,
               apply_bounds=apply_bounds, window_fragments=window_fragments,
+              skips_dead_tiles=skips_dead_tiles,
           )
+
+    def _stage_bounds():
+      # Note (david): synthesize the bounds rows once for the whole (1, bkv)
+      # kv window; evaluated per fragment they spilled vector registers the
+      # MXU then waited on (+13.4% on a 2048/256 prefill). Each kv compute
+      # tile's lanes go to its own slot.
+      k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
+      q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
+      for tile in range(num_k_compute_tiles):
+        tile_lanes = slice(tile * bkv_compute, (tile + 1) * bkv_compute)
+        bounds_buf[tile, 0:1, :] = q_lower[:, tile_lanes]
+        if schedule.has_q_span:
+          bounds_buf[tile, 1:2, :] = q_span[:, tile_lanes]
 
     # Note (david): a mask-free copy of the fragment pipeline and masked ones,
     # because the masks cost about as many VPU ops as the softmax itself: one
@@ -1014,33 +1114,45 @@ def fwd_body(
       needs_any_mask = jnp.logical_or(is_partial, needs_bounds)
     else:
       needs_any_mask = is_partial
-    for is_masked in (False, True):
-      is_selected = (
-          needs_any_mask if is_masked else jnp.logical_not(needs_any_mask))
 
-      if is_masked and window_plans is not None:
-        for block_offset, fragments in window_plans.items():
-          @pl.when(jnp.logical_and(is_selected, kv_tok - q_tok == block_offset))
-          def _run_window_block(fragments=fragments):
-            _run_group(
-                is_causal=True, apply_bounds=False, window_fragments=fragments)
-      else:
-        @pl.when(is_selected)
-        def _run_block(is_masked=is_masked):
-          if is_masked and is_per_seq:
-            # Note (david): synthesize the bounds rows once for the whole
-            # (1, bkv) kv window; evaluated per fragment they spilled vector
-            # registers the MXU then waited on (+13.4% on a 2048/256 prefill).
-            staged_bounds = bounds_buf.at[0]
-            k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
-            q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
-            staged_bounds[0:1, :] = q_lower
-            if schedule.has_q_span:
-              staged_bounds[1:2, :] = q_span
+    @pl.when(jnp.logical_not(needs_any_mask))
+    def _run_unmasked_block():
+      _run_group(is_causal=False, apply_bounds=False)
+
+    # Note (david): a masked block whose every kv compute tile is live runs
+    # the straight-line masked copy, and one whose kv frontier leaves tiles
+    # dead runs the live ones alone (_run_live_tiles). Each tile loop step
+    # ends a basic block, which the fragment pipeline cannot overlap across:
+    # running every masked block through the loop slowed the packed varlen
+    # kernel by 7% (v6e, 32:8 d128, 8 ragged rows over 16K, (512, 1024, 128,
+    # 512): 7.35 against 6.85 ms), whose first block of most sequences is
+    # masked with every tile live.
+    if skips_past_frontier and num_k_compute_tiles > 1:
+      skips_dead_tiles = num_live_tiles < num_k_compute_tiles
+      runs_every_tile = jnp.logical_and(
+          needs_any_mask, jnp.logical_not(skips_dead_tiles))
+
+      @pl.when(jnp.logical_and(needs_any_mask, skips_dead_tiles))
+      def _run_live_tile_block():
+        _stage_bounds()
+        _run_group(is_causal=has_static_mask, apply_bounds=True,
+                   skips_dead_tiles=True)
+    else:
+      runs_every_tile = needs_any_mask
+
+    if window_plans is not None:
+      for block_offset, fragments in window_plans.items():
+        @pl.when(jnp.logical_and(runs_every_tile,
+                                 kv_tok - q_tok == block_offset))
+        def _run_window_block(fragments=fragments):
           _run_group(
-              is_causal=is_masked and has_static_mask,
-              apply_bounds=is_masked and is_per_seq,
-          )
+              is_causal=True, apply_bounds=False, window_fragments=fragments)
+    else:
+      @pl.when(runs_every_tile)
+      def _run_masked_block():
+        if is_per_seq:
+          _stage_bounds()
+        _run_group(is_causal=has_static_mask, apply_bounds=is_per_seq)
 
     def _stage_gqa_folded_lse(row_sum_ref):
       # Note (david): lse is row_max + log2(row_sum) as below. Every lane of a
@@ -1302,7 +1414,7 @@ def fwd_body(
         next_g * num_rows + next_si,
     )
     if is_paged:
-      next_row_paged = (next_kv, next_ctx.seq_idx, next_ctx.kv_end)
+      next_row_paged = (next_kv, next_ctx)
     else:
       next_row_paged = None
     return lax.fori_loop(
@@ -1647,9 +1759,11 @@ def forward_common(
   if is_per_seq:
     # Note (david): the per-seq kernel synthesizes its bounds rows (the q lower
     # bound, plus the span under a left window) once per block in-kernel, so
-    # it needs one slot, not a kv-stream ring. Both rows share one (8, 128)
-    # int32 tile, so the span row costs no extra VMEM.
-    scratch_shapes.append(vmem((1, 2, bkv), jnp.int32))
+    # it needs one block's rows, not a kv-stream ring, in one slot per kv
+    # compute tile for the tile loop. Both rows share one (8, 128) int32
+    # tile, so the span row costs no extra VMEM.
+    scratch_shapes.append(
+        vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32))
   if rotary_dim:
     scratch_shapes += [
         vmem((num_stages, rotary_groups,
