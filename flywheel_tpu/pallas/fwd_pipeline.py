@@ -103,18 +103,17 @@ def fold_sink(
   # row_max)) needs no new anchor: an overflowed term gives 0, the output's
   # limit. lse re-anchors at max(row_max, sink), so exp2(sink - anchor) stays
   # finite when the sink sits far above the static anchor. A row that saw no
-  # key has row_sum 0 (decode) or a masked-score anchor (the
-  # fragment pipeline counts its masked scores against themselves); it
-  # returns out = 0 and lse = sink. A -inf sink is no sink: MASKED_ROW_BOUND
-  # keeps an empty row's anchor finite, so that row returns lse = -inf rather
-  # than NaN.
+  # key has row_sum 0 (decode) or a masked-score anchor (the fragment pipeline
+  # counts its masked scores against themselves). Its only term is the sink,
+  # so it takes the sink as its anchor with row_sum 1: out = 0 and lse = sink,
+  # and a -inf sink gives lse = -inf with no -inf - -inf.
   has_keys = jnp.logical_and(row_sum > 0, row_max > MASKED_ROW_BOUND)
   out_scale = jnp.where(
       has_keys, 1.0 / (row_sum + jnp.exp2(sink - row_max)), 0.0)
-  anchor = jnp.where(has_keys, jnp.maximum(row_max, sink),
-                     jnp.maximum(sink, MASKED_ROW_BOUND))
-  rescale = jnp.where(has_keys, jnp.exp2(row_max - anchor), 0.0)
-  row_sum = row_sum * rescale + jnp.exp2(sink - anchor)
+  anchor = jnp.where(has_keys, jnp.maximum(row_max, sink), sink)
+  row_sum = jnp.where(
+      has_keys,
+      row_sum * jnp.exp2(row_max - anchor) + jnp.exp2(sink - anchor), 1.0)
   return anchor, row_sum, out_scale
 
 
