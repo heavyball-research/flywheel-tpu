@@ -39,12 +39,11 @@ from .block_sizes import NUM_SUBLANES, hbm_bf16_tile_rows
 #   kv_load_end: the frontier rounded up to whole 8-row tiles, the end of the
 #     block's page loads.
 #   page_base: the sequence's first entry of the flat block table.
-#   key_base: the sequence's offset of fwd_body's staging key.
 PER_SEQ_ROW_FIELDS = (
     "q_tok", "q_start", "bottom_right_offset", "kv_start", "kv_base",
     "kv_frontier", "lo", "hi", "mask_from", "unmask_from", "live_tiles_hi",
 )
-PAGED_KV_FIELDS = ("kv_used_end", "kv_load_end", "page_base", "key_base")
+PAGED_KV_FIELDS = ("kv_used_end", "kv_load_end", "page_base")
 # Note (david): the run-wide scalars stored after the rows: the q block
 # count the row loop runs to, and cu_seqlens_q[-1], where the packed padding
 # rows begin.
@@ -136,7 +135,8 @@ class FwdSchedule:
     kv_page: set only by the paged schedule. kv_page(page_base, kv, page) is
       the physical page holding the page-th page of kv block kv of the
       sequence whose block table row starts at page_base (its rows'
-      page_base field).
+      page_base field); a page past the row's end reads the row's last
+      entry.
   """
   num_head_groups: int
   num_rows: int | jax.Array
@@ -629,18 +629,10 @@ def paged_num_kv_blocks(pages_per_seq: int, page_size: int, bkv: int) -> int:
   return -(-(pages_per_seq * page_size) // bkv)
 
 
-def paged_kv_key_strides(num_kv_blocks: int, bkv: int) -> tuple[int, int]:
-  """(per kv block, per kv head) strides of fwd_body's paged staging key,
-  whose last term counts a block's loaded 8-row tiles in [0, bkv // 8]."""
-  block_stride = bkv // NUM_SUBLANES + 1
-  return block_stride, num_kv_blocks * block_stride
-
-
 def paged_schedule_table(
     cu_seqlens_q: jax.Array,
     seqused_k: jax.Array,
     *,
-    num_kv_heads: int,
     padded_total_q: int,
     bq: int,
     bkv: int,
@@ -675,10 +667,10 @@ def paged_schedule_table(
       bq=bq, bkv=bkv, bkv_compute=bkv_compute,
       left=left, right=0 if causal else None,
   )
-  _, head_key_stride = paged_kv_key_strides(num_kv_blocks, bkv)
-  # Note (david): each page DMA is clipped to the 8-aligned tokens below the
-  # frontier, so only pages under kv_load_end are looked up, and the clamp to
-  # the row's capacity keeps every lookup inside the sequence's table row.
+  # Note (david): each page DMA moves the 8-aligned tokens below the frontier
+  # in its page, capped at the row's capacity; a page wholly past
+  # kv_load_end (every page when kv_len == 0) still moves one sublane tile
+  # of a clamped page, which fwd_body discards.
   kv_load_end = jnp.minimum(
       (rows.fields["kv_frontier"] + NUM_SUBLANES - 1) // NUM_SUBLANES
       * NUM_SUBLANES,
@@ -688,7 +680,6 @@ def paged_schedule_table(
       kv_used_end=kv_lens[rows.seq_idx],
       kv_load_end=kv_load_end,
       page_base=rows.seq_idx * pages_per_seq,
-      key_base=rows.seq_idx * (num_kv_heads * head_key_stride),
   )
   table = pack_schedule_table(
       layout, fields, rows.num_rows, rows.packed_q_end)
@@ -816,10 +807,11 @@ def make_paged_fwd_schedule(
   )
 
   def _kv_page(page_base, kv, page):
-    # Note (david): fwd_body looks a page up only when its DMA moves tokens,
-    # i.e. below kv_load_end, which paged_schedule_table keeps within the
-    # row's pages_per_seq pages; so the index needs no clamp.
-    return block_table_ref[page_base + kv * pages_per_block + page]
+    # Note (david): fwd_body issues every page DMA of a block, so a lookup
+    # past the row's last page clamps into the row; fwd_body clamps the entry
+    # into the pool and discards the rows it reads.
+    table_index = jnp.minimum(kv * pages_per_block + page, pages_per_seq - 1)
+    return block_table_ref[page_base + table_index]
 
   return dataclasses.replace(per_seq_schedule, kv_page=_kv_page)
 
