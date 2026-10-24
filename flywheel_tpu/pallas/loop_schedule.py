@@ -75,27 +75,28 @@ class ScheduleTableLayout:
 
 
 class ScheduleRow:
-  """row_interval context of the per-seq schedules: one q block's table row.
-
-  Each attribute (a ScheduleTableLayout field) is read from SMEM where it is
-  used, so the kv loop keeps only the row index live.
+  """row_interval context of the per-seq schedules: one q block's table row,
+  each ScheduleTableLayout field (or constant) an attribute.
   """
 
   def __init__(self, table_ref: jax.Array, layout: ScheduleTableLayout,
                row: jax.Array):
-    self._table_ref = table_ref
-    self._layout = layout
-    self._row = row
+    # Note (david): row_interval builds a row outside the kv loop, so every
+    # field is loaded from SMEM once per q block row. Loading each where the
+    # kv step uses it measured 0.5-1.1% slower (v6e, 32:8 d128, 8 ragged
+    # rows over 16K, paged: 5.296 against 5.255 ms at (1024, 512, 256, 512),
+    # 4.167 against 4.140 at (512, 1024, 128, 512)).
+    values = dict(layout.constants)
+    for index, name in enumerate(layout.fields):
+      values[name] = table_ref[index * layout.num_rows + row]
+    self._values = values
 
   def __getattr__(self, name: str) -> jax.Array | int:
     # Note (david): only reached for names that are not instance attributes.
-    constants = dict(self._layout.constants)
-    if name in constants:
-      return constants[name]
-    if name not in self._layout.fields:
+    values = self.__dict__.get("_values", {})
+    if name not in values:
       raise AttributeError(name)
-    return self._table_ref[
-        self._layout.fields.index(name) * self._layout.num_rows + self._row]
+    return values[name]
 
 
 BlockIndex = jax.Array | int
