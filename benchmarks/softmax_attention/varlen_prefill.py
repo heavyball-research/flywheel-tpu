@@ -190,9 +190,8 @@ def build_flywheel(cell, inputs, args):
     from flywheel_tpu import flash_attn_varlen_func
 
     lengths = cell.lengths
-    # Note (david): flash_attn_with_kvcache sizes its tiles for a packed call
-    # by max_seqlen_q = total_q, so this calls the paged kernel directly with
-    # the longest sequence, as FlashAttention's varlen callers pass it.
+    # Note (david): the read-only paged kernel alone, with the longest
+    # sequence as max_seqlen, as FlashAttention's varlen callers run it.
     max_seqlen = max(lengths)
     table = np.asarray(inputs.block_table)
     token_rows = np.concatenate([
