@@ -638,6 +638,7 @@ def test_flash_attn_kvcache(
         cache_batch_idx=cache_batch_idx,
         block_table=page_table,
         cu_seqlens_q=cu_seqlens_q,
+        max_seqlen_q=max_seqlen_q,
         causal=causal,
         window_size=window_size,
         softcap=softcap,

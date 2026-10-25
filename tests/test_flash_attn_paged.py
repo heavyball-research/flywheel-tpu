@@ -160,6 +160,7 @@ def run_extend(q, kc, vc, k, v, cu, lengths, table, *, return_lse=True,
   *attention_outputs, kv_cache = flash_attn_with_kvcache(
       q, interleave(kc, vc), None, k, v, block_table=table,
       cache_seqlens=lengths, cu_seqlens_q=cu,
+      max_seqlen_q=max(1, int(np.diff(np.asarray(cu)).max(initial=0))),
       return_softmax_lse=return_lse, interpret=INTERPRET, **kwargs)
   return (attention_outputs[0],
           attention_outputs[1] if return_lse else None,
@@ -340,6 +341,29 @@ def test_empty_packed_allocation(append):
                               causal=True)
   actual = run_extend(q, kc, vc, k, v, cu, lengths, table, causal=True)
   assert_extend_matches(actual, expected, cu, lengths)
+
+
+@pytest.mark.parametrize("max_seqlen_q", [None, 0, 5.0])
+def test_packed_call_needs_max_seqlen_q(max_seqlen_q):
+  # Note (david): q.shape[0] counts every packed request, so it cannot stand
+  # in for the longest one; as in FlashAttention-3, a packed call passes it.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
+  with pytest.raises(ValueError, match="max_seqlen_q must be a positive"):
+    flash_attn_with_kvcache(
+        q, interleave(kc, vc), None, k, v, block_table=table,
+        cache_seqlens=lengths, cu_seqlens_q=cu, max_seqlen_q=max_seqlen_q,
+        interpret=INTERPRET)
+
+
+def test_unpacked_call_rejects_max_seqlen_q():
+  q, kc, vc, k, v, _, lengths, table = random_ragged_case(
+      lengths=(4, 4, 4), padding=0)
+  batch = table.shape[0]
+  q, k, v = (rows.reshape(batch, 4, *rows.shape[1:]) for rows in (q, k, v))
+  with pytest.raises(ValueError, match="max_seqlen_q is only for a packed q"):
+    flash_attn_with_kvcache(
+        q, interleave(kc, vc), None, k, v, block_table=table,
+        cache_seqlens=lengths, max_seqlen_q=4, interpret=INTERPRET)
 
 
 @pytest.mark.parametrize("heads,kv_heads", [(132, 6), (128, 8)])
