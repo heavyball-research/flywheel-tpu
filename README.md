@@ -32,7 +32,7 @@ linear attention.
 
 ```bash
 pip install flywheel-tpu            # CPU, Pallas interpret mode
-pip install "flywheel-tpu[tpu]"     # TPU VM, adds jax[tpu]>=0.11.0
+pip install "flywheel-tpu[tpu]"     # TPU VM, adds jax[tpu]>=0.11.2
 ```
 
 From source, with [uv](https://github.com/astral-sh/uv) (needed for the
