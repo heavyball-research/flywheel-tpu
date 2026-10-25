@@ -71,6 +71,23 @@ MAX_FRAGMENT_ROWS = 1024
 # 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
 # 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
+# Note (david): a sequence shorter than block_q still fills a whole q block,
+# and the tiles cannot follow the lengths: they are static, and a server pads
+# cu_seqlens_q to its request slots. So block_q is fixed at 512, below the
+# longest sequence's 1024 that streamed its kv prefix the fewest times. v6e,
+# 32:8 heads, prefill batches of 16K-128K tokens: 512 x 1024 beat 1024 x 512
+# on every batch, by 7-26% on sequences of 8K-16K and by 1.35-1.6x on batches
+# of mostly short ones (128 x 16K tokens of 103..3298 at d128: 3.56 against
+# 5.69 ms).
+PAGED_MAX_BLOCK_Q = 512
+# Note (david): block_kv aims at four q blocks, at most 1024, and where the
+# block area caps the pair, block_kv is kept and block_q shrinks. At 32:8,
+# 256 x 1024 beat 256 x 512 on four of six d128 batches (by 3-8%). At 32:4 the
+# cap leaves 512 x 512 or 256 x 1024, and 256 x 1024 was as fast or faster on
+# all seven d128 / d256 batches (by up to 1.5x); at 32:2, 128 x 1024 beat
+# 256 x 512 on six of seven (by 2-39%, 8% slower on the seventh).
+PAGED_KV_PER_Q_BLOCK = 4
+PAGED_MAX_BLOCK_KV = 1024
 # Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
 # dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
 # by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
@@ -222,12 +239,16 @@ def resolve_paged_tiles(
 
   Among the builds whose TPU staging fits vmem_limit_bytes() and whose
   (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
-  one that streams the longest sequence's kv prefix the fewest times, then the
-  smaller q block, then the larger kv block. The q compute tile keeps a
-  fragment within MAX_FRAGMENT_ROWS rows. has_window caps both blocks at
-  PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page. A pinned
-  block_sizes is only checked against the budget.
+  largest kv block at most a kv target, then the largest q block at most a q
+  target; with none at most a target, the smallest above it. The q target is
+  the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
+  PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
+  tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
+  blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
+  A pinned block_sizes is only checked against the budget.
   """
+  target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
+  target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
   else:
@@ -284,11 +305,12 @@ def resolve_paged_tiles(
         f" bytes at {head_dim=}."
     )
 
-  def _prefix_streams(blocks):
-    return (-(-max_seqlen_q_bucket // blocks.block_q), blocks.block_q,
-            -blocks.block_kv)
+  def _nearest_below(size, target):
+    return (size <= target, size if size <= target else -size)
 
-  return min(fitting, key=_prefix_streams)
+  return max(fitting, key=lambda blocks: (
+      _nearest_below(blocks.block_kv, target_kv),
+      _nearest_below(blocks.block_q, target_q)))
 
 
 def flash_attn_varlen_paged(
