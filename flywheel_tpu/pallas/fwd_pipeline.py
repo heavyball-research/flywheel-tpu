@@ -499,20 +499,25 @@ def fwd_body(
       for kv_part, plane_rows in enumerate((k_rows, v_rows)):
         kv_planes[kv_part, tile_rows, :] = plane_rows.astype(kv_planes.dtype)
 
-  # Note (david): the kv stream prefetches two blocks ahead. Block j of the
-  # flattened (group, row, kv) block order stages in ring slot
-  # j % NUM_KV_STAGES; its step waits for it before dispatching a copy, and
-  # every copy of block j starts block j + 2's DMAs. That slot last held block
-  # j - 1, which no copy of block j reads (its pending PV reads pending_v), so
-  # the start may land anywhere in the copy. Mosaic's scheduler sinks a DMA
-  # start towards its wait, so a start and wait in one basic block leave the
-  # DMA no time to land, and a wait inside a copy splits the copy into two
-  # basic blocks, each with its own pipeline fill and drain (v6e, 512 x 512
-  # blocks: 1574 + 1553 cycles against 2330 for the whole copy). Started two
-  # blocks ahead, the page DMAs' scalar work rides the copy's idle scalar
-  # slots. Two rows that share a block load it twice, and the grid's last
-  # blocks prefetch blocks they already ran, which the kernel waits out after
-  # its loop.
+  # Note (david): the kv stream prefetches two blocks ahead. The blocks of the
+  # flattened (group, row, kv) block order stage in a NUM_KV_STAGES ring that
+  # advances once per issued DMA: a fresh block (one whose descriptor differs
+  # from the previous block's) takes the slot after the previous block's,
+  # and a block that is not fresh runs from the previous block's slot (see
+  # reuses_blocks below). Block j's step waits for its data when it is fresh,
+  # before dispatching a copy, and starts block j + 2's DMAs when that block
+  # is fresh. Blocks j and j + 1 hold at most two slots, so the slot block
+  # j + 2 takes last held a block before j, which no copy of block j reads
+  # (its pending PV reads pending_v), and the start may land anywhere in the
+  # step. Mosaic's scheduler sinks a DMA start towards its wait, so a start
+  # and wait in one basic block leave the DMA no time to land, and a wait
+  # inside a copy splits the copy into two basic blocks, each with its own
+  # pipeline fill and drain (v6e, 512 x 512 blocks: 1574 + 1553 cycles
+  # against 2330 for the whole copy). A path that loads every block starts
+  # the DMAs inside the copy, where the page DMAs' scalar work rides the
+  # copy's idle scalar slots; a reusing path starts them at the top of the
+  # step, under the freshness branch. The grid's last blocks prefetch blocks
+  # they already ran, which the kernel waits out after its loop.
   def _block_desc(head, kv, ctx):
     """The DMA inputs of kv block kv of head's group in the row of ctx."""
     kv_head = _kv_head_of(head)
@@ -529,6 +534,26 @@ def fwd_body(
   def _select_desc(predicate, desc_true, desc_false):
     return tuple(jnp.where(predicate, field_true, field_false)
                  for field_true, field_false in zip(desc_true, desc_false))
+
+  # Note (david): a block whose DMA inputs equal the previous block's in the
+  # flattened order (the q heads of one kv head over one-block rows, or two
+  # rows that share a kv block) holds the same staged data, so it skips its
+  # DMA and runs from the previous block's ring slot; dense GQA at one kv
+  # block per row otherwise re-staged each block once per q head (v6e, 32:4
+  # heads, d256, 1024 tokens: 63.4 against 60.6 us). A paged block keeps its
+  # DMA starts inside the copy, and a rotary K is rotated in place inside the
+  # copy, so both load every block.
+  reuses_blocks = not is_paged and not (rotary_dim and rotary_k)
+
+  def _is_fresh(desc, prev_desc):
+    if not reuses_blocks:
+      return jnp.bool_(True)
+    differs = [field != prev_field
+               for field, prev_field in zip(desc, prev_desc)]
+    is_different = differs[0]
+    for field_differs in differs[1:]:
+      is_different = jnp.logical_or(is_different, field_differs)
+    return is_different
 
   def _start_block_data(desc, slot):
     if is_paged:
@@ -663,10 +688,13 @@ def fwd_body(
 
   def _block_step(group, si, kv, lo, hi, ctx, row, ahead, carry):
     """ahead holds the descriptors of the next row's first block and of the
-    block after it in the flattened order; carry is (blocks run so far, this
-    block's descriptor, the next block's)."""
+    block after it in the flattened order; carry is (this block's ring slot,
+    the next block's, whether this block is fresh, whether the next one is,
+    this block's descriptor, the next block's). A fresh block has its own
+    DMAs in flight; one that is not runs from the previous block's slot."""
     q_tok, base_head, q_slot = row
-    kv_count, block_desc, next_block_desc = carry
+    (kv_slot, next_slot, is_fresh, is_next_fresh, block_desc,
+     next_block_desc) = carry
     if is_per_seq:
       kv_tok = schedule.kv_token(kv, ctx)
     else:
@@ -694,15 +722,24 @@ def fwd_body(
       new_parity = parity_smem[0]
       return new_parity, 1 - new_parity
 
-    kv_slot = lax.rem(kv_count, NUM_KV_STAGES)
-    ahead_slot = lax.rem(kv_count + 2, NUM_KV_STAGES)
     first_next_row_desc, second_ahead_desc = ahead
     ahead_desc = _select_desc(
         kv + 2 <= hi, _block_desc(base_head, kv + 2, ctx),
         _select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc))
+    is_ahead_fresh = _is_fresh(ahead_desc, next_block_desc).astype(jnp.int32)
+    ahead_slot = jnp.where(
+        is_ahead_fresh > 0, lax.rem(next_slot + 1, NUM_KV_STAGES), next_slot)
     for g in range(head_fold):
       guard_smem[g] = 0
-    _wait_block_data(block_desc, kv_slot)
+
+    @pl.when(is_fresh > 0)
+    def _wait_fresh_block():
+      _wait_block_data(block_desc, kv_slot)
+
+    if reuses_blocks:
+      @pl.when(is_ahead_fresh > 0)
+      def _start_fresh_ahead():
+        _start_block_data(ahead_desc, ahead_slot)
 
     def _qk(g, kv_compute_index, q_compute_index):
       slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
@@ -1119,9 +1156,12 @@ def fwd_body(
                    skips_dead_tiles=False, carries_out=False):
       # Note (david): the copy's first ops in program order; the scheduler
       # overlaps the unpack (or K rotation) with the pending PV, which reads
-      # only scratch, and the DMA start may sink anywhere in the copy.
+      # only scratch. A path that loads every block starts the block two
+      # ahead here, and the start may sink anywhere in the copy; a reusing
+      # path started it at the top of the step.
       _prepare_block_data(block_desc, kv_slot)
-      _start_block_data(ahead_desc, ahead_slot)
+      if not reuses_blocks:
+        _start_block_data(ahead_desc, ahead_slot)
       if is_lane_paired:
         # Note (david): one static-g pipeline per head, since the fused
         # pipeline's loop-carried g would make the 64-lane window offsets
@@ -1220,7 +1260,8 @@ def fwd_body(
           _stage_bounds()
         _run_group(is_causal=has_static_mask, apply_bounds=is_per_seq)
 
-    return kv_count + 1, next_block_desc, ahead_desc
+    return (next_slot, ahead_slot, is_next_fresh, is_ahead_fresh,
+            next_block_desc, ahead_desc)
 
   def _finish_row(group, si, ctx, q_tok, base_head, prev_out_tok,
                   num_out_copies):
@@ -1474,8 +1515,9 @@ def fwd_body(
     lo, hi, ctx = schedule.row_interval(si)
     # Note (david): past the very last row of the last group the lookahead is
     # the current row itself, so the q keys stay equal and nothing is
-    # prefetched; the kv stream then reloads blocks of the last row, which the
-    # kernel waits out after its loop.
+    # prefetched; the kv stream then reloads the last row's first blocks
+    # (unless they match the block before them), which the kernel waits out
+    # after its loop.
     next_g, next_si = _row_after(g, si)
     first_next_desc, second_next_desc, (_, _, next_ctx) = _first_two_blocks(
         next_g, next_si)
@@ -1520,15 +1562,23 @@ def fwd_body(
             num_out_copies + 1)
 
   # Note (david): the first two blocks' data is requested before the loop;
-  # every later block's is started two blocks ahead of it.
+  # every later fresh block's is started two blocks ahead of it. The second
+  # block takes slot 1 when it is fresh and shares slot 0 otherwise.
   _cancel_pending_pv()
   first_desc, second_desc, _ = _first_two_blocks(jnp.int32(0), jnp.int32(0))
   _start_block_data(first_desc, 0)
-  _start_block_data(second_desc, 1)
+  is_second_fresh = _is_fresh(second_desc, first_desc).astype(jnp.int32)
+  second_slot = is_second_fresh
+
+  @pl.when(is_second_fresh > 0)
+  def _start_second():
+    _start_block_data(second_desc, second_slot)
 
   minus_one = jnp.int32(-1)
   zero = jnp.int32(0)
-  init_carry = (minus_one, minus_one, zero, (zero, first_desc, second_desc),
+  init_carry = (minus_one, minus_one, zero,
+                (zero, second_slot, jnp.int32(1), is_second_fresh,
+                 first_desc, second_desc),
                 zero, zero)
   *_, kv_carry, _, num_out_copies = lax.fori_loop(
       0, num_head_groups,
@@ -1537,9 +1587,16 @@ def fwd_body(
           group_carry),
       init_carry,
   )
-  kv_count, last_desc, after_last_desc = kv_carry
-  _wait_block_data(last_desc, lax.rem(kv_count, NUM_KV_STAGES))
-  _wait_block_data(after_last_desc, lax.rem(kv_count + 1, NUM_KV_STAGES))
+  (last_slot, after_last_slot, is_last_fresh, is_after_last_fresh, last_desc,
+   after_last_desc) = kv_carry
+
+  @pl.when(is_last_fresh > 0)
+  def _wait_last():
+    _wait_block_data(last_desc, last_slot)
+
+  @pl.when(is_after_last_fresh > 0)
+  def _wait_after_last():
+    _wait_block_data(after_last_desc, after_last_slot)
 
   drain(num_out_copies, num_stages, lambda slot: _o_copy(0, 0, slot).wait())
 
