@@ -26,7 +26,10 @@ past its own pages repeat its last page.
 
 flywheel runs flash_attn_varlen_func's paged kernel, read-only as in
 FlashAttention, over a cache that already holds the batch's K/V, with
-max_seqlen the longest sequence and flywheel_tpu's own block sizes. rpa runs
+max_seqlen the longest sequence and flywheel_tpu's own block sizes. Every
+impl takes q and returns out token-major, (total, heads, head_dim), as a
+server holds them; flywheel's paged kernel is head-major, so its call also
+transposes q in and out back. rpa runs
 RPA v3's ragged_paged_attention with every sequence mixed and its blocks from
 rpa_tuned_<chip>.json at the next_pow2(max_seqlen) bucket, else its formula.
 batched_rpa runs vllm-torchtpu's batched RPA (--torchtpu-source) with its
@@ -212,16 +215,19 @@ def build_flywheel(cell, inputs, args):
             cell.head_dim)
 
     cache = jax.block_until_ready(fill(inputs.k, inputs.v))
-    q_head_major = jax.block_until_ready(jnp.transpose(inputs.q, (1, 0, 2)))
 
     def call(cache, q, cu_q_lens, block_table, kv_lens):
-        return flash_attn_varlen_func(
-            q, cache, None, cu_q_lens, None, max_seqlen, max_seqlen,
-            causal=True, block_table=block_table, seqused_k=kv_lens,
-            nheads_k=cell.heads_k)
+        # Note (david): a server holds q and out token-major, as both RPAs
+        # take them, and the paged kernel is head-major only, so the two
+        # relayouts are part of the call.
+        out = flash_attn_varlen_func(
+            jnp.transpose(q, (1, 0, 2)), cache, None, cu_q_lens, None,
+            max_seqlen, max_seqlen, causal=True, block_table=block_table,
+            seqused_k=kv_lens, nheads_k=cell.heads_k)
+        return jnp.transpose(out, (1, 0, 2))
 
     kernel = jax.jit(call)
-    operands = (q_head_major, inputs.cu_q_lens, inputs.block_table,
+    operands = (inputs.q, inputs.cu_q_lens, inputs.block_table,
                 inputs.kv_lens)
     return ((lambda cache: (kernel(cache, *operands), cache)),
             (lambda: cache), {})
