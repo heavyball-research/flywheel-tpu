@@ -346,7 +346,7 @@ def test_empty_packed_allocation(append):
 @pytest.mark.parametrize("max_seqlen_q", [None, 0, 5.0])
 def test_packed_call_needs_max_seqlen_q(max_seqlen_q):
   # Note (david): q.shape[0] counts every packed request, so it cannot stand
-  # in for the longest one; as in FlashAttention-3, a packed call passes it.
+  # in for the longest one.
   q, kc, vc, k, v, cu, lengths, table = random_ragged_case()
   with pytest.raises(ValueError, match="max_seqlen_q must be a positive"):
     flash_attn_with_kvcache(

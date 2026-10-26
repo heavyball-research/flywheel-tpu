@@ -52,7 +52,10 @@ import json
 import math
 import pathlib
 import sys
+from collections.abc import Callable
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 
 from benchmarks.common.records import recorded, write_record
@@ -71,27 +74,33 @@ from benchmarks.softmax_attention.kvcache_scenarios import (
     draw,
     trace_scenario,
 )
+from flywheel_tpu import flash_attn_varlen_func
+from flywheel_tpu.pallas.block_sizes import next_pow2
 
 IMPLS = ("flywheel", "rpa", "batched_rpa")
 PATTERNS = ("uniform", "spiky", "longtail")
 
+Step = Callable[[jax.Array], tuple[jax.Array, jax.Array]]
+BuildInfo = dict[str, str | int | list[int]]
 
-def pattern_weights(pattern, batch):
-    """FlashAttention benchmarks/clc_bench.py pattern_weights."""
+
+def pattern_weights(pattern: str, batch: int) -> list[float]:
+    """Relative sequence lengths of a pattern."""
     if pattern == "uniform":
         return [1.0] * batch
-    if pattern == "spiky":
+    elif pattern == "spiky":
         return [32.0] + [1.0] * (batch - 1)
-    if pattern == "longtail":
+    elif pattern == "longtail":
         return [float(batch - index) for index in range(batch)]
-    raise ValueError(f"unsupported pattern: {pattern}")
+    else:
+        raise ValueError(f"unsupported pattern: {pattern}")
 
 
-def split_budget(weights, total_tokens):
-    """clc_bench.py normalize_lengths: weights -> lengths summing to the budget.
+def split_budget(weights: list[float], total_tokens: int) -> list[int]:
+    """Lengths in proportion to weights that sum exactly to total_tokens.
 
     Floor each share, then hand out (or take back) the remainder one token at a
-    time in order of the dropped fraction, so the total is exact.
+    time in order of the dropped fraction.
     """
     if total_tokens < len(weights):
         raise ValueError(f"budget {total_tokens} below batch {len(weights)}")
@@ -126,36 +135,31 @@ class Cell:
     page_size: int
 
     @property
-    def key(self):
+    def key(self) -> str:
         return (f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
                 f"-{self.pattern}-b{self.batch}-t{self.budget}"
                 f"-p{self.page_size}")
 
     @property
-    def lengths(self):
+    def lengths(self) -> list[int]:
         return split_budget(pattern_weights(self.pattern, self.batch),
                             self.budget)
 
 
 @dataclasses.dataclass(frozen=True)
 class Inputs:
-    q: object
-    k: object
-    v: object
-    kv_lens: object
-    cu_q_lens: object
-    block_table: object
+    q: jax.Array
+    k: jax.Array
+    v: jax.Array
+    kv_lens: jax.Array
+    cu_q_lens: jax.Array
+    block_table: jax.Array
     num_pages: int
 
 
-def make_inputs(cell):
+def make_inputs(cell: Cell) -> Inputs:
     """Packed q, k, v, the ragged metadata and the page table, shared by every
     impl: the seed leaves the impl out, so each sees the same numbers."""
-    import jax
-    import jax.numpy as jnp
-
-    from flywheel_tpu.pallas.block_sizes import next_pow2
-
     lengths = cell.lengths
     seed = 0
     for part in (cell.heads, cell.heads_k, cell.head_dim, cell.batch,
@@ -184,17 +188,13 @@ def make_inputs(cell):
         jnp.asarray(cu_q_lens), jnp.asarray(table), num_pages))
 
 
-def build_flywheel(cell, inputs, args):
+def build_flywheel(
+    cell: Cell, inputs: Inputs, args: argparse.Namespace
+) -> tuple[Step, Callable[[], jax.Array], BuildInfo]:
     """(step, fresh_state, info) running flash_attn_varlen_func's paged
     kernel over a cache that holds the batch's K/V."""
-    import jax
-    import jax.numpy as jnp
-
-    from flywheel_tpu import flash_attn_varlen_func
-
     lengths = cell.lengths
-    # Note (david): the read-only paged kernel alone, with the longest
-    # sequence as max_seqlen, as FlashAttention's varlen callers run it.
+    # Note (david): varlen callers pass the longest sequence as max_seqlen.
     max_seqlen = max(lengths)
     table = np.asarray(inputs.block_table)
     token_rows = np.concatenate([
@@ -233,27 +233,28 @@ def build_flywheel(cell, inputs, args):
             (lambda: cache), {})
 
 
-def rpa_table_blocks(path, cell, bucket):
+def rpa_table_blocks(
+    path: pathlib.Path, cell: Cell, bucket: int
+) -> dict[str, int] | None:
     """The tuned RPA table's entry at this head config and bucket as
     {field: value}, or None. The table has no mask level."""
-    if not path.exists():
+    if path.exists():
+        table = json.loads(path.read_text())
+        head = (f"q_head-{cell.heads}_kv_head-{cell.heads_k}"
+                f"_head-{cell.head_dim}")
+        values = table["configs"].get(head, {}).get(str(bucket))
+        if values is None:
+            return None
+        else:
+            return dict(zip(table["block_order"], values))
+    else:
         return None
-    table = json.loads(path.read_text())
-    head = (f"q_head-{cell.heads}_kv_head-{cell.heads_k}"
-            f"_head-{cell.head_dim}")
-    values = table["configs"].get(head, {}).get(str(bucket))
-    if values is None:
-        return None
-    return dict(zip(table["block_order"], values))
 
 
-def build_rpa(cell, inputs, args):
+def build_rpa(
+    cell: Cell, inputs: Inputs, args: argparse.Namespace
+) -> tuple[Step, Callable[[], jax.Array], BuildInfo]:
     """(step, fresh_state, info) running ragged_paged_attention."""
-    import jax
-    import jax.numpy as jnp
-
-    from flywheel_tpu.pallas.block_sizes import next_pow2
-
     rpa = load_rpa_v3(args.rpa_source)
     shape = rpa.get_kv_cache_shape(inputs.num_pages, cell.page_size,
                                    cell.heads_k, cell.head_dim,
@@ -288,11 +289,10 @@ def build_rpa(cell, inputs, args):
             (lambda: jnp.zeros(shape, jnp.bfloat16)), info)
 
 
-def build_batched_rpa(cell, inputs, args):
+def build_batched_rpa(
+    cell: Cell, inputs: Inputs, args: argparse.Namespace
+) -> tuple[Step, Callable[[], jax.Array], BuildInfo]:
     """(step, fresh_state, info) running vllm-torchtpu's batched RPA."""
-    import jax
-    import jax.numpy as jnp
-
     if args.torchtpu_source is None:
         raise ValueError("--impl batched_rpa needs --torchtpu-source.")
     wrapper = load_batched_rpa(args.torchtpu_source)
@@ -321,7 +321,7 @@ BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa,
             "batched_rpa": build_batched_rpa}
 
 
-def run(cell, args):
+def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
     lengths = cell.lengths
     pairs = sum(length * (length + 1) // 2 for length in lengths)
     attn_flops = 4 * pairs * cell.heads * cell.head_dim
@@ -359,7 +359,7 @@ def run(cell, args):
     return record
 
 
-def main(argv=None):
+def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cell = Cell(args.impl, args.heads, args.heads_k, args.head_dim,
                 args.pattern, args.batch, args.budget, args.page_size)
@@ -367,8 +367,6 @@ def main(argv=None):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
     if cell.impl == "rpa" and args.rpa_table is None:
-        import jax
-
         args.rpa_table = tuned_table("rpa", jax.devices()[0].device_kind)
     record = run(cell, args)
     if args.output:
@@ -377,7 +375,7 @@ def main(argv=None):
     return 0 if record["status"] == "ok" else 1
 
 
-def parse_args(argv=None):
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)

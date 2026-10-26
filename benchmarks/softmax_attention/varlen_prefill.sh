@@ -2,7 +2,7 @@
 # Time ragged prefill batches over a paged KV cache for flywheel, RPA v3 and
 # vllm-torchtpu's batched RPA, with a profiler trace per cell.
 #
-# A token budget is split across `batch` sequences by a pattern's weights
+# A token budget is split across a batch of sequences by a pattern's weights
 # (uniform, spiky, longtail; see varlen_prefill.py), so every pattern at the
 # same (budget, batch) packs the same tokens and differs only in shape. The
 # impls of one cell run back to back.

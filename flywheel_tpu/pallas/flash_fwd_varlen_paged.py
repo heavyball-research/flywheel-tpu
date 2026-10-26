@@ -72,20 +72,14 @@ MAX_FRAGMENT_ROWS = 1024
 # 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
 # Note (david): a sequence shorter than block_q still fills a whole q block,
-# and the tiles cannot follow the lengths: they are static, and a server pads
-# cu_seqlens_q to its request slots. So block_q is fixed at 512, below the
-# longest sequence's 1024 that streamed its kv prefix the fewest times. v6e,
-# 32:8 heads, prefill batches of 16K-128K tokens: 512 x 1024 beat 1024 x 512
-# on every batch, by 7-26% on sequences of 8K-16K and by 1.35-1.6x on batches
-# of mostly short ones (128 x 16K tokens of 103..3298 at d128: 3.56 against
-# 5.69 ms).
+# and a server pads cu_seqlens_q to its request slots, so block_q cannot
+# follow the longest sequence. v6e, 32:8 d128, 16K-128K token batches:
+# 512 x 1024 beat 1024 x 512 on every batch, by 1.35-1.6x on mostly short
+# sequences (3.56 against 5.69 ms).
 PAGED_MAX_BLOCK_Q = 512
-# Note (david): block_kv aims at four q blocks, at most 1024, and where the
-# block area caps the pair, block_kv is kept and block_q shrinks. At 32:8,
-# 256 x 1024 beat 256 x 512 on four of six d128 batches (by 3-8%). At 32:4 the
-# cap leaves 512 x 512 or 256 x 1024, and 256 x 1024 was as fast or faster on
-# all seven d128 / d256 batches (by up to 1.5x); at 32:2, 128 x 1024 beat
-# 256 x 512 on six of seven (by 2-39%, 8% slower on the seventh).
+# Note (david): where the block area caps the pair, keeping block_kv and
+# shrinking block_q won: 256 x 1024 beat 512 x 512 by up to 1.5x at 32:4, and
+# 128 x 1024 beat 256 x 512 on six of seven batches at 32:2 (v6e).
 PAGED_KV_PER_Q_BLOCK = 4
 PAGED_MAX_BLOCK_KV = 1024
 # Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
@@ -452,10 +446,8 @@ def flash_attn_varlen_paged(
     padded_rotary = (
         jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))), None)
 
-  # Note (david): the schedule is resolved here, once per call, into one table
-  # row per q block (window, kv frontier, interval, flags, page base), so the
-  # kernel reads its block's row instead of searching the cu_seqlens and
-  # redoing the arithmetic in every q block.
+  # Note (david): resolving the schedule once per call spares every q block
+  # a search of the cu_seqlens and its window arithmetic.
   table, layout = paged_schedule_table(
       cu_seqlens_q, seqused_k,
       padded_total_q=padded_total_q,

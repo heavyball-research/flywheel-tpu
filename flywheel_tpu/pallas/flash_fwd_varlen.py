@@ -75,10 +75,8 @@ def flash_attn_forward_varlen(
     )
   # Note (david): padding rows past cu_seqlens_q[-1] own no q block and come
   # back out = 0, lse = -inf, so they cost no attention; kv tokens past
-  # cu_seqlens_k[-1] are masked wherever a block loads them. The schedule is
-  # resolved here, once per call, into one table row per q block, so the
-  # kernel reads its block's row instead of searching the cu_seqlens and
-  # redoing the arithmetic.
+  # cu_seqlens_k[-1] are masked wherever a block loads them. Resolving the
+  # schedule once per call spares every q block a search of the cu_seqlens.
   table, layout = varlen_schedule_table(
       cu_seqlens_q, cu_seqlens_k, varlen_sched=varlen_sched,
       bq=block_sizes.block_q, bkv=block_sizes.block_kv,
