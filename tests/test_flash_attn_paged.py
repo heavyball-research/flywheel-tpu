@@ -723,6 +723,47 @@ def test_paged_attention_sinks(entry, heads, kv_heads, window_left, softcap):
   assert_extend_matches(actual, expected, case[5], case[6])
 
 
+@pytest.mark.parametrize("append", [False, True])
+@pytest.mark.parametrize("heads,kv_heads,seqlen_q",
+                         [(32, 8, 4), (8, 1, 16), (6, 3, 3), (64, 8, 4)])
+def test_verify_window_attention_sinks(heads, kv_heads, seqlen_q, append):
+  # Note (deepolar): the decode kernel folds window token t of query head
+  # h * group + j into row (h * seqlen_q + t) * group + j, so a sink indexed by
+  # the folded row instead of its query head fails the check.
+  q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+      lengths=(seqlen_q,) * 4, prefixes=(128, 256 - seqlen_q + 1, 127, 200),
+      heads=heads, kv_heads=kv_heads, padding=0)
+  batch = table.shape[0]
+  num_active = 3
+  active_rows = num_active * seqlen_q
+  sinks = jnp.asarray(
+      np.random.default_rng(3).uniform(-2.0, 8.0, heads), jnp.float32)
+  if append:
+    reference_k, reference_v = k[:active_rows], v[:active_rows]
+    window_k, window_v = (
+        rows.reshape(batch, seqlen_q, *rows.shape[1:]) for rows in (k, v))
+  else:
+    reference_k = reference_v = window_k = window_v = None
+  expected = ragged_reference(
+      q[:active_rows], kc, vc, reference_k, reference_v, cu[:num_active + 1],
+      lengths[:num_active], table, causal=True, sinks=sinks)
+
+  def _window_attention(kv_cache):
+    return flash_attn_with_kvcache(
+        q.reshape(batch, seqlen_q, *q.shape[1:]), kv_cache, None, window_k,
+        window_v, block_table=table, cache_seqlens=lengths,
+        num_active=num_active, causal=True, return_softmax_lse=True,
+        learnable_sink=sinks, interpret=INTERPRET)
+
+  jaxpr = str(jax.make_jaxpr(_window_attention)(interleave(kc, vc)))
+  assert "flash_attn_varlen_paged_fwd" not in jaxpr
+  out, lse, kv_cache = _window_attention(interleave(kc, vc))
+  actual = (out.reshape(q.shape), lse.transpose(1, 0, 2).reshape(heads, -1),
+            *deinterleave(kv_cache))
+  assert_extend_matches(actual, expected, cu[:num_active + 1],
+                        lengths[:num_active])
+
+
 @pytest.mark.parametrize("window_left", [127, None])
 def test_paged_decode_attention_sinks_gpt_oss(window_left):
   # Note (deepolar): gpt-oss decodes 64 q heads on 8 kv heads at head_dim 64;
