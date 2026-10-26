@@ -3,6 +3,7 @@
 import math
 from collections.abc import Callable, Sequence
 from functools import partial
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -85,6 +86,22 @@ MIN_GUARD_THRESHOLD_NATS = 20.0
 MASKED_ROW_BOUND = 0.5 * DEFAULT_MASK_VALUE
 UNANCHORED_ROW_MAX = -DEFAULT_MASK_VALUE
 UNANCHORED_ROW_BOUND = -MASKED_ROW_BOUND
+
+
+class RowFinish(NamedTuple):
+  """What a q block row's output finish needs once its last PV has run: the
+  row (si, its window start q_tok, its group's first head), the rows its
+  stage blends from the previous output block, that block's q_tok, the row's
+  output copy count and the parity of its final row state. is_live 0 marks no
+  row (before the first one)."""
+  is_live: jax.Array
+  si: jax.Array
+  q_tok: jax.Array
+  base_head: jax.Array
+  num_blend_rows: jax.Array
+  prev_out_tok: jax.Array
+  out_count: jax.Array
+  parity: jax.Array
 
 
 def overflow_guard_threshold(kv_seq_len: int) -> float:
@@ -244,6 +261,14 @@ def fwd_body(
   # while later keys stay visible; anchoring on that masked score would push
   # the row's first visible key past the guard into a replay.
   defers_row_start = window[0] is not None or schedule.has_q_span
+  # Note (david): a per-seq row is often one or two blocks (a sequence of a
+  # few hundred tokens), so its fixed row-end work is paid every block or two:
+  # on v6e (32:8 d128, 512 x 512 tiles, 1024 one-tile rows) each row cost
+  # 0.97 us on top of its 1.89 us tile, 0.50 of it the last PV that nothing
+  # overlapped and 0.20 the output finish. The per-seq kernels therefore
+  # pipeline across rows (see the cross-row note below); the dense kernel's
+  # rows are long and keep the row-end drain.
+  defers_row_finish = is_per_seq
 
   if token_major is None:
     width_qk = width_v = q_heads_per_row = kv_heads_per_row = None
@@ -673,6 +698,16 @@ def fwd_body(
   # the replay still finds block k's entry state in the old parity and two
   # row-state parities suffice; a replay of the last head rewrites the
   # pending fragment itself, so it cancels the pending PV.
+  # Cross-row (defers_row_finish): every copy carries its last PV out, so a
+  # row's last PV rides the next row's first block like any other block's,
+  # and the row's output finish (normalize, blend, output DMA) runs right
+  # after that block, once the PV has landed. The row end only stages the lse,
+  # whose row_max and row_sum are final after the last softmax. For the
+  # finish to find the row's final o and row_sum, rows alternate parity: a
+  # row's first block writes the parity the previous row did not end on, and
+  # its second block, the first to write that parity again, runs after the
+  # finish. A row start discards the old parity it reads, so the alternation
+  # changes no values.
   pending_g, pending_k, pending_q = (
       head_fold - 1, num_k_compute_tiles - 1, num_q_compute_tiles - 1)
 
@@ -687,12 +722,14 @@ def fwd_body(
     pending_smem[PENDING_READ_PARITY] = TRASH_PARITY
 
   def _block_step(group, si, kv, lo, hi, ctx, row, ahead, carry):
-    """ahead holds the descriptors of the next row's first block and of the
-    block after it in the flattened order; carry is (this block's ring slot,
-    the next block's, whether this block is fresh, whether the next one is,
-    this block's descriptor, the next block's). A fresh block has its own
-    DMAs in flight; one that is not runs from the previous block's slot."""
-    q_tok, base_head, q_slot = row
+    """row is (q_tok, base_head, q_slot, the row's first block's new parity,
+    the previous row's RowFinish under defers_row_finish, else None); ahead
+    holds the descriptors of the next row's first block and of the block
+    after it in the flattened order; carry is (this block's ring slot, the
+    next block's, whether this block is fresh, whether the next one is, this
+    block's descriptor, the next block's). A fresh block has its own DMAs in
+    flight; one that is not runs from the previous block's slot."""
+    q_tok, base_head, q_slot, row_parity, prev_row_finish = row
     (kv_slot, next_slot, is_fresh, is_next_fresh, block_desc,
      next_block_desc) = carry
     if is_per_seq:
@@ -710,13 +747,14 @@ def fwd_body(
     # Note (david): row_sum and o scratch ping-pong, so a block's first kv tile
     # reads the previous block's exit state while later tiles update in place.
     # Every head of a group steps blocks together, so the parity is the
-    # block's offset in the row; each head keeps its own guard flag, so one
-    # head's overflow never replays another. The parity is re-read from SMEM
-    # at every use: computed once as a loop value, it lengthened every
-    # fragment-pipeline copy's schedule by about 30% (v6e, 512 x 512 paged
-    # blocks: 3537 against 2872 bundles for the mask-free copy), replays
-    # included.
-    parity_smem[0] = lax.rem(kv - lo, 2)
+    # block's offset in the row past the row's first parity (alternating
+    # across rows under defers_row_finish, else 0); each head keeps its own
+    # guard flag, so one head's overflow never replays another. The parity is
+    # re-read from SMEM at every use: computed once as a loop value, it
+    # lengthened every fragment-pipeline copy's schedule by about 30% (v6e,
+    # 512 x 512 paged blocks: 3537 against 2872 bundles for the mask-free
+    # copy), replays included.
+    parity_smem[0] = lax.rem(row_parity + kv - lo, 2)
 
     def _block_parities():
       new_parity = parity_smem[0]
@@ -967,17 +1005,21 @@ def fwd_body(
           read_parity=_tile_parity(
               kv_compute_index, is_tile_zero, new_parity, old_parity))
 
-    def _carry_out_pv(probs, is_row_start):
+    def _carry_out_pv(probs, is_row_start, kv_compute_index=pending_k,
+                      is_tile_zero=num_k_compute_tiles == 1):
+      """Leave the PV of the block's last fragment (head pending_g, q tile
+      pending_q, kv tile kv_compute_index) to the next block; is_tile_zero as
+      in _online_softmax."""
       new_parity, old_parity = _block_parities()
       pending_probs[...] = probs
-      pending_v[...] = _v_tile(pending_g, pending_k, kv_slot)
+      pending_v[...] = _v_tile(pending_g, kv_compute_index, kv_slot)
       pending_smem[PENDING_WRITE_PARITY] = new_parity
-      pending_smem[PENDING_READ_PARITY] = (
-          old_parity if num_k_compute_tiles == 1 else new_parity)
+      pending_smem[PENDING_READ_PARITY] = _tile_parity(
+          kv_compute_index, is_tile_zero, new_parity, old_parity)
       pending_smem[PENDING_ROW_START] = jnp.asarray(is_row_start, jnp.int32)
 
     def _run_live_tiles(is_causal, guard_recovery, static_g,
-                        after_first_softmax):
+                        after_first_softmax, carries_out):
       # Note (david): a block whose kv frontier leaves trailing kv compute
       # tiles dead runs only its live ones, in a loop whose body is the q
       # tiles of one kv tile, straight-line; the distance-1 pending PV crosses
@@ -993,7 +1035,8 @@ def fwd_body(
       # loop is built. The pending PV also crosses from one head to the next,
       # as on the fused pipeline. The previous block's pending PV is issued
       # after the first softmax, as on every copy, and the block's own last
-      # PV is issued here, since its fragment is a runtime tile.
+      # PV is issued here or, under carries_out, left pending with its
+      # runtime kv tile.
       heads = range(head_fold) if static_g is None else (static_g,)
       last_q_tile = num_q_compute_tiles - 1
       has_tile_loop = num_k_compute_tiles > 2
@@ -1031,7 +1074,12 @@ def fwd_body(
           carry = lax.fori_loop(
               1, num_live_tiles, _tile_step, tuple(pending_pv[3:6]))
           pending_pv = (g, last_live_tile, last_q_tile, *carry, None)
-      _block_pv(*pending_pv)
+      if carries_out:
+        assert not guard_recovery
+        _, last_k, _, probs, is_row_start, _, is_tile_zero = pending_pv
+        _carry_out_pv(probs, is_row_start, last_k, is_tile_zero)
+      else:
+        _block_pv(*pending_pv)
       if has_tile_loop and not guard_recovery:
         # Note (david): every tile step scores all q tiles, so once the loop
         # ends each head's new-parity row sums are its last live tile's; one
@@ -1057,9 +1105,8 @@ def fwd_body(
             _cancel_pending_pv()
 
       if skips_dead_tiles:
-        assert not carries_out
         _run_live_tiles(is_causal, guard_recovery, static_g,
-                        _after_first_softmax)
+                        _after_first_softmax, carries_out)
         return
 
       # Note (david): static_g None is the fast path, one distance-1 pipeline
@@ -1214,8 +1261,9 @@ def fwd_body(
     # slower at block 2048. A build carries either the static window (dense)
     # or the per-seq bounds (varlen), never both, and has_static_mask still
     # gates the former so a full-attention build never loses its upper
-    # triangle. Exactly one copy runs per block, and only the mask-free one
-    # carries its last PV out to the next block.
+    # triangle. Exactly one copy runs per block; the mask-free one carries
+    # its last PV out to the next block, and under defers_row_finish every
+    # copy does.
     if is_per_seq:
       needs_any_mask = jnp.logical_or(is_partial, needs_bounds)
     else:
@@ -1242,7 +1290,7 @@ def fwd_body(
       def _run_live_tile_block():
         _stage_bounds()
         _run_group(is_causal=has_static_mask, apply_bounds=True,
-                   skips_dead_tiles=True)
+                   skips_dead_tiles=True, carries_out=defers_row_finish)
     else:
       runs_every_tile = needs_any_mask
 
@@ -1258,54 +1306,146 @@ def fwd_body(
       def _run_masked_block():
         if is_per_seq:
           _stage_bounds()
-        _run_group(is_causal=has_static_mask, apply_bounds=is_per_seq)
+        _run_group(is_causal=has_static_mask, apply_bounds=is_per_seq,
+                   carries_out=defers_row_finish)
+
+    if defers_row_finish:
+      # Note (david): the previous row's last PV ran inside this copy, after
+      # its first softmax, and the previous row's o and row_sum stay at its
+      # final parity until this row's second block.
+      @pl.when(jnp.logical_and(is_first, prev_row_finish.is_live > 0))
+      def _finish_previous_row():
+        _finish_row_out(prev_row_finish)
 
     return (next_slot, ahead_slot, is_next_fresh, is_ahead_fresh,
             next_block_desc, ahead_desc)
 
-  def _finish_row(group, si, ctx, q_tok, base_head, prev_out_tok,
-                  num_out_copies):
-    """Normalize the row's output into the output stage and write it out."""
-    out_slot = lax.rem(num_out_copies, num_stages)
-    # Note (david): parity_smem still holds the row's last block's parity.
-    last_parity = parity_smem[0]
+  def _stage_gqa_folded_lse(row_sum_ref, out_slot):
+    # Note (david): lse is row_max + log2(row_sum) as in _finish_row_lse.
+    # Every lane of a row state holds the row's value, and the rows of a q
+    # tile run (folded head, token), so each head's token rows reach its own
+    # lse lane through one lane select per head.
+    lane_ids = lax.broadcasted_iota(
+        jnp.int32, (bq_compute, NUM_LANES), 1)
+    for q_compute_index in range(num_q_compute_tiles):
+      tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
+      tile_lse = (
+          (row_max_scratch[tile_rows, :]
+           + jnp.log2(row_sum_ref[tile_rows, :])) * math.log(2.0)
+      ).reshape(gqa_fold, bq_compute, NUM_LANES)
+      head_lanes = tile_lse[0]
+      for h in range(1, gqa_fold):
+        head_lanes = jnp.where(lane_ids == h, tile_lse[h], head_lanes)
+      lse_stage[out_slot,
+                pl.ds(q_compute_index * bq_compute, bq_compute), :] = (
+                    head_lanes)
+
+  def _blend_stage_rows(stage_ref, finish):
+    """Per-seq: copy the rows of the row's stage slot that the previous
+    output block owns from that block's slot."""
+    # Note (david): a per-seq window sits on the hbm_bf16_tile_rows() grid
+    # and may reach below blend_start into rows the previous output block
+    # computed correctly. That stage is still resident (num_stages >= 2 and
+    # only its outbound DMA reads it), so the rows are copied over from it.
+    # The bf16 stage is accessed in whole 16-row tiles, but the two windows
+    # can be only 8-aligned apart, so each own tile reads the two source
+    # tiles it straddles and picks their 8-row halves in f32, where 8 rows
+    # are one whole (8, 128) tile.
+    out_slot = lax.rem(finish.out_count, num_stages)
+    num_blend_rows = finish.num_blend_rows
+
+    # Note (david): rows below a head group's first block belong to no
+    # sequence, and the previous output block is the last group's, so the
+    # first block never blends.
+    @pl.when(jnp.logical_and(num_blend_rows > 0, finish.si > 0))
+    def _blend_head_rows():
+      prev_slot = lax.rem(finish.out_count + num_stages - 1, num_stages)
+      src_row_offset = finish.q_tok - finish.prev_out_tok
+      src_offset_in_tile = src_row_offset & (BF16_TILE_ROWS - 1)
+      half_rows = BF16_TILE_ROWS // 2
+
+      def _tile_index(slot, row_start):
+        return (slot,) + (slice(None),) * (len(stage_ref.shape) - 3) + (
+            pl.ds(pl.multiple_of(row_start, BF16_TILE_ROWS), BF16_TILE_ROWS),
+            slice(None))
+
+      def _blend_tile(tile, carry):
+        own_index = _tile_index(out_slot, tile * BF16_TILE_ROWS)
+        own_rows = stage_ref[own_index].astype(jnp.float32)
+        src_lower_start = (
+            src_row_offset - src_offset_in_tile + tile * BF16_TILE_ROWS)
+        # Note (david): the upper source tile is used only when
+        # src_offset_in_tile is 8 and this tile's upper half blends, and then
+        # it lies inside the source stage; the clamp keeps the unused read in
+        # bounds otherwise.
+        src_upper_start = jnp.minimum(src_lower_start + BF16_TILE_ROWS,
+                                      stage_ref.shape[-2] - BF16_TILE_ROWS)
+        src_lower = stage_ref[
+            _tile_index(prev_slot, src_lower_start)].astype(jnp.float32)
+        src_upper = stage_ref[
+            _tile_index(prev_slot, src_upper_start)].astype(jnp.float32)
+        half_ids = lax.broadcasted_iota(
+            jnp.int32, src_lower[..., :half_rows, :].shape,
+            src_lower.ndim - 2)
+        is_src_on_tile = half_ids + src_offset_in_tile < half_rows
+        prev_rows = jnp.concatenate([
+            jnp.where(is_src_on_tile, src_lower[..., :half_rows, :],
+                      src_lower[..., half_rows:, :]),
+            jnp.where(is_src_on_tile, src_lower[..., half_rows:, :],
+                      src_upper[..., :half_rows, :]),
+        ], axis=-2)
+        row_ids = tile * BF16_TILE_ROWS + lax.broadcasted_iota(
+            jnp.int32, own_rows.shape, own_rows.ndim - 2)
+        stage_ref[own_index] = jnp.where(
+            row_ids < num_blend_rows, prev_rows, own_rows).astype(
+                stage_ref.dtype)
+        return carry
+
+      lax.fori_loop(
+          0, (num_blend_rows + BF16_TILE_ROWS - 1) // BF16_TILE_ROWS,
+          _blend_tile, None)
+
+  def _fill_packed_padding(stage_ref, finish, fill_value):
+    """Per-seq: write fill_value into the rows of the row's stage slot at or
+    past cu_seqlens_q[-1]."""
+    # Note (david): rows at or past cu_seqlens_q[-1] belong to no sequence
+    # and read out = 0 (lse = -inf). A window reaching them fills them in its
+    # stage, which covers the partial tile at the packed end; the fill after
+    # the loop covers the whole tiles past it.
+    packed_q_end = schedule.packed_q_end
+
+    @pl.when(finish.q_tok + bq > packed_q_end)
+    def _fill_rows():
+      stage_slot = stage_ref.at[lax.rem(finish.out_count, num_stages)]
+      staged = stage_slot[...]
+      rows = finish.q_tok + lax.broadcasted_iota(
+          jnp.int32, staged.shape, staged.ndim - 2)
+      stage_slot[...] = jnp.where(
+          rows < packed_q_end, staged,
+          jnp.asarray(fill_value, staged.dtype))
+
+  def _finish_row_out(finish):
+    """Normalize the row's output into its output stage slot and start its
+    write; its last PV has run, and its final o and row_sum sit at
+    finish.parity."""
+    out_slot = lax.rem(finish.out_count, num_stages)
 
     # Note (david): o_stage is one output ring shared by the whole fold group,
     # so wait out the slot's previous DMA before any head writes into it.
-    @pl.when(num_out_copies >= num_stages)
+    @pl.when(finish.out_count >= num_stages)
     def _wait_prev_out():
       _o_copy(0, 0, out_slot).wait()
 
-    def _stage_gqa_folded_lse(row_sum_ref):
-      # Note (david): lse is row_max + log2(row_sum) as below. Every lane of a
-      # row state holds the row's value, and the rows of a q tile run (folded
-      # head, token), so each head's token rows reach its own lse lane through
-      # one lane select per head.
-      lane_ids = lax.broadcasted_iota(
-          jnp.int32, (bq_compute, NUM_LANES), 1)
-      for q_compute_index in range(num_q_compute_tiles):
-        tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
-        tile_lse = (
-            (row_max_scratch[tile_rows, :]
-             + jnp.log2(row_sum_ref[tile_rows, :])) * math.log(2.0)
-        ).reshape(gqa_fold, bq_compute, NUM_LANES)
-        head_lanes = tile_lse[0]
-        for h in range(1, gqa_fold):
-          head_lanes = jnp.where(lane_ids == h, tile_lse[h], head_lanes)
-        lse_stage[out_slot,
-                  pl.ds(q_compute_index * bq_compute, bq_compute), :] = (
-                      head_lanes)
-
     def _finalize_head(g):
       head_rows = pl.ds(g * group_bq, group_bq)
-      row_sum_new_ref = row_sum_scratch.at[last_parity, head_rows]
+      row_sum_ref = row_sum_scratch.at[finish.parity, head_rows]
       # Note (david): o_stage keeps an explicit fold axis (leading on
       # head-major, lanes on token-major) while o_scratch stays flat-row
       # addressed, so only o_stage goes through _fold_lane. A gqa fold
       # writes all of its heads at once.
-      o_new_ref = (
-          o_scratch.at[last_parity, :, head_rows] if transposed_pv
-          else o_scratch.at[last_parity, head_rows]
+      o_ref = (
+          o_scratch.at[finish.parity, :, head_rows] if transposed_pv
+          else o_scratch.at[finish.parity, head_rows]
       )
       if gqa_fold > 1:
         o_stage_g, o_half = o_stage.at[out_slot], None
@@ -1316,7 +1456,7 @@ def fwd_body(
 
       def _finalize_fragment(q_compute_index, carry):
         slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
-        row_sum = row_sum_new_ref[slice_q, :]
+        row_sum = row_sum_ref[slice_q, :]
         # Note (david): a quantized cache's V descale is one per-tensor
         # factor, folded into the softmax normalization.
         if transposed_pv:
@@ -1328,7 +1468,7 @@ def fwd_body(
               v_scale / row_sum, (1, head_dim_v_repeats)
           )[..., :o_scratch.shape[-1]]
         o_normalized = (
-            o_new_ref[tile_index] * inverse_row_sum).astype(o_stage.dtype)
+            o_ref[tile_index] * inverse_row_sum).astype(o_stage.dtype)
         if gqa_fold > 1:
           o_stage_g[:, pl.ds(q_compute_index * bq_compute, bq_compute),
                     :] = o_normalized.reshape(
@@ -1351,142 +1491,65 @@ def fwd_body(
           unroll=True,
       )
 
-      if return_lse and gqa_fold > 1:
-        _stage_gqa_folded_lse(row_sum_new_ref)
-      elif return_lse:
+    for g in range(head_fold):
+      _finalize_head(g)
+
+    if is_per_seq:
+      _blend_stage_rows(o_stage, finish)
+      _fill_packed_padding(o_stage, finish, 0.0)
+    # Note (david): the output copy starts only after the boundary blend has
+    # repaired the rows shared with the previous block.
+    _o_copy(finish.base_head, finish.q_tok, out_slot).start()
+
+  def _finish_row_lse(group, finish):
+    """Stage and write the row's lse; its last softmax has run, and its final
+    row_sum sits at finish.parity."""
+    if not return_lse:
+      return
+    out_slot = lax.rem(finish.out_count, num_stages)
+    for g in range(head_fold):
+      head_rows = pl.ds(g * group_bq, group_bq)
+      row_sum_ref = row_sum_scratch.at[finish.parity, head_rows]
+      if gqa_fold > 1:
+        _stage_gqa_folded_lse(row_sum_ref, out_slot)
+      else:
         # Note (david): the static anchor keeps sum_j exp2(logit_j) ==
         # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
         # units; scale by ln(2) for the natural-log lse that is returned.
         row_max = row_max_scratch.at[head_rows][:, 0:1]
         lse_row = (
-            (row_max + jnp.log2(row_sum_new_ref[:, 0:1])) * math.log(2.0))
+            (row_max + jnp.log2(row_sum_ref[:, 0:1])) * math.log(2.0))
         if is_per_seq:
           lse_stage[out_slot, :, g] = lse_row[:, 0]
         else:
           lse_stage[g, :] = lse_row[:, 0]
 
-    for g in range(head_fold):
-      _finalize_head(g)
-
     if is_per_seq:
-      # Note (david): a per-seq window sits on the hbm_bf16_tile_rows() grid
-      # and may reach below blend_start into rows the previous output block
-      # computed correctly. That stage is still resident (num_stages >= 2 and
-      # only its outbound DMA reads it), so the rows are copied over from it.
-      # The bf16 stage is accessed in whole 16-row tiles, but the two windows
-      # can be only 8-aligned apart, so each own tile reads the two source
-      # tiles it straddles and picks their 8-row halves in f32, where 8 rows
-      # are one whole (8, 128) tile.
-      num_blend_rows = schedule.blend_start(ctx) - q_tok
-
-      # Note (david): rows below a head group's first block belong to no
-      # sequence, and the previous output block is the last group's, so the
-      # first block never blends.
-      @pl.when(jnp.logical_and(num_blend_rows > 0, si > 0))
-      def _blend_head_rows():
-        prev_slot = lax.rem(num_out_copies + num_stages - 1, num_stages)
-        src_row_offset = q_tok - prev_out_tok
-        src_offset_in_tile = src_row_offset & (BF16_TILE_ROWS - 1)
-        half_rows = BF16_TILE_ROWS // 2
-
-        def _tile_index(stage_ref, slot, row_start):
-          return (slot,) + (slice(None),) * (len(stage_ref.shape) - 3) + (
-              pl.ds(pl.multiple_of(row_start, BF16_TILE_ROWS), BF16_TILE_ROWS),
-              slice(None))
-
-        def _blend_stage(stage_ref, tile):
-          own_index = _tile_index(stage_ref, out_slot, tile * BF16_TILE_ROWS)
-          own_rows = stage_ref[own_index].astype(jnp.float32)
-          src_lower_start = (
-              src_row_offset - src_offset_in_tile + tile * BF16_TILE_ROWS)
-          # Note (david): the upper source tile is used only when
-          # src_offset_in_tile is 8 and this tile's upper half blends, and then
-          # it lies inside the source stage; the clamp keeps the unused read in
-          # bounds otherwise.
-          src_upper_start = jnp.minimum(src_lower_start + BF16_TILE_ROWS,
-                                        stage_ref.shape[-2] - BF16_TILE_ROWS)
-          src_lower = stage_ref[
-              _tile_index(stage_ref, prev_slot, src_lower_start)].astype(
-                  jnp.float32)
-          src_upper = stage_ref[
-              _tile_index(stage_ref, prev_slot, src_upper_start)].astype(
-                  jnp.float32)
-          half_ids = lax.broadcasted_iota(
-              jnp.int32, src_lower[..., :half_rows, :].shape,
-              src_lower.ndim - 2)
-          is_src_on_tile = half_ids + src_offset_in_tile < half_rows
-          prev_rows = jnp.concatenate([
-              jnp.where(is_src_on_tile, src_lower[..., :half_rows, :],
-                        src_lower[..., half_rows:, :]),
-              jnp.where(is_src_on_tile, src_lower[..., half_rows:, :],
-                        src_upper[..., :half_rows, :]),
-          ], axis=-2)
-          row_ids = tile * BF16_TILE_ROWS + lax.broadcasted_iota(
-              jnp.int32, own_rows.shape, own_rows.ndim - 2)
-          stage_ref[own_index] = jnp.where(
-              row_ids < num_blend_rows, prev_rows, own_rows).astype(
-                  stage_ref.dtype)
-
-        def _blend_tile(tile, carry):
-          _blend_stage(o_stage, tile)
-          if return_lse:
-            _blend_stage(lse_stage, tile)
-          return carry
-
-        lax.fori_loop(
-            0, (num_blend_rows + BF16_TILE_ROWS - 1) // BF16_TILE_ROWS,
-            _blend_tile, None)
-
-      packed_q_end = schedule.packed_q_end
-
-      # Note (david): rows at or past cu_seqlens_q[-1] belong to no sequence
-      # and read out = 0 (lse = -inf). A window reaching them zeroes them in
-      # its stage, which covers the partial tile at the packed end; the fill
-      # after the loop covers the whole tiles past it.
-      @pl.when(q_tok + bq > packed_q_end)
-      def _zero_packed_padding():
-        o_stage_slot = o_stage.at[out_slot]
-        staged_out = o_stage_slot[...]
-        out_rows = q_tok + lax.broadcasted_iota(
-            jnp.int32, staged_out.shape, staged_out.ndim - 2)
-        o_stage_slot[...] = jnp.where(
-            out_rows < packed_q_end, staged_out, jnp.zeros_like(staged_out))
-        if return_lse:
-          lse_stage_slot = lse_stage.at[out_slot]
-          staged_lse = lse_stage_slot[...]
-          lse_rows = q_tok + lax.broadcasted_iota(
-              jnp.int32, staged_lse.shape, 0)
-          lse_stage_slot[...] = jnp.where(
-              lse_rows < packed_q_end, staged_lse, -jnp.inf)
-
-    # Note (david): the output and LSE copies start only after the boundary
-    # blend has repaired the rows shared with the previous block.
-    _o_copy(base_head, q_tok, out_slot).start()
-    if return_lse:
-      if is_per_seq:
-        # Note (david): the head group is a leading untiled axis and its
-        # 128-lane minor axis is copied whole, avoiding the rejected dynamic
-        # minor-axis slice at the head offset.
-        lse_copies = [(lse_stage.at[out_slot],
-                       lse_hbm.at[group, pl.ds(q_tok, bq), :])]
-      elif head_fold % NUM_SUBLANES == 0:
-        # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned fold
-        # is one group-wide copy; a smaller fold copies row by row, since
-        # later groups start at h = 2 or 4 and would break tile alignment.
-        lse_copies = [(lse_stage,
-                       lse_hbm.at[pl.ds(base_head, head_fold),
-                                  pl.ds(q_tok, bq)])]
-      else:
-        lse_copies = [
-            (lse_stage.at[pl.ds(local_head, 1), :],
-             lse_hbm.at[pl.ds(base_head + local_head, 1), pl.ds(q_tok, bq)])
-            for local_head in range(head_fold)
-        ]
-      for lse_src, lse_dst in lse_copies:
-        lse_copy = pltpu.make_async_copy(
-            lse_src, lse_dst, sems.at[SEM_LSE, 0])
-        lse_copy.start()
-        lse_copy.wait()
+      _blend_stage_rows(lse_stage, finish)
+      _fill_packed_padding(lse_stage, finish, -jnp.inf)
+      # Note (david): the head group is a leading untiled axis and its
+      # 128-lane minor axis is copied whole, avoiding the rejected dynamic
+      # minor-axis slice at the head offset.
+      lse_copies = [(lse_stage.at[out_slot],
+                     lse_hbm.at[group, pl.ds(finish.q_tok, bq), :])]
+    elif head_fold % NUM_SUBLANES == 0:
+      # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned fold
+      # is one group-wide copy; a smaller fold copies row by row, since later
+      # groups start at h = 2 or 4 and would break tile alignment.
+      lse_copies = [(lse_stage,
+                     lse_hbm.at[pl.ds(finish.base_head, head_fold),
+                                pl.ds(finish.q_tok, bq)])]
+    else:
+      lse_copies = [
+          (lse_stage.at[pl.ds(local_head, 1), :],
+           lse_hbm.at[pl.ds(finish.base_head + local_head, 1),
+                      pl.ds(finish.q_tok, bq)])
+          for local_head in range(head_fold)
+      ]
+    for lse_src, lse_dst in lse_copies:
+      lse_copy = pltpu.make_async_copy(lse_src, lse_dst, sems.at[SEM_LSE, 0])
+      lse_copy.start()
+      lse_copy.wait()
 
   def _row_after(g, si):
     """The (group, row) after row si of group g; the grid's last row is its
@@ -1509,9 +1572,23 @@ def fwd_body(
         _block_desc(after_g * group_heads, after_lo, after_ctx))
     return first_desc, second_desc, (lo, hi, ctx)
 
+  def _carried_finish(row_state):
+    # Note (david): a loop carry drops q_token's pl.multiple_of, and the
+    # output DMA window must start on the hbm_bf16_tile_rows() grid, where
+    # q_token put it.
+    row_parity, finish = row_state
+    return row_parity, finish._replace(
+        q_tok=pl.multiple_of(finish.q_tok, hbm_bf16_tile_rows()))
+
   def _row_body(g, si, carry):
-    q_loaded, q_inflight, q_slot, kv_carry, prev_out_tok, num_out_copies = (
-        carry)
+    """carry ends with (the row's first block's new parity, the previous
+    row's RowFinish) under defers_row_finish, else with ()."""
+    (q_loaded, q_inflight, q_slot, kv_carry, prev_out_tok, num_out_copies,
+     row_state) = carry
+    if defers_row_finish:
+      row_parity, prev_row_finish = _carried_finish(row_state)
+    else:
+      row_parity, prev_row_finish = 0, None
     lo, hi, ctx = schedule.row_interval(si)
     # Note (david): past the very last row of the last group the lookahead is
     # the current row itself, so the q keys stay equal and nothing is
@@ -1546,20 +1623,35 @@ def fwd_body(
     kv_carry = lax.fori_loop(
         lo, hi + 1,
         lambda kv, block_carry: _block_step(
-            g, si, kv, lo, hi, ctx, (q_tok, base_head, q_slot),
+            g, si, kv, lo, hi, ctx,
+            (q_tok, base_head, q_slot, row_parity, prev_row_finish),
             (first_next_desc, second_next_desc), block_carry),
         kv_carry,
     )
 
-    @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
-    def _drain_pending_pv():
-      _issue_pending_pv()
+    finish = RowFinish(
+        is_live=jnp.int32(1), si=si, q_tok=q_tok, base_head=base_head,
+        num_blend_rows=(schedule.blend_start(ctx) - q_tok if is_per_seq
+                        else jnp.int32(0)),
+        prev_out_tok=prev_out_tok, out_count=num_out_copies,
+        parity=lax.rem(row_parity + hi - lo, 2))
+    if defers_row_finish:
+      # Note (david): the row's last PV is pending, and the next row's first
+      # block runs it and then finishes this row's output.
+      _finish_row_lse(g, finish)
+      next_row_state = (1 - finish.parity, finish)
+    else:
+      @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
+      def _drain_pending_pv():
+        _issue_pending_pv()
 
-    _cancel_pending_pv()
-    _finish_row(g, si, ctx, q_tok, base_head, prev_out_tok, num_out_copies)
+      _cancel_pending_pv()
+      _finish_row_out(finish)
+      _finish_row_lse(g, finish)
+      next_row_state = ()
     next_prev_out_tok = q_tok if is_per_seq else prev_out_tok
     return (q_loaded, q_inflight, q_slot, kv_carry, next_prev_out_tok,
-            num_out_copies + 1)
+            num_out_copies + 1, next_row_state)
 
   # Note (david): the first two blocks' data is requested before the loop;
   # every later fresh block's is started two blocks ahead of it. The second
@@ -1576,11 +1668,15 @@ def fwd_body(
 
   minus_one = jnp.int32(-1)
   zero = jnp.int32(0)
+  if defers_row_finish:
+    init_row_state = (zero, RowFinish(*([zero] * len(RowFinish._fields))))
+  else:
+    init_row_state = ()
   init_carry = (minus_one, minus_one, zero,
                 (zero, second_slot, jnp.int32(1), is_second_fresh,
                  first_desc, second_desc),
-                zero, zero)
-  *_, kv_carry, _, num_out_copies = lax.fori_loop(
+                zero, zero, init_row_state)
+  *_, kv_carry, _, num_out_copies, row_state = lax.fori_loop(
       0, num_head_groups,
       lambda g, group_carry: lax.fori_loop(
           0, num_rows, lambda si, row_carry: _row_body(g, si, row_carry),
@@ -1589,6 +1685,21 @@ def fwd_body(
   )
   (last_slot, after_last_slot, is_last_fresh, is_after_last_fresh, last_desc,
    after_last_desc) = kv_carry
+
+  if defers_row_finish:
+    # Note (david): the last row has no next row to run its pending PV and
+    # finish its output.
+    _, last_row_finish = _carried_finish(row_state)
+
+    @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
+    def _drain_last_pending_pv():
+      _issue_pending_pv()
+
+    _cancel_pending_pv()
+
+    @pl.when(last_row_finish.is_live > 0)
+    def _finish_last_row():
+      _finish_row_out(last_row_finish)
 
   @pl.when(is_last_fresh > 0)
   def _wait_last():
