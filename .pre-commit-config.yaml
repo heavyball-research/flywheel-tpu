@@ -1,0 +1,21 @@
+# The lint set follows tokamax: pyink formats, pylint checks against the
+# Google Python style guide (.pylintrc), and zizmor audits the workflows.
+# .github/workflows/lint.yml runs these same hooks on every file.
+#
+#   uv run pre-commit install           # run on each commit
+#   uv run pre-commit run --all-files   # run on the whole tree
+repos:
+  - repo: https://github.com/google/pyink
+    rev: 26.5.1
+    hooks:
+      - id: pyink
+  - repo: https://github.com/pylint-dev/pylint
+    rev: v4.1.3
+    hooks:
+      - id: pylint
+        # pylint parallelizes itself (jobs in .pylintrc).
+        require_serial: true
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.31.1
+    hooks:
+      - id: zizmor
