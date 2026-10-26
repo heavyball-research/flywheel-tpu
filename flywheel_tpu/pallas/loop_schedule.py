@@ -106,8 +106,8 @@ class FwdSchedule:
         blend_start(ctx) is the first row the block owns, and fwd_body blends
         rows [q_token, blend_start) of the output stage from the previous block
         before the packed write.
-      has_q_span: per-seq only; q_bounds returns a span row (a left window bounds
-        q from above), otherwise its span is None.
+      has_q_span: per-seq only; q_bounds returns a span row (a left window
+        bounds q from above), otherwise its span is None.
       heads_outer_batch: dense head-major only. None is the batch-outer fold
         (q fold index h reads kv fold index h // q_heads_per_kv_head); an int B
         is a heads-outer fold of B sequences (q fold index n * B + b reads kv
@@ -484,7 +484,8 @@ def per_seq_schedule_rows(
         )
     if bkv % bkv_compute:
         raise ValueError(f"{bkv=} must be a multiple of {bkv_compute=}.")
-    # Note (david): a floored count would clip hi below the ragged last kv block.
+    # Note (david): a floored count would clip hi below the ragged last kv
+    # block.
     num_kv_blocks = -(-padded_total_k // bkv)
     num_kv_tiles = bkv // bkv_compute
     cu_q = jnp.asarray(cu_seqlens_q, jnp.int32)
@@ -853,7 +854,8 @@ class DenseBwdParams(NamedTuple):
 def first_visible_q_block(kv: BlockIndex, params: DenseBwdParams) -> BlockIndex:
     """Smallest qi whose block's last row reaches kv block kv."""
     # Note (david): host ints stay pure Python. The host builder runs inside the
-    # caller's jit trace, where a jnp op would stage a tracer that int() rejects.
+    # caller's jit trace, where a jnp op would stage a tracer that int()
+    # rejects.
     is_traced = isinstance(kv, jax.Array)
     if params.causal:
         first_row_numerator = kv * params.bkv - params.offset - params.bq + 1

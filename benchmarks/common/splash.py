@@ -62,7 +62,8 @@ FIELDS = (
 
 
 def validate_splash_source(source_root: Path) -> Path:
-    """The pinned splash_attention package directory inside a tokamax checkout."""
+    """The pinned splash_attention package directory inside a tokamax
+    checkout."""
     source_root = Path(source_root).expanduser().resolve()
     module_root = source_root.joinpath(*SPLASH_PACKAGE.split("."))
     missing = [

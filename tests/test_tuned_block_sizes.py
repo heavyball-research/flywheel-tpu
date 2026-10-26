@@ -26,8 +26,8 @@ TUNED_DECODE = dict(
 UNTUNED_DECODE = {**TUNED_DECODE, "batch": 48}
 
 
-@pytest.fixture
-def run_on(monkeypatch, recwarn):
+@pytest.fixture(name="run_on")
+def fixture_run_on(monkeypatch, recwarn):
     """run_on(device_name) makes the lookup see that device and returns a
     callable listing the fallback warnings raised since."""
 
@@ -35,7 +35,7 @@ def run_on(monkeypatch, recwarn):
         monkeypatch.setattr(
             tuned_block_sizes, "get_device_name", lambda: device_name
         )
-        tuned_block_sizes._warn_untuned_once.cache_clear()
+        tuned_block_sizes._warn_untuned_once.cache_clear()  # pylint: disable=protected-access
         recwarn.clear()
         return lambda: [
             str(warning.message)

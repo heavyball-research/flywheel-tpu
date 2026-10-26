@@ -13,8 +13,14 @@ load_batched_rpa takes a vllm-torchtpu checkout (--torchtpu-source) and loads
 src/vllm_torchtpu/kernels/experimental/batched_rpa, every file verified
 against its SHA-256 at BATCHED_RPA_GIT_SHA.
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/common/rpa.py   # host-only self-test
+Host-only self-test:
+
+    PYTHONPATH=. uv run --no-sync python benchmarks/common/rpa.py
 """
+
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
 
 from __future__ import annotations
 

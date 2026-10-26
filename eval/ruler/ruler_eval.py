@@ -22,6 +22,10 @@ returns the vLLM outputs, so both halves of tokens/s are exact and cost nothing
 extra to collect.
 """
 
+# The serving stack (vllm, lm_eval, tpu_inference) and the task repos on
+# sys.path are imported where they are used.
+# pylint: disable=import-outside-toplevel
+
 import argparse
 import importlib.util
 import json
@@ -71,9 +75,9 @@ class GenerationMeter:
     def install(self):
         from lm_eval.models.vllm_causallms import VLLM
 
-        original = VLLM._model_generate
+        original = VLLM._model_generate  # pylint: disable=protected-access
 
-        def instrumented(inner_self, requests=None, *args, **kwargs):
+        def instrumented(inner_self, requests=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
             if self.before_generate is not None:
                 self.before_generate(requests)
             start = time.perf_counter()
@@ -89,7 +93,7 @@ class GenerationMeter:
             )
             return outputs
 
-        VLLM._model_generate = instrumented
+        VLLM._model_generate = instrumented  # pylint: disable=protected-access
 
     def report(self) -> dict:
         return {
@@ -356,7 +360,7 @@ def main() -> None:
 
     import lm_eval
 
-    model = glue._create_vllm_model(model_args, "auto", None, None)
+    model = glue._create_vllm_model(model_args, "auto", None, None)  # pylint: disable=protected-access
     warmed = set()
     meter.before_generate = lambda prompts: warmup(model, args, prompts, warmed)
     started = time.perf_counter()

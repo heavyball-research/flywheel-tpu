@@ -5,11 +5,14 @@ around its four pallas_calls, since that glue is part of the baseline cost.
 --pkgs times each package's fused_conv1d_kda (conv1d + silu + KDA) against the
 first package.
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_kda_fwd.py \
-        --pkgs flywheel_tpu.linear_attention.kda --compute-chunk-size 64 --mixed-tile-size 128
+    PYTHONPATH=. uv run --no-sync python \\
+        benchmarks/linear_attention/benchmark/bench_kda_fwd.py \\
+        --pkgs flywheel_tpu.linear_attention.kda \\
+        --compute-chunk-size 64 --mixed-tile-size 128
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_kda_fwd.py \
-        --impl baseline \
+    PYTHONPATH=. uv run --no-sync python \\
+        benchmarks/linear_attention/benchmark/bench_kda_fwd.py \\
+        --impl baseline \\
         --output benchmarks/linear_attention/benchmark/results/kda_fwd_v6e.json
 """
 
@@ -53,7 +56,8 @@ def make_inputs(
     nseqs: int,
     dtype: jnp.dtype,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    """Packed q, k, v, g, beta and cu_seqlens of nseqs equal-length sequences."""
+    """Packed q, k, v, g, beta and cu_seqlens of nseqs equal-length
+    sequences."""
     assert (
         num_tokens % nseqs == 0
     ), f"T={num_tokens} not divisible by nseqs={nseqs}"
@@ -103,7 +107,8 @@ def make_fused_inputs(
     nseqs: int,
     dtype: jnp.dtype,
 ) -> tuple[dict[str, jax.Array | None], KernelState]:
-    """Fresh-prefill inputs of fused_conv1d_kda and its zeroed conv / recurrent state."""
+    """Fresh-prefill inputs of fused_conv1d_kda and its zeroed conv / recurrent
+    state."""
     assert (
         num_tokens % nseqs == 0
     ), f"T={num_tokens} not divisible by nseqs={nseqs}"

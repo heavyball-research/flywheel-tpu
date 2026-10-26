@@ -28,6 +28,10 @@ appended to predictions.jsonl as they land, so a killed run resumes where it
 stopped.
 """
 
+# The serving stack (vllm, lm_eval, tpu_inference) and the task repos on
+# sys.path are imported where they are used.
+# pylint: disable=import-outside-toplevel
+
 import argparse
 import json
 import os
@@ -37,7 +41,7 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ruler"))
-from ruler_eval import (  # noqa: E402
+from ruler_eval import (  # noqa: E402  # pylint: disable=wrong-import-position
     BLOCK_SIZE,
     kv_block_budget,
     signature_groups,

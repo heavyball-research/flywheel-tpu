@@ -81,6 +81,8 @@ class Dtypes:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class KDAConfig:
+    """Shapes, dtypes and tiling of one KDA kernel build."""
+
     mode: KDAMode
     dtypes: Dtypes
     batch_size: int

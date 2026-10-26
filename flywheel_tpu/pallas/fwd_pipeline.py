@@ -221,8 +221,8 @@ def fwd_body(
     q_buf = remaining_refs.pop(0)
     if is_paged:
         # Note (david): a paged block stages its kv head's K and V rows as a
-        # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into dense K
-        # and V planes, so every q tile of the block reads plain tiles.
+        # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into dense
+        # K and V planes, so every q tile of the block reads plain tiles.
         kv_pair_buf, kv_planes = remaining_refs.pop(0), remaining_refs.pop(0)
         k_buf = v_buf = None
     else:
@@ -357,8 +357,8 @@ def fwd_body(
             return value[..., half * width : (half + 1) * width]
 
     def _set_half(value, half, width, new_half):
-        # Note (david): jnp .at[].set lowers to scatter, which Pallas TPU lacks, so
-        # replace the half with a static split + concatenate.
+        # Note (david): jnp .at[].set lowers to scatter, which Pallas TPU lacks,
+        # so replace the half with a static split + concatenate.
         halves = [
             value[..., i * width : (i + 1) * width]
             for i in range(value.shape[-1] // width)
@@ -467,9 +467,9 @@ def fwd_body(
             else:
                 _rotate_staged(q_buf, rotary_q_buf, slot, bq)
         if isinstance(q_scale, jax.Array) or q_scale != 1.0:
-            # Note (david): each staged Q tile is waited on exactly once per row, so
-            # scaling it here replaces an HBM pre-scaled Q copy with the same f32
-            # multiply and cast, leaving the logits unchanged.
+            # Note (david): each staged Q tile is waited on exactly once per
+            # row, so scaling it here replaces an HBM pre-scaled Q copy with the
+            # same f32 multiply and cast, leaving the logits unchanged.
             q_ref = q_buf.at[slot]
             q_ref[...] = (q_ref[...].astype(jnp.float32) * q_scale).astype(
                 q_buf.dtype
@@ -550,9 +550,9 @@ def fwd_body(
         ]
 
     def _paged_page_rows(kv_load_end, kv):
-        # Note (david): every page DMA of a block is issued, so its wait needs no
-        # branch. A page past the load extent moves one sublane tile of a clamped
-        # page, whose rows the unpack zeroes.
+        # Note (david): every page DMA of a block is issued, so its wait needs
+        # no branch. A page past the load extent moves one sublane tile of a
+        # clamped page, whose rows the unpack zeroes.
         num_load_rows = jnp.clip(kv_load_end - kv * bkv, 0, bkv)
         return [
             pl.multiple_of(
@@ -660,9 +660,10 @@ def fwd_body(
     def _wait_block_data(desc, slot):
         if is_paged:
             _, _, kv_load_end, _, kv = desc
-            # Note (david): every page signals the one semaphore by its size, and a
-            # DMA wait only needs a destination of the awaited size, so one wait on
-            # a window as long as all the pages together covers the block.
+            # Note (david): every page signals the one semaphore by its size,
+            # and a DMA wait only needs a destination of the awaited size, so
+            # one wait on a window as long as all the pages together covers the
+            # block.
             num_rows = pl.multiple_of(
                 sum(_paged_page_rows(kv_load_end, kv)), NUM_SUBLANES
             )
@@ -734,8 +735,8 @@ def fwd_body(
             )
         elif transposed_pv:
             # Note (david): contracting the SEQ_MINOR (head_dim, bkv_compute) v
-            # slab against probs yields o^T and fills the MXU's K and N dims with
-            # bkv_compute and bq_compute instead of capping N at head_dim.
+            # slab against probs yields o^T and fills the MXU's K and N dims
+            # with bkv_compute and bq_compute instead of capping N at head_dim.
             o_curr = lax.dot_general(
                 v_tile,
                 probs,
@@ -753,8 +754,8 @@ def fwd_body(
         slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
         if transposed_pv:
             # Note (david): q is the lane axis of the transposed o scratch, and
-            # Mosaic only slices lanes dynamically at an offset that is static per
-            # unrolled copy, as q_compute_index is.
+            # Mosaic only slices lanes dynamically at an offset that is static
+            # per unrolled copy, as q_compute_index is.
             o_new_ref = o_scratch.at[write_parity, :, head_rows]
             o_read_ref = o_scratch.at[read_parity, :, head_rows]
             tile_index = (slice(None), slice_q)
@@ -766,9 +767,9 @@ def fwd_body(
         if rescale is None:
             o_prev = o_read
         elif transposed_pv:
-            # Note (david): every lane of the rescale holds the row value, so lane
-            # 0 transposed to (1, bq_compute) broadcasts over the head_dim_v
-            # sublanes without any lane tiling.
+            # Note (david): every lane of the rescale holds the row value, so
+            # lane 0 transposed to (1, bq_compute) broadcasts over the
+            # head_dim_v sublanes without any lane tiling.
             o_prev = rescale[:, 0:1].T * o_read
         else:
             o_prev = (
@@ -811,10 +812,10 @@ def fwd_body(
         pending_smem[PENDING_WRITE_PARITY] = TRASH_PARITY
         pending_smem[PENDING_READ_PARITY] = TRASH_PARITY
 
-    def _block_step(group, si, kv, lo, hi, ctx, row, ahead, carry):
+    def _block_step(si, kv, lo, hi, ctx, row, ahead, carry):
         """One kv block of row si. ahead holds the descriptors of the next row's
-        first two blocks in the flattened block order, and carry this block's and
-        the next block's ring slot, freshness and descriptor."""
+        first two blocks in the flattened block order, and carry this block's
+        and the next block's ring slot, freshness and descriptor."""
         q_tok, base_head, q_slot, row_parity, prev_row_finish = row
         (
             kv_slot,
@@ -834,12 +835,12 @@ def fwd_body(
             num_live_tiles = schedule.num_live_tiles(kv, ctx)
         else:
             num_live_tiles = None
-        # Note (david): row_sum and o scratch ping-pong, so a block's first kv tile
-        # reads the previous block's exit state while later tiles update in place;
-        # each head keeps its own guard flag, so one head's overflow never replays
-        # another. The parity is re-read from SMEM at every use: held as a loop
-        # value it lengthened every copy's schedule by about 30% (v6e, 512 x 512
-        # paged: 3537 against 2872 bundles).
+        # Note (david): row_sum and o scratch ping-pong, so a block's first kv
+        # tile reads the previous block's exit state while later tiles update in
+        # place; each head keeps its own guard flag, so one head's overflow
+        # never replays another. The parity is re-read from SMEM at every use:
+        # held as a loop value it lengthened every copy's schedule by about 30%
+        # (v6e, 512 x 512 paged: 3537 against 2872 bundles).
         parity_smem[0] = lax.rem(row_parity + kv - lo, 2)
 
         def _block_parities():
@@ -875,9 +876,9 @@ def fwd_body(
             slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
             if is_paged:
                 if gqa_fold > 1:
-                    # Note (david): the q tile's tokens of every folded head, stacked
-                    # head-major over the fragment rows; bq_compute is whole bf16 tiles,
-                    # so the reshape moves no data.
+                    # Note (david): the q tile's tokens of every folded head,
+                    # stacked head-major over the fragment rows; bq_compute is
+                    # whole bf16 tiles, so the reshape moves no data.
                     q = q_buf[q_slot, :, slice_q, :].reshape(
                         frag_rows, q_buf.shape[-1]
                     )
@@ -917,8 +918,9 @@ def fwd_body(
         def _masked_scores(
             kv_compute_index, q_compute_index, logits, needs_mask, apply_bounds
         ):
-            # Note (david): per-seq bounds live in unshifted q coordinates, while the
-            # static window lives in coordinates shifted by causal_offset.
+            # Note (david): per-seq bounds live in unshifted q coordinates,
+            # while the static window lives in coordinates shifted by
+            # causal_offset.
             q_unshifted = q_tok + q_compute_index * bq_compute
             q_abs = q_unshifted + causal_offset
             k_abs = kv_tok + kv_compute_index * bkv_compute
@@ -944,9 +946,10 @@ def fwd_body(
                         k_ids <= q_ids + right, left_masked, DEFAULT_MASK_VALUE
                     )
 
-            # Note (david): a mask depends on the row's token alone, so a gqa fold
-            # masks the (gqa_fold, bq_compute, bkv_compute) view of the fragment,
-            # and one token-plane comparison broadcasts over its heads.
+            # Note (david): a mask depends on the row's token alone, so a gqa
+            # fold masks the (gqa_fold, bq_compute, bkv_compute) view of the
+            # fragment, and one token-plane comparison broadcasts over its
+            # heads.
             if gqa_fold > 1:
                 token_logits = logits.reshape(gqa_fold, *token_tile_shape)
             else:
@@ -959,11 +962,12 @@ def fwd_body(
             )
 
             if apply_bounds:
-                # Note (david): apply_bounds is static so interior blocks never trace
-                # these VPU ops per score tile. The bounds rows sit in one slot per kv
-                # compute tile, since the tile loop indexes the tile at runtime and
-                # Mosaic slices lanes only at static offsets; the span row exists only
-                # under a left window, so every other build keeps a single comparison.
+                # Note (david): apply_bounds is static so interior blocks never
+                # trace these VPU ops per score tile. The bounds rows sit in one
+                # slot per kv compute tile, since the tile loop indexes the tile
+                # at runtime and Mosaic slices lanes only at static offsets; the
+                # span row exists only under a left window, so every other build
+                # keeps a single comparison.
                 q_ids = q_unshifted + lax.broadcasted_iota(
                     jnp.int32, token_tile_shape, 0
                 )
@@ -989,19 +993,20 @@ def fwd_body(
         def _tile_parity(
             kv_compute_index, is_tile_zero, new_parity, old_parity
         ):
-            """The parity a kv tile reads the row state from, the old one at tile 0;
-            is_tile_zero is a static bool where the caller knows, else None."""
+            """The parity a kv tile reads the row state from, the old one at
+            tile 0; is_tile_zero is a static bool where the caller knows, else
+            None."""
             if is_tile_zero is None:
                 return jnp.where(kv_compute_index == 0, old_parity, new_parity)
             else:
                 return old_parity if is_tile_zero else new_parity
 
         def _flag_overflow_risk(g, row_sum, is_checked):
-            # Note (david): row_sum upper-bounds every single score of the row, so
-            # this detector may request a needless replay but never misses a score
-            # above the guard bound. Checking at the block's last live tile is
-            # enough, since a tile past a q tile's own frontier adds exactly 0 to
-            # every anchored row's sum.
+            # Note (david): row_sum upper-bounds every single score of the row,
+            # so this detector may request a needless replay but never misses a
+            # score above the guard bound. Checking at the block's last live
+            # tile is enough, since a tile past a q tile's own frontier adds
+            # exactly 0 to every anchored row's sum.
             has_overflow_risk = jnp.any(
                 jnp.logical_not(row_sum <= guard_detect_bound)
             )
@@ -1023,10 +1028,11 @@ def fwd_body(
             last_kv_tile=num_k_compute_tiles - 1,
         ):
             """window_fragment is the fragment's static plan entry on a window
-            block copy, None on the generic copies. is_tile_zero is a static bool
-            when the caller knows whether kv_compute_index is 0, else None.
-            last_kv_tile is the block's last kv compute tile that runs, where the
-            ordinary pass checks the guard; None leaves the check to the caller.
+            block copy, None on the generic copies. is_tile_zero is a static
+            bool when the caller knows whether kv_compute_index is 0, else None.
+            last_kv_tile is the block's last kv compute tile that runs, where
+            the ordinary pass checks the guard; None leaves the check to the
+            caller.
             """
             head_rows = pl.ds(g * group_bq, group_bq)
             new_parity, old_parity = _block_parities()
@@ -1059,17 +1065,19 @@ def fwd_body(
                     else is_tile_zero,
                 )
             else:
-                # Note (david): a band clipped at kv 0 starts at the row's first block.
+                # Note (david): a band clipped at kv 0 starts at the row's first
+                # block.
                 is_row_start = jnp.logical_or(
                     window_fragment.starts_band,
                     jnp.logical_and(is_first, kv_compute_index == 0),
                 )
             row_max_prev = row_max_scratch_g[slice_q, :]
             if defers_row_start:
-                # Note (david): a row whose fragments so far all lay before its window
-                # holds UNANCHORED_ROW_MAX, which zeroes every probability it scores,
-                # so its row_sum and o stay exactly 0 until its first visible key
-                # anchors it, and no rescale is due then.
+                # Note (david): a row whose fragments so far all lay before its
+                # window holds UNANCHORED_ROW_MAX, which zeroes every
+                # probability it scores, so its row_sum and o stay exactly 0
+                # until its first visible key anchors it, and no rescale is due
+                # then.
                 was_unanchored = row_max_prev >= UNANCHORED_ROW_BOUND
                 takes_frag_anchor = jnp.logical_or(is_row_start, was_unanchored)
                 frag_anchor = jnp.where(
@@ -1082,8 +1090,8 @@ def fwd_body(
                 frag_anchor = frag_row_max
             if guard_recovery:
                 # Note (david): the recovery replay rebases the anchor onto the
-                # overflowing fragment; the ordinary pass keeps the anchor it first
-                # picked.
+                # overflowing fragment; the ordinary pass keeps the anchor it
+                # first picked.
                 should_rebase = frag_row_max - row_max_prev > guard_threshold
                 row_max = jnp.where(
                     takes_frag_anchor,
@@ -1098,8 +1106,8 @@ def fwd_body(
                 row_max = jnp.where(
                     takes_frag_anchor, frag_anchor, row_max_prev
                 )
-            # Note (david): logits are in log2 units, so exp2 drops the per-element
-            # multiply jnp.exp lowers to on TPU.
+            # Note (david): logits are in log2 units, so exp2 drops the
+            # per-element multiply jnp.exp lowers to on TPU.
             probs = jnp.exp2(scores - jnp.tile(row_max, (1, bkv_repeats)))
             frag_row_sum = lax.broadcast_in_dim(
                 probs.sum(axis=-1), state_shape, (0,)
@@ -1123,10 +1131,11 @@ def fwd_body(
             row_sum_new_ref[slice_q, :] = row_sum_new
             row_max_scratch_g[slice_q, :] = row_max
             if guard_recovery:
-                # Note (david): the rescale rides the pipeline carry to this fragment's
-                # PV. A per-q-tile scratch would race: once skipped fragments make two
-                # fragments of one q tile adjacent, the later softmax overwrites it
-                # before the earlier fragment's PV reads it.
+                # Note (david): the rescale rides the pipeline carry to this
+                # fragment's PV. A per-q-tile scratch would race: once skipped
+                # fragments make two fragments of one q tile adjacent, the later
+                # softmax overwrites it before the earlier fragment's PV reads
+                # it.
                 rescale = jnp.where(is_row_start, 1.0, rescale)
             elif window_fragment is not None:
                 _flag_overflow_risk(
@@ -1169,8 +1178,8 @@ def fwd_body(
             is_tile_zero=num_k_compute_tiles == 1,
         ):
             """Leave the PV of the block's last fragment (head pending_g, q tile
-            pending_q, kv tile kv_compute_index) to the next block; is_tile_zero as
-            in _online_softmax."""
+            pending_q, kv tile kv_compute_index) to the next block; is_tile_zero
+            as in _online_softmax."""
             new_parity, old_parity = _block_parities()
             pending_probs[...] = probs
             pending_v[...] = _v_tile(pending_g, kv_compute_index, kv_slot)
@@ -1193,10 +1202,10 @@ def fwd_body(
             takes_pending=False,
             carries_out=False,
         ):
-            """takes_pending issues the previous block's pending PV after the first
-            softmax, and carries_out leaves the last fragment's PV pending; a
-            replay passes neither. skips_dead_tiles runs a bounds-masked block's
-            live tiles alone."""
+            """takes_pending issues the previous block's pending PV after the
+            first softmax, and carries_out leaves the last fragment's PV
+            pending; a replay passes neither. skips_dead_tiles runs a
+            bounds-masked block's live tiles alone."""
 
             def _after_first_softmax():
                 if takes_pending:
@@ -1204,19 +1213,20 @@ def fwd_body(
                     if not carries_out:
                         _cancel_pending_pv()
 
-            # Note (david): static_g None is the fast path, one distance-1 pipeline
-            # across every folded head so head g + 1's first QK overlaps head g's
-            # last PV. An int static_g is the rare per-head overflow replay, kept
-            # simple on purpose.
+            # Note (david): static_g None is the fast path, one distance-1
+            # pipeline across every folded head so head g + 1's first QK
+            # overlaps head g's last PV. An int static_g is the rare per-head
+            # overflow replay, kept simple on purpose.
             heads = range(head_fold) if static_g is None else (static_g,)
             if skips_dead_tiles:
-                # Note (david): the live tiles run in a loop whose body is the q tiles
-                # of one kv tile, straight-line, with the pending PV in the carry; a
-                # cond around every fragment instead ran 17.4 against 3.78 ms (v6e,
-                # 32:8 d128, paged (512, 2048, 128, 512)). A live tile past a q tile's
-                # own frontier scores fully masked fragments, which leave every
-                # anchored row's state as it was. Tile 0 is peeled so the carry always
-                # holds a pending PV, and with two tiles per block only tile 0 is live.
+                # Note (david): the live tiles run in a loop whose body is the q
+                # tiles of one kv tile, straight-line, with the pending PV in
+                # the carry; a cond around every fragment instead ran 17.4
+                # against 3.78 ms (v6e, 32:8 d128, paged (512, 2048, 128, 512)).
+                # A live tile past a q tile's own frontier scores fully masked
+                # fragments, which leave every anchored row's state as it was.
+                # Tile 0 is peeled so the carry always holds a pending PV, and
+                # with two tiles per block only tile 0 is live.
                 last_q_tile = num_q_compute_tiles - 1
                 has_tile_loop = num_k_compute_tiles > 2
                 last_live_tile = num_live_tiles - 1 if has_tile_loop else 0
@@ -1258,8 +1268,8 @@ def fwd_body(
                     if has_tile_loop:
 
                         def _tile_step(kv_compute_index, carry, g=g):
-                            # Note (david): the carried PV is tile 0's on the first
-                            # iteration, so its parity stays runtime.
+                            # Note (david): the carried PV is tile 0's on the
+                            # first iteration, so its parity stays runtime.
                             pending = (
                                 g,
                                 kv_compute_index - 1,
@@ -1296,9 +1306,9 @@ def fwd_body(
                 else:
                     _block_pv(*pending_pv)
                 if has_tile_loop and not guard_recovery:
-                    # Note (david): once the loop ends each head's new-parity row sums
-                    # are its last live tile's, so one check replaces a runtime tile
-                    # compare in every fragment.
+                    # Note (david): once the loop ends each head's new-parity
+                    # row sums are its last live tile's, so one check replaces a
+                    # runtime tile compare in every fragment.
                     for g in heads:
                         new_parity, _ = _block_parities()
                         _flag_overflow_risk(
@@ -1360,9 +1370,9 @@ def fwd_body(
                             frag_idx % num_q_compute_tiles,
                         )
 
-                # Note (david): a pinned g replaces the loop-carried copy as a Python
-                # int, because sub-tile (d64) lane windows need static offsets; a
-                # static g costs nothing on the other builds.
+                # Note (david): a pinned g replaces the loop-carried copy as a
+                # Python int, because sub-tile (d64) lane windows need static
+                # offsets; a static g costs nothing on the other builds.
                 def _resolve_g(g):
                     return static_g if static_g is not None else g
 
@@ -1444,8 +1454,8 @@ def fwd_body(
                     unroll=True,
                 )
                 if carries_out:
-                    # Note (david): this copy runs every fragment, so its last fragment
-                    # is the static pending one.
+                    # Note (david): this copy runs every fragment, so its last
+                    # fragment is the static pending one.
                     assert not guard_recovery
                     _carry_out_pv(probs_last, is_row_start_last)
                 else:
@@ -1480,12 +1490,13 @@ def fwd_body(
                     0,
                     bkv,
                 )
-                # Note (david): a staged word holds the kv head's K and V rows, split
-                # into planes once per compute tile, not once per q tile. Staged rows
-                # from valid_rows on may hold NaN (cache slots past seqused_k or stale
-                # VMEM), and a zero probability times a NaN value is still NaN, so
-                # they unpack as zero values; the keys are masked and skip the
-                # select, which keeps it off the path to the first QK.
+                # Note (david): a staged word holds the kv head's K and V rows,
+                # split into planes once per compute tile, not once per q tile.
+                # Staged rows from valid_rows on may hold NaN (cache slots past
+                # seqused_k or stale VMEM), and a zero probability times a NaN
+                # value is still NaN, so they unpack as zero values; the keys
+                # are masked and skip the select, which keeps it off the path to
+                # the first QK.
                 for tile in range(num_k_compute_tiles):
                     tile_rows = pl.ds(tile * bkv_compute, bkv_compute)
 
@@ -1525,26 +1536,28 @@ def fwd_body(
                             for kv_part in range(2)
                         )
                         v_rows = _valid_only(v_rows)
-                    # Note (david): an fp8 block is widened to bf16 once per staged
-                    # block rather than fed to the MXU as fp8, which makes Mosaic
-                    # rescale every f32 score and output tile for e4m3fn's bias (v6e:
-                    # 0.356 against 0.349 ms a 1024-token chunk).
+                    # Note (david): an fp8 block is widened to bf16 once per
+                    # staged block rather than fed to the MXU as fp8, which
+                    # makes Mosaic rescale every f32 score and output tile for
+                    # e4m3fn's bias (v6e: 0.356 against 0.349 ms a 1024-token
+                    # chunk).
                     for kv_part, plane_rows in enumerate((k_rows, v_rows)):
                         kv_planes[kv_part, tile_rows, :] = plane_rows.astype(
                             kv_planes.dtype
                         )
             elif rotary_dim and rotary_k:
                 _rotate_staged(k_buf, rotary_k_buf, kv_slot, bkv)
-            # Note (david): a path that loads every block starts the block two ahead
-            # inside the copy, where the page DMAs' scalar work rides the copy's
-            # idle scalar slots.
+            # Note (david): a path that loads every block starts the block two
+            # ahead inside the copy, where the page DMAs' scalar work rides the
+            # copy's idle scalar slots.
             if not reuses_blocks:
                 _start_block_data(ahead_desc, ahead_slot)
             if is_lane_paired:
                 # Note (david): one static-g pipeline per head, since the fused
-                # pipeline's loop-carried g would make the 64-lane window offsets
-                # dynamic; this gives up the overlap across head boundaries, while the
-                # first head still takes the pending PV in and the last carries out.
+                # pipeline's loop-carried g would make the 64-lane window
+                # offsets dynamic; this gives up the overlap across head
+                # boundaries, while the first head still takes the pending PV in
+                # and the last carries out.
                 for g in range(head_fold):
                     _run_schedule(
                         is_causal,
@@ -1584,9 +1597,9 @@ def fwd_body(
                         _cancel_pending_pv()
 
         def _stage_bounds():
-            # Note (david): synthesize the bounds rows once for the whole (1, bkv)
-            # kv window; evaluated per fragment they spilled vector registers the
-            # MXU then waited on (+13.4% on a 2048/256 prefill).
+            # Note (david): synthesize the bounds rows once for the whole (1,
+            # bkv) kv window; evaluated per fragment they spilled vector
+            # registers the MXU then waited on (+13.4% on a 2048/256 prefill).
             k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
             q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
             for tile in range(num_k_compute_tiles):
@@ -1595,14 +1608,14 @@ def fwd_body(
                 if schedule.has_q_span:
                     bounds_buf[tile, 1:2, :] = q_span[:, tile_lanes]
 
-        # Note (david): a mask-free copy of the fragment pipeline and masked ones,
-        # because the masks cost about as many VPU ops as the softmax itself: one
-        # per partial-block offset under window_plans, else one applying every
-        # mask the build has. One copy per (causal, bounds) pair measured 2.6x
-        # slower at block 2048. A build carries either the static window (dense)
-        # or the per-seq bounds (varlen), never both, and has_static_mask still
-        # gates the former so a full-attention build never loses its upper
-        # triangle.
+        # Note (david): a mask-free copy of the fragment pipeline and masked
+        # ones, because the masks cost about as many VPU ops as the softmax
+        # itself: one per partial-block offset under window_plans, else one
+        # applying every mask the build has. One copy per (causal, bounds) pair
+        # measured 2.6x slower at block 2048. A build carries either the static
+        # window (dense) or the per-seq bounds (varlen), never both, and
+        # has_static_mask still gates the former so a full-attention build never
+        # loses its upper triangle.
         if is_per_seq:
             needs_any_mask = jnp.logical_or(is_partial, needs_bounds)
         else:
@@ -1663,8 +1676,9 @@ def fwd_body(
                 )
 
         if defers_row_finish:
-            # Note (david): the previous row's last PV ran inside this block's copy,
-            # and its final parity stays untouched until this row's second block.
+            # Note (david): the previous row's last PV ran inside this block's
+            # copy, and its final parity stays untouched until this row's second
+            # block.
             @pl.when(jnp.logical_and(is_first, prev_row_finish.is_live > 0))
             def _finish_previous_row():
                 _finish_row_out(prev_row_finish)
@@ -1722,9 +1736,9 @@ def fwd_body(
                     src_row_offset - src_offset_in_tile + tile * BF16_TILE_ROWS
                 )
                 # Note (david): the upper source tile is used only when
-                # src_offset_in_tile is 8 and this tile's upper half blends, and then
-                # it lies inside the source stage; the clamp keeps the unused read in
-                # bounds otherwise.
+                # src_offset_in_tile is 8 and this tile's upper half blends, and
+                # then it lies inside the source stage; the clamp keeps the
+                # unused read in bounds otherwise.
                 src_upper_start = jnp.minimum(
                     src_lower_start + BF16_TILE_ROWS,
                     stage_ref.shape[-2] - BF16_TILE_ROWS,
@@ -1775,9 +1789,9 @@ def fwd_body(
         """Per-seq: write fill_value into the rows of the row's stage slot at or
         past cu_seqlens_q[-1]."""
         # Note (david): rows at or past cu_seqlens_q[-1] belong to no sequence
-        # and read out = 0 (lse = -inf). A window reaching them fills them in its
-        # stage, which covers the partial tile at the packed end; the fill after
-        # the loop covers the whole tiles past it.
+        # and read out = 0 (lse = -inf). A window reaching them fills them in
+        # its stage, which covers the partial tile at the packed end; the fill
+        # after the loop covers the whole tiles past it.
         packed_q_end = schedule.packed_q_end
 
         @pl.when(finish.q_tok + bq > packed_q_end)
@@ -1799,8 +1813,9 @@ def fwd_body(
         finish.parity."""
         out_slot = lax.rem(finish.out_count, num_stages)
 
-        # Note (david): o_stage is one output ring shared by the whole fold group,
-        # so wait out the slot's previous DMA before any head writes into it.
+        # Note (david): o_stage is one output ring shared by the whole fold
+        # group, so wait out the slot's previous DMA before any head writes into
+        # it.
         @pl.when(finish.out_count >= num_stages)
         def _wait_prev_out():
             _o_copy(0, 0, out_slot).wait()
@@ -1849,9 +1864,9 @@ def fwd_body(
                 elif o_half is None:
                     o_stage_g[tile_index] = o_normalized
                 else:
-                    # Note (david): the stage tile holds both heads of the pair, and the
-                    # head loop is sequential, so the other half is either untouched or
-                    # already this step's final value.
+                    # Note (david): the stage tile holds both heads of the pair,
+                    # and the head loop is sequential, so the other half is
+                    # either untouched or already this step's final value.
                     o_stage_g[tile_index] = _set_half(
                         o_stage_g[tile_index],
                         o_half,
@@ -1881,11 +1896,11 @@ def fwd_body(
     def _head_sinks(base_head):
         """The sink of each pipeline head of the group at base_head."""
 
-        # Note (deepolar): the sinks hold one logit per sequence head: flat q head
-        # f reads sinks[f % nheads], or sinks[f // B] heads-outer. Pipeline head g
-        # is flat q head base_head + g * gqa_fold, and the rows of a q tile run
-        # (folded head, token), so the tile below, built once per head, gives
-        # each folded head's rows its own sink.
+        # Note (deepolar): the sinks hold one logit per sequence head: flat q
+        # head f reads sinks[f % nheads], or sinks[f // B] heads-outer. Pipeline
+        # head g is flat q head base_head + g * gqa_fold, and the rows of a q
+        # tile run (folded head, token), so the tile below, built once per head,
+        # gives each folded head's rows its own sink.
         def sink_of(flat_head):
             if heads_outer_batch is None:
                 return sinks_ref[lax.rem(flat_head, sinks_ref.shape[0])]
@@ -1928,8 +1943,9 @@ def fwd_body(
                 row_sum_ref[tile_rows, :] = 1.0 / out_scale
 
     def _finish_row_lse(group, finish, sinks):
-        """Stage and write the row's lse; its last softmax has run, and its final
-        row_sum sits at finish.parity. sinks is _head_sinks's list, or None."""
+        """Stage and write the row's lse; its last softmax has run, and its
+        final row_sum sits at finish.parity. sinks is _head_sinks's list, or
+        None."""
         out_slot = lax.rem(finish.out_count, num_stages)
         for g in range(head_fold):
             head_rows = pl.ds(g * group_bq, group_bq)
@@ -1938,9 +1954,10 @@ def fwd_body(
             # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
             # units; scale by ln(2) for the natural-log lse that is returned.
             if gqa_fold > 1:
-                # Note (david): every lane of a row state holds the row's value, and
-                # the rows of a q tile run (folded head, token), so each head's token
-                # rows reach its own lse lane through one lane select per head.
+                # Note (david): every lane of a row state holds the row's value,
+                # and the rows of a q tile run (folded head, token), so each
+                # head's token rows reach its own lse lane through one lane
+                # select per head.
                 lane_ids = lax.broadcasted_iota(
                     jnp.int32, (bq_compute, NUM_LANES), 1
                 )
@@ -1987,9 +2004,10 @@ def fwd_body(
                 lse_hbm.at[group, pl.ds(finish.q_tok, bq), :],
             )]
         elif head_fold % NUM_SUBLANES == 0:
-            # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned fold
-            # is one group-wide copy; a smaller fold copies row by row, since later
-            # groups start at h = 2 or 4 and would break tile alignment.
+            # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned
+            # fold is one group-wide copy; a smaller fold copies row by row,
+            # since later groups start at h = 2 or 4 and would break tile
+            # alignment.
             lse_copies = [(
                 lse_stage,
                 lse_hbm.at[
@@ -2026,8 +2044,8 @@ def fwd_body(
         return next_g, next_si
 
     def _first_two_blocks(g, si):
-        """The descriptors of the first two blocks of the flattened order from row
-        si of group g on, and that row's (lo, hi, ctx)."""
+        """The descriptors of the first two blocks of the flattened order from
+        row si of group g on, and that row's (lo, hi, ctx)."""
         lo, hi, ctx = schedule.row_interval(si)
         after_g, after_si = _row_after(g, si)
         after_lo, _, after_ctx = schedule.row_interval(after_si)
@@ -2065,9 +2083,9 @@ def fwd_body(
         else:
             row_parity, prev_row_finish = 0, None
         lo, hi, ctx = schedule.row_interval(si)
-        # Note (david): past the grid's last row the lookahead is that row itself,
-        # so the q stream prefetches nothing, and the kv stream reloads blocks the
-        # kernel waits out after its loop.
+        # Note (david): past the grid's last row the lookahead is that row
+        # itself, so the q stream prefetches nothing, and the kv stream reloads
+        # blocks the kernel waits out after its loop.
         next_g, next_si = _row_after(g, si)
         first_next_desc, second_next_desc, (_, _, next_ctx) = _first_two_blocks(
             next_g, next_si
@@ -2096,7 +2114,6 @@ def fwd_body(
             lo,
             hi + 1,
             lambda kv, block_carry: _block_step(
-                g,
                 si,
                 kv,
                 lo,
@@ -2230,9 +2247,9 @@ def fwd_body(
     if is_per_seq:
         # Note (david): packed padding rows own no q block, so once every output
         # DMA has landed they are written from a cleared stage. The last block
-        # already zeroed its window's padding rows, so the fill starts at the next
-        # HBM tile; with no block at all, cu_seqlens_q is all 0 and so is that
-        # tile.
+        # already zeroed its window's padding rows, so the fill starts at the
+        # next HBM tile; with no block at all, cu_seqlens_q is all 0 and so is
+        # that tile.
         packed_q_end = schedule.packed_q_end
         padded_total_q = o_hbm.shape[-2]
         tile_rows = hbm_bf16_tile_rows()
@@ -2428,8 +2445,8 @@ def forward_common(
                 f" {kv_heads_per_row} * head_dim_v {head_dim_v}."
             )
         if head_dim_v % NUM_LANES and (head_fold * head_dim_v) % NUM_LANES:
-            # Note (david): a sub-tile head_dim (d64) relies on an even head_fold so
-            # every DMA group spans whole 128-lane tiles.
+            # Note (david): a sub-tile head_dim (d64) relies on an even
+            # head_fold so every DMA group spans whole 128-lane tiles.
             raise ValueError(
                 "token-major requires head_dim_v % 128 == 0, or a head_fold"
                 " that pads the DMA group to a 128-lane multiple; got"
@@ -2473,7 +2490,8 @@ def forward_common(
         raise ValueError(f"{bkv_compute=} must be a multiple of {NUM_LANES}.")
 
     # Note (david): a per-seq schedule clamps its windows to the axis end and
-    # checks that each block fits, so only the dense grid needs the divisibility.
+    # checks that each block fits, so only the dense grid needs the
+    # divisibility.
     if not is_per_seq and (q_seq_len % bq or kv_seq_len % bkv):
         raise ValueError(f"{bq=} and {bkv=} must divide the sequence lengths.")
     if rotary is None:
@@ -2533,8 +2551,8 @@ def forward_common(
             )
         rotary_q_heads = num_q_heads // rotary_batch
         rotary_k_heads = num_kv_heads // rotary_batch
-        # Note (david): a dense head-major fold may span batch rows, and only then
-        # does each folded head need its own coefficient plane.
+        # Note (david): a dense head-major fold may span batch rows, and only
+        # then does each folded head need its own coefficient plane.
         if rotary_q_heads % head_fold or rotary_k_heads % head_fold:
             rotary_groups = head_fold
         else:
@@ -2578,15 +2596,15 @@ def forward_common(
         if group_heads == 1:
             return (stages, *from_head_minor((rows, head_dim), layout))
         elif token_major is not None:
-            # Note (david): a token-major group is head_fold * head_dim consecutive
-            # lanes of one row, so the fold rides the lane axis and one DMA per
-            # stream lands the whole group.
+            # Note (david): a token-major group is head_fold * head_dim
+            # consecutive lanes of one row, so the fold rides the lane axis and
+            # one DMA per stream lands the whole group.
             return (stages, rows, head_fold * head_dim)
         else:
             # Note (david): an explicit fold axis rank-matches the 3-D HBM head
             # slices, so XLA never materializes a reshaped q/k/v copy, which
-            # dominated wall time at short sequences when head_dim < 128 needed lane
-            # padding.
+            # dominated wall time at short sequences when head_dim < 128 needed
+            # lane padding.
             return (
                 stages,
                 group_heads,
@@ -2604,9 +2622,9 @@ def forward_common(
         scratch_shapes = [q_buf, k_buf, v_buf]
     else:
         # Note (david): a paged block stages the u32 word rows holding one kv
-        # head's K and V, then unpacks them into one bf16 K and one bf16 V plane;
-        # a word's (kv_word_rows, head_dim) rows pad to nothing, so the staging
-        # costs what two dense planes of the cache dtype would.
+        # head's K and V, then unpacks them into one bf16 K and one bf16 V
+        # plane; a word's (kv_word_rows, head_dim) rows pad to nothing, so the
+        # staging costs what two dense planes of the cache dtype would.
         scratch_shapes = [
             q_buf,
             vmem(
@@ -2616,10 +2634,11 @@ def forward_common(
             vmem((2, bkv, head_dim_qk), q.dtype),
         ]
     if is_per_seq:
-        # Note (david): the per-seq kernel synthesizes its bounds rows (the q lower
-        # bound, plus the span under a left window) once per block in-kernel, so
-        # it needs one block's rows, not a kv-stream ring. Both rows share one
-        # (8, 128) int32 tile, so the span row costs no extra VMEM.
+        # Note (david): the per-seq kernel synthesizes its bounds rows (the q
+        # lower bound, plus the span under a left window) once per block
+        # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
+        # rows share one (8, 128) int32 tile, so the span row costs no extra
+        # VMEM.
         scratch_shapes.append(
             vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32)
         )
@@ -2689,12 +2708,13 @@ def forward_common(
     else:
         q_in, k_in, v_in, *rotary_in = (q, k, v, *rotary_operands)
     if paged is not None:
-        # Note (david): the pool is pinned to HBM because memory space assignment
-        # otherwise moves a pool that fits its VMEM budget there and back around
-        # every call, the whole pool however few pages the call reads (v6e, 16 MB
-        # e5m2 pool: 0.369 against 0.339 ms a chunk). The spec stays pl.ANY: a
-        # layout copy XLA inserts before the call escapes the constraint and can
-        # land in VMEM, where DMAs compiled for an HBM operand halt the chip.
+        # Note (david): the pool is pinned to HBM because memory space
+        # assignment otherwise moves a pool that fits its VMEM budget there and
+        # back around every call, the whole pool however few pages the call
+        # reads (v6e, 16 MB e5m2 pool: 0.369 against 0.339 ms a chunk). The spec
+        # stays pl.ANY: a layout copy XLA inserts before the call escapes the
+        # constraint and can land in VMEM, where DMAs compiled for an HBM
+        # operand halt the chip.
         kernel_inputs = [
             q_in,
             pltpu.with_memory_space_constraint(k_in, pltpu.HBM),
@@ -2721,8 +2741,8 @@ def forward_common(
         )
     # Note (david): per-seq LSE gives every head group an explicit minor axis of
     # whole 128-lane tiles, so fwd_body DMAs complete tiles at offset zero and
-    # groups never alias in the physical layout; only the first group_heads lanes
-    # are returned.
+    # groups never alias in the physical layout; only the first group_heads
+    # lanes are returned.
     lse_shape = (
         (num_q_heads // group_heads, q_seq_len, NUM_LANES)
         if is_per_seq
@@ -2751,12 +2771,10 @@ def forward_common(
             ),
             interpret=pltpu.InterpretParams() if interpret else False,
         )(*smem_operands, *kernel_inputs)
-    if return_lse:
-        o_kernel, lse_kernel = outputs
-    else:
-        o_kernel = outputs
-    # Note (david): transposed_pv emits (heads, head_dim_v, seq); for d64 the swap
-    # back is the {1,2,0} layout XLA already prefers, so it folds into a bitcast.
+    o_kernel, lse_kernel = outputs if return_lse else (outputs, None)
+    # Note (david): transposed_pv emits (heads, head_dim_v, seq); for d64 the
+    # swap back is the {1,2,0} layout XLA already prefers, so it folds into a
+    # bitcast.
     o = o_kernel.swapaxes(-1, -2) if transposed_pv else o_kernel
     if not return_lse:
         return o

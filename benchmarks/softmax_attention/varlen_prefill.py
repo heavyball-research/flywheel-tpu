@@ -127,6 +127,8 @@ def split_budget(weights: list[float], total_tokens: int) -> list[int]:
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
+    """One benchmark point: an implementation on one ragged prefill batch."""
+
     impl: str
     heads: int
     heads_k: int
@@ -212,6 +214,7 @@ def build_flywheel(
 ) -> tuple[Step, Callable[[], jax.Array], BuildInfo]:
     """(step, fresh_state, info) running flash_attn_varlen_func's paged
     kernel over a cache that holds the batch's K/V."""
+    del args  # Unused.
     lengths = cell.lengths
     # Note (david): varlen callers pass the longest sequence as max_seqlen.
     max_seqlen = max(lengths)
@@ -446,7 +449,7 @@ def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
         step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
         record.update(info)
         timing, _ = time_call(step, fresh())
-    except Exception as error:
+    except Exception as error:  # pylint: disable=broad-exception-caught
         record.update(
             status="error", error=f"{type(error).__name__}: {str(error)[:400]}"
         )

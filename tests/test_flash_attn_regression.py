@@ -1,6 +1,6 @@
-"""Regression tests for kernel paths the random grids of test_flash_attn.py do not
-reach: dense and packed flash_attn_func / flash_attn_varlen_func, and single-token
-decode through flash_attn_with_kvcache."""
+"""Regression tests for kernel paths the random grids of test_flash_attn.py do
+not reach: dense and packed flash_attn_func / flash_attn_varlen_func, and
+single-token decode through flash_attn_with_kvcache."""
 
 import itertools
 import math
@@ -24,8 +24,8 @@ INTERPRET = jax.default_backend() != "tpu"
 
 
 def to_head_major(x):
-    """(batch, seqlen, nheads, d) <-> (batch, nheads, seqlen, d), or packed (total,
-    nheads, d) <-> (nheads, total, d)."""
+    """(batch, seqlen, nheads, d) <-> (batch, nheads, seqlen, d), or packed
+    (total, nheads, d) <-> (nheads, total, d)."""
     return jnp.swapaxes(x, -3, -2)
 
 
@@ -34,8 +34,8 @@ def max_abs(x):
 
 
 def assert_output_close(out, q, k, v, rows=slice(None), **mask_kwargs):
-    """test_flash_attn.py's rule: at most twice the error of the bf16 reference with
-    reordered ops, plus the rounding of arithmetic on the f32 reference."""
+    """test_flash_attn.py's rule: at most twice the error of the bf16 reference
+    with reordered ops, plus the rounding of arithmetic on the f32 reference."""
     out_ref, _ = attention_ref(q, k, v, **mask_kwargs)
     out_bf16, _ = attention_ref(
         q, k, v, upcast=False, reorder_ops=True, **mask_kwargs
@@ -67,8 +67,8 @@ def random_qkv(seed, batch, seqlen_q, nheads, nheads_k, d, seqlen_k=None):
 
 @pytest.mark.parametrize("causal", [False, True])
 def test_flash_attn_overflow_guard_recovery(causal):
-    # Note (david): scaled keys in the last quarter push late row maxima far past
-    # the guard threshold anchored on the first kv block, so the recovery
+    # Note (david): scaled keys in the last quarter push late row maxima far
+    # past the guard threshold anchored on the first kv block, so the recovery
     # replay runs, while early causal rows never see them and stay on the fast
     # path.
     seqlen = 256 if INTERPRET else 1024
@@ -182,7 +182,7 @@ def test_flash_attn_varlen_padding_rows_are_zero(seqlens_q, num_pad, causal):
     k = jnp.concatenate([k, pad_k[0]])
     v = jnp.concatenate([v, pad_v[0]])
     cu = cu_seqlens_of(seqlens_q)
-    max_seqlen = max(max(seqlens_q), 1)
+    max_seqlen = max(*seqlens_q, 1)
     out, lse = varlen_attn(
         q,
         k,
@@ -430,22 +430,26 @@ def test_attention_sinks_are_forward_only(entry):
     q, k, v = random_qkv(0, 1, 128, 4, 2, 128)
     sinks = random_sinks(4)
     if entry == "dense":
-        loss = lambda q: dense_attn(
-            q, k, v, causal=True, learnable_sink=sinks
-        ).sum()
+
+        def loss(q):
+            return dense_attn(q, k, v, causal=True, learnable_sink=sinks).sum()
+
     else:
         cu = cu_seqlens_of([128])
-        loss = lambda q: varlen_attn(
-            q[0],
-            k[0],
-            v[0],
-            cu,
-            cu,
-            128,
-            128,
-            causal=True,
-            learnable_sink=sinks,
-        ).sum()
+
+        def loss(q):
+            return varlen_attn(
+                q[0],
+                k[0],
+                v[0],
+                cu,
+                cu,
+                128,
+                128,
+                causal=True,
+                learnable_sink=sinks,
+            ).sum()
+
     with pytest.raises(NotImplementedError, match="forward-only"):
         jax.grad(loss)(q)
 
@@ -737,7 +741,7 @@ def test_traced_sinks_compile_once():
     )
     attend(random_sinks(4)).block_until_ready()
     attend(random_sinks(4) + 1.0).block_until_ready()
-    assert attend._cache_size() == 1
+    assert attend._cache_size() == 1  # pylint: disable=protected-access
 
 
 def decode_reference(

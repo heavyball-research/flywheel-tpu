@@ -37,6 +37,10 @@ heuristic. A cell already recorded as ok in --output is skipped unless --trace
 is given.
 """
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse
@@ -77,6 +81,8 @@ TRACE_CALLS = 3
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
+    """One benchmark point: an attention implementation on one prefill shape."""
+
     impl: str
     heads: int
     heads_k: int
@@ -167,6 +173,7 @@ def make_weights(cell):
 
 def build_flywheel(cell, w, args):
     """(step, fresh_state, info) for flash_attn_func on head-major q, k, v."""
+    del args  # Unused.
     import jax
     import jax.numpy as jnp
 
@@ -188,7 +195,8 @@ def build_flywheel(cell, w, args):
 
 
 def build_splash(cell, w, args):
-    """(step, fresh_state, info) for splash attention on (batch * heads, ...)."""
+    """(step, fresh_state, info) for splash attention on (batch * heads,
+    ...)."""
     import jax
     import jax.numpy as jnp
 
@@ -359,8 +367,6 @@ def trace_cell(cell, step, state, directory):
 
 
 def run(cell, args):
-    import jax
-
     pair_count = cell.batch * cell.seq * cell.seq
     if cell.causal:
         pair_count //= 2
@@ -386,7 +392,7 @@ def run(cell, args):
         step, fresh, info = BUILDERS[cell.impl](cell, weights, args)
         record.update(info)
         timing, _ = time_call(step, fresh())
-    except Exception as error:
+    except Exception as error:  # pylint: disable=broad-exception-caught
         record.update(
             status="error", error=f"{type(error).__name__}: {str(error)[:300]}"
         )

@@ -15,6 +15,8 @@ repos:
       - id: pylint
         # pylint parallelizes itself (jobs in .pylintrc).
         require_serial: true
+        # Frozen copies of the baseline kernels the benchmarks compare against.
+        exclude: ^benchmarks/linear_attention/baseline_kernel/
   - repo: https://github.com/zizmorcore/zizmor-pre-commit
     rev: v1.31.1
     hooks:

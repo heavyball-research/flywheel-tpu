@@ -1,4 +1,5 @@
-"""Conversion between padded (batch, seqlen, ...) and packed (total, ...) tokens."""
+"""Conversion between padded (batch, seqlen, ...) and packed (total, ...)
+tokens."""
 
 import jax.numpy as jnp
 
@@ -10,7 +11,8 @@ def unpad_input(hidden_states, attention_mask):
         attention_mask: (batch, seqlen), bool, True means valid.
     Return:
         hidden_states: (total_nnz, ...), the selected tokens.
-        indices: (total_nnz,), their positions in the flattened (batch * seqlen).
+        indices: (total_nnz,), their positions in the flattened (batch *
+            seqlen).
         cu_seqlens: (batch + 1,) int32, the cumulative sequence lengths.
         max_seqlen_in_batch: int.
         seqused: (batch,) int32, the number of tokens selected in each sequence.
@@ -32,10 +34,10 @@ def unpad_input(hidden_states, attention_mask):
 def pad_input(hidden_states, indices, batch, seqlen):
     """
     Arguments:
-        hidden_states: (total_nnz, ...), where total_nnz = number of tokens selected
-            in attention_mask.
-        indices: (total_nnz,), the indices that represent the non-masked tokens of
-            the original padded input sequence.
+        hidden_states: (total_nnz, ...), where total_nnz = number of tokens
+            selected in attention_mask.
+        indices: (total_nnz,), the indices that represent the non-masked tokens
+            of the original padded input sequence.
         batch: int, batch size for the padded sequence.
         seqlen: int, maximum sequence length for the padded sequence.
     Return:

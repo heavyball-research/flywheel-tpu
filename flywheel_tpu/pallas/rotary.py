@@ -25,18 +25,20 @@ def prepare_rotary(
     rotate_k: bool = True,
     seqused_k: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array | None] | None:
-    """Gather per-token cos/sin coefficients without materializing rotated Q or K.
+    """Gather per-token cos/sin coefficients without materializing rotated Q or
+    K.
 
     cos and sin are (seqlen_ro, head_dim / 2) tables in Q's dtype or float32;
-    float32 keeps the in-kernel f32 rotation identical to an f32 RoPE outside the
-    kernel. Prefill positions are 0..len_k-1 for K and len_k-len_q..len_k-1 for Q
-    per sequence. Returns (q_coefficients, k_coefficients), each
-    (1, tokens, head_dim) with cos and sin packed in the rotation's own pairing:
+    float32 keeps the in-kernel f32 rotation identical to an f32 RoPE outside
+    the kernel. Prefill positions are 0..len_k-1 for K and len_k-len_q..len_k-1
+    for Q per sequence. Returns (q_coefficients, k_coefficients), each (1,
+    tokens, head_dim) with cos and sin packed in the rotation's own pairing:
     [cos | sin] for split halves, [cos_0, sin_0, cos_1, sin_1, ...] interleaved,
     so rotate_tile pairs them with the same rolls as the head. The packed plane
     is the same bytes as separate half-width cos and sin planes. The singleton
-    axis is shared by all batch rows or packed heads. k_coefficients is None when
-    rotate_k is False (K arrives already rotated). Returns None without tables.
+    axis is shared by all batch rows or packed heads. k_coefficients is None
+    when rotate_k is False (K arrives already rotated). Returns None without
+    tables.
 
     seqused_k replaces cu_k for a paged KV cache, whose K arrives rotated
     (rotate_k=False).
@@ -92,7 +94,8 @@ def prepare_rotary(
             )
             positions = token_ids - cu_seqlens[seq_ids] + seq_offsets[seq_ids]
             # Note (david): unused packed capacity is a kernel-internal padding
-            # sequence whose rotation is irrelevant; position 0 keeps it in the table.
+            # sequence whose rotation is irrelevant; position 0 keeps it in the
+            # table.
             return jnp.where(token_ids < cu_seqlens[-1], positions, 0)
 
         if cu_q is None and seqlen_q > seqlen_k:
@@ -115,8 +118,9 @@ def prepare_rotary(
                     "RoPE requires 0 <= len_q <= len_k <= rotary table length."
                 )
 
-            # Note (david): traced cu_seqlens cannot be checked at trace time, so the
-            # check runs on device and raises through an ordered debug callback.
+            # Note (david): traced cu_seqlens cannot be checked at trace time,
+            # so the check runs on device and raises through an ordered debug
+            # callback.
             if isinstance(are_lengths_valid, jax.core.Tracer):
                 lax.cond(
                     are_lengths_valid,
@@ -187,8 +191,9 @@ def rotate_tile(
 
     tile_f32 = tile.astype(jnp.float32)
     packed = coefficients.astype(jnp.float32)
-    # Note (david): swapping the packed plane's pairs puts sin under each cos and
-    # cos under each sin, so one select per plane spreads both over the head.
+    # Note (david): swapping the packed plane's pairs puts sin under each cos
+    # and cos under each sin, so one select per plane spreads both over the
+    # head.
     swapped = _swap_pairs(packed)
     cosine = jnp.where(is_first_of_pair, packed, swapped)
     sine = jnp.where(is_first_of_pair, -swapped, packed)

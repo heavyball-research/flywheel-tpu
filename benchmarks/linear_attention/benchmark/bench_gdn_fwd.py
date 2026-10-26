@@ -4,9 +4,11 @@ Times a fresh prefill through fused_conv1d_gdn, chaining the donated state
 buffers from call to call as serving does. Defaults mirror bench_kda_fwd.py so
 tokens/s is comparable. The first of --pkgs is the baseline.
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench_gdn_fwd.py \
-        --pkgs gdn_v3,flywheel_tpu.linear_attention.gdn \
-        --output benchmarks/linear_attention/benchmark/results/gdn_v3_fwd_v6e.json
+    PYTHONPATH=. uv run --no-sync python \\
+        benchmarks/linear_attention/benchmark/bench_gdn_fwd.py \\
+        --pkgs gdn_v3,flywheel_tpu.linear_attention.gdn \\
+        --output \\
+        benchmarks/linear_attention/benchmark/results/gdn_v3_fwd_v6e.json
 """
 
 from __future__ import annotations
@@ -47,7 +49,8 @@ def make_inputs(
     num_seqs: int,
     dtype: jnp.dtype,
 ) -> tuple[dict[str, jax.Array | None], KernelState]:
-    """Fresh-prefill inputs of fused_conv1d_gdn and its zeroed conv / recurrent state."""
+    """Fresh-prefill inputs of fused_conv1d_gdn and its zeroed conv / recurrent
+    state."""
     dim = n_kq * d_k * 2 + n_v * d_v
     qkv_key, b_key, a_key, weight_key, a_log_key, dt_bias_key = (
         jax.random.split(key, 6)

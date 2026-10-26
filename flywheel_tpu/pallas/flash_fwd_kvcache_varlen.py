@@ -72,8 +72,8 @@ def append_kernel(
                 for copy in incoming:
                     copy.wait()
 
-                # Note (david): K and V are interleaved in VMEM so that each page's new
-                # rows go out as whole cache rows in one DMA.
+                # Note (david): K and V are interleaved in VMEM so that each
+                # page's new rows go out as whole cache rows in one DMA.
                 def _interleave_step(step, carry):
                     rows = pl.ds(
                         pl.multiple_of(step * step_rows, step_rows), step_rows
@@ -235,9 +235,9 @@ def flash_attn_kvcache_varlen(
         else:
             updated_kv_cache = kv_cache
         # Note (david): pinning every boundary past num_active to
-        # cu_seqlens_q[num_active] empties the inactive requests, so they own no q
-        # block and the kernel never reads their lengths or table rows; their rows
-        # become packed padding (out = 0, lse = -inf).
+        # cu_seqlens_q[num_active] empties the inactive requests, so they own no
+        # q block and the kernel never reads their lengths or table rows; their
+        # rows become packed padding (out = 0, lse = -inf).
         num_active_scalar = num_active_array[0]
         kept_cu_seqlens_q = jnp.where(
             jnp.arange(batch + 1, dtype=jnp.int32) <= num_active_scalar,

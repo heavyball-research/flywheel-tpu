@@ -2,9 +2,9 @@
 NumPy reference, on paths the random grid of test_flash_attn_kvcache does not
 reach.
 
-flash_attn_varlen_func(block_table=...) reads a merged interleaved cache the test
-filled on the host; flash_attn_with_kvcache's multi-token and packed calls append
-the new tokens, then run that same kernel.
+flash_attn_varlen_func(block_table=...) reads a merged interleaved cache the
+test filled on the host; flash_attn_with_kvcache's multi-token and packed calls
+append the new tokens, then run that same kernel.
 """
 
 import math
@@ -99,10 +99,9 @@ def ragged_reference(
     """Appends k/v to the paged caches, then attends each request's rows.
 
     window_left hides the keys more than window_left positions before a row's
-    bottom-right diagonal; softcap > 0 maps each scaled score s to
-    softcap * tanh(s / softcap) before masking. sinks (heads,) adds exp(sinks[h])
-    to head h's softmax denominator; a row that sees no key then has lse
-    sinks[h].
+    bottom-right diagonal; softcap > 0 maps each scaled score s to softcap *
+    tanh(s / softcap) before masking. sinks (heads,) adds exp(sinks[h]) to head
+    h's softmax denominator; a row that sees no key then has lse sinks[h].
 
     Returns (out, lse, k_pages, v_pages, top2), where top2 is the attention mass
     on the two heaviest keys of every attending (row, head).
@@ -125,9 +124,9 @@ def ragged_reference(
         total = lengths[seq] + (0 if k is None else query_length)
         positions = np.arange(total)
         pages = table[seq, positions // page_size]
-        # Note (david): (1, kv_heads, 1, head_dim, total) keys and (1, kv_heads, 1,
-        # total, head_dim) values broadcast against (rows, kv_heads, repeats, 1,
-        # head_dim).
+        # Note (david): (1, kv_heads, 1, head_dim, total) keys and (1, kv_heads,
+        # 1, total, head_dim) values broadcast against (rows, kv_heads, repeats,
+        # 1, head_dim).
         keys = kc[pages, positions % page_size].transpose(1, 2, 0)[
             None, :, None
         ]
@@ -161,7 +160,7 @@ def ragged_reference(
             scores = np.where(visible[:, None, None], scores, -np.inf)
             anchor = np.where(
                 seen[:, None, None, None],
-                scores.max(axis=-1, keepdims=True, initial=-np.inf),
+                scores.max(axis=-1, keepdims=True, initial=-np.inf),  # pylint: disable=unexpected-keyword-arg
                 0,
             )
             if sinks is not None:
@@ -746,8 +745,9 @@ def probe_case(
         zip(prefixes, lengths, totals)
     ):
         own = table[seq, : live_pages[seq]]
-        # Note (david): stale slots of the request's own pages, the append target
-        # included, copy its own codes: the strongest distractors for its queries.
+        # Note (david): stale slots of the request's own pages, the append
+        # target included, copy its own codes: the strongest distractors for its
+        # queries.
         kc[own] = codes[seq][rng.integers(0, total, (len(own), page_size))]
         positions = np.arange(prefix)
         slots = (table[seq, positions // page_size], positions % page_size)
@@ -763,7 +763,7 @@ def probe_case(
         marks = np.concatenate(
             [
                 np.arange(0, total + 1, step)
-                for step in {page_size, 256, 512, 1024, 2048}
+                for step in sorted({page_size, 256, 512, 1024, 2048})
             ]
             + [prefix + np.arange(0, length + 1, 128)]
         )
@@ -796,8 +796,8 @@ def probe_case(
             if window_left is None:
                 aimed_target, aimed_second = target, second
             else:
-                # Note (david): a missed left edge splits the attention of an edge row
-                # onto the hidden key it also aims at.
+                # Note (david): a missed left edge splits the attention of an
+                # edge row onto the hidden key it also aims at.
                 first_visible = np.maximum(rows - window_left, 0)
                 at_edge = rng.random(length) < 0.5
                 aimed_target = np.where(
@@ -866,9 +866,9 @@ def test_paged_unaligned_sequence_boundaries(padding, causal):
 def test_paged_chunked_prefill_long_prefix(
     lengths, prefixes, page_size, causal
 ):
-    # Note (david): max_seqlen_q = 256 underestimates the chunks, which only caps
-    # the q block, so one request splits across several q blocks and its causal
-    # limit must advance row by row across every block edge.
+    # Note (david): max_seqlen_q = 256 underestimates the chunks, which only
+    # caps the q block, so one request splits across several q blocks and its
+    # causal limit must advance row by row across every block edge.
     case = probe_case(
         lengths,
         prefixes,
@@ -998,8 +998,8 @@ def test_paged_overflow_guard_checks_last_live_kv_tile():
 
 
 def run_decode(q, kc, vc, k, v, cu, lengths, table, **kwargs):
-    """flash_attn_with_kvcache's single-token decode on the merged pool, one q, k
-    and v row per request; returns run_extend's (out, lse, updated_k,
+    """flash_attn_with_kvcache's single-token decode on the merged pool, one q,
+    k and v row per request; returns run_extend's (out, lse, updated_k,
     updated_v), out and lse in packed row order."""
     del cu
     out, lse, kv_cache = flash_attn_with_kvcache(
@@ -1075,8 +1075,8 @@ def test_paged_attention_sinks(entry, heads, kv_heads, window_left, softcap):
     "heads,kv_heads,seqlen_q", [(32, 8, 4), (8, 1, 16), (6, 3, 3), (64, 8, 4)]
 )
 def test_verify_window_attention_sinks(heads, kv_heads, seqlen_q, append):
-    # Note (deepolar): the decode kernel folds window token t of query head
-    # h * group + j into row (h * seqlen_q + t) * group + j, so a sink indexed by
+    # Note (deepolar): the decode kernel folds window token t of query head h *
+    # group + j into row (h * seqlen_q + t) * group + j, so a sink indexed by
     # the folded row instead of its query head fails the check.
     q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
         lengths=(seqlen_q,) * 4,

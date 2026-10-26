@@ -210,10 +210,10 @@ def hbm_tm_slice(
     batch_idx = head // heads_per_row
     local_head = head % heads_per_row
     row_window = pl.ds(token_start, num_rows)
-    # Note (david): Mosaic needs a 128-aligned lane offset for an HBM DMA window.
-    # A sub-tile width (d64) relies on builders enforcing
-    # fold * width % 128 == 0; local_head is a multiple of fold, so the offset is
-    # aligned, but the compiler cannot derive that from a traced head.
+    # Note (david): Mosaic needs a 128-aligned lane offset for an HBM DMA
+    # window. A sub-tile width (d64) relies on builders enforcing fold * width %
+    # 128 == 0; local_head is a multiple of fold, so the offset is aligned, but
+    # the compiler cannot derive that from a traced head.
     if width % NUM_LANES:
         assert (fold * width) % NUM_LANES == 0, (fold, width)
         lane_start = pl.multiple_of(local_head * width, NUM_LANES)
@@ -299,9 +299,9 @@ def load_kv_fragment(
     is_cache_head_major: bool,
     is_bitcast_load: bool,
 ) -> jax.Array:
-    """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 rows of one head
-    group, read from a slot of kv_stage: keys from the K staging buffer, values
-    from the V staging buffer."""
+    """(kv_heads_per_fragment * block_kv_compute, head_dim) bf16 rows of one
+    head group, read from a slot of kv_stage: keys from the K staging buffer,
+    values from the V staging buffer."""
     head_dim = kv_stage.shape[-1]
     compute_start = pl.multiple_of(
         kv_compute_index * block_kv_compute, MIN_BLOCK_KV
@@ -373,11 +373,11 @@ def load_staged_words(
     if head_dim <= NUM_LANES:
         return words_ref[pl.ds(word_start, num_rows, stride)]
     else:
-        # Note (david): a wide head loads each 128-lane half with its own strided
-        # load and joins the halves along lanes. Loading (rows, halves, 128) and
-        # reshaping instead interleaves sublanes; on v7x decode at 32 heads of 256
-        # that was 40K rotate/combine ops per 4096-token block, 8.55 against 5.22
-        # ms a step at 4 KV heads (flywheel-tpu PR #7).
+        # Note (david): a wide head loads each 128-lane half with its own
+        # strided load and joins the halves along lanes. Loading (rows, halves,
+        # 128) and reshaping instead interleaves sublanes; on v7x decode at 32
+        # heads of 256 that was 40K rotate/combine ops per 4096-token block,
+        # 8.55 against 5.22 ms a step at 4 KV heads (flywheel-tpu PR #7).
         lanes_ref = words_ref.reshape(num_word_rows * folds, NUM_LANES)
         return jnp.concatenate(
             [

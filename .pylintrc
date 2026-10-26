@@ -5,8 +5,12 @@
 # Its canonical open-source location is:
 #   https://google.github.io/styleguide/pylintrc
 #
-# Local changes: module-rgx accepts __main__, and check-quote-consistency is
-# off because pyink owns quote style.
+# Local changes:
+#   - module-rgx accepts __main__.
+#   - check-quote-consistency is off: pyink owns quote style.
+#   - consider-using-f-string is off: the style guide allows the % operator.
+#   - unidiomatic-typecheck is off: exact type(x) is int / bool checks are
+#     deliberate here, to reject bools and numpy scalars as static arguments.
 
 # Copyright 2018 Google LLC
 #
@@ -78,6 +82,7 @@ disable=R,
         buffer-builtin,
         c-extension-no-member,
         consider-using-enumerate,
+        consider-using-f-string,  # added
         cmp-builtin,
         cmp-method,
         coerce-builtin,
@@ -138,6 +143,7 @@ disable=R,
         trailing-newlines,
         unichr-builtin,
         unicode-builtin,
+        unidiomatic-typecheck,  # added
         unnecessary-pass,
         unpacking-in-except,
         useless-else-on-loop,

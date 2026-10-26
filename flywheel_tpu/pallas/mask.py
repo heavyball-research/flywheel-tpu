@@ -14,8 +14,9 @@ def apply_packed_bounds_mask(
 ) -> jax.Array:
     """Mask qk entries whose major-axis id lies outside [lo, lo + span).
 
-    ids is qk-shaped: the absolute index along qk's sublane axis. lo and span are
-    (1, minor) rows indexed by qk's lane axis and broadcast over the sublanes.
+    ids is qk-shaped: the absolute index along qk's sublane axis. lo and span
+    are (1, minor) rows indexed by qk's lane axis and broadcast over the
+    sublanes.
     """
     # Note (david): one unsigned comparison checks both bounds, since ids below
     # lo wrap around to large unsigned values.

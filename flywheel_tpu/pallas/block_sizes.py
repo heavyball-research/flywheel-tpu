@@ -88,7 +88,8 @@ def round_up(value: int, alignment: int) -> int:
 
 
 def pick_tile(candidates: Sequence[int], block: int) -> int:
-    """Largest of the descending candidates dividing block, else block itself."""
+    """Largest of the descending candidates dividing block, else block
+    itself."""
     return next((tile for tile in candidates if block % tile == 0), block)
 
 
@@ -190,8 +191,9 @@ class BlockSizes:
     """Tile sizes and physical layout of one attention kernel build.
 
     block_kv_compute defaults to block_kv; block_q_compute defaults to
-    DEFAULT_BLOCK_Q_COMPUTE and is read only by the forward. qkv_layout is shared
-    by q/k/v because head_fold allocates one scratch shape per fold group.
+    DEFAULT_BLOCK_Q_COMPUTE and is read only by the forward. qkv_layout is
+    shared by q/k/v because head_fold allocates one scratch shape per fold
+    group.
     """
 
     block_q: int

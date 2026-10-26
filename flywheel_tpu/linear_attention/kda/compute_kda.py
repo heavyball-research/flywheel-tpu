@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""In-kernel KDA math: chunked, recurrent and ReplaySSM paths."""
 
 import contextlib
 import functools
@@ -964,6 +965,7 @@ def run_pipelined(
         # Note (david): tinv calls _fill synchronously within this iteration,
         # so closing over this iteration's chunks is safe.
         def _fill(slot: int, num_slots: int) -> None:
+            # pylint: disable=cell-var-from-loop
             nonlocal pending_state_steps, pending_kkt_groups
             # Note (david): the chain reports its gap count only at slot 0, so
             # both queues are sized, and the incoming state bound, there.

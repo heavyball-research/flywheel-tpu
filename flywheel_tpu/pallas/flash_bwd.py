@@ -86,11 +86,12 @@ def fold_vmem_bytes(
     """(dq_acc bytes, total scratch bytes) of a general-kernel build at a fold.
 
     The staged terms over-count on purpose: this is a fail-fast gate, not a
-    memory model. dq_acc comes back separately because it is the one scratch that
-    grows with q_seq_len, so it carries its own tighter limit.
+    memory model. dq_acc comes back separately because it is the one scratch
+    that grows with q_seq_len, so it carries its own tighter limit.
     """
-    # Note (david): VMEM pads every minor head_dim axis to a whole lane tile, so a
-    # sub-tile head_dim costs its padded width, which the slack does not cover.
+    # Note (david): VMEM pads every minor head_dim axis to a whole lane tile, so
+    # a sub-tile head_dim costs its padded width, which the slack does not
+    # cover.
     padded_head_dim_qk = round_up(head_dim_qk, NUM_LANES)
     padded_head_dim_v = round_up(head_dim_v, NUM_LANES)
     f32_bytes = jnp.dtype(jnp.float32).itemsize
@@ -207,8 +208,8 @@ def flash_bwd_folded_kernel(
             )
             for hbm, buf, sem, lane_width in input_streams
         ]
-        # Note (david): lse/di stay head-major (heads, 1, seq) under both layouts,
-        # so their fold always rides the leading axis.
+        # Note (david): lse/di stay head-major (heads, 1, seq) under both
+        # layouts, so their fold always rides the leading axis.
         for hbm, buf, sem in (
             (lse_hbm, lse_buf, SEM_LSE),
             (di_hbm, di_buf, SEM_DI),
@@ -267,10 +268,10 @@ def flash_bwd_folded_kernel(
         def _():
             _wait_all(_output_copies(0, out_slot))
 
-        # Note (david): one head per iteration keeps the live score tile a single
-        # head's (seq_len, seq_len), so VMEM scales with head_fold only through the
-        # staged buffers. Mosaic already overlaps the independent heads' matmuls;
-        # explicit cross-head pipelining measured identical.
+        # Note (david): one head per iteration keeps the live score tile a
+        # single head's (seq_len, seq_len), so VMEM scales with head_fold only
+        # through the staged buffers. Mosaic already overlaps the independent
+        # heads' matmuls; explicit cross-head pipelining measured identical.
         for head_idx in range(head_fold):
             q_head = q_buf[_head_index(in_slot, head_idx, lane_width_qk)]
             do_head = do_buf[_head_index(in_slot, head_idx, lane_width_v)]
@@ -279,8 +280,8 @@ def flash_bwd_folded_kernel(
             lse_row = lse_buf[in_slot, head_idx]
             di_row = di_buf[in_slot, head_idx]
             # Note (david): the scores start from the forward's rounded q *
-            # score_scale, so p stays normalized against its lse; dq/dk take the raw
-            # q.
+            # score_scale, so p stays normalized against its lse; dq/dk take the
+            # raw q.
             q_scaled_head = (q_head.astype(f32) * score_scale).astype(
                 q_head.dtype
             )
@@ -345,7 +346,8 @@ def flash_attn_bwd_folded(
     num_stages: int,
     token_major: TokenMajorInfo | None,
 ) -> list[jax.Array]:
-    """Launch flash_bwd_folded_kernel with one head group of scratch per stage."""
+    """Launch flash_bwd_folded_kernel with one head group of scratch per
+    stage."""
     vmem = pltpu.VMEM
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
 
@@ -423,7 +425,8 @@ def flash_attn_bwd_q_chunked(
     causal_offset: int,
     **knobs: int | float | bool | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """Dense backward as one rectangular backward per q-row chunk -> (dq, dk, dv).
+    """Dense backward as one rectangular backward per q-row chunk -> (dq, dk,
+    dv).
 
     dq rows are disjoint, so the chunks concatenate; dk/dv sum in f32, so each
     chunk's own out_dtype rounding is the only one added. A causal chunk drops
@@ -439,8 +442,9 @@ def flash_attn_bwd_q_chunked(
     for start in range(0, q_seq_len, chunk_rows):
         stop = min(start + chunk_rows, q_seq_len)
         if causal and stop + causal_offset <= 0:
-            # Note (david): every row sits below the diagonal, so dq is exactly 0 and
-            # dk/dv get nothing; the dense schedule would reject the empty chunk.
+            # Note (david): every row sits below the diagonal, so dq is exactly
+            # 0 and dk/dv get nothing; the dense schedule would reject the empty
+            # chunk.
             dq_chunks.append(jnp.zeros_like(q[..., start:stop, :]))
             continue
         if causal:
@@ -527,8 +531,9 @@ def flash_attn_bwd(
                 " head_dim % 128 == 0, or head_dim == 64 (paired); got"
                 f" {head_dim!r}."
             )
-        # Note (david): k/v carry the kv sequence and o/do the q one, so across all
-        # five only the rank is shared; a rectangular backward differs in length.
+        # Note (david): k/v carry the kv sequence and o/do the q one, so across
+        # all five only the rank is shared; a rectangular backward differs in
+        # length.
         if any(operand.ndim != 3 for operand in (q, k, v, o, do)):
             raise ValueError(
                 "token-major q/k/v/o/do must all be (batch, seq, heads *"
@@ -570,9 +575,10 @@ def flash_attn_bwd(
                 " head_dim."
             )
         if head_dim_qk % NUM_LANES or head_dim_v % NUM_LANES:
-            # Note (david): a d64 fold must span whole lane tiles on both the q and kv
-            # streams, which the unfolded kv side of GQA/MQA cannot; MLA cannot fold
-            # at all, and an odd per-row head count leaves no pair to fold.
+            # Note (david): a d64 fold must span whole lane tiles on both the q
+            # and kv streams, which the unfolded kv side of GQA/MQA cannot; MLA
+            # cannot fold at all, and an odd per-row head count leaves no pair
+            # to fold.
             if head_dim_v != head_dim_qk:
                 raise NotImplementedError(
                     "token-major d64 requires head_dim_v == head_dim (no MLA);"
@@ -588,9 +594,9 @@ def flash_attn_bwd(
                     "token-major d64 requires an even per-row head count; got"
                     f" {heads_per_row}."
                 )
-        # Note (david): o holds one vector per q head whatever the kv head count,
-        # so its fused width is heads_per_row * head_dim_v, which matches v's only
-        # under MHA.
+        # Note (david): o holds one vector per q head whatever the kv head
+        # count, so its fused width is heads_per_row * head_dim_v, which matches
+        # v's only under MHA.
         expected_o_shape = (*q.shape[:-1], heads_per_row * head_dim_v)
         if o.shape != expected_o_shape or do.shape != o.shape:
             raise ValueError(
@@ -660,9 +666,9 @@ def flash_attn_bwd(
     # table's and this function's own picks get clamped instead.
     is_explicit_head_fold = head_fold is not None
     # Note (david): the block knobs, head_fold and num_stages are co-tuned
-    # (head_fold > 1 needs block == seq_len, block_kv_compute must divide block),
-    # so the table applies only when all of them are unset. It is keyed on
-    # square, zero-offset MHA shapes.
+    # (head_fold > 1 needs block == seq_len, block_kv_compute must divide
+    # block), so the table applies only when all of them are unset. It is keyed
+    # on square, zero-offset MHA shapes.
     is_tunable = (
         block is None
         and block_kv is None
@@ -736,8 +742,8 @@ def flash_attn_bwd(
     # Note (david): the general kernel folds only a GQA/MQA group or a d64 lane
     # pair; any other fold goes to the single-block kernel.
     if is_gqa:
-        # Note (david): a GQA/MQA schedule group is one kv head plus its q heads,
-        # so the q-side fold is the group itself.
+        # Note (david): a GQA/MQA schedule group is one kv head plus its q
+        # heads, so the q-side fold is the group itself.
         resolved_head_fold = num_heads // num_kv_heads
     elif head_fold is not None:
         resolved_head_fold = head_fold
@@ -748,11 +754,13 @@ def flash_attn_bwd(
         or head_dim_v != head_dim_qk
     ):
         # Note (david): the single-block kernel is square, zero-offset and
-        # one-block only, and its fold was never modelled for MLA's wider do/v/dv.
+        # one-block only, and its fold was never modelled for MLA's wider
+        # do/v/dv.
         resolved_head_fold = 1
     else:
-        # Note (david): the fold-scaled buffers grow with the block and head_dim,
-        # so the target halves for large blocks and shrinks per extra lane tile.
+        # Note (david): the fold-scaled buffers grow with the block and
+        # head_dim, so the target halves for large blocks and shrinks per extra
+        # lane tile.
         if bq <= FULL_FOLD_MAX_BLOCK:
             block_fold_target = MAX_SINGLE_BLOCK_HEAD_FOLD
         else:
@@ -767,10 +775,10 @@ def flash_attn_bwd(
         ):
             resolved_head_fold *= 2
 
-    # Note (david): a fold group is head_fold consecutive flat heads, which stays
-    # inside one token-major batch row only if head_fold also divides the per-row
-    # head count. Automatic picks are keyed on the flat count, so they halve to
-    # the largest legal group instead of raising.
+    # Note (david): a fold group is head_fold consecutive flat heads, which
+    # stays inside one token-major batch row only if head_fold also divides the
+    # per-row head count. Automatic picks are keyed on the flat count, so they
+    # halve to the largest legal group instead of raising.
     if (
         is_explicit_head_fold
         and token_major
@@ -791,7 +799,8 @@ def flash_attn_bwd(
 
     # Note (david): on d64 the fold is the DMA-alignment mechanism (a group must
     # span whole lane tiles), so it must be even, even where folding does not
-    # pay; 2 always divides the per-row head count, which was checked to be even.
+    # pay; 2 always divides the per-row head count, which was checked to be
+    # even.
     is_lane_paired = token_major and head_dim_qk % NUM_LANES != 0
     if is_lane_paired and resolved_head_fold % 2:
         if is_explicit_head_fold:
@@ -843,8 +852,8 @@ def flash_attn_bwd(
     fold_limit = int(vmem_limit_bytes() * FOLD_VMEM_LIMIT_FRACTION)
     # Note (david): the general kernel keeps the whole group's dq in VMEM, so a
     # build past that gate runs as q-row chunks that each fit. Chunks are
-    # equalized rather than filled to the gate, so a full-mask build compiles one
-    # kernel, not two.
+    # equalized rather than filled to the gate, so a full-mask build compiles
+    # one kernel, not two.
     chunk_blocks = dq_acc_limit // (dq_acc_bytes // num_q_blocks)
     should_chunk = (
         (head_fold == 1 or is_gqa or is_lane_paired)
@@ -855,11 +864,12 @@ def flash_attn_bwd(
 
     def _lse_log2_and_delta():
         if token_major:
-            # Note (david): one lane window per head, never a reshape of the fused
-            # axis: splitting heads * head_dim moves the (8, 128)-tiled sublane axis
-            # from seq to heads, so XLA re-tiles and materializes o * do in f32 (three
-            # HBM passes, about 370us per backward at 16k tokens on v6e). Per-head
-            # accumulation can differ from head-major's by 1 f32 ULP.
+            # Note (david): one lane window per head, never a reshape of the
+            # fused axis: splitting heads * head_dim moves the (8, 128)-tiled
+            # sublane axis from seq to heads, so XLA re-tiles and materializes
+            # o * do in f32 (three HBM passes, about 370us per backward at 16k
+            # tokens on v6e). Per-head accumulation can differ from head-major's
+            # by 1 f32 ULP.
             per_head_delta = []
             for head_idx in range(token_major_info.num_q_heads):
                 lane_start = head_idx * head_dim_v
@@ -873,8 +883,9 @@ def flash_attn_bwd(
                         do_head.astype(jnp.float32),
                     )
                 )
-            # Note (david): stacking at -2 puts heads next to seq in the kernel's
-            # flat batch-major, head-minor order, so no transpose follows.
+            # Note (david): stacking at -2 puts heads next to seq in the
+            # kernel's flat batch-major, head-minor order, so no transpose
+            # follows.
             delta = jnp.stack(per_head_delta, axis=-2).reshape(
                 num_heads, q_seq_len
             )
@@ -940,7 +951,8 @@ def flash_attn_bwd(
             )
         # Note (david): the folded do/v/dv buffers scale with head_dim_v, so a
         # fold sized for head_dim_qk overshoots VMEM (16 heads at seq 512 with
-        # head_dim_qk 256 and head_dim_v 512 want 80MB of the 64MB scoped budget).
+        # head_dim_qk 256 and head_dim_v 512 want 80MB of the 64MB scoped
+        # budget).
         if head_dim_v != head_dim_qk:
             raise ValueError(
                 "head_fold > 1 requires head_dim_v == head_dim_qk; got"
@@ -986,9 +998,9 @@ def flash_attn_bwd(
                 " sequence across chips."
             )
         lse_log2, delta = _lse_log2_and_delta()
-        # Note (david): the general kernel runs unfolded for MHA, one kv head's q
-        # group for GQA/MQA, or an even DMA-alignment fold for d64 token-major, so
-        # dense_params' group count is num_heads // head_fold.
+        # Note (david): the general kernel runs unfolded for MHA, one kv head's
+        # q group for GQA/MQA, or an even DMA-alignment fold for d64
+        # token-major, so dense_params' group count is num_heads // head_fold.
         assert head_fold == 1 or is_gqa or is_lane_paired, (
             head_fold,
             num_kv_heads,

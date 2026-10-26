@@ -11,6 +11,10 @@ rows whose conv width (2 * H + HV) * D is a multiple of 128, since the
 kernels' conv works on whole 128-lane slabs of qkv.
 """
 
+# The shape letters (B, T, H, HV, D) and A_log name tensors as the gated
+# delta rule's math does.
+# pylint: disable=invalid-name
+
 import jax
 import jax.numpy as jnp
 import numpy as np

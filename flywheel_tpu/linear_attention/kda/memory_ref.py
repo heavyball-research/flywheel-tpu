@@ -100,6 +100,8 @@ class PackedPIdRecord:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class MetadataRef:
+    """Refs to a call's tile records and per-sequence state indices."""
+
     num_tiles: jax.Array
     records: jax.Array
     s_idx_has_initial_state: jax.Array

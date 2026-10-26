@@ -32,6 +32,10 @@ table for a device attention_block.py has no table suffix for, or over a table
 that holds cells the directory has no search for, which would drop them.
 """
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse
@@ -106,6 +110,8 @@ def snap(value, values, block):
 
 
 class Flywheel:
+    """The block config search space and kernel build of flash_attn_func."""
+
     fields = FLYWHEEL_FIELDS
     # The fields a config's VMEM footprint grows with.
     size_fields = (
@@ -119,6 +125,7 @@ class Flywheel:
     layout = "hm"
 
     def __init__(self, cell, args):
+        del args  # Unused.
         self.cell = cell
 
     def axes(self):
@@ -214,6 +221,8 @@ class Flywheel:
 
 
 class Splash:
+    """The block config search space and kernel build of Splash attention."""
+
     fields = SPLASH_FIELDS
     size_fields = (
         "block_q",
@@ -262,6 +271,7 @@ class Splash:
         ]
 
     def normalize(self, config, changed):
+        del changed  # Unused.
         config = dict(config)
         config["block_kv_compute"] = snap(
             config["block_kv_compute"],
@@ -310,6 +320,8 @@ class Splash:
 
 
 class Rpa:
+    """The block config search space and kernel build of RPA v3."""
+
     fields = RPA_FIELDS
     size_fields = RPA_FIELDS
     layout = "tm"
@@ -363,6 +375,7 @@ class Rpa:
         return seeds
 
     def normalize(self, config, changed):
+        del changed  # Unused.
         config, axes = dict(config), self.axes()
         config["bq_csz"] = snap(
             config["bq_csz"], axes["bq_csz"], config["bq_sz"]
@@ -435,7 +448,7 @@ class Log:
         self.best = None
         started = None
         if path.exists():
-            for line in path.read_text().splitlines():
+            for line in path.read_text(encoding="utf-8").splitlines():
                 try:
                     record = json.loads(line)
                 except json.JSONDecodeError:
@@ -588,7 +601,7 @@ def evaluate(searcher, config, qkv, log, timeout):
             "single_ms": single_ms,
             "pruned": pruned,
         }
-    except Exception as error:
+    except Exception as error:  # pylint: disable=broad-exception-caught
         message = next(
             (line for line in str(error).splitlines() if line.strip()), ""
         )
@@ -608,7 +621,7 @@ def evaluate(searcher, config, qkv, log, timeout):
         print(
             f"  {key}: {record['error'][:90]}; exiting to restart", flush=True
         )
-        os._exit(HALT_EXIT)
+        os._exit(HALT_EXIT)  # pylint: disable=protected-access
     if record["status"] == "ok":
         shown = f"{record['ms']:.3f} ms" + (
             " (pruned)" if record["pruned"] else ""
@@ -638,7 +651,9 @@ def search(cell, args):
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     searcher = SEARCHERS[cell.impl](cell, args)
     qkv = make_qkv(cell, searcher.layout)
-    as_config = lambda record: dict(zip(searcher.fields, record["config"]))
+
+    def as_config(record):
+        return dict(zip(searcher.fields, record["config"]))
 
     print(f"{cell.key}: seeds", flush=True)
     for seed in searcher.seeds():
@@ -824,7 +839,7 @@ def collect(directory):
                 else configs
             )
             dropped = table_cells(
-                json.loads(path.read_text())["configs"]
+                json.loads(path.read_text(encoding="utf-8"))["configs"]
             ) - table_cells(nested)
             if dropped:
                 raise ValueError(
@@ -844,12 +859,12 @@ def collect(directory):
 
     written = []
     for path, text, count in tables:
-        path.write_text(text)
+        path.write_text(text, encoding="utf-8")
         written.append((path, count))
 
     if by_impl["flywheel"]:
         path = tuned_block_sizes.TUNED_CONFIGS_PATH
-        table = json.loads(path.read_text())
+        table = json.loads(path.read_text(encoding="utf-8"))
         section = table.setdefault(section_name, {})
         for record in by_impl["flywheel"]:
             cell = record["cell"]
@@ -867,7 +882,7 @@ def collect(directory):
             )
             section[key] = record["config"]
         table[section_name] = dict(sorted(section.items()))
-        path.write_text(json.dumps(table, indent=2) + "\n")
+        path.write_text(json.dumps(table, indent=2) + "\n", encoding="utf-8")
         written.append((path, len(by_impl["flywheel"])))
 
     for path, count in written:

@@ -160,7 +160,7 @@ def main() -> None:
             recurrent_state = inputs.pop("recurrent_state")
             read_offsets = jnp.full((num_seqs,), window - 1, jnp.int32)
 
-            def _conventional(
+            def _conventional(  # pylint: disable=dangerous-default-value
                 conv,
                 rec,
                 inputs=inputs,
@@ -200,7 +200,7 @@ def main() -> None:
             # few ops add no eager dispatches and the kernel's in-place
             # aliasing survives the outer call.
             @functools.partial(jax.jit, donate_argnums=(0, 1, 2, 3, 4))
-            def _replay(
+            def _replay(  # pylint: disable=dangerous-default-value
                 conv,
                 rec,
                 replay,

@@ -13,6 +13,10 @@ against the activated beta. The grids hold only rows whose conv width
 whole 128-lane slabs of qkv.
 """
 
+# The shape letters (B, T, H, HV, D) and A_log name tensors as the gated
+# delta rule's math does.
+# pylint: disable=invalid-name
+
 import math
 
 import jax
@@ -472,7 +476,7 @@ def test_chunk_causality(
         )
         outputs.append(np.asarray(o[:, :P]))
 
-    ref, tri = outputs
+    ref, tri = outputs  # pylint: disable=unbalanced-tuple-unpacking
     assert np.isfinite(ref).all() and np.isfinite(tri).all()
     assert np.array_equal(ref, tri), "future gates changed prefix outputs"
 

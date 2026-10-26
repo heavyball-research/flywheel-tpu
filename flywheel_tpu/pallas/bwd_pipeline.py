@@ -103,8 +103,8 @@ def bwd_body(
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
     score_scale = scale * LOG2E
-    # Note (david): fully masked q rows (causal_offset < 0) carry lse == -inf, so
-    # exp2(qk - lse) overflows to inf and 0 * inf = NaN would reach dk/dv.
+    # Note (david): fully masked q rows (causal_offset < 0) carry lse == -inf,
+    # so exp2(qk - lse) overflows to inf and 0 * inf = NaN would reach dk/dv.
     should_guard_lse = causal and causal_offset < 0
 
     if token_major is None:
@@ -118,11 +118,12 @@ def bwd_body(
         q_heads_per_row = token_major.num_q_heads
         kv_heads_per_row = token_major.num_kv_heads
 
-    # Note (david): Mosaic takes a lane window of a scratch ref only at whole-tile
-    # offset and size once another axis is sliced too, so 64-wide heads are
-    # addressed a lane tile (a head pair) at a time: loads take the head's half
-    # out of the value and stores go through a tile-wide read-modify-write. The
-    # head loop is sequential Python, so the partner half is never stale.
+    # Note (david): Mosaic takes a lane window of a scratch ref only at
+    # whole-tile offset and size once another axis is sliced too, so 64-wide
+    # heads are addressed a lane tile (a head pair) at a time: loads take the
+    # head's half out of the value and stores go through a tile-wide
+    # read-modify-write. The head loop is sequential Python, so the partner half
+    # is never stale.
     is_lane_paired = (
         token_major is not None and token_major.head_dim_qk % NUM_LANES != 0
     )
@@ -161,8 +162,8 @@ def bwd_body(
             updated = update(current)
             ref[rows, :] = updated
         else:
-            # Note (david): jnp .at[].set lowers to scatter, which Pallas TPU lacks,
-            # so replace the half with a static split + concatenate.
+            # Note (david): jnp .at[].set lowers to scatter, which Pallas TPU
+            # lacks, so replace the half with a static split + concatenate.
             updated = update(
                 current[:, half * lane_width : (half + 1) * lane_width]
             )
@@ -348,9 +349,9 @@ def bwd_body(
         is_first_q_block = qi == qlo
         is_last_q_block = qi == qhi
         is_dq_first, is_dq_last, should_mask = schedule.block_flags(kv, qi, ctx)
-        # Note (david): past the last q block of a kv row the lookahead targets the
-        # next row's first entry; on the final entry that is the current one, and
-        # equal keys issue no prefetch.
+        # Note (david): past the last q block of a kv row the lookahead targets
+        # the next row's first entry; on the final entry that is the current
+        # one, and equal keys issue no prefetch.
         (
             next_row_group,
             next_row_kv,
@@ -412,11 +413,11 @@ def bwd_body(
             q_tile_rows = pl.ds(q_tile * bq_compute, bq_compute)
             dq_acc_rows = pl.ds(q_start, bq_compute)
 
-            # Note (david): one head of the fold per iteration keeps the live score
-            # tile a single head's, so only the staged buffers and accumulators scale
-            # with the fold. The schedule is head-independent, so every head shares
-            # the same first/last flags. Explicit cross-head pipelining measured
-            # identical.
+            # Note (david): one head of the fold per iteration keeps the live
+            # score tile a single head's, so only the staged buffers and
+            # accumulators scale with the fold. The schedule is
+            # head-independent, so every head shares the same first/last flags.
+            # Explicit cross-head pipelining measured identical.
             def _compute_head(head_idx):
                 q_ref, q_half = _fold_lane(
                     q_buf.at[q_slot], head_idx, lane_width_qk
@@ -424,10 +425,11 @@ def bwd_body(
                 q_head_tile = _take_half(
                     q_ref[q_tile_rows, :], q_half, lane_width_qk
                 )
-                # Note (david): the forward rounds q * score_scale to q's dtype before
-                # its scores, and its lse comes from those; recomputing the scores from
-                # the same rounded q keeps p normalized against that lse, e.g. exactly
-                # 1 on a row with one visible key. dq/dk still take the raw q.
+                # Note (david): the forward rounds q * score_scale to q's dtype
+                # before its scores, and its lse comes from those; recomputing
+                # the scores from the same rounded q keeps p normalized against
+                # that lse, e.g. exactly 1 on a row with one visible key. dq/dk
+                # still take the raw q.
                 q_scaled_tile = (q_head_tile.astype(f32) * score_scale).astype(
                     q_head_tile.dtype
                 )
@@ -457,11 +459,12 @@ def bwd_body(
                     dv_acc, head_idx, lane_width_v, fold=kv_fold
                 )
 
-                # Note (david): kv fragments run to completion one at a time, not
-                # distance-1 pipelined like the forward: dp does not depend on p, so
-                # intra-fragment ILP already hides the exp/ds work, and the d256
-                # ablation measured the pipeline as pure register pressure (+23% vector
-                # spill traffic, -2..4% throughput at every seq_len).
+                # Note (david): kv fragments run to completion one at a time,
+                # not distance-1 pipelined like the forward: dp does not depend
+                # on p, so intra-fragment ILP already hides the exp/ds work, and
+                # the d256 ablation measured the pipeline as pure register
+                # pressure (+23% vector spill traffic, -2..4% throughput at
+                # every seq_len).
                 def _kv_tile_step(kv_tile, dq_partial):
                     kv_tile_rows = pl.ds(kv_tile * bkv_compute, bkv_compute)
                     k_tile = _take_half(
@@ -477,8 +480,8 @@ def bwd_body(
                         preferred_element_type=f32,
                     )
                     k_start = kv * bkv + kv_tile * bkv_compute
-                    # Note (david): is_masked selects one of two static copies of this
-                    # pipeline, so it is a Python bool, never a tracer.
+                    # Note (david): is_masked selects one of two static copies
+                    # of this pipeline, so it is a Python bool, never a tracer.
                     if is_masked and causal:
                         masked_qk = apply_causal_kv_major(
                             qk,
@@ -513,8 +516,8 @@ def bwd_body(
                         preferred_element_type=f32,
                     )
                     if head_idx > 0 and kv_fold == 1:
-                        # Note (david): under GQA every head after the first accumulates
-                        # into the group's one shared dk/dv.
+                        # Note (david): under GQA every head after the first
+                        # accumulates into the group's one shared dk/dv.
                         should_init_dkv = jnp.bool_(False)
                     else:
                         should_init_dkv = jnp.logical_and(
@@ -584,10 +587,11 @@ def bwd_body(
                 unroll=True,
             )
 
-        # Note (david): two static copies of the q-tile pipeline, one with no mask
-        # and one with the causal mask, picked per schedule step: the mask costs
-        # VPU ops per score element that a block below the diagonal should not
-        # pay. The schedule hands back a Python bool when the choice is static.
+        # Note (david): two static copies of the q-tile pipeline, one with no
+        # mask and one with the causal mask, picked per schedule step: the mask
+        # costs VPU ops per score element that a block below the diagonal should
+        # not pay. The schedule hands back a Python bool when the choice is
+        # static.
         if isinstance(should_mask, bool):
             _run_q_tiles(should_mask)
         else:
@@ -742,7 +746,8 @@ def call_bwd(
     kernel_name: str,
     token_major: TokenMajorInfo | None,
 ) -> list[jax.Array]:
-    """Allocate a bwd_body kernel's stage buffers and accumulators and run it."""
+    """Allocate a bwd_body kernel's stage buffers and accumulators and run
+    it."""
     vmem = pltpu.VMEM
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
 

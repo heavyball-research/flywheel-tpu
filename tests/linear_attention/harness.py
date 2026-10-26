@@ -11,6 +11,10 @@ Fused.chunk runs one prefill call; Fused.recurrent runs decode steps of one
 token per sequence, through the fused kernel or its ReplaySSM variant.
 """
 
+# The shape letters (B, T, H, HV, D) and A_log name tensors as the gated
+# delta rule's math does.
+# pylint: disable=invalid-name
+
 import dataclasses
 from collections.abc import Callable
 

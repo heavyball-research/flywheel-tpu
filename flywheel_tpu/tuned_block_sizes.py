@@ -89,7 +89,8 @@ def get_device_variant_name(device_kind: str | None = None) -> str:
 
 
 def get_device_name(device_kind: str | None = None) -> str:
-    """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX does)."""
+    """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX
+    does)."""
     return re.sub(
         r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind)
     )
@@ -144,7 +145,8 @@ def tuned_config_key(
     """
     base_key = (
         f"{direction}|{'tm' if token_major else 'hm'}|bfloat16"
-        f"|h{num_heads}|b{'-' if batch is None else batch}|s{seq_len}|d{head_dim}"
+        f"|h{num_heads}|b{'-' if batch is None else batch}"
+        f"|s{seq_len}|d{head_dim}"
         f"|c{int(bool(causal))}|m{'-' if max_seqlen is None else max_seqlen}"
         f"|l{int(bool(return_lse))}"
     )
@@ -161,7 +163,7 @@ def tuned_config_key(
 
 @functools.cache
 def load_tuned_configs() -> dict[str, dict[str, list[int | str | bool]]]:
-    return json.loads(TUNED_CONFIGS_PATH.read_text())
+    return json.loads(TUNED_CONFIGS_PATH.read_text(encoding="utf-8"))
 
 
 @functools.cache

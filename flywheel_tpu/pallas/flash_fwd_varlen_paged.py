@@ -192,8 +192,8 @@ def paged_scratch_shapes(
     if rotary_dtype is None:
         rotary_shapes = []
     else:
-        # Note (david): prepare_rotary's one batch plane is shared by every head,
-        # so one Q coefficient group is staged.
+        # Note (david): prepare_rotary's one batch plane is shared by every
+        # head, so one Q coefficient group is staged.
         rotary_shapes = [
             ((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))
         ]
@@ -286,27 +286,28 @@ def resolve_paged_tiles(
         candidate_blocks = [block_sizes]
     else:
         block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
-        # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
-        # five or three pages (1920 tokens), where no power-of-two block ends on a
-        # page edge; smaller kv blocks halve the page count.
+        # Note (david): block_kv is whole pages, so a 384- or 640-token page
+        # takes five or three pages (1920 tokens), where no power-of-two block
+        # ends on a page edge; smaller kv blocks halve the page count.
         kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
         max_kv_pages = kv_block_cap // page_size
         kv_blocks = [
             page_size * (max_kv_pages >> shift)
             for shift in range(max_kv_pages.bit_length())
         ]
-        # Note (david): a fragment reloads its rows' softmax state per kv compute
-        # tile, so no larger q block is bought with a kv block below one full kv
-        # compute tile. At 32:4 heads of 256 (1024-token chunks over 16K, v6e,
-        # gqa fold 8) a 1024 x 256 block took 12.44 ms
-        # against 9.14 at 512 x 512.
+        # Note (david): a fragment reloads its rows' softmax state per kv
+        # compute tile, so no larger q block is bought with a kv block below one
+        # full kv compute tile. At 32:4 heads of 256 (1024-token chunks over
+        # 16K, v6e, gqa fold 8) a 1024 x 256 block took 12.44 ms against 9.14 at
+        # 512 x 512.
         min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
         kv_blocks = [
             block_kv for block_kv in kv_blocks if block_kv >= min_kv_block
         ]
         q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
-        # Note (david): FWD_BLOCKS are powers of two, so the smaller of two powers
-        # of two divides the q block; a folded tile stays whole bf16 tiles.
+        # Note (david): FWD_BLOCKS are powers of two, so the smaller of two
+        # powers of two divides the q block; a folded tile stays whole bf16
+        # tiles.
         head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
         q_compute_cap = max(
             BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1)

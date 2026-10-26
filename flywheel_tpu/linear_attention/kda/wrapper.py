@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""Fused conv1d + KDA kernel: its pallas_call and entry points."""
 
 import dataclasses
 import functools

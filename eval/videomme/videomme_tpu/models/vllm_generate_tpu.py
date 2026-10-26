@@ -157,6 +157,7 @@ class RequestPlan:
 
 
 class VLLMGenerateTPU(VLLMGenerate):
+    """VLLMGenerate with the Video-MME timing changes the module lists."""
 
     def __init__(
         self,
@@ -253,9 +254,8 @@ class VLLMGenerateTPU(VLLMGenerate):
             raise ValueError("This backend serves from a single process.")
 
         self._encoder_budgets = frozenset(encoder_budgets)
-        self._video_token_id = (
-            self.client.llm_engine.vllm_config.model_config.hf_config.video_token_id
-        )
+        hf_config = self.client.llm_engine.vllm_config.model_config.hf_config
+        self._video_token_id = hf_config.video_token_id
         self._request_log_path = request_log
         self._compile_seconds = 0.0
         jax.monitoring.register_event_duration_secs_listener(self._on_jax_event)
@@ -271,6 +271,7 @@ class VLLMGenerateTPU(VLLMGenerate):
         })
 
     def _on_jax_event(self, event: str, duration_secs: float, **kwargs) -> None:
+        del kwargs  # Unused.
         if event in COMPILE_EVENTS:
             self._compile_seconds += duration_secs
 

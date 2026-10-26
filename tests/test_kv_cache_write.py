@@ -1,6 +1,6 @@
-"""The host-sliced page writer (tpu-inference's prefill cache fill) against a NumPy-built
-merged cache, bit for bit. flash_attn_with_kvcache never calls it, so the kvcache tests
-leave it uncovered."""
+"""The host-sliced page writer (tpu-inference's prefill cache fill) against a
+NumPy-built merged cache, bit for bit. flash_attn_with_kvcache never calls it,
+so the kvcache tests leave it uncovered."""
 
 import jax
 import jax.numpy as jnp
@@ -25,8 +25,8 @@ def test_write_kv_cache_pages(dtype, nheads_k):
     num_tokens = 300
     k = randn(rng, (num_tokens, nheads_k, d), jnp.float32).astype(dtype)
     v = randn(rng, (num_tokens, nheads_k, d), jnp.float32).astype(dtype)
-    # Note (david): (cache_row_start, new_row_start, length) pieces, each inside one page:
-    # a page tail, a whole page and a page head, out of token order.
+    # Note (david): (cache_row_start, new_row_start, length) pieces, each inside
+    # one page: a page tail, a whole page and a page head, out of token order.
     pieces = [
         (4 * page_size + 100, 0, 28),
         (1 * page_size, 28, 128),

@@ -208,8 +208,8 @@ def make_flash_attn_mha(
     token_major: (batch, seq, heads * head_dim) or (total, heads * head_dim)
       q/k/v addressing; None is head-major (heads, seq, head_dim).
     heads_outer_batch: B for a heads-outer dense fold of B sequences, where q
-      fold index n * B + b reads kv fold index (n // q_heads_per_kv_head) * B + b;
-      None keeps the batch-outer fold.
+      fold index n * B + b reads kv fold index (n // q_heads_per_kv_head) * B +
+      b; None keeps the batch-outer fold.
     runtime_causal_offset: dense causal only; the causal offset becomes a
       device-side int32 scalar argument of the returned callable, and the static
       causal_offset must stay 0.
@@ -276,9 +276,9 @@ def make_flash_attn_mha(
                 "token-major requires head_dim % 128 == 0, or head_dim =="
                 f" head_dim_v == 64 (paired); got {token_major!r}."
             )
-        # Note (david): the schedule reads num_heads / num_kv_heads while the DMA
-        # windows read token_major, so a disagreement would silently address the
-        # wrong lanes.
+        # Note (david): the schedule reads num_heads / num_kv_heads while the
+        # DMA windows read token_major, so a disagreement would silently address
+        # the wrong lanes.
         expected_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
         if (token_major.num_q_heads, token_major.num_kv_heads) != (
             num_heads,
@@ -332,9 +332,9 @@ def make_flash_attn_mha(
             )
         if num_q_heads % head_fold:
             raise ValueError(f"{head_fold=} must divide {num_q_heads=}.")
-        # Note (david): a d64 lane-pair fold is the DMA-alignment mechanism, not an
-        # optimization, so it skips the single-block restriction that is only a
-        # performance heuristic for other dense folds.
+        # Note (david): a d64 lane-pair fold is the DMA-alignment mechanism, not
+        # an optimization, so it skips the single-block restriction that is only
+        # a performance heuristic for other dense folds.
         if is_varlen:
             has_foldable_blocks = block_sizes.block_q == block_sizes.block_kv
         else:
@@ -424,9 +424,9 @@ def make_flash_attn_mha(
             )
         }
         static_window = (left, right)
-    # Note (david): Q carries softmax_scale / softcap rather than log2(e), so the
-    # log2(e) the exp2 softmax needs is folded into the tanh output scale; 0.0
-    # stays 0.0, so the kernel never traces the tanh.
+    # Note (david): Q carries softmax_scale / softcap rather than log2(e), so
+    # the log2(e) the exp2 softmax needs is folded into the tanh output scale;
+    # 0.0 stays 0.0, so the kernel never traces the tanh.
     log2_softcap = softcap * LOG2E
     return partial(
         forward,

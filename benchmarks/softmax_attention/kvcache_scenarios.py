@@ -46,6 +46,10 @@ reused, so a step's inputs cost nothing. With --trace the scenario also runs
 under jax.profiler, and every device op of one scenario is summed by name.
 """
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse
@@ -75,6 +79,8 @@ KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
+    """One benchmark point: an implementation on one KV cache scenario."""
+
     impl: str
     scenario: str
     heads: int
@@ -274,6 +280,7 @@ def fill_cache(shape, dtype, generator):
 
 def build_flywheel(cell, inputs, args):
     """(step, fresh_state, info) running flash_attn_with_kvcache."""
+    del args  # Unused.
     import jax
 
     from flywheel_tpu import flash_attn_with_kvcache
@@ -570,7 +577,7 @@ def run(cell, args):
         step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
         record.update(info)
         timing, _ = time_call(step, fresh())
-    except Exception as error:
+    except Exception as error:  # pylint: disable=broad-exception-caught
         record.update(
             status="error", error=f"{type(error).__name__}: {str(error)[:400]}"
         )

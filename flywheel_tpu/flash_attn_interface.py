@@ -97,10 +97,10 @@ def default_block_sizes(
     head_dim: int = NUM_LANES,
 ) -> BlockSizes:
     # Note (david): the kernel masks in absolute coordinates, so block_q and
-    # block_kv come from their own axes. Chunked-prefill q chunks are far shorter
-    # than their kv contexts, and a q block sized to the kv cap straddles several
-    # sequences and leaves the block-diagonal schedule little to skip, so
-    # max_seqlen_q caps the q axis on its own.
+    # block_kv come from their own axes. Chunked-prefill q chunks are far
+    # shorter than their kv contexts, and a q block sized to the kv cap
+    # straddles several sequences and leaves the block-diagonal schedule little
+    # to skip, so max_seqlen_q caps the q axis on its own.
     seq_q_cap = max_seqlen if max_seqlen_q is None else max_seqlen_q
     is_dense_band = max_seqlen is None and window_size[0] != -1
     # Note (david): only the dense grid needs blocks that divide both axes. The
@@ -174,9 +174,10 @@ def get_kernel(
     return_lse: bool = False,
     heads_outer_batch: int | None = None,
 ) -> functools.partial:
-    # Note (david): seqlen_q and seqlen_kv are padded lengths while causal_offset
-    # comes from the original ones. Different original pairs can pad to the same
-    # multiples of 128, so a rectangular mask is detected by causal_offset too.
+    # Note (david): seqlen_q and seqlen_kv are padded lengths while
+    # causal_offset comes from the original ones. Different original pairs can
+    # pad to the same multiples of 128, so a rectangular mask is detected by
+    # causal_offset too.
     is_rectangular = seqlen_q != seqlen_kv or causal_offset != 0
     is_varlen = varlen_max_seqlen_kv is not None
     has_window = window_size != (-1, -1)
@@ -217,8 +218,8 @@ def get_kernel(
             tuned_transposed_pv,
         ) = tuned_config
         # Note (david): the per-sequence varlen schedule DMAs at arbitrary token
-        # offsets, which needs the token axis second-minor, so it overrides a tuned
-        # SEQ_MINOR layout and transposed_pv.
+        # offsets, which needs the token axis second-minor, so it overrides a
+        # tuned SEQ_MINOR layout and transposed_pv.
         if is_varlen:
             qkv_layout = QKVLayout.HEAD_DIM_MINOR
             transposed_pv = False
@@ -245,8 +246,8 @@ def get_kernel(
                 head_dim=head_dim,
             )
         else:
-            # Note (david): the caller already padded both axes to multiples of these
-            # blocks, and the kernel build rejects infeasible tiles.
+            # Note (david): the caller already padded both axes to multiples of
+            # these blocks, and the kernel build rejects infeasible tiles.
             block_q, block_kv, block_q_compute, block_kv_compute = (
                 blocks_override
             )
@@ -256,13 +257,13 @@ def get_kernel(
                 block_kv_compute=block_kv_compute,
                 block_q_compute=block_q_compute,
             )
-        # Note (david): only varlen has a fold table of its own, so a dense build
-        # that missed the tuned configs runs unfolded. The kernel folds varlen only
-        # on square physical blocks, which chunked prefill breaks while keeping the
-        # padded axes equal. The table was measured head-major but serves
-        # token-major too: the fold amortizes per-head step costs the layout does
-        # not change, and halving it until it divides the per-row num_heads keeps a
-        # token-major group inside one batch row.
+        # Note (david): only varlen has a fold table of its own, so a dense
+        # build that missed the tuned configs runs unfolded. The kernel folds
+        # varlen only on square physical blocks, which chunked prefill breaks
+        # while keeping the padded axes equal. The table was measured head-major
+        # but serves token-major too: the fold amortizes per-head step costs the
+        # layout does not change, and halving it until it divides the per-row
+        # num_heads keeps a token-major group inside one batch row.
         if (
             not is_varlen
             or num_heads != num_kv_heads
@@ -278,16 +279,16 @@ def get_kernel(
                 head_dim,
                 head_dim_v,
             )
-    # Note (david): token-major d64 pairs heads, so the fold is the DMA alignment
-    # unit and an odd fold is bumped to the minimal pair.
+    # Note (david): token-major d64 pairs heads, so the fold is the DMA
+    # alignment unit and an odd fold is bumped to the minimal pair.
     if token_major and head_dim % NUM_LANES and head_fold % 2:
         kernel_head_fold = 2
     else:
         kernel_head_fold = head_fold
     if has_window:
         window_left = None if window_size[0] == -1 else window_size[0]
-        # Note (david): window semantics: causal forces the right bound to 0, and
-        # -1 means unbounded.
+        # Note (david): window semantics: causal forces the right bound to 0,
+        # and -1 means unbounded.
         if causal:
             window_right = 0
         elif window_size[1] == -1:
@@ -378,8 +379,8 @@ def attn_with_vjp(
 ) -> jax.Array:
     # Note (david): the forward kernel fuses q_scale into Q, so the backward
     # differentiates the raw q/k/v against the true softmax_scale. Only the
-    # custom_vjp forward asks the kernel for lse, so the primal skips its compute
-    # and DMA.
+    # custom_vjp forward asks the kernel for lse, so the primal skips its
+    # compute and DMA.
     @jax.custom_vjp
     def _attn(q, k, v):
         return build_kernel(return_lse=False)(q, k, v)
@@ -583,7 +584,7 @@ def parse_qkv(
         )
     if nheads % nheads_k:
         raise ValueError(f"{nheads=} must be a multiple of {nheads_k=}.")
-    if not (q.dtype == k.dtype == v.dtype == jnp.bfloat16):
+    if not q.dtype == k.dtype == v.dtype == jnp.bfloat16:
         raise NotImplementedError(
             f"Only bfloat16 is supported on TPU (v0); got {q.dtype=},"
             f" {k.dtype=}, {v.dtype=}."
@@ -686,8 +687,8 @@ def flash_attn_func(
     bfloat16.
 
     causal is bottom-right aligned on the original lengths: query i attends key
-    j iff j <= i + seqlen_k - seqlen_q. seqlen_q may be any length; seqlen_k must
-    be a multiple of 128 unless the mask's right bound is 0. Rows with no
+    j iff j <= i + seqlen_k - seqlen_q. seqlen_q may be any length; seqlen_k
+    must be a multiple of 128 unless the mask's right bound is 0. Rows with no
     reachable key return out = 0 and lse = -inf. return_softmax_lse adds lse
     (batch, nheads, seqlen_q) float32, the natural-log logsumexp of the scaled,
     masked scores. softcap > 0 applies
@@ -825,9 +826,9 @@ def flash_attn_func(
         kernel_batch=token_major_batch,
         q_scale=float(fused_q_scale(softmax_scale, softcap)),
     )
-    # Note (david): token-major kernels address heads as lane-axis column windows
-    # of the fused refs, and either head-major layout is the kernel's leading
-    # axis split in two, so no operand is relaid out.
+    # Note (david): token-major kernels address heads as lane-axis column
+    # windows of the fused refs, and either head-major layout is the kernel's
+    # leading axis split in two, so no operand is relaid out.
     if token_major:
         kernel_q, kernel_k, kernel_v = q, k, v
     else:
@@ -838,9 +839,9 @@ def flash_attn_func(
     sink_args = () if sinks is None else (sinks,)
     if heads_outer_fold:
         # Note (david): flash_attn_bwd has no heads-outer kv map, so this layout
-        # is forward-only. Q-only RoPE stays valid: the dense coefficients carry a
-        # singleton batch shared by every kernel row, and each heads-outer row is
-        # one sequence at positions 0..seqlen-1.
+        # is forward-only. Q-only RoPE stays valid: the dense coefficients carry
+        # a singleton batch shared by every kernel row, and each heads-outer row
+        # is one sequence at positions 0..seqlen-1.
         reason = "heads_outer_fold" if rotary_coeffs is None else "Fused RoPE"
         kernel_output = forward_only_attn(
             build_kernel(return_lse=False, heads_outer_batch=batch),
@@ -1155,9 +1156,9 @@ def paged_varlen_attn(
             )
         num_active = num_active.astype(jnp.int32)
         # Note (david): pinning every boundary past num_active to
-        # cu_seqlens_q[num_active] empties the inactive sequences, so they own no
-        # q block, the kernel never reads their seqused_k or block_table entries,
-        # and their rows become packed padding.
+        # cu_seqlens_q[num_active] empties the inactive sequences, so they own
+        # no q block, the kernel never reads their seqused_k or block_table
+        # entries, and their rows become packed padding.
         cu_seqlens_q = jnp.where(
             jnp.arange(batch + 1, dtype=jnp.int32) <= num_active,
             cu_seqlens_q,
@@ -1398,8 +1399,8 @@ def flash_attn_varlen_func(
             ("max_seqlen_k", max_seqlen_k),
         ):
             if isinstance(seqlen_bound, jax.core.Tracer):
-                # Note (david): a non-concrete bound is a ValueError in the public
-                # contract, not a TypeError.
+                # Note (david): a non-concrete bound is a ValueError in the
+                # public contract, not a TypeError.
                 raise ValueError(
                     f"{arg_name} must be a concrete int (it picks the kernel's"
                     " block sizes); pass a static bucket bound, not a traced"
@@ -1424,8 +1425,9 @@ def flash_attn_varlen_func(
             max_seqlen_k=max_seqlen_k,
         )
 
-        # Note (david): cu_seqlens needs no adjustment for the padding, because rows
-        # past cu_seqlens_q[-1] own no q block and the kernel writes them as zeros.
+        # Note (david): cu_seqlens needs no adjustment for the padding, because
+        # rows past cu_seqlens_q[-1] own no q block and the kernel writes them
+        # as zeros.
         if blocks_override is None:
             padded_total_q = pad_seqlen(total_q)
             padded_total_k = pad_seqlen(total_k)
@@ -1452,14 +1454,14 @@ def flash_attn_varlen_func(
             if softmax_scale is None
             else softmax_scale
         )
-        # Note (david): the max_seqlen bounds only cap the block sizes but ride in
-        # the kernel cache key, so power-of-two buckets keep a wobbling longest
-        # sequence on one compiled kernel.
+        # Note (david): the max_seqlen bounds only cap the block sizes but ride
+        # in the kernel cache key, so power-of-two buckets keep a wobbling
+        # longest sequence on one compiled kernel.
         max_seqlen_k_bucket = min(padded_total_k, next_pow2(max_seqlen_k))
         max_seqlen_q_bucket = min(padded_total_q, next_pow2(max_seqlen_q))
         # Note (david): causal_offset stays 0 because packed causal and window
-        # masking is per-sequence bottom-right, derived from the cu_seqlens pair in
-        # the kernel.
+        # masking is per-sequence bottom-right, derived from the cu_seqlens pair
+        # in the kernel.
         build_kernel = functools.partial(
             get_kernel,
             num_heads=nheads,
@@ -1481,8 +1483,9 @@ def flash_attn_varlen_func(
         )
         sinks = check_sinks(learnable_sink, nheads)
         sink_args = () if sinks is None else (sinks,)
-        # Note (david): varlen has no backward kernel, so every path, lse included,
-        # is forward-only and jax.grad names it instead of failing in the tracer.
+        # Note (david): varlen has no backward kernel, so every path, lse
+        # included, is forward-only and jax.grad names it instead of failing in
+        # the tracer.
         kernel_output = forward_only_attn(
             build_kernel(return_lse=bool(return_softmax_lse)),
             "flash_attn_varlen_func",
@@ -1499,8 +1502,8 @@ def flash_attn_varlen_func(
             out = kernel_output
         out = jax.lax.slice_in_dim(out, 0, total_q, axis=token_axis)
         if return_softmax_lse:
-            # Note (david): the kernel emits lse as (nheads, padded_total_q) in both
-            # layouts.
+            # Note (david): the kernel emits lse as (nheads, padded_total_q) in
+            # both layouts.
             return out, kernel_lse[:, :total_q]
         else:
             return out
@@ -1826,7 +1829,7 @@ def flash_attn_with_kvcache(
             num_active,
             max_seqlen_q=packed_max_seqlen_q,
             q_scale=float(fused_q_scale(softmax_scale, softcap)),
-            causal=is_right_bounded,
+            causal=is_right_bounded,  # pylint: disable=possibly-used-before-assignment
             window_left=window_left,
             softcap=float(softcap),
             return_lse=bool(return_softmax_lse),
@@ -1837,11 +1840,11 @@ def flash_attn_with_kvcache(
             sinks=sinks,
         )
     else:
-        # Note (david): the decode kernel runs its softmax in log2 units straight
-        # off q @ k^T, so softmax_scale * log2(e) (softmax_scale / softcap with a
-        # softcap) is folded into Q here, with the same bf16 rounding the dense
-        # kernels apply per staged Q tile. The K descale is one per-tensor
-        # factor on every score, so it rides in the same scale.
+        # Note (david): the decode kernel runs its softmax in log2 units
+        # straight off q @ k^T, so softmax_scale * log2(e) (softmax_scale /
+        # softcap with a softcap) is folded into Q here, with the same bf16
+        # rounding the dense kernels apply per staged Q tile. The K descale is
+        # one per-tensor factor on every score, so it rides in the same scale.
         q_scaled = (
             q.astype(jnp.float32)
             * fused_q_scale(softmax_scale * k_descale, softcap)
@@ -1877,8 +1880,8 @@ def flash_attn_with_kvcache(
                 new_token_shape
             )
         else:
-            # Note (david): without has_new the kernel never touches these, but it
-            # still needs correctly shaped operands to build its BlockSpecs.
+            # Note (david): without has_new the kernel never touches these, but
+            # it still needs correctly shaped operands to build its BlockSpecs.
             k_new = v_new = jnp.zeros(new_token_shape, k_cache.dtype)
         window_left = None if window_size[0] == -1 else window_size[0]
         kernel_outputs = flash_attn_kvcache_pallas(

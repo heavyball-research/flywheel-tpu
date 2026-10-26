@@ -1,6 +1,10 @@
 """Naive GDN and KDA references, their gates and the error check of the
 linear attention tests. Tensors are [B, T, H, D]."""
 
+# The shape letters (B, T, H, HV, D) and A_log name tensors as the gated
+# delta rule's math does.
+# pylint: disable=invalid-name
+
 import jax
 import jax.numpy as jnp
 import numpy as np

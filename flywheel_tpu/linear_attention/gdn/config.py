@@ -81,6 +81,8 @@ class Dtypes:
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class GDNConfig:
+    """Shapes, dtypes and tiling of one GDN kernel build."""
+
     mode: GDNMode
     dtypes: Dtypes
     batch_size: int
