@@ -1127,6 +1127,19 @@ def launch_fused_conv1d_kda(
     conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
 
+    # The token-axis DMAs of qkv, g and out move whole SUBLANE_ALIGN-row
+    # windows (memory_ref.aligned_window), which stay inside the allocation
+    # only if XLA pads the token axis to that grid. It does from SUBLANE_ALIGN
+    # tokens on; below, it tiles 1, 2 or 4 rows deep (bf16[2, dim] is
+    # T(2,128)(2,1)) and the unchecked windows would read and write past the
+    # buffers (on v7x the stray write halted a later program, issue #36). So
+    # fewer tokens are padded up and the output is cut back.
+    num_tokens = qkv.shape[0]
+    token_padding = max(0, config.SUBLANE_ALIGN - num_tokens)
+    if token_padding:
+        qkv, b, g = (jnp.pad(x, ((0, token_padding), (0, 0)))
+                     for x in (qkv, b, g))
+
     # Note (david): qkv enters the kernel in the caller's [batch, dim] layout
     # and dtype and is cast to f32 on-chip; an f32 [batch, 1, dim] reshape here
     # is a T(8,128) -> T(1,128) retile that XLA materializes in HBM, measured
@@ -1472,4 +1485,4 @@ def launch_fused_conv1d_kda(
 
     return (jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
             recurrent_state_out.astype(recurrent_out_dtype), replay_state_out,
-            replay_gates_out), out
+            replay_gates_out), out[:num_tokens]
