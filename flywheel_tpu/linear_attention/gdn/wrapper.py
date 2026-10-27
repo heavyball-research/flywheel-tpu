@@ -1153,6 +1153,21 @@ def launch_fused_conv1d_gdn(
     conv_out_dtype = conv_state.dtype
     recurrent_out_dtype = recurrent_state.dtype
 
+    # The token-axis DMAs of qkv and out move whole SUBLANE_ALIGN-row
+    # windows (memory_ref.aligned_window), which stay inside the allocation
+    # only if XLA pads the token axis to that grid. It does from SUBLANE_ALIGN
+    # tokens on; below, it tiles 1, 2 or 4 rows deep (bf16[2, dim] is
+    # T(2,128)(2,1)) and the unchecked windows would read and write past the
+    # buffers (on v7x the stray write halted a later program, issue #36). So
+    # fewer tokens are padded up and the output is cut back. The decode tile
+    # is still capped by num_tokens: capped by the padded batch, one decode
+    # sequence ran a 4-sequence tile.
+    num_tokens = qkv.shape[0]
+    token_padding = max(0, config.SUBLANE_ALIGN - num_tokens)
+    if token_padding:
+        qkv, b, a = (jnp.pad(x, ((0, token_padding), (0, 0)))
+                     for x in (qkv, b, a))
+
     # Note (david): qkv enters the kernel in the caller's [batch, dim] layout
     # and dtype and is cast to f32 on-chip; an f32 [batch, 1, dim] reshape here
     # is a T(8,128) -> T(1,128) retile that XLA materializes in HBM, 0.497 ms
@@ -1197,7 +1212,7 @@ def launch_fused_conv1d_gdn(
         # whatever its window: two f32 checkpoints' bytes per sequence and
         # ring slot, plus one for the compiler's temporaries. Only the conv
         # state keeps a checkpoint per window position.
-        decode_tile_size = min(decode_tile_size, batch_size)
+        decode_tile_size = min(decode_tile_size, num_tokens)
         state_bytes = n_v * d_k * d_v * F32_BYTES
         record_bytes = replay_window * (
             replay_state.shape[-1] * replay_state.dtype.itemsize +
@@ -1234,10 +1249,10 @@ def launch_fused_conv1d_gdn(
         spec_tile_budget = (vmem_budget // 2) // config.NUM_BUFFERS
         decode_tile_size = max(
             1,
-            min(decode_tile_size, batch_size,
+            min(decode_tile_size, num_tokens,
                 spec_tile_budget // bytes_per_seq))
     else:
-        decode_tile_size = min(decode_tile_size, batch_size)
+        decode_tile_size = min(decode_tile_size, num_tokens)
         # Note (david): every state ring slot holds each sequence's initial
         # state and its one checkpoint. Where the rings cannot fit the scoped
         # VMEM limit (v7x has half of v6e's VMEM: 4 sequences of 48 value heads
@@ -1452,4 +1467,4 @@ def launch_fused_conv1d_gdn(
 
     return (jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
             recurrent_state_out.astype(recurrent_out_dtype), replay_state_out,
-            replay_gates_out), out
+            replay_gates_out), out[:num_tokens]
