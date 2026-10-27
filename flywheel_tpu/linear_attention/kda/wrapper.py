@@ -1133,7 +1133,9 @@ def launch_fused_conv1d_kda(
     # tokens on; below, it tiles 1, 2 or 4 rows deep (bf16[2, dim] is
     # T(2,128)(2,1)) and the unchecked windows would read and write past the
     # buffers (on v7x the stray write halted a later program, issue #36). So
-    # fewer tokens are padded up and the output is cut back.
+    # fewer tokens are padded up and the output is cut back. The decode tile
+    # is still capped by num_tokens: capped by the padded batch, one decode
+    # sequence ran a 4-sequence tile.
     num_tokens = qkv.shape[0]
     token_padding = max(0, config.SUBLANE_ALIGN - num_tokens)
     if token_padding:
@@ -1222,7 +1224,7 @@ def launch_fused_conv1d_kda(
         # whatever its window: two f32 checkpoints' bytes per sequence and
         # ring slot, plus one for the compiler's temporaries. Only the conv
         # state keeps a checkpoint per window position.
-        decode_tile_size = min(decode_tile_size, batch_size)
+        decode_tile_size = min(decode_tile_size, num_tokens)
         state_bytes = n_v * d_k * d_v * F32_BYTES
         record_bytes = replay_window * (
             replay_state.shape[-1] * replay_state.dtype.itemsize +
@@ -1259,10 +1261,10 @@ def launch_fused_conv1d_kda(
         spec_tile_budget = (vmem_budget // 2) // config.NUM_BUFFERS
         decode_tile_size = max(
             1,
-            min(decode_tile_size, batch_size,
+            min(decode_tile_size, num_tokens,
                 spec_tile_budget // bytes_per_seq))
     else:
-        decode_tile_size = min(decode_tile_size, batch_size)
+        decode_tile_size = min(decode_tile_size, num_tokens)
         # Note (david): every state ring slot holds each sequence's initial
         # state and its one checkpoint. Where the rings cannot fit the scoped
         # VMEM limit (v7x has half of v6e's VMEM: 4 sequences of 48 value heads
