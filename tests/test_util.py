@@ -17,7 +17,9 @@ MASK_VALUE = -1e30
 
 def randn(rng, shape, dtype=jnp.bfloat16):
     """Standard normal samples drawn in f32 from a numpy Generator, cast to dtype."""
-    return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(dtype)
+    return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(
+        dtype
+    )
 
 
 def merge_kv_heads(k, v):
@@ -26,9 +28,13 @@ def merge_kv_heads(k, v):
     padded by one zero head."""
     *leading, nheads_k, d = k.shape
     heads_per_word = 2 // k.dtype.itemsize
-    head_pad = [(0, 0)] * len(leading) + [(0, -nheads_k % heads_per_word), (0, 0)]
+    head_pad = [(0, 0)] * len(leading) + [
+        (0, -nheads_k % heads_per_word),
+        (0, 0),
+    ]
     k_words, v_words = (
-        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d) for x in (k, v)
+        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d)
+        for x in (k, v)
     )
     return jnp.stack([k_words, v_words], axis=-3).reshape(*leading, -1, d)
 
@@ -39,14 +45,17 @@ def split_kv_heads(kv, nheads_k):
     heads_per_word = 2 // kv.dtype.itemsize
     words = kv.reshape(*leading, -1, 2, heads_per_word, d)
     return tuple(
-        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :] for part in range(2)
+        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :]
+        for part in range(2)
     )
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, rng):
     """(batch_size, max_seqlen) bool prefix masks whose lengths are drawn from
     [max(1, max_seqlen - 20), max_seqlen]."""
-    lengths = rng.integers(max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1))
+    lengths = rng.integers(
+        max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1)
+    )
     return jnp.asarray(np.arange(max_seqlen)[None, :] < lengths)
 
 
@@ -60,7 +69,9 @@ def generate_qkv(q, k, v, query_padding_mask, key_padding_mask):
     back to (batch_size, seqlen_q, ...).
     """
     batch_size, seqlen_q = q.shape[:2]
-    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, query_padding_mask)
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+        q, query_padding_mask
+    )
     k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, key_padding_mask)
     v_unpad, *_ = unpad_input(v, key_padding_mask)
 
@@ -79,7 +90,9 @@ def generate_qkv(q, k, v, query_padding_mask, key_padding_mask):
     )
 
 
-def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlens=None):
+def apply_rotary_emb(
+    x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlens=None
+):
     """FlashAttention's apply_rotary_emb on (batch_size, seqlen, nheads, d), or on packed
     (total, nheads, d) with cu_seqlens.
 
@@ -91,7 +104,9 @@ def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlen
     """
     seqlen_ro, rotary_dim = cos.shape[0], 2 * cos.shape[1]
     if cu_seqlens is None:
-        positions = jnp.reshape(jnp.asarray(seqlen_offsets), (-1, 1)) + jnp.arange(x.shape[1])
+        positions = jnp.reshape(
+            jnp.asarray(seqlen_offsets), (-1, 1)
+        ) + jnp.arange(x.shape[1])
     else:
         token_ids = jnp.arange(x.shape[0])
         num_seqs = cu_seqlens.shape[0] - 1
@@ -111,8 +126,12 @@ def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlen
         rotated = rotated.reshape(x_ro.shape)
     else:
         x1, x2 = jnp.split(x_ro, 2, axis=-1)
-        rotated = jnp.concatenate((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
-    return jnp.concatenate((rotated.astype(x.dtype), x[..., rotary_dim:]), axis=-1)
+        rotated = jnp.concatenate(
+            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1
+        )
+    return jnp.concatenate(
+        (rotated.astype(x.dtype), x[..., rotary_dim:]), axis=-1
+    )
 
 
 def construct_local_mask(
@@ -138,7 +157,9 @@ def construct_local_mask(
         else query_padding_mask.sum(-1)[:, None, None, None]
     )
     diagonal = row_idx + sk - sq
-    mask = jnp.zeros(jnp.broadcast_shapes(jnp.shape(diagonal), col_idx.shape), bool)
+    mask = jnp.zeros(
+        jnp.broadcast_shapes(jnp.shape(diagonal), col_idx.shape), bool
+    )
     if window_size[1] >= 0:
         mask = mask | (col_idx > diagonal + window_size[1])
     if window_size[0] >= 0:
@@ -187,11 +208,17 @@ def attention_ref(
     # bf16 pass, which would make the upcast reference as coarse as the kernel.
     if not reorder_ops:
         scores = jnp.einsum(
-            "bthd,bshd->bhts", q * softmax_scale, k, precision=jax.lax.Precision.HIGHEST
+            "bthd,bshd->bhts",
+            q * softmax_scale,
+            k,
+            precision=jax.lax.Precision.HIGHEST,
         )
     else:
         scores = jnp.einsum(
-            "bthd,bshd->bhts", q, k * softmax_scale, precision=jax.lax.Precision.HIGHEST
+            "bthd,bshd->bhts",
+            q,
+            k * softmax_scale,
+            precision=jax.lax.Precision.HIGHEST,
         )
     if softcap > 0:
         scores = jnp.tanh(scores / softcap) * softcap
@@ -200,7 +227,11 @@ def attention_ref(
         masked = masked | ~key_padding_mask[:, None, None, :]
     if window_size[0] >= 0 or window_size[1] >= 0:
         masked = masked | construct_local_mask(
-            seqlen_q, seqlen_k, window_size, query_padding_mask, key_padding_mask
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            query_padding_mask,
+            key_padding_mask,
         )
     scores = jnp.where(masked, MASK_VALUE, scores)
     empty_row = masked.all(axis=-1, keepdims=True)
@@ -209,15 +240,20 @@ def attention_ref(
     logits = scores.astype(jnp.float32)
     if sinks is not None:
         sink_logits = jnp.broadcast_to(
-            sinks.astype(jnp.float32)[None, :, None, None], (*logits.shape[:3], 1)
+            sinks.astype(jnp.float32)[None, :, None, None],
+            (*logits.shape[:3], 1),
         )
-        logits = jnp.concatenate([jnp.where(masked, -jnp.inf, logits), sink_logits], axis=-1)
+        logits = jnp.concatenate(
+            [jnp.where(masked, -jnp.inf, logits), sink_logits], axis=-1
+        )
     attention = jax.nn.softmax(logits, axis=-1)[..., :seqlen_k].astype(v.dtype)
     attention = jnp.where(empty_row, 0.0, attention)
     lse = jax.nn.logsumexp(logits, axis=-1)
     if sinks is None:
         lse = jnp.where(empty_row[..., 0], -jnp.inf, lse)
-    output = jnp.einsum("bhts,bshd->bthd", attention, v, precision=jax.lax.Precision.HIGHEST)
+    output = jnp.einsum(
+        "bhts,bshd->bthd", attention, v, precision=jax.lax.Precision.HIGHEST
+    )
     if query_padding_mask is not None:
         output = jnp.where(~query_padding_mask[:, :, None, None], 0.0, output)
     return output.astype(dtype_og), lse

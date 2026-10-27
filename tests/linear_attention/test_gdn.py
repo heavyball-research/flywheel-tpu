@@ -40,27 +40,34 @@ from tests.linear_attention.reference import (
 pytestmark = TPU_ONLY
 
 
-def reference(fused: Fused, beta: jax.Array, g: jax.Array,
-              initial_state: jax.Array | None
-              ) -> tuple[jax.Array, jax.Array]:
+def reference(
+    fused: Fused, beta: jax.Array, g: jax.Array, initial_state: jax.Array | None
+) -> tuple[jax.Array, jax.Array]:
     """The naive recurrence on the conv's activated q, k, v, sequence by
     sequence when packed; beta is the kernel's logits. o is rounded to the
     kernel's bf16 output dtype."""
     num_groups = fused.n_v // fused.n_kq
-    inputs = (normalize(repeat_heads(fused.q, num_groups)),
-              normalize(repeat_heads(fused.k, num_groups)), fused.v,
-              jax.nn.sigmoid(beta), g)
+    inputs = (
+        normalize(repeat_heads(fused.q, num_groups)),
+        normalize(repeat_heads(fused.k, num_groups)),
+        fused.v,
+        jax.nn.sigmoid(beta),
+        g,
+    )
     if not fused.varlen:
         out, state = naive_recurrent_gated_delta_rule(
-            *inputs, initial_state=initial_state, output_final_state=True)
+            *inputs, initial_state=initial_state, output_final_state=True
+        )
         return bf16_values(out), state
     outs, states = [], []
     for seq, (bos, eos) in enumerate(
-            zip(fused.cu_seqlens[:-1], fused.cu_seqlens[1:])):
+        zip(fused.cu_seqlens[:-1], fused.cu_seqlens[1:])
+    ):
         out, state = naive_recurrent_gated_delta_rule(
             *(x[:, bos:eos] for x in inputs),
-            initial_state=initial_state[seq:seq + 1],
-            output_final_state=True)
+            initial_state=initial_state[seq : seq + 1],
+            output_final_state=True,
+        )
         outs.append(out)
         states.append(state)
     return bf16_values(jnp.concatenate(outs, axis=1)), jnp.concatenate(states)
@@ -81,9 +88,15 @@ def reference(fused: Fused, beta: jax.Array, g: jax.Array,
         ],
     ),
 )
-def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
-                         gate_logit_normalizer: float,
-                         record_dtype: jnp.dtype | None) -> None:
+def test_fused_recurrent(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    gate_logit_normalizer: float,
+    record_dtype: jnp.dtype | None,
+) -> None:
     rng = np.random.default_rng(42)
     q = randn(rng, (B, T, H, D))
     k = randn(rng, (B, T, H, D))
@@ -120,9 +133,16 @@ def test_fused_recurrent(B: int, T: int, H: int, HV: int, D: int,
         ],
     ),
 )
-def test_chunk(B: int, T: int, H: int, HV: int, D: int,
-               gate_logit_normalizer: float, mask_p: float,
-               ratio: float) -> None:
+def test_chunk(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    gate_logit_normalizer: float,
+    mask_p: float,
+    ratio: float,
+) -> None:
     rng = np.random.default_rng(42)
     q = rand(rng, (B, T, H, D))
     k = rand(rng, (B, T, H, D))
@@ -147,9 +167,15 @@ def test_chunk(B: int, T: int, H: int, HV: int, D: int,
         [(1, 64, 2, 4, 32, 1.0, chunk_size) for chunk_size in [16, 32, 64]],
     ),
 )
-def test_chunk_with_chunk_size(B: int, T: int, H: int, HV: int, D: int,
-                               gate_logit_normalizer: float,
-                               chunk_size: int) -> None:
+def test_chunk_with_chunk_size(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    gate_logit_normalizer: float,
+    chunk_size: int,
+) -> None:
     rng = np.random.default_rng(42)
     q = rand(rng, (B, T, H, D))
     k = rand(rng, (B, T, H, D))
@@ -176,8 +202,9 @@ def test_chunk_with_chunk_size(B: int, T: int, H: int, HV: int, D: int,
         ],
     ),
 )
-def test_chunk_beta_sigmoid_in_kernel(B: int, T: int, H: int, HV: int,
-                                      D: int) -> None:
+def test_chunk_beta_sigmoid_in_kernel(
+    B: int, T: int, H: int, HV: int, D: int
+) -> None:
     """The kernel's in-kernel sigmoid of raw beta logits matches the
     reference's manual sigmoid."""
     rng = np.random.default_rng(42)
@@ -209,10 +236,15 @@ def test_chunk_beta_sigmoid_in_kernel(B: int, T: int, H: int, HV: int,
         ],
     ),
 )
-def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
-                                        D: int, has_dt_bias: bool,
-                                        record_dtype: jnp.dtype | None
-                                        ) -> None:
+def test_fused_recurrent_gate_in_kernel(
+    B: int,
+    T: int,
+    H: int,
+    HV: int,
+    D: int,
+    has_dt_bias: bool,
+    record_dtype: jnp.dtype | None,
+) -> None:
     """The in-kernel gate matches the manual gate path."""
     rng = np.random.default_rng(42)
     q = randn(rng, (B, T, H, D))
@@ -220,15 +252,16 @@ def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
     v = randn(rng, (B, T, HV, D))
     beta = rand(rng, (B, T, HV))
     g_raw = randn(rng, (B, T, HV))
-    A_log = jnp.log(uniform(rng, (HV, ), 1, 16))
-    dt_bias = randn(rng, (HV, )) if has_dt_bias else None
+    A_log = jnp.log(uniform(rng, (HV,), 1, 16))
+    dt_bias = randn(rng, (HV,)) if has_dt_bias else None
     h0 = randn(rng, (B, HV, D, D))
     fused = Fused(GDN, rng, q, k, v, initial_state=h0)
 
     g_ref, _ = encode_gate(GDN, naive_gdn_gate(g_raw, A_log, dt_bias))
     ref, ref_ht = fused.recurrent(g_ref, beta, record_dtype)
-    tri, tri_ht = fused.recurrent(g_raw, beta, record_dtype, A_log=A_log,
-                                  dt_bias=dt_bias)
+    tri, tri_ht = fused.recurrent(
+        g_raw, beta, record_dtype, A_log=A_log, dt_bias=dt_bias
+    )
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
 
@@ -244,8 +277,8 @@ def test_fused_recurrent_gate_in_kernel(B: int, T: int, H: int, HV: int,
     ),
 )
 def test_fused_recurrent_beta_sigmoid_in_kernel(
-        B: int, T: int, H: int, HV: int, D: int,
-        record_dtype: jnp.dtype | None) -> None:
+    B: int, T: int, H: int, HV: int, D: int, record_dtype: jnp.dtype | None
+) -> None:
     """The in-kernel sigmoid of raw beta logits matches the reference's
     manual sigmoid."""
     rng = np.random.default_rng(42)
@@ -277,8 +310,13 @@ def test_fused_recurrent_beta_sigmoid_in_kernel(
     ),
 )
 def test_fused_recurrent_gate_in_kernel_varlen(
-        H: int, HV: int, D: int, has_dt_bias: bool, cu_seqlens: list[int],
-        record_dtype: jnp.dtype | None) -> None:
+    H: int,
+    HV: int,
+    D: int,
+    has_dt_bias: bool,
+    cu_seqlens: list[int],
+    record_dtype: jnp.dtype | None,
+) -> None:
     """Varlen decode with the in-kernel gate."""
     rng = np.random.default_rng(42)
     T = cu_seqlens[-1]
@@ -289,15 +327,16 @@ def test_fused_recurrent_gate_in_kernel_varlen(
     v = randn(rng, (1, T, HV, D))
     beta = rand(rng, (1, T, HV))
     g_raw = randn(rng, (1, T, HV))
-    A_log = jnp.log(uniform(rng, (HV, ), 1, 16))
-    dt_bias = randn(rng, (HV, )) if has_dt_bias else None
+    A_log = jnp.log(uniform(rng, (HV,), 1, 16))
+    dt_bias = randn(rng, (HV,)) if has_dt_bias else None
     h0 = randn(rng, (N, HV, D, D))
     fused = Fused(GDN, rng, q, k, v, cu_seqlens=cu_seqlens, initial_state=h0)
 
     g_ref, _ = encode_gate(GDN, naive_gdn_gate(g_raw, A_log, dt_bias))
     ref, ref_ht = fused.recurrent(g_ref, beta, record_dtype)
-    tri, tri_ht = fused.recurrent(g_raw, beta, record_dtype, A_log=A_log,
-                                  dt_bias=dt_bias)
+    tri, tri_ht = fused.recurrent(
+        g_raw, beta, record_dtype, A_log=A_log, dt_bias=dt_bias
+    )
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
 
@@ -314,8 +353,9 @@ def test_fused_recurrent_gate_in_kernel_varlen(
         ],
     ),
 )
-def test_chunk_varlen(H: int, HV: int, D: int, mask_p: float,
-                      cu_seqlens: list[int]) -> None:
+def test_chunk_varlen(
+    H: int, HV: int, D: int, mask_p: float, cu_seqlens: list[int]
+) -> None:
     rng = np.random.default_rng(42)
     T = cu_seqlens[-1]
     N = len(cu_seqlens) - 1
@@ -346,8 +386,9 @@ def test_chunk_varlen(H: int, HV: int, D: int, mask_p: float,
         ],
     ),
 )
-def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
-                              cu_seqlens: list[int]) -> None:
+def test_chunk_varlen_prefill(
+    H: int, D: int, mask_p: float, cu_seqlens: list[int]
+) -> None:
     rng = np.random.default_rng(42)
     T = cu_seqlens[-1]
     N = len(cu_seqlens) - 1
@@ -379,8 +420,9 @@ def test_chunk_varlen_prefill(H: int, D: int, mask_p: float,
         ],
     ),
 )
-def test_chunk_gate_in_kernel(B: int, T: int, H: int, D: int,
-                              has_dt_bias: bool) -> None:
+def test_chunk_gate_in_kernel(
+    B: int, T: int, H: int, D: int, has_dt_bias: bool
+) -> None:
     """The in-kernel gate matches the manual gate path."""
     rng = np.random.default_rng(42)
     q = rand(rng, (B, T, H, D))
@@ -388,8 +430,8 @@ def test_chunk_gate_in_kernel(B: int, T: int, H: int, D: int,
     v = rand(rng, (B, T, H, D))
     beta = rand(rng, (B, T, H))
     g_raw = randn(rng, (B, T, H))
-    A_log = randn(rng, (H, ))
-    dt_bias = randn(rng, (H, )) if has_dt_bias else None
+    A_log = randn(rng, (H,))
+    dt_bias = randn(rng, (H,)) if has_dt_bias else None
     h0 = jnp.zeros((B, H, D, D))
     fused = Fused(GDN, rng, q, k, v, initial_state=h0)
 
@@ -412,8 +454,9 @@ def test_chunk_gate_in_kernel(B: int, T: int, H: int, D: int,
         ],
     ),
 )
-def test_chunk_gate_in_kernel_gqa(B: int, T: int, Hq: int, H: int, D: int,
-                                  has_dt_bias: bool) -> None:
+def test_chunk_gate_in_kernel_gqa(
+    B: int, T: int, Hq: int, H: int, D: int, has_dt_bias: bool
+) -> None:
     """The in-kernel gate with grouped value heads (H > Hq)."""
     rng = np.random.default_rng(42)
     q = rand(rng, (B, T, Hq, D))
@@ -421,8 +464,8 @@ def test_chunk_gate_in_kernel_gqa(B: int, T: int, Hq: int, H: int, D: int,
     v = rand(rng, (B, T, H, D))
     beta = rand(rng, (B, T, H))
     g_raw = randn(rng, (B, T, H))
-    A_log = randn(rng, (H, ))
-    dt_bias = randn(rng, (H, )) if has_dt_bias else None
+    A_log = randn(rng, (H,))
+    dt_bias = randn(rng, (H,)) if has_dt_bias else None
     h0 = jnp.zeros((B, H, D, D))
     fused = Fused(GDN, rng, q, k, v, initial_state=h0)
 
@@ -443,8 +486,9 @@ def test_chunk_gate_in_kernel_gqa(B: int, T: int, Hq: int, H: int, D: int,
         ],
     ),
 )
-def test_chunk_gate_in_kernel_varlen(H: int, D: int, has_dt_bias: bool,
-                                     cu_seqlens: list[int]) -> None:
+def test_chunk_gate_in_kernel_varlen(
+    H: int, D: int, has_dt_bias: bool, cu_seqlens: list[int]
+) -> None:
     """The in-kernel gate with variable-length sequences."""
     rng = np.random.default_rng(42)
     T = cu_seqlens[-1]
@@ -455,8 +499,8 @@ def test_chunk_gate_in_kernel_varlen(H: int, D: int, has_dt_bias: bool,
     v = randn(rng, (1, T, H, D))
     beta = rand(rng, (1, T, H))
     g_raw = randn(rng, (1, T, H))
-    A_log = randn(rng, (H, ))
-    dt_bias = randn(rng, (H, )) if has_dt_bias else None
+    A_log = randn(rng, (H,))
+    dt_bias = randn(rng, (H,)) if has_dt_bias else None
     h0 = randn(rng, (N, H, D, D))
     fused = Fused(GDN, rng, q, k, v, cu_seqlens=cu_seqlens, initial_state=h0)
 

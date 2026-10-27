@@ -27,8 +27,9 @@ NUM_LANES = 128
 HALO_ROWS = 16
 
 
-def token_rows(prev_tokens: jax.Array, chunk_tokens: jax.Array, start: int,
-               count: int) -> jax.Array:
+def token_rows(
+    prev_tokens: jax.Array, chunk_tokens: jax.Array, start: int, count: int
+) -> jax.Array:
     """Rows [start, start + count) of concat([prev_tokens, chunk_tokens], 1).
 
     prev_tokens is [seq, prev_kernel_size, dim] and chunk_tokens [seq, chunk,
@@ -40,7 +41,7 @@ def token_rows(prev_tokens: jax.Array, chunk_tokens: jax.Array, start: int,
     num_from_chunk = count - num_from_prev
     row_slices = []
     if num_from_prev:
-        row_slices.append(prev_tokens[:, start:start + num_from_prev])
+        row_slices.append(prev_tokens[:, start : start + num_from_prev])
     if num_from_chunk:
         chunk_start = start + num_from_prev - num_prev
         chunk_end = chunk_start + num_from_chunk
@@ -74,8 +75,11 @@ def tap_select_matrix(chunk: int, kernel_size: int) -> jax.Array:
         shifted_row = out_row + (tap - prev_kernel)
         src_row = jnp.where(shifted_row >= 0, shifted_row, shifted_row + chunk)
         is_tap_src = w_row == tap * chunk + src_row
-        is_selected = (is_tap_src if is_selected is None else
-                       jnp.logical_or(is_selected, is_tap_src))
+        is_selected = (
+            is_tap_src
+            if is_selected is None
+            else jnp.logical_or(is_selected, is_tap_src)
+        )
     return jnp.where(is_selected, 1.0, 0.0).astype(jnp.bfloat16)
 
 
@@ -104,8 +108,9 @@ def causal_conv1d_static(
     assert dim % lanes_per_dot == 0, dim
     tap_select = tap_select_matrix(chunk, cfg.kernel_size)
     tap_weights = conv_weight.astype(jnp.bfloat16)
-    halo_row = jax.lax.broadcasted_iota(jnp.int32,
-                                        (HALO_ROWS, lanes_per_dot), 0)
+    halo_row = jax.lax.broadcasted_iota(
+        jnp.int32, (HALO_ROWS, lanes_per_dot), 0
+    )
 
     # Note (david): per lane slab one dot tap_select @ W, W the kernel_size
     # tap-scaled copies of the chunk with each copy's unused tail rows holding
@@ -123,18 +128,26 @@ def causal_conv1d_static(
             scaled_chunk = tap_weight * chunk_tokens
             # Note (david): rows chunk - prev_kernel_size + j, j >= tap, of copy
             # tap carry halo token j.
-            copy_tail = jnp.where(halo_row >= HALO_ROWS - prev_kernel + tap,
-                                  tap_weight * halo_tokens,
-                                  scaled_chunk[chunk - HALO_ROWS:])
+            copy_tail = jnp.where(
+                halo_row >= HALO_ROWS - prev_kernel + tap,
+                tap_weight * halo_tokens,
+                scaled_chunk[chunk - HALO_ROWS :],
+            )
             if chunk == HALO_ROWS:
                 tap_copies.append(copy_tail)
             else:
                 tap_copies.append(
                     jnp.concatenate(
-                        [scaled_chunk[:chunk - HALO_ROWS], copy_tail], axis=0))
+                        [scaled_chunk[: chunk - HALO_ROWS], copy_tail], axis=0
+                    )
+                )
         slab_outs.append(
-            jax.lax.dot(tap_select, jnp.concatenate(tap_copies, axis=0),
-                        preferred_element_type=jnp.float32))
+            jax.lax.dot(
+                tap_select,
+                jnp.concatenate(tap_copies, axis=0),
+                preferred_element_type=jnp.float32,
+            )
+        )
     conv_out = jnp.concatenate(slab_outs, axis=-1)
     if conv_bias is None:
         biased_out = conv_out
@@ -143,8 +156,12 @@ def causal_conv1d_static(
     return biased_out[jnp.newaxis]
 
 
-def make_halo(prev_conv: jax.Array, delta: jax.Array, block_head_ref: jax.Ref,
-              cfg: config.KDAConfig) -> jax.Array:
+def make_halo(
+    prev_conv: jax.Array,
+    delta: jax.Array,
+    block_head_ref: jax.Ref,
+    cfg: config.KDAConfig,
+) -> jax.Array:
     """Place a tile's carried conv state on the block grid.
 
     prev_conv is the [prev_kernel_size, dim] f32 run of tokens before the
@@ -156,7 +173,8 @@ def make_halo(prev_conv: jax.Array, delta: jax.Array, block_head_ref: jax.Ref,
     dim = prev_conv.shape[-1]
     halo_f32 = jnp.concatenate(
         [jnp.zeros((HALO_ROWS - prev_kernel, dim), jnp.float32), prev_conv],
-        axis=0)
+        axis=0,
+    )
     halo = pltpu.roll(halo_f32, delta, 0).astype(block_head_ref.dtype)
 
     # Note (david): the carried tokens belong at rows [delta - prev_kernel_size,
@@ -170,8 +188,12 @@ def make_halo(prev_conv: jax.Array, delta: jax.Array, block_head_ref: jax.Ref,
     return halo
 
 
-def conv_state_on_grid(qkv_view_ref: jax.Ref, halo: jax.Array,
-                       end: jax.Array, cfg: config.KDAConfig) -> jax.Array:
+def conv_state_on_grid(
+    qkv_view_ref: jax.Ref,
+    halo: jax.Array,
+    end: jax.Array,
+    cfg: config.KDAConfig,
+) -> jax.Array:
     """Conv state after the chunk's last real token.
 
     Returns [prev_kernel_size, dim] f32. end is the block-grid row after the
@@ -183,7 +205,7 @@ def conv_state_on_grid(qkv_view_ref: jax.Ref, halo: jax.Array,
     prev_kernel = cfg.prev_kernel_size
     chunk = cfg.compute_chunk_size
     chunk_tokens = qkv_view_ref[0, :chunk, :].astype(jnp.float32)
-    prev_tokens = halo[HALO_ROWS - prev_kernel:].astype(jnp.float32)
+    prev_tokens = halo[HALO_ROWS - prev_kernel :].astype(jnp.float32)
     # Note (david): a partially filled chunk checkpoints after its last real
     # token, a full or empty one after the chunk.
     ckpt_row = jnp.where(jnp.logical_and(end > 0, end < chunk), end, chunk)
@@ -192,17 +214,21 @@ def conv_state_on_grid(qkv_view_ref: jax.Ref, halo: jax.Array,
     # causal_conv1d would cost O(chunk) selects that each occupy a full sublane
     # tile in the native layout. pltpu.roll only accepts non-negative shifts.
     window_end = jnp.maximum(ckpt_row, prev_kernel)
-    conv_state = pltpu.roll(chunk_tokens,
-                            (chunk - (window_end - prev_kernel)) % chunk,
-                            0)[:prev_kernel]
+    conv_state = pltpu.roll(
+        chunk_tokens, (chunk - (window_end - prev_kernel)) % chunk, 0
+    )[:prev_kernel]
     # Note (david): ckpt_row < prev_kernel_size reaches back into the halo. Only
     # prev_kernel_size - 1 such cases exist and they are all static, so they
     # are plain selects.
     for short_end in range(1, prev_kernel):
         conv_state = jnp.where(
             short_end == end,
-            token_rows(prev_tokens[jnp.newaxis], chunk_tokens[jnp.newaxis],
-                       short_end, prev_kernel)[0],
+            token_rows(
+                prev_tokens[jnp.newaxis],
+                chunk_tokens[jnp.newaxis],
+                short_end,
+                prev_kernel,
+            )[0],
             conv_state,
         )
     return conv_state
@@ -235,8 +261,9 @@ def causal_conv1d(
     for tap in range(cfg.kernel_size):
         # Note (david): out[c] = sum_k w[k] * lhs[c + k] with
         # lhs = concat(prev_conv, chunk_tokens), exactly upstream's indexing.
-        tap_term = conv_weight[tap:tap + 1] * token_rows(
-            prev_conv, chunk_tokens, tap, cfg.compute_chunk_size)
+        tap_term = conv_weight[tap : tap + 1] * token_rows(
+            prev_conv, chunk_tokens, tap, cfg.compute_chunk_size
+        )
         conv_out = tap_term if conv_out is None else conv_out + tap_term
     if conv_bias is None:
         biased_out = conv_out
@@ -250,7 +277,7 @@ def causal_conv1d(
     for w_idx in range(cfg.window_size):
         last_row = 1 + cfg.compute_chunk_size - cfg.window_size + w_idx
         conv_ckpts.append(
-            token_rows(prev_conv, chunk_tokens, last_row,
-                       cfg.prev_kernel_size))
+            token_rows(prev_conv, chunk_tokens, last_row, cfg.prev_kernel_size)
+        )
 
     return biased_out, jnp.stack(conv_ckpts, axis=1)

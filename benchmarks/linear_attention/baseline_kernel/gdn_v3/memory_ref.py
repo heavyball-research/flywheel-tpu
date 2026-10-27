@@ -137,8 +137,9 @@ class MetadataRef:
     def get_record(self, p_id: jax.Array, idx: int) -> PackedPIdRecord:
         row_stride, col_stride = pl.strides_from_shape(self.shape)
         record_idx = row_stride * p_id + col_stride * idx
-        return PackedPIdRecord(self.records,
-                               record_idx * PackedPIdRecord.STRUCT_SIZE)
+        return PackedPIdRecord(
+            self.records, record_idx * PackedPIdRecord.STRUCT_SIZE
+        )
 
     @classmethod
     def create(
@@ -157,14 +158,17 @@ class MetadataRef:
     ) -> Self:
         assert s_idx_has_initial_state.shape[0] <= PackedPIdRecord.MAX_SEQS, (
             f"Number of sequences ({s_idx_has_initial_state.shape[0]}) exceeds"
-            f" PackedPIdRecord limit ({PackedPIdRecord.MAX_SEQS}).")
+            f" PackedPIdRecord limit ({PackedPIdRecord.MAX_SEQS})."
+        )
         assert cfg.tile_size <= PackedPIdRecord.R_SIZE_MASK, (
             f"Tile size ({cfg.tile_size}) exceeds PackedPIdRecord limit"
-            f" ({PackedPIdRecord.R_SIZE_MASK}).")
+            f" ({PackedPIdRecord.R_SIZE_MASK})."
+        )
 
         r_base = p_id_to_r_base.reshape(-1).astype(jnp.int32)
-        word = PackedPIdRecord.pack(p_id_to_s_idx, p_id_to_r_size,
-                                    p_id_is_first_tile, p_id_is_last_tile)
+        word = PackedPIdRecord.pack(
+            p_id_to_s_idx, p_id_to_r_size, p_id_is_first_tile, p_id_is_last_tile
+        )
         # Note (david): every tile reads all seq_tile_size of its records, so
         # the last tile reads up to seq_tile_size - 1 records past the valid
         # ones. Zero padding makes those reads hit s_idx 0, r_size 0 and both
@@ -189,8 +193,9 @@ class MetadataRef:
         return len(jax.tree_util.tree_leaves(self))
 
 
-def wait_row_dma(sem: jax.Array, vmem_ref: jax.Ref,
-                 num_rows: jax.Array) -> None:
+def wait_row_dma(
+    sem: jax.Array, vmem_ref: jax.Ref, num_rows: jax.Array
+) -> None:
     # Note (david): the self-copy descriptor is never executed, it only waits
     # for the bytes the matching start issued. With bounds checks disabled it
     # may nominally exceed the window row.
@@ -252,8 +257,9 @@ class BaseBufferedRef(pltpu.BufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class InBufferedRef(BaseBufferedRef):
 
-    def copy_in(self, src_ref: jax.Ref,
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def copy_in(
+        self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.recv_slot_refs(self.current_copy_in_slot)
         for idx in range(self.cfg.seq_tile_size):
             record = self.metadata_ref.get_record(grid_indices[0], idx)
@@ -265,13 +271,15 @@ class InBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
-    def wait_in(self, src_ref: jax.Ref,
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def wait_in(
+        self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.recv_slot_refs(self.current_wait_in_slot)
         num_rows = 0
         for idx in range(self.cfg.seq_tile_size):
-            num_rows += self.metadata_ref.get_record(grid_indices[0],
-                                                     idx).r_size
+            num_rows += self.metadata_ref.get_record(
+                grid_indices[0], idx
+            ).r_size
         wait_row_dma(sem, vmem_ref, num_rows)
 
 
@@ -279,8 +287,9 @@ class InBufferedRef(BaseBufferedRef):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class OutBufferedRef(BaseBufferedRef):
 
-    def copy_out(self, dst_ref: jax.Ref,
-                 grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def copy_out(
+        self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.send_slot_refs(self.current_copy_out_slot)
         for idx in range(self.cfg.seq_tile_size):
             record = self.metadata_ref.get_record(grid_indices[0], idx)
@@ -292,13 +301,15 @@ class OutBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
-    def wait_out(self, dst_ref: jax.Ref,
-                 grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def wait_out(
+        self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.send_slot_refs(self.current_wait_out_slot)
         num_rows = 0
         for idx in range(self.cfg.seq_tile_size):
-            num_rows += self.metadata_ref.get_record(grid_indices[0],
-                                                     idx).r_size
+            num_rows += self.metadata_ref.get_record(
+                grid_indices[0], idx
+            ).r_size
         wait_row_dma(sem, vmem_ref, num_rows)
 
 
@@ -314,16 +325,16 @@ class StateBufferedRef(BaseBufferedRef):
     state_indices[s] onwards.
     """
 
-    def copy_in(self, src_ref: jax.Ref,
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def copy_in(
+        self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.recv_slot_refs(self.current_copy_in_slot)
         for idx in range(self.cfg.seq_tile_size):
             record = self.metadata_ref.get_record(grid_indices[0], idx)
             is_first_tile = record.is_first_tile
             s_idx = record.s_idx
             read_slot = self.metadata_ref.s_idx_to_read_indices[s_idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                s_idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             num_states = jnp.where(should_read, 1, 0)
             # Note (david): resume from the checkpoint of the last accepted
@@ -336,21 +347,24 @@ class StateBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
-    def wait_in(self, src_ref: jax.Ref,
-                grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def wait_in(
+        self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.recv_slot_refs(self.current_wait_in_slot)
         num_states = 0
         for idx in range(self.cfg.seq_tile_size):
             record = self.metadata_ref.get_record(grid_indices[0], idx)
             is_first_tile = record.is_first_tile
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[
-                record.s_idx]
+                record.s_idx
+            ]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
             num_states += jnp.where(should_read, 1, 0)
         wait_row_dma(sem, vmem_ref, num_states)
 
-    def copy_out(self, dst_ref: jax.Ref,
-                 grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def copy_out(
+        self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.send_slot_refs(self.current_copy_out_slot)
         for idx in range(self.cfg.seq_tile_size):
             record = self.metadata_ref.get_record(grid_indices[0], idx)
@@ -370,8 +384,9 @@ class StateBufferedRef(BaseBufferedRef):
                 sem,
             ).start()
 
-    def wait_out(self, dst_ref: jax.Ref,
-                 grid_indices: tuple[int | jax.Array, ...]) -> None:
+    def wait_out(
+        self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array, ...]
+    ) -> None:
         sem, vmem_ref = self.send_slot_refs(self.current_wait_out_slot)
         num_states = 0
         for idx in range(self.cfg.seq_tile_size):
@@ -392,12 +407,12 @@ def create_allocs(
     recurrent_state_ref: jax.Array,
     cfg: config.GDNConfig,
 ) -> tuple[
-        InBufferedRef,
-        InBufferedRef,
-        InBufferedRef,
-        StateBufferedRef,
-        StateBufferedRef,
-        OutBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    InBufferedRef,
+    StateBufferedRef,
+    StateBufferedRef,
+    OutBufferedRef,
 ]:
     qkv_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.dim_size)
     ba_shape = (cfg.seq_tile_size, cfg.chunk_size, 1, cfg.aligned_num_v_heads)
@@ -407,8 +422,13 @@ def create_allocs(
         cfg.num_v_heads,
         cfg.v_head_dim,
     )
-    conv_shape = (cfg.seq_tile_size, cfg.window_size, cfg.prev_kernel_size, 1,
-                  cfg.dim_size)
+    conv_shape = (
+        cfg.seq_tile_size,
+        cfg.window_size,
+        cfg.prev_kernel_size,
+        1,
+        cfg.dim_size,
+    )
     recurrent_shape = (
         cfg.seq_tile_size,
         cfg.window_size,
@@ -417,13 +437,14 @@ def create_allocs(
         cfg.v_head_dim,
     )
 
-    pipeline_mode = pl.Buffered(buffer_count=cfg.num_buffers,
-                                use_lookahead=False)
+    pipeline_mode = pl.Buffered(
+        buffer_count=cfg.num_buffers, use_lookahead=False
+    )
 
     block_spec_partial = functools.partial(
         pl.BlockSpec,
         memory_space=pltpu.VMEM,
-        index_map=lambda i: (i, ),
+        index_map=lambda i: (i,),
         pipeline_mode=pipeline_mode,
     )
 
@@ -458,9 +479,11 @@ def create_allocs(
         cfg=cfg,
         metadata_ref=metadata_ref,
     )
-    conv_alloc = state_buffered_partial(spec=conv_spec,
-                                        dtype_or_type=conv_state_ref)
-    recurrent_alloc = state_buffered_partial(spec=recurrent_spec,
-                                             dtype_or_type=recurrent_state_ref)
+    conv_alloc = state_buffered_partial(
+        spec=conv_spec, dtype_or_type=conv_state_ref
+    )
+    recurrent_alloc = state_buffered_partial(
+        spec=recurrent_spec, dtype_or_type=recurrent_state_ref
+    )
 
     return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc

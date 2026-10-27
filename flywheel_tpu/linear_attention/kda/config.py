@@ -118,8 +118,9 @@ class KDAConfig:
     split_checkpoint: bool = False
 
     def __post_init__(self) -> None:
-        assert self.split_checkpoint or not self.is_replay, (
-            "a replay decode reads the hi plane of a split checkpoint")
+        assert (
+            self.split_checkpoint or not self.is_replay
+        ), "a replay decode reads the hi plane of a split checkpoint"
 
     @property
     def is_replay(self) -> bool:
@@ -136,7 +137,8 @@ class KDAConfig:
     def num_compute_chunks(self) -> int:
         assert self.chunk_size % self.compute_chunk_size == 0, (
             f"chunk_size ({self.chunk_size}) must be a multiple of "
-            f"compute_chunk_size ({self.compute_chunk_size})")
+            f"compute_chunk_size ({self.compute_chunk_size})"
+        )
         return self.chunk_size // self.compute_chunk_size
 
     @property
@@ -167,8 +169,10 @@ class KDAConfig:
         # whole stage tiles keeps the 16-row tile holding the last used row,
         # and the DMA window, inside the stage.
         tile_rows = self.seq_tile_size * self.chunk_size
-        return (pl.cdiv(tile_rows + SUBLANE_ALIGN, STAGE_TILE_ROWS) *
-                STAGE_TILE_ROWS)
+        return (
+            pl.cdiv(tile_rows + SUBLANE_ALIGN, STAGE_TILE_ROWS)
+            * STAGE_TILE_ROWS
+        )
 
     @property
     def v_dim_size(self) -> int:
@@ -226,8 +230,13 @@ class KDAConfig:
         """
         slots = self.num_buffers
         tile_seqs = self.seq_tile_size
-        b_shape = (slots, tile_seqs, self.chunk_size, 1,
-                   self.aligned_num_v_heads)
+        b_shape = (
+            slots,
+            tile_seqs,
+            self.chunk_size,
+            1,
+            self.aligned_num_v_heads,
+        )
         g_dim_size = self.num_v_heads * self.kq_head_dim
         conv_state_shape = (self.prev_kernel_size, self.dim_size)
         rec_state_shape = (self.num_v_heads, self.kq_head_dim, self.v_head_dim)
@@ -238,10 +247,12 @@ class KDAConfig:
         # Note (david): a BATCHED tile holds whole sequences, so only PER_SEQ
         # carries state from one tile to the next.
         if self.mode == KDAMode.PER_SEQ:
-            carry_conv_scratch = pltpu.VMEM((tile_seqs, *conv_state_shape),
-                                            jnp.float32)
+            carry_conv_scratch = pltpu.VMEM(
+                (tile_seqs, *conv_state_shape), jnp.float32
+            )
             carry_recurrent_scratch = pltpu.VMEM(
-                (tile_seqs, *rec_state_shape), jnp.float32)
+                (tile_seqs, *rec_state_shape), jnp.float32
+            )
         else:
             carry_conv_scratch = None
             carry_recurrent_scratch = None
@@ -254,13 +265,17 @@ class KDAConfig:
             rec_in_shape = self.checkpoint_plane_shape
             rec_lo_in_buf = pltpu.VMEM(
                 (slots, tile_seqs, 1, *self.checkpoint_plane_shape),
-                self.dtypes.recurrent_state)
-            replay_shape = (slots, tile_seqs, self.replay_window,
-                            self.record_dim)
+                self.dtypes.recurrent_state,
+            )
+            replay_shape = (
+                slots,
+                tile_seqs,
+                self.replay_window,
+                self.record_dim,
+            )
             gate_shape = (slots, tile_seqs, self.replay_window, self.gate_dim)
             replay_in_buf = pltpu.VMEM(replay_shape, self.dtypes.replay_record)
-            replay_out_buf = pltpu.VMEM(replay_shape,
-                                        self.dtypes.replay_record)
+            replay_out_buf = pltpu.VMEM(replay_shape, self.dtypes.replay_record)
             replay_gate_in_buf = pltpu.VMEM(gate_shape, jnp.float32)
             replay_gate_out_buf = pltpu.VMEM(gate_shape, jnp.float32)
         else:
@@ -274,32 +289,40 @@ class KDAConfig:
         return {
             "qkv_buf": pltpu.VMEM(
                 (slots, tile_seqs, self.qkv_block_rows, self.dim_size),
-                self.dtypes.act_in),
+                self.dtypes.act_in,
+            ),
             "b_buf": pltpu.VMEM(b_shape, jnp.float32),
             # Note (david): the per-key-channel gate is a native-layout
             # [batch, g_dim_size] stream like qkv, so it shares the qkv block
             # geometry and dtype.
             "g_buf": pltpu.VMEM(
                 (slots, tile_seqs, self.qkv_block_rows, g_dim_size),
-                self.dtypes.act_in),
-            "conv_in_buf": pltpu.VMEM((slots, tile_seqs, 1, *conv_state_shape),
-                                      self.dtypes.conv_state),
-            "rec_in_buf": pltpu.VMEM((slots, tile_seqs, 1, *rec_in_shape),
-                                     self.dtypes.recurrent_state),
+                self.dtypes.act_in,
+            ),
+            "conv_in_buf": pltpu.VMEM(
+                (slots, tile_seqs, 1, *conv_state_shape), self.dtypes.conv_state
+            ),
+            "rec_in_buf": pltpu.VMEM(
+                (slots, tile_seqs, 1, *rec_in_shape),
+                self.dtypes.recurrent_state,
+            ),
             "rec_lo_in_buf": rec_lo_in_buf,
             "conv_out_buf": pltpu.VMEM(
                 (slots, tile_seqs, self.window_size, *conv_state_shape),
-                self.dtypes.conv_state),
+                self.dtypes.conv_state,
+            ),
             "rec_out_buf": pltpu.VMEM(
                 (slots, tile_seqs, num_rec_out, *self.stored_state_shape),
-                self.dtypes.recurrent_state),
+                self.dtypes.recurrent_state,
+            ),
             "replay_in_buf": replay_in_buf,
             "replay_out_buf": replay_out_buf,
             "replay_gate_in_buf": replay_gate_in_buf,
             "replay_gate_out_buf": replay_gate_out_buf,
             "out_buf": pltpu.VMEM(
                 (slots, self.out_window_rows, self.v_dim_size),
-                self.dtypes.act_out),
+                self.dtypes.act_out,
+            ),
             "carry_conv_scratch_ref": carry_conv_scratch,
             "carry_recurrent_scratch_ref": carry_recurrent_scratch,
             "sems": pltpu.SemaphoreType.DMA((NUM_STREAMS, slots)),

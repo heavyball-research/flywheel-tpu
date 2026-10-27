@@ -20,8 +20,9 @@ def randn(rng: np.random.Generator, shape: tuple[int, ...]) -> jax.Array:
     return jnp.asarray(rng.standard_normal(shape, dtype=np.float32))
 
 
-def uniform(rng: np.random.Generator, shape: tuple[int, ...], low: float,
-            high: float) -> jax.Array:
+def uniform(
+    rng: np.random.Generator, shape: tuple[int, ...], low: float, high: float
+) -> jax.Array:
     """U[low, high) samples."""
     return jnp.asarray(rng.uniform(low, high, shape).astype(np.float32))
 
@@ -53,11 +54,13 @@ def get_err_ratio(x: jax.Array, y: jax.Array) -> float:
     return float(err / (base + 1e-8))
 
 
-def assert_close(prefix: str,
-                 ref: jax.Array,
-                 tri: jax.Array,
-                 ratio: float,
-                 err_atol: float = 1e-6) -> None:
+def assert_close(
+    prefix: str,
+    ref: jax.Array,
+    tri: jax.Array,
+    ratio: float,
+    err_atol: float = 1e-6,
+) -> None:
     """tri's RMS error relative to ref's RMS stays below ratio, unless no
     element is further than err_atol off."""
     abs_atol = get_abs_err(ref, tri)
@@ -66,17 +69,24 @@ def assert_close(prefix: str,
     print(msg)
     if abs_atol <= err_atol:
         return
-    assert not np.isnan(np.asarray(ref, np.float32)).any(), (
-        f"{prefix}: NaN detected in ref")
-    assert not np.isnan(np.asarray(tri, np.float32)).any(), (
-        f"{prefix}: NaN detected in tri")
+    assert not np.isnan(
+        np.asarray(ref, np.float32)
+    ).any(), f"{prefix}: NaN detected in ref"
+    assert not np.isnan(
+        np.asarray(tri, np.float32)
+    ).any(), f"{prefix}: NaN detected in tri"
     assert error_rate < ratio, msg
 
 
 @jax.jit
-def _gated_delta_rule_scan(q: jax.Array, k: jax.Array, v: jax.Array,
-                           beta: jax.Array, g: jax.Array,
-                           h: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _gated_delta_rule_scan(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    beta: jax.Array,
+    g: jax.Array,
+    h: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
     """Time-major [T, B, H, ...] inputs, q already scaled."""
 
     def _step(h, token):
@@ -116,8 +126,9 @@ def naive_recurrent_gated_delta_rule(
         o: [B, T, H, V]
         final_state: [B, H, K, V] if output_final_state else None
     """
-    q, k, v, beta, g = (jnp.swapaxes(x, 0, 1).astype(jnp.float32)
-                        for x in (q, k, v, beta, g))
+    q, k, v, beta, g = (
+        jnp.swapaxes(x, 0, 1).astype(jnp.float32) for x in (q, k, v, beta, g)
+    )
     _, batch, heads, key_dim = k.shape
     if scale is None:
         scale = key_dim**-0.5
@@ -129,16 +140,23 @@ def naive_recurrent_gated_delta_rule(
 
 
 @jax.jit
-def _kda_scan(q: jax.Array, k: jax.Array, v: jax.Array, g: jax.Array,
-              beta: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _kda_scan(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    g: jax.Array,
+    beta: jax.Array,
+    s: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
     """Time-major [T, B, HV, ...] inputs, q already scaled."""
 
     def _step(s, token):
         q_i, k_i, v_i, g_i, b_i = token
         s = s * jnp.exp(g_i)[..., None]
         v_i = v_i - jnp.einsum("bhk,bhkv->bhv", k_i, s, precision=HIGHEST)
-        s = s + jnp.einsum("bhk,bhv->bhkv", b_i[..., None] * k_i, v_i,
-                           precision=HIGHEST)
+        s = s + jnp.einsum(
+            "bhk,bhv->bhkv", b_i[..., None] * k_i, v_i, precision=HIGHEST
+        )
         return s, jnp.einsum("bhk,bhkv->bhv", q_i, s, precision=HIGHEST)
 
     return jax.lax.scan(_step, s, (q, k, v, g, beta))
@@ -176,8 +194,9 @@ def naive_recurrent_kda(
         scale = key_dim**-0.5
     q = repeat_heads(q, num_v_heads // heads) * scale
     k = repeat_heads(k, num_v_heads // heads)
-    q, k, v, g, beta = (jnp.swapaxes(x, 0, 1).astype(jnp.float32)
-                        for x in (q, k, v, g, beta))
+    q, k, v, g, beta = (
+        jnp.swapaxes(x, 0, 1).astype(jnp.float32) for x in (q, k, v, g, beta)
+    )
     s = jnp.zeros((batch, num_v_heads, key_dim, v.shape[-1]), jnp.float32)
     if initial_state is not None:
         s = s + initial_state
@@ -185,9 +204,9 @@ def naive_recurrent_kda(
     return jnp.swapaxes(o, 0, 1), s if output_final_state else None
 
 
-def naive_gdn_gate(g: jax.Array,
-                   A_log: jax.Array,
-                   dt_bias: jax.Array | None = None) -> jax.Array:
+def naive_gdn_gate(
+    g: jax.Array, A_log: jax.Array, dt_bias: jax.Array | None = None
+) -> jax.Array:
     """-exp(A_log) * softplus(g + dt_bias) for g [..., HV]."""
     g = g.astype(jnp.float32)
     if dt_bias is not None:
@@ -195,22 +214,25 @@ def naive_gdn_gate(g: jax.Array,
     return -jnp.exp(A_log.astype(jnp.float32)) * jax.nn.softplus(g)
 
 
-def naive_kda_gate(g: jax.Array,
-                   A_log: jax.Array,
-                   dt_bias: jax.Array | None = None) -> jax.Array:
+def naive_kda_gate(
+    g: jax.Array, A_log: jax.Array, dt_bias: jax.Array | None = None
+) -> jax.Array:
     """-exp(A_log)[:, None] * softplus(g + dt_bias) for g [..., H, K]."""
     heads = g.shape[-2]
     g = g.astype(jnp.float32)
     if dt_bias is not None:
         g = g + dt_bias.reshape(heads, -1)
-    return -jnp.exp(A_log.reshape(heads, 1).astype(
-        jnp.float32)) * jax.nn.softplus(g)
+    return -jnp.exp(
+        A_log.reshape(heads, 1).astype(jnp.float32)
+    ) * jax.nn.softplus(g)
 
 
-def naive_kda_lowerbound_gate(g: jax.Array,
-                              A_log: jax.Array | None = None,
-                              dt_bias: jax.Array | None = None,
-                              lower_bound: float = -5.0) -> jax.Array:
+def naive_kda_lowerbound_gate(
+    g: jax.Array,
+    A_log: jax.Array | None = None,
+    dt_bias: jax.Array | None = None,
+    lower_bound: float = -5.0,
+) -> jax.Array:
     """lower_bound * sigmoid(exp(A_log) * (g + dt_bias)) for g [..., H, K]."""
     heads = g.shape[-2]
     g = g.astype(jnp.float32)

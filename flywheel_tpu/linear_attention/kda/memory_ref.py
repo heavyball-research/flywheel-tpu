@@ -120,7 +120,8 @@ class MetadataRef:
         record_idx = p_id * self.records_per_tile + idx
         return PackedPIdRecord(
             records=self.records,
-            offset=record_idx * PackedPIdRecord.STRUCT_SIZE)
+            offset=record_idx * PackedPIdRecord.STRUCT_SIZE,
+        )
 
     @classmethod
     def create(
@@ -141,10 +142,12 @@ class MetadataRef:
     ) -> Self:
         assert s_idx_has_initial_state.shape[0] <= PackedPIdRecord.MAX_SEQS, (
             f"Number of sequences ({s_idx_has_initial_state.shape[0]}) exceeds"
-            f" PackedPIdRecord limit ({PackedPIdRecord.MAX_SEQS}).")
+            f" PackedPIdRecord limit ({PackedPIdRecord.MAX_SEQS})."
+        )
         assert cfg.tile_size <= PackedPIdRecord.R_SIZE_MASK, (
             f"Tile size ({cfg.tile_size}) exceeds PackedPIdRecord limit"
-            f" ({PackedPIdRecord.R_SIZE_MASK}).")
+            f" ({PackedPIdRecord.R_SIZE_MASK})."
+        )
 
         r_base = p_id_to_r_base.reshape(-1).astype(jnp.int32)
         s_idx = p_id_to_s_idx.reshape(-1).astype(jnp.int32)
@@ -154,10 +157,12 @@ class MetadataRef:
         r_size = jnp.maximum(p_id_to_r_size.reshape(-1).astype(jnp.int32), 0)
         is_first_tile = p_id_is_first_tile.reshape(-1).astype(jnp.int32)
         is_last_tile = p_id_is_last_tile.reshape(-1).astype(jnp.int32)
-        word = ((s_idx << PackedPIdRecord.S_IDX_SHIFT)
-                | (r_size << PackedPIdRecord.R_SIZE_SHIFT)
-                | (is_last_tile << PackedPIdRecord.LAST_TILE_SHIFT)
-                | (is_first_tile << PackedPIdRecord.FIRST_TILE_SHIFT))
+        word = (
+            (s_idx << PackedPIdRecord.S_IDX_SHIFT)
+            | (r_size << PackedPIdRecord.R_SIZE_SHIFT)
+            | (is_last_tile << PackedPIdRecord.LAST_TILE_SHIFT)
+            | (is_first_tile << PackedPIdRecord.FIRST_TILE_SHIFT)
+        )
         # Note (david): every tile reads all seq_tile_size of its records, so
         # the last tile reads up to seq_tile_size - 1 records past the valid
         # ones. Zero padding makes those reads hit s_idx 0, r_size 0 and both
@@ -182,15 +187,17 @@ class MetadataRef:
 
     def replay_base(self, s_idx: jax.Array) -> jax.Array:
         """Record row the sequence's new tokens are written from."""
-        return jnp.where(self.s_idx_to_flush[s_idx] != 0, 0,
-                         self.s_idx_to_replay_len[s_idx])
+        return jnp.where(
+            self.s_idx_to_flush[s_idx] != 0, 0, self.s_idx_to_replay_len[s_idx]
+        )
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
 
 
-def aligned_window(r_base: jax.Array,
-                   r_size: jax.Array) -> tuple[jax.Array, jax.Array]:
+def aligned_window(
+    r_base: jax.Array, r_size: jax.Array
+) -> tuple[jax.Array, jax.Array]:
     """Base and size of the smallest SUBLANE_ALIGN-aligned row window covering
     [r_base, r_base + r_size)."""
     # Note (david): the token axis of a native [batch, dim] array is its tiled
@@ -206,8 +213,7 @@ def aligned_window(r_base: jax.Array,
     return window_base, window_rows
 
 
-def wait_row_dma(buf_ref: jax.Ref, num_rows: jax.Array,
-                 sem: jax.Ref) -> None:
+def wait_row_dma(buf_ref: jax.Ref, num_rows: jax.Array, sem: jax.Ref) -> None:
     # Note (david): a DMA semaphore counts bytes, so one wait sized to the sum
     # of a tile's transfers covers all of them. The self-copy descriptor is
     # never executed; with bounds checks disabled it may nominally exceed the
@@ -216,8 +222,14 @@ def wait_row_dma(buf_ref: jax.Ref, num_rows: jax.Array,
     pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
-def qkv_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-             p_id: int | jax.Array, idx: int, metadata_ref: MetadataRef):
+def qkv_copy(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    idx: int,
+    metadata_ref: MetadataRef,
+):
     """The DMA that fetches record idx's rows of a native [batch, dim] input,
     widened to their aligned window."""
     record = metadata_ref.get_record(p_id, idx)
@@ -229,9 +241,14 @@ def qkv_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     )
 
 
-def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                 p_id: int | jax.Array, metadata_ref: MetadataRef,
-                 cfg: config.KDAConfig) -> None:
+def start_qkv_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     """Fetch each record's rows of a native [batch, dim] input, widened to
     their aligned window.
 
@@ -242,9 +259,14 @@ def start_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
         qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).start()
 
 
-def wait_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                p_id: int | jax.Array, metadata_ref: MetadataRef,
-                cfg: config.KDAConfig) -> None:
+def wait_qkv_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     # Note (david): each copy is waited on with its own descriptor, not one
     # wait_row_dma sized to the summed rows. These rows are the block's tiled
     # axis, and where Mosaic tiles the block 16 rows deep (v7x, e.g. a verify
@@ -255,9 +277,14 @@ def wait_qkv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
         qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).wait()
 
 
-def start_compact_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                     p_id: int | jax.Array, metadata_ref: MetadataRef,
-                     cfg: config.KDAConfig) -> None:
+def start_compact_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     """Fetch each record's rows of a compact [batch, 1, heads] input (b)."""
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
@@ -278,8 +305,13 @@ def start_compact_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
         ).start()
 
 
-def wait_compact_in(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                    metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
+def wait_compact_in(
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     """Wait for a tile's compact transfers (b)."""
     num_rows = 0
     for idx in range(cfg.seq_tile_size):
@@ -314,9 +346,14 @@ def out_window(
     return window_base, window_rows, delta, delta + tile_rows
 
 
-def out_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-             p_id: int | jax.Array, metadata_ref: MetadataRef,
-             cfg: config.KDAConfig):
+def out_copy(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+):
     """The one DMA that writes the tile's whole aligned output window."""
     window_base, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
     return pltpu.make_async_copy(
@@ -326,43 +363,58 @@ def out_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     )
 
 
-def start_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-              p_id: int | jax.Array, metadata_ref: MetadataRef,
-              cfg: config.KDAConfig) -> None:
+def start_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).start()
 
 
-def wait_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-             p_id: int | jax.Array, metadata_ref: MetadataRef,
-             cfg: config.KDAConfig) -> None:
+def wait_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     # Note (david): waited on with its own descriptor, for the reason
     # wait_qkv_in gives: the stage's rows are its tiled axis.
     out_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).wait()
 
 
-def reads_state(record: PackedPIdRecord, metadata_ref: MetadataRef,
-                only_flushing: bool) -> jax.Array:
+def reads_state(
+    record: PackedPIdRecord, metadata_ref: MetadataRef, only_flushing: bool
+) -> jax.Array:
     """Whether the record's sequence fetches its initial state: on its first
     tile, if it has one, and with only_flushing only if it flushes."""
     s_idx = record.s_idx
-    should_read = jnp.logical_and(record.is_first_tile,
-                                  metadata_ref.s_idx_has_initial_state[s_idx])
+    should_read = jnp.logical_and(
+        record.is_first_tile, metadata_ref.s_idx_has_initial_state[s_idx]
+    )
     if only_flushing:
-        return jnp.logical_and(should_read,
-                               metadata_ref.s_idx_to_flush[s_idx] != 0)
+        return jnp.logical_and(
+            should_read, metadata_ref.s_idx_to_flush[s_idx] != 0
+        )
     else:
         return should_read
 
 
-def start_state_in(hbm_ref: jax.Ref,
-                   buf_ref: jax.Ref,
-                   sem: jax.Ref,
-                   p_id: int | jax.Array,
-                   metadata_ref: MetadataRef,
-                   cfg: config.KDAConfig,
-                   apply_read_offset: bool = True,
-                   only_flushing: bool = False,
-                   plane: int | None = None) -> None:
+def start_state_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+    apply_read_offset: bool = True,
+    only_flushing: bool = False,
+    plane: int | None = None,
+) -> None:
     """Fetch each sequence's initial checkpoint into window position 0.
 
     Only a sequence's first tile reads, and only if it has an initial state.
@@ -374,12 +426,15 @@ def start_state_in(hbm_ref: jax.Ref,
         record = metadata_ref.get_record(p_id, idx)
         s_idx = record.s_idx
         if apply_read_offset:
-            read_slot = (metadata_ref.s_idx_to_read_indices[s_idx] +
-                         metadata_ref.s_idx_to_read_offset[s_idx])
+            read_slot = (
+                metadata_ref.s_idx_to_read_indices[s_idx]
+                + metadata_ref.s_idx_to_read_offset[s_idx]
+            )
         else:
             read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
         num_states = jnp.where(
-            reads_state(record, metadata_ref, only_flushing), 1, 0)
+            reads_state(record, metadata_ref, only_flushing), 1, 0
+        )
         if plane is None:
             state_ref = hbm_ref.at[pl.ds(read_slot, num_states)]
         else:
@@ -391,23 +446,31 @@ def start_state_in(hbm_ref: jax.Ref,
         ).start()
 
 
-def wait_state_in(buf_ref: jax.Ref,
-                  sem: jax.Ref,
-                  p_id: int | jax.Array,
-                  metadata_ref: MetadataRef,
-                  cfg: config.KDAConfig,
-                  only_flushing: bool = False) -> None:
+def wait_state_in(
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+    only_flushing: bool = False,
+) -> None:
     num_states = 0
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
         num_states += jnp.where(
-            reads_state(record, metadata_ref, only_flushing), 1, 0)
+            reads_state(record, metadata_ref, only_flushing), 1, 0
+        )
     wait_row_dma(buf_ref, num_states, sem)
 
 
-def start_state_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                    p_id: int | jax.Array, metadata_ref: MetadataRef,
-                    cfg: config.KDAConfig) -> None:
+def start_state_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     """On a sequence's last tile, write one checkpoint per valid window
     position from its base slot state_indices[s] on."""
     for idx in range(cfg.seq_tile_size):
@@ -425,8 +488,13 @@ def start_state_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
         ).start()
 
 
-def wait_state_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                   metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
+def wait_state_out(
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     num_states = 0
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
@@ -441,9 +509,14 @@ def wait_state_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
 # DMA, waited on with its own descriptor.
 
 
-def conv_in_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                   p_id: int | jax.Array, metadata_ref: MetadataRef,
-                   cfg: config.KDAConfig):
+def conv_in_copies(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+):
     """(is_read, DMA) per sequence: its initial conv state from
     read_indices[s] + read_offset[s] into window position 0, read on its first
     tile if it has an initial state, as start_state_in."""
@@ -451,70 +524,113 @@ def conv_in_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
         s_idx = record.s_idx
-        read_slot = (metadata_ref.s_idx_to_read_indices[s_idx] +
-                     metadata_ref.s_idx_to_read_offset[s_idx])
+        read_slot = (
+            metadata_ref.s_idx_to_read_indices[s_idx]
+            + metadata_ref.s_idx_to_read_offset[s_idx]
+        )
         is_read = jnp.logical_and(
-            record.is_first_tile, metadata_ref.s_idx_has_initial_state[s_idx])
-        copies.append((is_read,
-                       pltpu.make_async_copy(hbm_ref.at[:, read_slot],
-                                             buf_ref.at[idx, 0], sem)))
+            record.is_first_tile, metadata_ref.s_idx_has_initial_state[s_idx]
+        )
+        copies.append((
+            is_read,
+            pltpu.make_async_copy(
+                hbm_ref.at[:, read_slot], buf_ref.at[idx, 0], sem
+            ),
+        ))
     return copies
 
 
-def start_conv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                  p_id: int | jax.Array, metadata_ref: MetadataRef,
-                  cfg: config.KDAConfig) -> None:
-    for is_read, copy in conv_in_copies(hbm_ref, buf_ref, sem, p_id,
-                                        metadata_ref, cfg):
+def start_conv_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
+    for is_read, copy in conv_in_copies(
+        hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg
+    ):
         pl.when(is_read)(copy.start)
 
 
-def wait_conv_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                 p_id: int | jax.Array, metadata_ref: MetadataRef,
-                 cfg: config.KDAConfig) -> None:
-    for is_read, copy in conv_in_copies(hbm_ref, buf_ref, sem, p_id,
-                                        metadata_ref, cfg):
+def wait_conv_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
+    for is_read, copy in conv_in_copies(
+        hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg
+    ):
         pl.when(is_read)(copy.wait)
 
 
-def conv_out_copies(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                    p_id: int | jax.Array, metadata_ref: MetadataRef,
-                    cfg: config.KDAConfig):
+def conv_out_copies(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+):
     """(is_written, DMA) per sequence and window position: position t of a
     sequence's last tile goes to state_indices[s] + t, as start_state_out."""
     copies = []
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
         write_slot = metadata_ref.s_idx_to_state_indices[record.s_idx]
-        num_ckpts = jnp.where(record.is_last_tile,
-                              jnp.minimum(record.r_size, cfg.window_size), 0)
+        num_ckpts = jnp.where(
+            record.is_last_tile, jnp.minimum(record.r_size, cfg.window_size), 0
+        )
         for pos in range(cfg.window_size):
-            copies.append((pos < num_ckpts,
-                           pltpu.make_async_copy(
-                               buf_ref.at[idx, pos],
-                               hbm_ref.at[:, write_slot + pos], sem)))
+            copies.append((
+                pos < num_ckpts,
+                pltpu.make_async_copy(
+                    buf_ref.at[idx, pos], hbm_ref.at[:, write_slot + pos], sem
+                ),
+            ))
     return copies
 
 
-def start_conv_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                   p_id: int | jax.Array, metadata_ref: MetadataRef,
-                   cfg: config.KDAConfig) -> None:
-    for is_written, copy in conv_out_copies(hbm_ref, buf_ref, sem, p_id,
-                                            metadata_ref, cfg):
+def start_conv_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
+    for is_written, copy in conv_out_copies(
+        hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg
+    ):
         pl.when(is_written)(copy.start)
 
 
-def wait_conv_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                  p_id: int | jax.Array, metadata_ref: MetadataRef,
-                  cfg: config.KDAConfig) -> None:
-    for is_written, copy in conv_out_copies(hbm_ref, buf_ref, sem, p_id,
-                                            metadata_ref, cfg):
+def wait_conv_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
+    for is_written, copy in conv_out_copies(
+        hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg
+    ):
         pl.when(is_written)(copy.wait)
 
 
-def replay_in_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                   p_id: int | jax.Array, idx: int,
-                   metadata_ref: MetadataRef):
+def replay_in_copy(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    idx: int,
+    metadata_ref: MetadataRef,
+):
     """The DMA that fetches record idx's committed replay rows, rounded up to
     whole SUBLANE_ALIGN-row tiles; none on a padded record."""
     record = metadata_ref.get_record(p_id, idx)
@@ -522,7 +638,9 @@ def replay_in_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     align = config.SUBLANE_ALIGN
     num_rows = jnp.where(
         record.is_first_tile,
-        pl.cdiv(metadata_ref.s_idx_to_replay_len[s_idx], align) * align, 0)
+        pl.cdiv(metadata_ref.s_idx_to_replay_len[s_idx], align) * align,
+        0,
+    )
     num_rows = pl.multiple_of(num_rows, align)
     read_slot = metadata_ref.s_idx_to_read_indices[s_idx]
     return pltpu.make_async_copy(
@@ -532,25 +650,40 @@ def replay_in_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     )
 
 
-def start_replay_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                    p_id: int | jax.Array, metadata_ref: MetadataRef,
-                    cfg: config.KDAConfig) -> None:
+def start_replay_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     for idx in range(cfg.seq_tile_size):
         replay_in_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).start()
 
 
-def wait_replay_in(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                   p_id: int | jax.Array, metadata_ref: MetadataRef,
-                   cfg: config.KDAConfig) -> None:
+def wait_replay_in(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     # Note (david): the record rows are the tiled axis, so each copy is waited
     # with its own descriptor, as in wait_qkv_in.
     for idx in range(cfg.seq_tile_size):
         replay_in_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).wait()
 
 
-def replay_out_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                    p_id: int | jax.Array, idx: int,
-                    metadata_ref: MetadataRef):
+def replay_out_copy(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    idx: int,
+    metadata_ref: MetadataRef,
+):
     """The DMA that writes the aligned row window holding record idx's new
     records [base, base + r_size); none on a padded record.
 
@@ -569,53 +702,77 @@ def replay_out_copy(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     )
 
 
-def start_replay_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                     p_id: int | jax.Array, metadata_ref: MetadataRef,
-                     cfg: config.KDAConfig) -> None:
+def start_replay_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     for idx in range(cfg.seq_tile_size):
         replay_out_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).start()
 
 
-def wait_replay_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                    p_id: int | jax.Array, metadata_ref: MetadataRef,
-                    cfg: config.KDAConfig) -> None:
+def wait_replay_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     for idx in range(cfg.seq_tile_size):
         replay_out_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).wait()
 
 
-def num_flushed_ckpts(record: PackedPIdRecord,
-                      metadata_ref: MetadataRef) -> jax.Array:
+def num_flushed_ckpts(
+    record: PackedPIdRecord, metadata_ref: MetadataRef
+) -> jax.Array:
     is_flush = metadata_ref.s_idx_to_flush[record.s_idx] != 0
     return jnp.where(jnp.logical_and(record.is_last_tile, is_flush), 1, 0)
 
 
-def wait_flushed_ckpt_in(buf_ref: jax.Ref, sem: jax.Ref,
-                         p_id: int | jax.Array, idx: int,
-                         metadata_ref: MetadataRef,
-                         cfg: config.KDAConfig) -> None:
+def wait_flushed_ckpt_in(
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    idx: int,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     """Wait, before record idx's flush reads its checkpoint's lo plane, for
     the tile's lo plane reads (start_state_in with only_flushing)."""
     # Note (david): the reads share one byte-counting semaphore, so a wait
     # sized to one record's read could return on another record's bytes; the
     # tile's first reading record waits for all of them.
     reads = [
-        reads_state(metadata_ref.get_record(p_id, prev), metadata_ref,
-                    only_flushing=True) for prev in range(idx + 1)
+        reads_state(
+            metadata_ref.get_record(p_id, prev),
+            metadata_ref,
+            only_flushing=True,
+        )
+        for prev in range(idx + 1)
     ]
     is_first_read = reads[idx]
     for prev_reads in reads[:idx]:
-        is_first_read = jnp.logical_and(is_first_read,
-                                        jnp.logical_not(prev_reads))
+        is_first_read = jnp.logical_and(
+            is_first_read, jnp.logical_not(prev_reads)
+        )
 
     @pl.when(is_first_read)
     def _wait():
-        wait_state_in(buf_ref, sem, p_id, metadata_ref, cfg,
-                      only_flushing=True)
+        wait_state_in(buf_ref, sem, p_id, metadata_ref, cfg, only_flushing=True)
 
 
-def start_flushed_ckpt_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
-                           p_id: int | jax.Array, idx: int,
-                           metadata_ref: MetadataRef) -> None:
+def start_flushed_ckpt_out(
+    hbm_ref: jax.Ref,
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    idx: int,
+    metadata_ref: MetadataRef,
+) -> None:
     """Write record idx's new checkpoint to state_indices[s] if its sequence
     flushes; none on a padded record."""
     record = metadata_ref.get_record(p_id, idx)
@@ -628,8 +785,13 @@ def start_flushed_ckpt_out(hbm_ref: jax.Ref, buf_ref: jax.Ref, sem: jax.Ref,
     ).start()
 
 
-def wait_ckpt_out(buf_ref: jax.Ref, sem: jax.Ref, p_id: int | jax.Array,
-                  metadata_ref: MetadataRef, cfg: config.KDAConfig) -> None:
+def wait_ckpt_out(
+    buf_ref: jax.Ref,
+    sem: jax.Ref,
+    p_id: int | jax.Array,
+    metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
+) -> None:
     num_states = 0
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)

@@ -38,7 +38,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "ruler"))
 from ruler_eval import (  # noqa: E402
-    BLOCK_SIZE, kv_block_budget, signature_groups, yarn_rope_overrides)
+    BLOCK_SIZE,
+    kv_block_budget,
+    signature_groups,
+    yarn_rope_overrides,
+)
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
@@ -50,35 +54,40 @@ def load_samples(data_dir: Path, task: str, length: str) -> list[dict]:
 def build_prompts(args, tokenizer) -> list[dict]:
     """Every sample of every task as token ids, formatted the official way."""
     sys.path.insert(0, str(args.babilong_repo))
-    from babilong.prompts import (DEFAULT_PROMPTS, DEFAULT_TEMPLATE,
-                                  get_formatted_input)
+    from babilong.prompts import (
+        DEFAULT_PROMPTS,
+        DEFAULT_TEMPLATE,
+        get_formatted_input,
+    )
 
     items = []
     for task in args.tasks:
         samples = load_samples(args.data_dir, task, args.length)
         if args.limit is not None:
-            samples = samples[:args.limit]
+            samples = samples[: args.limit]
         prompt_cfg = DEFAULT_PROMPTS[task]
         texts = []
         for sample in samples:
-            user_text = get_formatted_input(sample["input"],
-                                            sample["question"],
-                                            prompt_cfg["examples"],
-                                            prompt_cfg["instruction"],
-                                            prompt_cfg["post_prompt"],
-                                            template=DEFAULT_TEMPLATE)
-            messages = [{
-                "role": "system",
-                "content": SYSTEM_PROMPT
-            }, {
-                "role": "user",
-                "content": user_text
-            }]
+            user_text = get_formatted_input(
+                sample["input"],
+                sample["question"],
+                prompt_cfg["examples"],
+                prompt_cfg["instruction"],
+                prompt_cfg["post_prompt"],
+                template=DEFAULT_TEMPLATE,
+            )
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_text},
+            ]
             texts.append(
-                tokenizer.apply_chat_template(messages,
-                                              tokenize=False,
-                                              add_generation_prompt=True,
-                                              enable_thinking=False))
+                tokenizer.apply_chat_template(
+                    messages,
+                    tokenize=False,
+                    add_generation_prompt=True,
+                    enable_thinking=False,
+                )
+            )
         # The rendered template already carries every special token.
         token_ids = tokenizer(texts, add_special_tokens=False).input_ids
         for index, (sample, ids) in enumerate(zip(samples, token_ids)):
@@ -144,22 +153,17 @@ def build_engine_args(args, max_model_len: int) -> dict:
         "enable_chunked_prefill": False,
         "async_scheduling": False,
         "language_model_only": True,
-        "limit_mm_per_prompt": {
-            "image": 0,
-            "video": 0
-        },
+        "limit_mm_per_prompt": {"image": 0, "video": 0},
         "disable_log_stats": True,
     }
     if args.enable_sp:
         engine_args["compilation_config"] = {
-            "pass_config": {
-                "enable_sp": True,
-                "sp_min_token_num": 2048
-            }
+            "pass_config": {"enable_sp": True, "sp_min_token_num": 2048}
         }
     if args.yarn_factor is not None:
         engine_args["hf_overrides"] = yarn_rope_overrides(
-            str(args.snapshot), args.yarn_factor)
+            str(args.snapshot), args.yarn_factor
+        )
     return engine_args
 
 
@@ -180,10 +184,14 @@ def run_config(args, max_model_len: int) -> dict:
         "babilong_commit": args.babilong_commit,
         "kernel_env": {
             name: os.environ.get(name, "")
-            for name in ("USE_FLYWHEEL_TPU_KERNEL",
-                         "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
-                         "RPA_V3_MIXED_BLOCK_SIZES", "MODEL_IMPL_TYPE",
-                         "NEW_MODEL_DESIGN", "TPU_MULTIHOST_BACKEND")
+            for name in (
+                "USE_FLYWHEEL_TPU_KERNEL",
+                "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
+                "RPA_V3_MIXED_BLOCK_SIZES",
+                "MODEL_IMPL_TYPE",
+                "NEW_MODEL_DESIGN",
+                "TPU_MULTIHOST_BACKEND",
+            )
         },
     }
 
@@ -203,21 +211,30 @@ def warmup(llm, items: list[dict], sampling_params, cp_size: int) -> None:
         num_tokens = max(lengths)
         token_ids = (filler * (num_tokens // len(filler) + 1))[:num_tokens]
         start = time.perf_counter()
-        llm.generate([TokensPrompt(prompt_token_ids=token_ids)],
-                     sampling_params=sampling_params,
-                     use_tqdm=False)
-        print("warmup %s (%d tokens, %d samples): %.1f s" %
-              (signature, num_tokens, len(lengths),
-               time.perf_counter() - start),
-              flush=True)
+        llm.generate(
+            [TokensPrompt(prompt_token_ids=token_ids)],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
+        print(
+            "warmup %s (%d tokens, %d samples): %.1f s"
+            % (
+                signature,
+                num_tokens,
+                len(lengths),
+                time.perf_counter() - start,
+            ),
+            flush=True,
+        )
 
 
 def summarize(records: list[dict], tasks: list[str]) -> dict:
     accuracy = {}
     for task in tasks:
         task_records = [r for r in records if r["task"] == task]
-        accuracy[task] = sum(r["correct"]
-                             for r in task_records) / len(task_records)
+        accuracy[task] = sum(r["correct"] for r in task_records) / len(
+            task_records
+        )
     seconds = [r["seconds"] for r in records]
     prompt_tokens = sum(r["prompt_tokens"] for r in records)
     generated_tokens = sum(r["generated_tokens"] for r in records)
@@ -247,9 +264,9 @@ def main() -> None:
     parser.add_argument("--babilong-commit", required=True)
     parser.add_argument("--length", required=True, help="e.g. 128k")
     parser.add_argument("--tasks", default="qa1,qa2,qa3,qa4,qa5")
-    parser.add_argument("--limit",
-                        type=int,
-                        help="Samples per task (default: all 100).")
+    parser.add_argument(
+        "--limit", type=int, help="Samples per task (default: all 100)."
+    )
     parser.add_argument("--tp-size", type=int, default=8)
     parser.add_argument("--cp-size", type=int, default=1)
     parser.add_argument("--enable-sp", action="store_true")
@@ -260,7 +277,8 @@ def main() -> None:
     parser.add_argument(
         "--measure-only",
         action="store_true",
-        help="Tokenize the prompts, report their lengths and exit.")
+        help="Tokenize the prompts, report their lengths and exit.",
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     args.tasks = [task.strip() for task in args.tasks.split(",")]
@@ -274,30 +292,39 @@ def main() -> None:
     started = time.perf_counter()
     items = build_prompts(args, tokenizer)
     stats = length_stats(items)
-    print("tokenized %d prompts in %.1f s" %
-          (len(items), time.perf_counter() - started),
-          flush=True)
+    print(
+        "tokenized %d prompts in %.1f s"
+        % (len(items), time.perf_counter() - started),
+        flush=True,
+    )
     print(json.dumps(stats, indent=2), flush=True)
     (args.out / "prompt_lengths.json").write_text(json.dumps(stats, indent=2))
 
-    max_model_len = -(-(stats["all"]["max"] + args.max_new_tokens) //
-                      BLOCK_SIZE) * BLOCK_SIZE
+    max_model_len = (
+        -(-(stats["all"]["max"] + args.max_new_tokens) // BLOCK_SIZE)
+        * BLOCK_SIZE
+    )
     position_limit = native_context(args.snapshot) * (args.yarn_factor or 1)
-    print("max_model_len %d, position limit %d" %
-          (max_model_len, position_limit),
-          flush=True)
+    print(
+        "max_model_len %d, position limit %d" % (max_model_len, position_limit),
+        flush=True,
+    )
     if max_model_len > position_limit:
         raise SystemExit(
             f"the longest prompt needs max_model_len {max_model_len}, past "
-            f"the {position_limit} positions this RoPE setup covers")
+            f"the {position_limit} positions this RoPE setup covers"
+        )
     if args.measure_only:
         for flywheel in (False, True):
-            groups = signature_groups(prompt_lengths(items), flywheel,
-                                      args.cp_size)
+            groups = signature_groups(
+                prompt_lengths(items), flywheel, args.cp_size
+            )
             print("compile signatures, flywheel=%s:" % flywheel)
             for signature, lengths in sorted(groups.items()):
-                print("  %s: %d samples, %d-%d tokens" %
-                      (signature, len(lengths), min(lengths), max(lengths)))
+                print(
+                    "  %s: %d samples, %d-%d tokens"
+                    % (signature, len(lengths), min(lengths), max(lengths))
+                )
         return
 
     config = run_config(args, max_model_len)
@@ -307,7 +334,8 @@ def main() -> None:
         if saved != config:
             raise SystemExit(
                 f"{config_path} differs from this run; use a fresh --out:\n"
-                f"saved={saved}\nnow={config}")
+                f"saved={saved}\nnow={config}"
+            )
     else:
         config_path.write_text(json.dumps(config, indent=2))
 
@@ -329,15 +357,17 @@ def main() -> None:
     from vllm import LLM, SamplingParams, TokensPrompt
 
     engine_args = build_engine_args(args, max_model_len)
-    print("engine args: %s" %
-          json.dumps({
-              k: v
-              for k, v in engine_args.items() if k != "hf_overrides"
-          }),
-          flush=True)
+    print(
+        "engine args: %s"
+        % json.dumps(
+            {k: v for k, v in engine_args.items() if k != "hf_overrides"}
+        ),
+        flush=True,
+    )
     llm = LLM(**engine_args)
-    sampling_params = SamplingParams(temperature=0.0,
-                                     max_tokens=args.max_new_tokens)
+    sampling_params = SamplingParams(
+        temperature=0.0, max_tokens=args.max_new_tokens
+    )
     try:
         if pending:
             warmup(llm, pending, sampling_params, args.cp_size)
@@ -347,7 +377,8 @@ def main() -> None:
                 outputs = llm.generate(
                     [TokensPrompt(prompt_token_ids=item["token_ids"])],
                     sampling_params=sampling_params,
-                    use_tqdm=False)
+                    use_tqdm=False,
+                )
                 seconds = time.perf_counter() - start
                 completion = outputs[0].outputs[0]
                 output = completion.text.strip()
@@ -360,18 +391,30 @@ def main() -> None:
                     "question": item["question"],
                     "target": item["target"],
                     "output": output,
-                    "correct": compare_answers(item["target"], output,
-                                               item["question"],
-                                               TASK_LABELS[item["task"]]),
+                    "correct": compare_answers(
+                        item["target"],
+                        output,
+                        item["question"],
+                        TASK_LABELS[item["task"]],
+                    ),
                 }
                 predictions.write(json.dumps(record) + "\n")
                 predictions.flush()
                 records.append(record)
-                print("[%d/%d] %s #%d %d tok %.2f s correct=%s out=%r" %
-                      (position + 1, len(pending), item["task"],
-                       item["index"], record["prompt_tokens"], seconds,
-                       record["correct"], output[:60]),
-                      flush=True)
+                print(
+                    "[%d/%d] %s #%d %d tok %.2f s correct=%s out=%r"
+                    % (
+                        position + 1,
+                        len(pending),
+                        item["task"],
+                        item["index"],
+                        record["prompt_tokens"],
+                        seconds,
+                        record["correct"],
+                        output[:60],
+                    ),
+                    flush=True,
+                )
     finally:
         # vLLM's synchronous client stops EngineCore through garbage
         # collection, which reference cycles can defer indefinitely.

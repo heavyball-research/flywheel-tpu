@@ -40,33 +40,49 @@ TILE = 128
 # to softcap and local windows, so it runs on the plain mask only, and the kernels rotate
 # the full head only, so rotary_fraction skips FlashAttention's 0.5.
 FEATURE_CASES = [
-    (softcap, local, 0.0, False) for softcap in (0.0, 15.0) for local in (False, True)
-] + [(0.0, False, 1.0, rotary_interleaved) for rotary_interleaved in (False, True)]
+    (softcap, local, 0.0, False)
+    for softcap in (0.0, 15.0)
+    for local in (False, True)
+] + [
+    (0.0, False, 1.0, rotary_interleaved)
+    for rotary_interleaved in (False, True)
+]
 
 
 def on_backend(seqlens):
     """The (seqlen_q, seqlen_k, ...) cases the backend affords."""
-    return [case for case in seqlens if not INTERPRET or max(case[:2]) <= MAX_INTERPRET_SEQLEN]
+    return [
+        case
+        for case in seqlens
+        if not INTERPRET or max(case[:2]) <= MAX_INTERPRET_SEQLEN
+    ]
 
 
 def dense_cases(seqlens):
     """(seqlen_q, seqlen_k, causal) flash_attn_func supports: the dense kernel needs
     seqlen_k % 128 == 0 unless causal keeps every row off the padded kv tail."""
-    return on_backend(
-        [
-            (seqlen_q, seqlen_k, causal)
-            for seqlen_q, seqlen_k in seqlens
-            for causal in (False, True)
-            if causal or seqlen_k % TILE == 0
-        ]
-    )
+    return on_backend([
+        (seqlen_q, seqlen_k, causal)
+        for seqlen_q, seqlen_k in seqlens
+        for causal in (False, True)
+        if causal or seqlen_k % TILE == 0
+    ])
 
 
 def dense_feature_cases(seqlens):
     """dense_cases with (softcap, local, rotary_fraction, rotary_interleaved) appended;
-    RoPE puts the queries on the last seqlen_q keys, so it needs seqlen_q <= seqlen_k."""
+    RoPE puts the queries on the last seqlen_q keys, so it needs seqlen_q <= seqlen_k.
+    """
     return [
-        (seqlen_q, seqlen_k, causal, softcap, local, rotary_fraction, rotary_interleaved)
+        (
+            seqlen_q,
+            seqlen_k,
+            causal,
+            softcap,
+            local,
+            rotary_fraction,
+            rotary_interleaved,
+        )
         for seqlen_q, seqlen_k, causal in dense_cases(seqlens)
         for softcap, local, rotary_fraction, rotary_interleaved in FEATURE_CASES
         if rotary_fraction == 0.0 or seqlen_q <= seqlen_k
@@ -77,14 +93,12 @@ def varlen_feature_cases(seqlens):
     """(seqlen_q, seqlen_k, causal, softcap, local, rotary_fraction, rotary_interleaved)
     for flash_attn_varlen_func; the test trims each sequence's query length to what the
     mask and RoPE need."""
-    return on_backend(
-        [
-            (seqlen_q, seqlen_k, causal, *features)
-            for seqlen_q, seqlen_k in seqlens
-            for causal in (False, True)
-            for features in FEATURE_CASES
-        ]
-    )
+    return on_backend([
+        (seqlen_q, seqlen_k, causal, *features)
+        for seqlen_q, seqlen_k in seqlens
+        for causal in (False, True)
+        for features in FEATURE_CASES
+    ])
 
 
 def to_head_major(x):
@@ -167,7 +181,11 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    dv_vals = (
+        [128, d]
+        if d > 128 and d <= 192
+        else ([256, 512, d] if d <= 64 else [d])
+    )
     for dv in dv_vals:
         print(f"{dv = }")
         q = randn(rng, (batch_size, seqlen_q, nheads, d), dtype)
@@ -176,7 +194,11 @@ def test_flash_attn_output(
             q = q * softcap / 4
         k = randn(rng, (batch_size, seqlen_k, nheads_kv, d), dtype)
         v = randn(rng, (batch_size, seqlen_k, nheads_kv, dv), dtype)
-        window_size = (-1, -1) if not local else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        window_size = (
+            (-1, -1)
+            if not local
+            else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        )
         if rotary_dim > 0:
             angle = rng.random((seqlen_k, rotary_dim // 2)) * 2 * math.pi
             cos = jnp.asarray(np.cos(angle), dtype)
@@ -184,14 +206,23 @@ def test_flash_attn_output(
             # Note (david): flash_attn_func rotates K at positions 0..seqlen_k - 1 and Q
             # at the last seqlen_q of them.
             q_ro = apply_rotary_emb(
-                q, cos, sin, seqlen_offsets=seqlen_k - seqlen_q, interleaved=rotary_interleaved
+                q,
+                cos,
+                sin,
+                seqlen_offsets=seqlen_k - seqlen_q,
+                interleaved=rotary_interleaved,
             )
             k_ro = apply_rotary_emb(k, cos, sin, interleaved=rotary_interleaved)
         else:
             cos, sin = None, None
             q_ro, k_ro = q, k
         out_ref, lse_ref = attention_ref(
-            q_ro, k_ro, v, causal=causal, window_size=window_size, softcap=softcap
+            q_ro,
+            k_ro,
+            v,
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
         )
         out_bf16, lse_bf16 = attention_ref(
             q_ro,
@@ -222,7 +253,10 @@ def test_flash_attn_output(
         out = to_head_major(out)
         print(f"Output max diff: {max_abs(out - out_ref)}")
         print(f"Output mean diff: {mean_abs(out - out_ref)}")
-        assert max_abs(out - out_ref) <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        assert (
+            max_abs(out - out_ref)
+            <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        )
         # Note (david): rows with no visible key are exact zeros with lse -inf.
         assert jnp.array_equal(jnp.isneginf(lse), jnp.isneginf(lse_ref))
         assert_lse_close(lse, lse_ref, lse_bf16, jnp.isfinite(lse_ref), rtol)
@@ -234,7 +268,9 @@ def test_flash_attn_output(
 
             def attn(q, k, v):
                 out = flash_attn_func(
-                    *map(to_head_major, (q, k, v)), causal=causal, interpret=INTERPRET
+                    *map(to_head_major, (q, k, v)),
+                    causal=causal,
+                    interpret=INTERPRET,
                 )
                 return to_head_major(out)
 
@@ -244,7 +280,12 @@ def test_flash_attn_output(
             dq, dk, dv_ = jax.vjp(attn, q, k, v)[1](g)
             dq_ref, dk_ref, dv_ref = jax.vjp(attn_ref, q, k, v)[1](g)
             dq_bf16, dk_bf16, dv_bf16 = jax.vjp(
-                lambda q, k, v: attn_ref(q, k, v, upcast=False, reorder_ops=True), q, k, v
+                lambda q, k, v: attn_ref(
+                    q, k, v, upcast=False, reorder_ops=True
+                ),
+                q,
+                k,
+                v,
             )[1](g)
             for name, grad, grad_ref, grad_bf16 in (
                 ("dQ", dq, dq_ref, dq_bf16),
@@ -253,14 +294,23 @@ def test_flash_attn_output(
             ):
                 print(f"{name} max diff: {max_abs(grad - grad_ref)}")
                 print(f"{name} mean diff: {mean_abs(grad - grad_ref)}")
-                print(f"{name} bf16 reference max diff: {max_abs(grad_bf16 - grad_ref)}")
-                print(f"{name} bf16 reference mean diff: {mean_abs(grad_bf16 - grad_ref)}")
+                print(
+                    f"{name} bf16 reference max diff:"
+                    f" {max_abs(grad_bf16 - grad_ref)}"
+                )
+                print(
+                    f"{name} bf16 reference mean diff:"
+                    f" {mean_abs(grad_bf16 - grad_ref)}"
+                )
                 # Note (david): a row with one visible key has a dQ of exactly 0 in
                 # both references, while the kernel's D = rowsum(dO * O) and dP sum
                 # in different orders, so the floor keeps an all-zero reference
                 # from demanding a bit-exact 0.
                 atol = arithmetic_atol(grad_ref) + 1e-4
-                assert max_abs(grad - grad_ref) <= rtol * max_abs(grad_bf16 - grad_ref) + atol, name
+                assert (
+                    max_abs(grad - grad_ref)
+                    <= rtol * max_abs(grad_bf16 - grad_ref) + atol
+                ), name
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16])
@@ -304,13 +354,19 @@ def test_flash_attn_varlen_output(
     mha_type,
     dtype,
 ):
-    rng = np.random.default_rng(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
+    rng = np.random.default_rng(
+        seqlen_q + seqlen_k + d + int(causal) * 2 + int(local)
+    )
     batch_size = 9 if seqlen_q <= 2048 else 2
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (2 if mha_type == "gqa" else 1)
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
+    dv_vals = (
+        [128, d]
+        if d > 128 and d <= 192
+        else ([256, 512, d] if d <= 64 else [d])
+    )
     for dv in dv_vals:
         print(f"{dv = }")
         q = randn(rng, (batch_size, seqlen_q, nheads, d), dtype)
@@ -319,7 +375,11 @@ def test_flash_attn_varlen_output(
             q = q * softcap / 4
         k = randn(rng, (batch_size, seqlen_k, nheads_kv, d), dtype)
         v = randn(rng, (batch_size, seqlen_k, nheads_kv, dv), dtype)
-        window_size = (-1, -1) if not local else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        window_size = (
+            (-1, -1)
+            if not local
+            else tuple(rng.integers(0, seqlen_k, 2).tolist())
+        )
         query_padding_mask = generate_random_padding_mask(
             seqlen_q, batch_size, rng
         )
@@ -333,7 +393,8 @@ def test_flash_attn_varlen_output(
         right = 0 if causal or rotary_dim > 0 else window_size[1]
         if right >= 0:
             query_padding_mask = query_padding_mask & (
-                jnp.arange(seqlen_q)[None, :] < key_padding_mask.sum(-1, keepdims=True) + right
+                jnp.arange(seqlen_q)[None, :]
+                < key_padding_mask.sum(-1, keepdims=True) + right
             )
         (
             q_unpad,
@@ -353,7 +414,8 @@ def test_flash_attn_varlen_output(
                 q,
                 cos,
                 sin,
-                seqlen_offsets=key_padding_mask.sum(-1) - query_padding_mask.sum(-1),
+                seqlen_offsets=key_padding_mask.sum(-1)
+                - query_padding_mask.sum(-1),
                 interleaved=rotary_interleaved,
             )
             k_ro = apply_rotary_emb(k, cos, sin, interleaved=rotary_interleaved)
@@ -409,18 +471,32 @@ def test_flash_attn_varlen_output(
         lse = jnp.swapaxes(output_pad_fn(lse_unpad.T), 1, 2)
         print(f"Output max diff: {max_abs(out - out_ref)}")
         print(f"Output mean diff: {mean_abs(out - out_ref)}")
-        assert max_abs(out - out_ref) <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        assert (
+            max_abs(out - out_ref)
+            <= rtol * max_abs(out_bf16 - out_ref) + fwd_atol
+        )
         assert_lse_close(lse, lse_ref, lse_bf16, valid, rtol)
 
 
-def generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, rng, dtype):
+def generate_block_kvcache(
+    seqlen_k, page_size, batch_size, nheads_k, d, dv, rng, dtype
+):
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
     k_cache_paged = randn(rng, (num_blocks, page_size, nheads_k, d), dtype)
     v_cache_paged = randn(rng, (num_blocks, page_size, nheads_k, dv), dtype)
-    page_table = jnp.asarray(rng.permutation(num_blocks), jnp.int32).reshape(batch_size, -1)
+    page_table = jnp.asarray(rng.permutation(num_blocks), jnp.int32).reshape(
+        batch_size, -1
+    )
     k_cache = gather_paged_cache(k_cache_paged, page_table)[:, :seqlen_k]
     v_cache = gather_paged_cache(v_cache_paged, page_table)[:, :seqlen_k]
-    return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+    return (
+        k_cache,
+        v_cache,
+        page_table,
+        k_cache_paged,
+        v_cache_paged,
+        num_blocks,
+    )
 
 
 def gather_paged_cache(cache_paged, page_table):
@@ -448,12 +524,20 @@ def kvcache_cases(seqlens):
     """
     cases = []
     for (seqlen_q, seqlen_k), *case in itertools.product(
-        seqlens, [None, 128, 256], [False, True], [False, True], ["mha", "mqa", "gqa"], KV_DTYPES
+        seqlens,
+        [None, 128, 256],
+        [False, True],
+        [False, True],
+        ["mha", "mqa", "gqa"],
+        KV_DTYPES,
     ):
         page_size, has_batch_idx, varlen_q, mha_type, kv_dtype = case
         if page_size is None:
             supported = (
-                seqlen_q == 1 and not varlen_q and mha_type != "gqa" and kv_dtype == jnp.bfloat16
+                seqlen_q == 1
+                and not varlen_q
+                and mha_type != "gqa"
+                and kv_dtype == jnp.bfloat16
             )
         else:
             supported = seqlen_k % page_size == 0 and not has_batch_idx
@@ -464,7 +548,9 @@ def kvcache_cases(seqlens):
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16])
 @pytest.mark.parametrize("new_kv", [False, True])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize(
+    "causal,local", [(False, False), (True, False), (False, True)]
+)
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("d", [128])
 # Note (david): every cache layout holds whole 128-token tiles, so the capacities
@@ -510,7 +596,9 @@ def test_flash_attn_kvcache(
 
     def cache_rows(pages, descale):
         """Each batch row's dequantized (seqlen_k, ...) view of a paged pool."""
-        return gather_paged_cache(dequantize(pages, descale), page_table)[:, :seqlen_k]
+        return gather_paged_cache(dequantize(pages, descale), page_table)[
+            :, :seqlen_k
+        ]
 
     batch_size = 5
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -523,16 +611,24 @@ def test_flash_attn_kvcache(
         # Note (david): lifting q puts the scores in the range the cap bends.
         q = q * softcap / 4
     if varlen_q:
-        query_padding_mask = generate_random_padding_mask(seqlen_q, batch_size, rng)
-        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(q, query_padding_mask)
-        output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_q, batch_size, seqlen_q)
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q, batch_size, rng
+        )
+        q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, *rest = unpad_input(
+            q, query_padding_mask
+        )
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
     else:
         query_padding_mask = None
         q_unpad = q
         cu_seqlens_q, max_seqlen_q = None, None
     # Note (david): the paged kernel bounds a row's keys on the right only at the
     # causal diagonal, so a local window here is left-only.
-    window_size = (-1, -1) if not local else (int(rng.integers(0, seqlen_k)), -1)
+    window_size = (
+        (-1, -1) if not local else (int(rng.integers(0, seqlen_k)), -1)
+    )
 
     # Note (david): appended k / v share q's token layout, so seqlen_new is seqlen_q
     # and varlen k / v follow q's packing.
@@ -540,12 +636,18 @@ def test_flash_attn_kvcache(
     if new_kv:
         # Note (david): an fp8 pool takes appends already quantized; k / v below are the
         # dequantized values the reference attends.
-        k_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype), k_descale)
-        v_stored = quantize(randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype), v_descale)
+        k_stored = quantize(
+            randn(rng, (batch_size, seqlen_new, nheads_k, d), dtype), k_descale
+        )
+        v_stored = quantize(
+            randn(rng, (batch_size, seqlen_new, nheads_k, dv), dtype), v_descale
+        )
         k, v = dequantize(k_stored, k_descale), dequantize(v_stored, v_descale)
         if varlen_q:
             key_new_padding_mask = query_padding_mask
-            k_unpad, indices_k, *rest = unpad_input(k_stored, key_new_padding_mask)
+            k_unpad, indices_k, *rest = unpad_input(
+                k_stored, key_new_padding_mask
+            )
             v_unpad, *rest = unpad_input(v_stored, key_new_padding_mask)
         else:
             k_unpad, v_unpad = k_stored, v_stored
@@ -563,10 +665,14 @@ def test_flash_attn_kvcache(
             k_cache_paged,
             v_cache_paged,
             num_blocks,
-        ) = generate_block_kvcache(seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, rng, dtype)
+        ) = generate_block_kvcache(
+            seqlen_k, page_size, batch_size_cache, nheads_k, d, dv, rng, dtype
+        )
         k_cache_paged = quantize(k_cache_paged, k_descale)
         v_cache_paged = quantize(v_cache_paged, v_descale)
-        k_cache, v_cache = cache_rows(k_cache_paged, k_descale), cache_rows(v_cache_paged, v_descale)
+        k_cache, v_cache = cache_rows(k_cache_paged, k_descale), cache_rows(
+            v_cache_paged, v_descale
+        )
     # Note (david): a multi-token row with no visible key is unspecified, so a causal
     # read-only call keeps every query at or past position 0: cache_seqlens >= seqlen_q.
     cache_seqlens = jnp.asarray(
@@ -578,7 +684,9 @@ def test_flash_attn_kvcache(
         jnp.int32,
     )
     if has_batch_idx:
-        cache_batch_idx = jnp.asarray(rng.permutation(batch_size_cache)[:batch_size], jnp.int32)
+        cache_batch_idx = jnp.asarray(
+            rng.permutation(batch_size_cache)[:batch_size], jnp.int32
+        )
     else:
         cache_batch_idx = None
     arange = jnp.arange(seqlen_k)[None, :]
@@ -586,7 +694,11 @@ def test_flash_attn_kvcache(
     if not new_kv:
         key_padding_mask = arange < cache_seqlens_expanded
     else:
-        k_new_seqlens = key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+        k_new_seqlens = (
+            key_new_padding_mask.sum(-1, keepdims=True)
+            if varlen_q
+            else seqlen_new
+        )
         key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
     k_cache_ref = k_cache if not has_batch_idx else k_cache[cache_batch_idx]
     v_cache_ref = v_cache if not has_batch_idx else v_cache[cache_batch_idx]
@@ -664,8 +776,16 @@ def test_flash_attn_kvcache(
     if new_kv:
         if page_size is None:
             k_cache_out, v_cache_out = caches_out
-            k_cache_select = k_cache_out if not has_batch_idx else k_cache_out[cache_batch_idx]
-            v_cache_select = v_cache_out if not has_batch_idx else v_cache_out[cache_batch_idx]
+            k_cache_select = (
+                k_cache_out
+                if not has_batch_idx
+                else k_cache_out[cache_batch_idx]
+            )
+            v_cache_select = (
+                v_cache_out
+                if not has_batch_idx
+                else v_cache_out[cache_batch_idx]
+            )
         else:
             (kv_cache_out,) = caches_out
             k_pages_out, v_pages_out = split_kv_heads(kv_cache_out, nheads_k)
@@ -713,7 +833,9 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, causal, dtype):
 
     @jax.jit
     def fwd_bwd(q, k, v, g):
-        out, vjp = jax.vjp(lambda q, k, v: flash_attn_func(q, k, v, causal=causal), q, k, v)
+        out, vjp = jax.vjp(
+            lambda q, k, v: flash_attn_func(q, k, v, causal=causal), q, k, v
+        )
         return out, *vjp(g)
 
     g = randn(rng, (batch_size, nheads, seqlen_q, d), dtype)

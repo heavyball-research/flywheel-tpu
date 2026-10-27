@@ -47,9 +47,13 @@ def time_call(step, state):
             out, state = step(state)
         jax.block_until_ready(out)
         samples.append((time.perf_counter() - start) * 1e3 / iters)
-    return {"compile_s": compile_s, "warmup_calls": warmup, "iters": iters,
-            "samples_ms": samples,
-            "median_ms": statistics.median(samples)}, out
+    return {
+        "compile_s": compile_s,
+        "warmup_calls": warmup,
+        "iters": iters,
+        "samples_ms": samples,
+        "median_ms": statistics.median(samples),
+    }, out
 
 
 def time_stateful(

@@ -15,33 +15,33 @@ import jax
 import jax.numpy as jnp
 
 from .block_sizes import (
-  F32_BYTES,
-  FWD_BLOCKS,
-  FWD_KV_COMPUTE_BLOCKS,
-  LOG2E,
-  NUM_LANES,
-  NUM_SUBLANES,
-  BlockSizes,
-  PagedKVInfo,
-  next_pow2,
-  pick_tile,
-  round_up,
-  vmem_limit_bytes,
+    F32_BYTES,
+    FWD_BLOCKS,
+    FWD_KV_COMPUTE_BLOCKS,
+    LOG2E,
+    NUM_LANES,
+    NUM_SUBLANES,
+    BlockSizes,
+    PagedKVInfo,
+    next_pow2,
+    pick_tile,
+    round_up,
+    vmem_limit_bytes,
 )
 from .copy_utils import kv_word_rows, resolve_merged_kv_heads
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
-  BF16_TILE_ROWS,
-  NUM_KV_STAGES,
-  NUM_O_SLOTS,
-  forward_common,
-  fwd_body,
-  overflow_guard_threshold,
+    BF16_TILE_ROWS,
+    NUM_KV_STAGES,
+    NUM_O_SLOTS,
+    forward_common,
+    fwd_body,
+    overflow_guard_threshold,
 )
 from .loop_schedule import (
-  ScheduleTableLayout,
-  make_paged_fwd_schedule,
-  paged_schedule_table,
+    ScheduleTableLayout,
+    make_paged_fwd_schedule,
+    paged_schedule_table,
 )
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
@@ -107,44 +107,64 @@ def flash_fwd_varlen_paged_kernel(
     q_scale: float,
     **body,
 ) -> None:
-  if has_sinks:
-    sinks_ref, q_hbm, kv_hbm, *refs = refs
-  else:
-    sinks_ref = None
-    q_hbm, kv_hbm, *refs = refs
-  schedule = make_paged_fwd_schedule(
-      table_ref, block_table_ref,
-      layout=layout,
-      num_head_groups=num_head_groups,
-      q_heads_per_kv_head=q_heads_per_kv_head,
-      bq=bq, bkv=bkv, bkv_compute=bkv_compute,
-      page_size=paged.page_size, pages_per_seq=paged.pages_per_seq,
-      causal=causal, left=window_left,
-  )
-  # Note (david): K and V share the one merged cache operand. The K and V
-  # descales arrive in SMEM, so a new descale value compiles no new kernel.
-  fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv,
-           bkv_compute=bkv_compute, paged=paged,
-           q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
-           sinks_ref=sinks_ref, **body)
+    if has_sinks:
+        sinks_ref, q_hbm, kv_hbm, *refs = refs
+    else:
+        sinks_ref = None
+        q_hbm, kv_hbm, *refs = refs
+    schedule = make_paged_fwd_schedule(
+        table_ref,
+        block_table_ref,
+        layout=layout,
+        num_head_groups=num_head_groups,
+        q_heads_per_kv_head=q_heads_per_kv_head,
+        bq=bq,
+        bkv=bkv,
+        bkv_compute=bkv_compute,
+        page_size=paged.page_size,
+        pages_per_seq=paged.pages_per_seq,
+        causal=causal,
+        left=window_left,
+    )
+    # Note (david): K and V share the one merged cache operand. The K and V
+    # descales arrive in SMEM, so a new descale value compiles no new kernel.
+    fwd_body(
+        schedule,
+        q_hbm,
+        kv_hbm,
+        kv_hbm,
+        refs,
+        bq=bq,
+        bkv=bkv,
+        bkv_compute=bkv_compute,
+        paged=paged,
+        q_scale=q_scale * kv_scales_ref[0],
+        v_scale=kv_scales_ref[1],
+        sinks_ref=sinks_ref,
+        **body,
+    )
 
 
 def vmem_buffer_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
-  """Bytes of one VMEM scratch buffer under Mosaic's v6 memref tiling.
+    """Bytes of one VMEM scratch buffer under Mosaic's v6 memref tiling.
 
-  A second-minor axis shorter than one large tile pads only to a power of two,
-  so a (2, head_dim) bf16 head pair costs no pad.
-  """
-  itemsize = jnp.dtype(dtype).itemsize
-  *leading, rows, lanes = shape
-  packing = F32_BYTES // itemsize
-  large_tile_rows = NUM_SUBLANES * packing
-  if rows >= large_tile_rows:
-    tile_rows = large_tile_rows
-  else:
-    tile_rows = max(packing, next_pow2(min(rows, NUM_SUBLANES)))
-  return (math.prod(leading) * round_up(rows, tile_rows)
-          * round_up(lanes, NUM_LANES) * itemsize)
+    A second-minor axis shorter than one large tile pads only to a power of two,
+    so a (2, head_dim) bf16 head pair costs no pad.
+    """
+    itemsize = jnp.dtype(dtype).itemsize
+    *leading, rows, lanes = shape
+    packing = F32_BYTES // itemsize
+    large_tile_rows = NUM_SUBLANES * packing
+    if rows >= large_tile_rows:
+        tile_rows = large_tile_rows
+    else:
+        tile_rows = max(packing, next_pow2(min(rows, NUM_SUBLANES)))
+    return (
+        math.prod(leading)
+        * round_up(rows, tile_rows)
+        * round_up(lanes, NUM_LANES)
+        * itemsize
+    )
 
 
 def paged_scratch_shapes(
@@ -156,45 +176,51 @@ def paged_scratch_shapes(
     gqa_fold: int,
     kv_dtype: jnp.dtype,
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
-  """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
-  one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
-  bounds rows per kv compute tile, Q rotary coefficients, out stage, row max,
-  row sum, f32 accumulator, pending probs, pending V tile, lse."""
-  bq, bkv = block_sizes.block_q, block_sizes.block_kv
-  bkv_compute = block_sizes.block_kv_compute
-  num_stages = block_sizes.num_stages
-  bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
-  if gqa_fold > 1:
-    stage_shape = (num_stages, gqa_fold, bq, head_dim)
-  else:
-    stage_shape = (num_stages, bq, head_dim)
-  group_bq = gqa_fold * bq
-  if rotary_dtype is None:
-    rotary_shapes = []
-  else:
-    # Note (david): prepare_rotary's one batch plane is shared by every head,
-    # so one Q coefficient group is staged.
-    rotary_shapes = [
-        ((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))]
-  if return_lse:
-    lse_shapes = [((num_stages, bq, NUM_LANES), f32)]
-  else:
-    lse_shapes = []
-  return [
-      (stage_shape, bf16),
-      ((NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
-      ((2, bkv, head_dim), bf16),
-      ((bkv // bkv_compute, 2, bkv_compute), jnp.dtype(jnp.int32)),
-      *rotary_shapes,
-      (stage_shape, bf16),
-      ((group_bq, NUM_LANES), f32),
-      ((2, group_bq, NUM_LANES), f32),
-      ((NUM_O_SLOTS, group_bq, head_dim), f32),
-      ((gqa_fold * block_sizes.block_q_compute, block_sizes.block_kv_compute),
-       f32),
-      ((block_sizes.block_kv_compute, head_dim), bf16),
-      *lse_shapes,
-  ]
+    """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
+    one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
+    bounds rows per kv compute tile, Q rotary coefficients, out stage, row max,
+    row sum, f32 accumulator, pending probs, pending V tile, lse."""
+    bq, bkv = block_sizes.block_q, block_sizes.block_kv
+    bkv_compute = block_sizes.block_kv_compute
+    num_stages = block_sizes.num_stages
+    bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
+    if gqa_fold > 1:
+        stage_shape = (num_stages, gqa_fold, bq, head_dim)
+    else:
+        stage_shape = (num_stages, bq, head_dim)
+    group_bq = gqa_fold * bq
+    if rotary_dtype is None:
+        rotary_shapes = []
+    else:
+        # Note (david): prepare_rotary's one batch plane is shared by every head,
+        # so one Q coefficient group is staged.
+        rotary_shapes = [
+            ((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))
+        ]
+    if return_lse:
+        lse_shapes = [((num_stages, bq, NUM_LANES), f32)]
+    else:
+        lse_shapes = []
+    return [
+        (stage_shape, bf16),
+        ((NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
+        ((2, bkv, head_dim), bf16),
+        ((bkv // bkv_compute, 2, bkv_compute), jnp.dtype(jnp.int32)),
+        *rotary_shapes,
+        (stage_shape, bf16),
+        ((group_bq, NUM_LANES), f32),
+        ((2, group_bq, NUM_LANES), f32),
+        ((NUM_O_SLOTS, group_bq, head_dim), f32),
+        (
+            (
+                gqa_fold * block_sizes.block_q_compute,
+                block_sizes.block_kv_compute,
+            ),
+            f32,
+        ),
+        ((block_sizes.block_kv_compute, head_dim), bf16),
+        *lse_shapes,
+    ]
 
 
 def estimate_vmem_bytes(
@@ -206,17 +232,26 @@ def estimate_vmem_bytes(
     gqa_fold: int,
     kv_dtype: jnp.dtype,
 ) -> int:
-  """Scoped VMEM bytes of one paged build: its scratch plus the score
-  temporaries of one compute fragment."""
-  scratch_bytes = sum(
-      vmem_buffer_bytes(shape, dtype)
-      for shape, dtype in paged_scratch_shapes(
-          block_sizes, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold, kv_dtype=kv_dtype))
-  temporary_bytes = (
-      gqa_fold * block_sizes.block_q_compute * block_sizes.block_kv_compute
-      * SCORE_TEMPORARY_BYTES)
-  return scratch_bytes + temporary_bytes
+    """Scoped VMEM bytes of one paged build: its scratch plus the score
+    temporaries of one compute fragment."""
+    scratch_bytes = sum(
+        vmem_buffer_bytes(shape, dtype)
+        for shape, dtype in paged_scratch_shapes(
+            block_sizes,
+            head_dim=head_dim,
+            return_lse=return_lse,
+            rotary_dtype=rotary_dtype,
+            gqa_fold=gqa_fold,
+            kv_dtype=kv_dtype,
+        )
+    )
+    temporary_bytes = (
+        gqa_fold
+        * block_sizes.block_q_compute
+        * block_sizes.block_kv_compute
+        * SCORE_TEMPORARY_BYTES
+    )
+    return scratch_bytes + temporary_bytes
 
 
 @cache
@@ -233,82 +268,100 @@ def resolve_paged_tiles(
     kv_dtype: jnp.dtype,
     block_sizes: BlockSizes | None = None,
 ) -> BlockSizes:
-  """block_sizes of one paged build, whose q sizes count tokens per head.
+    """block_sizes of one paged build, whose q sizes count tokens per head.
 
-  Among the builds whose TPU staging fits vmem_limit_bytes() and whose
-  (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
-  largest kv block at most a kv target, then the largest q block at most a q
-  target; with none at most a target, the smallest above it. The q target is
-  the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
-  PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
-  tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
-  blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
-  A pinned block_sizes is only checked against the budget.
-  """
-  target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
-  target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
-  if block_sizes is not None:
-    candidate_blocks = [block_sizes]
-  else:
-    block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
-    # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
-    # five or three pages (1920 tokens), where no power-of-two block ends on a
-    # page edge; smaller kv blocks halve the page count.
-    kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
-    max_kv_pages = kv_block_cap // page_size
-    kv_blocks = [page_size * (max_kv_pages >> shift)
-                 for shift in range(max_kv_pages.bit_length())]
-    # Note (david): a fragment reloads its rows' softmax state per kv compute
-    # tile, so no larger q block is bought with a kv block below one full kv
-    # compute tile. At 32:4 heads of 256 (1024-token chunks over 16K, v6e,
-    # gqa fold 8) a 1024 x 256 block took 12.44 ms
-    # against 9.14 at 512 x 512.
-    min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
-    kv_blocks = [block_kv for block_kv in kv_blocks
-                 if block_kv >= min_kv_block]
-    q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
-    # Note (david): FWD_BLOCKS are powers of two, so the smaller of two powers
-    # of two divides the q block; a folded tile stays whole bf16 tiles.
-    head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
-    q_compute_cap = max(BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1))
-    candidate_blocks = [
-        BlockSizes(
-            block_q=block_q,
-            block_kv=block_kv,
-            block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
-            block_q_compute=min(
-                q_compute_cap, block_q // MIN_Q_TILES_PER_BLOCK),
+    Among the builds whose TPU staging fits vmem_limit_bytes() and whose
+    (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
+    largest kv block at most a kv target, then the largest q block at most a q
+    target; with none at most a target, the smallest above it. The q target is
+    the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
+    PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
+    tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
+    blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
+    A pinned block_sizes is only checked against the budget.
+    """
+    target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
+    target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
+    if block_sizes is not None:
+        candidate_blocks = [block_sizes]
+    else:
+        block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
+        # Note (david): block_kv is whole pages, so a 384- or 640-token page takes
+        # five or three pages (1920 tokens), where no power-of-two block ends on a
+        # page edge; smaller kv blocks halve the page count.
+        kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
+        max_kv_pages = kv_block_cap // page_size
+        kv_blocks = [
+            page_size * (max_kv_pages >> shift)
+            for shift in range(max_kv_pages.bit_length())
+        ]
+        # Note (david): a fragment reloads its rows' softmax state per kv compute
+        # tile, so no larger q block is bought with a kv block below one full kv
+        # compute tile. At 32:4 heads of 256 (1024-token chunks over 16K, v6e,
+        # gqa fold 8) a 1024 x 256 block took 12.44 ms
+        # against 9.14 at 512 x 512.
+        min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
+        kv_blocks = [
+            block_kv for block_kv in kv_blocks if block_kv >= min_kv_block
+        ]
+        q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
+        # Note (david): FWD_BLOCKS are powers of two, so the smaller of two powers
+        # of two divides the q block; a folded tile stays whole bf16 tiles.
+        head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
+        q_compute_cap = max(
+            BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1)
         )
-        for block_q in FWD_BLOCKS if block_q <= q_block_cap
-        for block_kv in kv_blocks
-        if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
+        candidate_blocks = [
+            BlockSizes(
+                block_q=block_q,
+                block_kv=block_kv,
+                block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
+                block_q_compute=min(
+                    q_compute_cap, block_q // MIN_Q_TILES_PER_BLOCK
+                ),
+            )
+            for block_q in FWD_BLOCKS
+            if block_q <= q_block_cap
+            for block_kv in kv_blocks
+            if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
+        ]
+    estimates = {
+        blocks: estimate_vmem_bytes(
+            blocks,
+            head_dim=head_dim,
+            return_lse=return_lse,
+            rotary_dtype=rotary_dtype,
+            gqa_fold=gqa_fold,
+            kv_dtype=kv_dtype,
+        )
+        for blocks in candidate_blocks
+    }
+    fitting = [
+        blocks
+        for blocks, estimate in estimates.items()
+        if estimate <= vmem_limit_bytes()
     ]
-  estimates = {
-      blocks: estimate_vmem_bytes(
-          blocks, head_dim=head_dim, return_lse=return_lse,
-          rotary_dtype=rotary_dtype, gqa_fold=gqa_fold, kv_dtype=kv_dtype)
-      for blocks in candidate_blocks
-  }
-  fitting = [
-      blocks for blocks, estimate in estimates.items()
-      if estimate <= vmem_limit_bytes()
-  ]
-  if not fitting:
-    blocks, estimate = min(
-        estimates.items(), key=lambda blocks_and_bytes: blocks_and_bytes[1])
-    raise ValueError(
-        "paged attention does not fit the scoped VMEM budget of"
-        f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
-        f"{blocks.block_q}, block_kv={blocks.block_kv}) needs ~{estimate}"
-        f" bytes at {head_dim=}."
+    if not fitting:
+        blocks, estimate = min(
+            estimates.items(), key=lambda blocks_and_bytes: blocks_and_bytes[1]
+        )
+        raise ValueError(
+            "paged attention does not fit the scoped VMEM budget of"
+            f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
+            f"{blocks.block_q}, block_kv={blocks.block_kv}) needs ~{estimate}"
+            f" bytes at {head_dim=}."
+        )
+
+    def _nearest_below(size, target):
+        return (size <= target, size if size <= target else -size)
+
+    return max(
+        fitting,
+        key=lambda blocks: (
+            _nearest_below(blocks.block_kv, target_kv),
+            _nearest_below(blocks.block_q, target_q),
+        ),
     )
-
-  def _nearest_below(size, target):
-    return (size <= target, size if size <= target else -size)
-
-  return max(fitting, key=lambda blocks: (
-      _nearest_below(blocks.block_kv, target_kv),
-      _nearest_below(blocks.block_q, target_q)))
 
 
 def flash_attn_varlen_paged(
@@ -334,181 +387,209 @@ def flash_attn_varlen_paged(
     k_scale: float | jax.Array = 1.0,
     v_scale: float | jax.Array = 1.0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-  """Packed head-major attention over a paged KV cache, read-only.
+    """Packed head-major attention over a paged KV cache, read-only.
 
-  q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
-  entry is 0. kv_cache is the merged (num_pages, page_size,
-  merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
-  interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
-  defaults to half its head axis, and an fp8 pool, which pads an odd head
-  count, needs it. An fp8 pool is widened to bf16 once per staged block;
-  k_scale multiplies every score and v_scale the output, both scalars that
-  may be traced. seqused_k is each sequence's kv length with its new tokens,
-  which the cache must already hold; a block_table entry past those tokens'
-  pages is only read through a clamp into the pool, and the rows it names are
-  discarded.
-  Causal rows align to the end of their sequence's keys; window_left (None
-  unbounded) also hides the keys more than window_left positions before that
-  diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
-  scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
-  softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
-  max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
-  slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
-  sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
-  denominator, sink logits on the scale of the softcapped scores (gpt-oss
-  attention sinks).
-  """
-  num_q_heads, total_q, head_dim = q.shape
-  if q.dtype != jnp.bfloat16:
-    raise NotImplementedError(
-        f"paged attention takes a bfloat16 q; got {q.dtype}.")
-  if kv_cache.ndim != 4:
-    raise ValueError(
-        "kv_cache must be one merged (num_pages, page_size, cache_heads,"
-        f" head_dim) cache; got {kv_cache.shape}."
+    q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
+    entry is 0. kv_cache is the merged (num_pages, page_size,
+    merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
+    interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
+    defaults to half its head axis, and an fp8 pool, which pads an odd head
+    count, needs it. An fp8 pool is widened to bf16 once per staged block;
+    k_scale multiplies every score and v_scale the output, both scalars that
+    may be traced. seqused_k is each sequence's kv length with its new tokens,
+    which the cache must already hold; a block_table entry past those tokens'
+    pages is only read through a clamp into the pool, and the rows it names are
+    discarded.
+    Causal rows align to the end of their sequence's keys; window_left (None
+    unbounded) also hides the keys more than window_left positions before that
+    diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
+    scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
+    softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
+    max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
+    slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
+    sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
+    denominator, sink logits on the scale of the softcapped scores (gpt-oss
+    attention sinks).
+    """
+    num_q_heads, total_q, head_dim = q.shape
+    if q.dtype != jnp.bfloat16:
+        raise NotImplementedError(
+            f"paged attention takes a bfloat16 q; got {q.dtype}."
+        )
+    if kv_cache.ndim != 4:
+        raise ValueError(
+            "kv_cache must be one merged (num_pages, page_size, cache_heads,"
+            f" head_dim) cache; got {kv_cache.shape}."
+        )
+    _, page_size, cache_heads, cache_head_dim = kv_cache.shape
+    num_kv_heads = resolve_merged_kv_heads(
+        cache_heads, kv_cache.dtype, nheads_k
     )
-  _, page_size, cache_heads, cache_head_dim = kv_cache.shape
-  num_kv_heads = resolve_merged_kv_heads(cache_heads, kv_cache.dtype, nheads_k)
-  if cache_head_dim != head_dim or head_dim % NUM_LANES:
-    raise ValueError(
-        f"head_dim must be a multiple of {NUM_LANES} shared by q and the"
-        f" cache; got q {head_dim}, cache {cache_head_dim}."
-    )
-  if page_size % PAGE_SIZE_MULTIPLE:
-    raise ValueError(
-        f"page_size must be a multiple of {PAGE_SIZE_MULTIPLE}; got"
-        f" {page_size}."
-    )
-  if num_q_heads % num_kv_heads:
-    raise ValueError(
-        f"nheads={num_q_heads} must be a multiple of nheads_k={num_kv_heads}."
-    )
-  if total_q == 0:
-    raise ValueError("q needs at least one token row.")
-  if sinks is not None and sinks.shape != (num_q_heads,):
-    raise ValueError(
-        f"sinks must be ({num_q_heads},), one per q head; got {sinks.shape}.")
+    if cache_head_dim != head_dim or head_dim % NUM_LANES:
+        raise ValueError(
+            f"head_dim must be a multiple of {NUM_LANES} shared by q and the"
+            f" cache; got q {head_dim}, cache {cache_head_dim}."
+        )
+    if page_size % PAGE_SIZE_MULTIPLE:
+        raise ValueError(
+            f"page_size must be a multiple of {PAGE_SIZE_MULTIPLE}; got"
+            f" {page_size}."
+        )
+    if num_q_heads % num_kv_heads:
+        raise ValueError(
+            f"nheads={num_q_heads} must be a multiple of"
+            f" nheads_k={num_kv_heads}."
+        )
+    if total_q == 0:
+        raise ValueError("q needs at least one token row.")
+    if sinks is not None and sinks.shape != (num_q_heads,):
+        raise ValueError(
+            f"sinks must be ({num_q_heads},), one per q head; got"
+            f" {sinks.shape}."
+        )
 
-  cu_seqlens_q = jnp.asarray(cu_seqlens_q)
-  seqused_k = jnp.asarray(seqused_k)
-  block_table = jnp.asarray(block_table)
-  batch = cu_seqlens_q.shape[0] - 1
-  if (seqused_k.shape != (batch,)
-      or not jnp.issubdtype(seqused_k.dtype, jnp.integer)):
-    raise ValueError(
-        f"seqused_k must be a ({batch},) integer array; got"
-        f" {seqused_k.shape} {seqused_k.dtype}."
-    )
-  if (block_table.ndim != 2 or block_table.shape[0] != batch
-      or block_table.shape[1] == 0
-      or not jnp.issubdtype(block_table.dtype, jnp.integer)):
-    raise ValueError(
-        f"block_table must be a (batch={batch}, max_pages_per_seq >= 1)"
-        f" integer array; got {block_table.shape} {block_table.dtype}."
-    )
-  pages_per_seq = block_table.shape[1]
-  capacity = pages_per_seq * page_size
+    cu_seqlens_q = jnp.asarray(cu_seqlens_q)
+    seqused_k = jnp.asarray(seqused_k)
+    block_table = jnp.asarray(block_table)
+    batch = cu_seqlens_q.shape[0] - 1
+    if seqused_k.shape != (batch,) or not jnp.issubdtype(
+        seqused_k.dtype, jnp.integer
+    ):
+        raise ValueError(
+            f"seqused_k must be a ({batch},) integer array; got"
+            f" {seqused_k.shape} {seqused_k.dtype}."
+        )
+    if (
+        block_table.ndim != 2
+        or block_table.shape[0] != batch
+        or block_table.shape[1] == 0
+        or not jnp.issubdtype(block_table.dtype, jnp.integer)
+    ):
+        raise ValueError(
+            f"block_table must be a (batch={batch}, max_pages_per_seq >= 1)"
+            f" integer array; got {block_table.shape} {block_table.dtype}."
+        )
+    pages_per_seq = block_table.shape[1]
+    capacity = pages_per_seq * page_size
 
-  if block_sizes is not None and block_sizes.block_kv % page_size:
-    raise ValueError(
-        f"block_kv={block_sizes.block_kv} must be whole pages of"
-        f" page_size={page_size}.")
-  if block_sizes is not None and (
-      block_sizes.block_q % block_sizes.block_q_compute
-      or block_sizes.block_q // block_sizes.block_q_compute
-      < MIN_Q_TILES_PER_BLOCK):
-    raise ValueError(
-        "the static-anchor softmax needs block_q to hold >= 2 whole q"
-        f" compute tiles; got block_q={block_sizes.block_q},"
-        f" block_q_compute={block_sizes.block_q_compute}."
+    if block_sizes is not None and block_sizes.block_kv % page_size:
+        raise ValueError(
+            f"block_kv={block_sizes.block_kv} must be whole pages of"
+            f" page_size={page_size}."
+        )
+    if block_sizes is not None and (
+        block_sizes.block_q % block_sizes.block_q_compute
+        or block_sizes.block_q // block_sizes.block_q_compute
+        < MIN_Q_TILES_PER_BLOCK
+    ):
+        raise ValueError(
+            "the static-anchor softmax needs block_q to hold >= 2 whole q"
+            f" compute tiles; got block_q={block_sizes.block_q},"
+            f" block_q_compute={block_sizes.block_q_compute}."
+        )
+    if rotary is None:
+        rotary_dtype = None
+    else:
+        rotary_dtype = jnp.dtype(rotary[0].dtype)
+    gqa_fold = num_q_heads // num_kv_heads
+    # Note (david): the bounds key the tile cache, so power-of-two buckets keep
+    # a wobbling longest sequence on one build. The caps hold because no q
+    # block passes the 128-padded buffer and no sequence outgrows its table row.
+    block_sizes = resolve_paged_tiles(
+        max_seqlen_q_bucket=min(
+            next_pow2(max_seqlen_q), round_up(total_q, NUM_LANES)
+        ),
+        max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
+        page_size=page_size,
+        head_dim=head_dim,
+        return_lse=return_lse,
+        rotary_dtype=rotary_dtype,
+        gqa_fold=gqa_fold,
+        has_window=window_left is not None,
+        block_sizes=block_sizes,
+        kv_dtype=kv_cache.dtype,
     )
-  if rotary is None:
-    rotary_dtype = None
-  else:
-    rotary_dtype = jnp.dtype(rotary[0].dtype)
-  gqa_fold = num_q_heads // num_kv_heads
-  # Note (david): the bounds key the tile cache, so power-of-two buckets keep
-  # a wobbling longest sequence on one build. The caps hold because no q
-  # block passes the 128-padded buffer and no sequence outgrows its table row.
-  block_sizes = resolve_paged_tiles(
-      max_seqlen_q_bucket=min(
-          next_pow2(max_seqlen_q), round_up(total_q, NUM_LANES)),
-      max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
-      page_size=page_size,
-      head_dim=head_dim,
-      return_lse=return_lse,
-      rotary_dtype=rotary_dtype,
-      gqa_fold=gqa_fold,
-      has_window=window_left is not None,
-      block_sizes=block_sizes,
-      kv_dtype=kv_cache.dtype,
-  )
-  bq = block_sizes.block_q
-  paged = PagedKVInfo(
-      num_kv_heads=num_kv_heads, page_size=page_size,
-      pages_per_seq=pages_per_seq, is_bitcast_load=not interpret)
+    bq = block_sizes.block_q
+    paged = PagedKVInfo(
+        num_kv_heads=num_kv_heads,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        is_bitcast_load=not interpret,
+    )
 
-  padded_total_q = round_up(total_q, bq)
-  num_pad_q = padded_total_q - total_q
-  padded_q = jnp.pad(q, ((0, 0), (0, num_pad_q), (0, 0)))
-  if rotary is None:
-    padded_rotary = None
-  else:
-    padded_rotary = (
-        jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))), None)
+    padded_total_q = round_up(total_q, bq)
+    num_pad_q = padded_total_q - total_q
+    padded_q = jnp.pad(q, ((0, 0), (0, num_pad_q), (0, 0)))
+    if rotary is None:
+        padded_rotary = None
+    else:
+        padded_rotary = (
+            jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))),
+            None,
+        )
 
-  # Note (david): resolving the schedule once per call spares every q block
-  # a search of the cu_seqlens and its window arithmetic.
-  table, layout = paged_schedule_table(
-      cu_seqlens_q, seqused_k,
-      padded_total_q=padded_total_q,
-      bq=bq, bkv=block_sizes.block_kv,
-      bkv_compute=block_sizes.block_kv_compute,
-      page_size=page_size, pages_per_seq=pages_per_seq,
-      causal=causal, left=window_left,
-  )
-  smem_operands = [
-      table,
-      block_table.astype(jnp.int32).reshape(-1),
-      jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
-                 for scale in (k_scale, v_scale)]),
-  ]
-  if sinks is not None:
-    smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
-  kernel = partial(
-      flash_fwd_varlen_paged_kernel,
-      has_sinks=sinks is not None,
-      layout=layout,
-      causal=causal,
-      window_left=window_left,
-      num_head_groups=num_kv_heads,
-      q_heads_per_kv_head=gqa_fold,
-  )
-  outputs = forward_common(
-      kernel, smem_operands, padded_q, kv_cache, None,
-      block_sizes=block_sizes,
-      num_kv_heads=num_kv_heads,
-      head_fold=PAGED_HEAD_FOLD,
-      transposed_pv=False,
-      return_lse=return_lse,
-      kernel_name="flash_attn_varlen_paged_fwd",
-      interpret=interpret,
-      token_major=None,
-      is_per_seq=True,
-      rotary=padded_rotary,
-      rotary_interleaved=rotary_interleaved,
-      paged=paged,
-      gqa_fold=gqa_fold,
-      guard_threshold=overflow_guard_threshold(capacity),
-      window=(None, None),
-      causal_offset=0,
-      # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
-      # softcap, so log2(e) rides in the tanh output scale.
-      softcap=softcap * LOG2E,
-      q_scale=q_scale,
-  )
-  if return_lse:
-    out, lse = outputs
-    return out[:, :total_q], lse[:, :total_q]
-  else:
-    return outputs[:, :total_q]
+    # Note (david): resolving the schedule once per call spares every q block
+    # a search of the cu_seqlens and its window arithmetic.
+    table, layout = paged_schedule_table(
+        cu_seqlens_q,
+        seqused_k,
+        padded_total_q=padded_total_q,
+        bq=bq,
+        bkv=block_sizes.block_kv,
+        bkv_compute=block_sizes.block_kv_compute,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        causal=causal,
+        left=window_left,
+    )
+    smem_operands = [
+        table,
+        block_table.astype(jnp.int32).reshape(-1),
+        jnp.stack([
+            jnp.asarray(scale, jnp.float32).reshape(())
+            for scale in (k_scale, v_scale)
+        ]),
+    ]
+    if sinks is not None:
+        smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
+    kernel = partial(
+        flash_fwd_varlen_paged_kernel,
+        has_sinks=sinks is not None,
+        layout=layout,
+        causal=causal,
+        window_left=window_left,
+        num_head_groups=num_kv_heads,
+        q_heads_per_kv_head=gqa_fold,
+    )
+    outputs = forward_common(
+        kernel,
+        smem_operands,
+        padded_q,
+        kv_cache,
+        None,
+        block_sizes=block_sizes,
+        num_kv_heads=num_kv_heads,
+        head_fold=PAGED_HEAD_FOLD,
+        transposed_pv=False,
+        return_lse=return_lse,
+        kernel_name="flash_attn_varlen_paged_fwd",
+        interpret=interpret,
+        token_major=None,
+        is_per_seq=True,
+        rotary=padded_rotary,
+        rotary_interleaved=rotary_interleaved,
+        paged=paged,
+        gqa_fold=gqa_fold,
+        guard_threshold=overflow_guard_threshold(capacity),
+        window=(None, None),
+        causal_offset=0,
+        # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
+        # softcap, so log2(e) rides in the tanh output scale.
+        softcap=softcap * LOG2E,
+        q_scale=q_scale,
+    )
+    if return_lse:
+        out, lse = outputs
+        return out[:, :total_q], lse[:, :total_q]
+    else:
+        return outputs[:, :total_q]

@@ -20,7 +20,13 @@ def unpad_input(hidden_states, attention_mask):
     max_seqlen_in_batch = int(seqlens_in_batch.max())
     cu_seqlens = jnp.pad(jnp.cumsum(seqlens_in_batch, dtype=jnp.int32), (1, 0))
     flat = hidden_states.reshape(-1, *hidden_states.shape[2:])
-    return flat[indices], indices, cu_seqlens, max_seqlen_in_batch, seqlens_in_batch
+    return (
+        flat[indices],
+        indices,
+        cu_seqlens,
+        max_seqlen_in_batch,
+        seqlens_in_batch,
+    )
 
 
 def pad_input(hidden_states, indices, batch, seqlen):
@@ -35,6 +41,8 @@ def pad_input(hidden_states, indices, batch, seqlen):
     Return:
         hidden_states: (batch, seqlen, ...), zeros at the masked tokens.
     """
-    output = jnp.zeros((batch * seqlen, *hidden_states.shape[1:]), hidden_states.dtype)
+    output = jnp.zeros(
+        (batch * seqlen, *hidden_states.shape[1:]), hidden_states.dtype
+    )
     output = output.at[indices].set(hidden_states)
     return output.reshape(batch, seqlen, *hidden_states.shape[1:])
