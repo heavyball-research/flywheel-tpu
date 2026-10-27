@@ -60,7 +60,8 @@ returning JAX arrays:
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 ```
 
-All inputs must be bfloat16. `dropout_p`, `alibi_slopes`, `deterministic`,
+All inputs must be bfloat16, except a paged KV cache, which may also be
+float8_e4m3fn or float8_e5m2. `dropout_p`, `alibi_slopes`, `deterministic`,
 `return_attn_probs` and `attention_chunk` are accepted for compatibility and
 raise `NotImplementedError` on any non-default value. `interpret=True` runs
 the Pallas TPU interpreter, e.g. on CPU.
@@ -71,7 +72,8 @@ flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
                 alibi_slopes=None, deterministic=False, return_attn_probs=False,
                 return_softmax_lse=False, interpret=False, head_dim=None,
                 token_major=False, *, rotary_cos=None, rotary_sin=None,
-                rotary_interleaved=False, rotary_k=True, heads_outer_fold=False):
+                rotary_interleaved=False, rotary_k=True, heads_outer_fold=False,
+                learnable_sink=None):
 """Unlike flash-attn, the default layout is head-major, (batch, nheads, seqlen, headdim),
 which is the kernel's own layout, so no operand is relaid out.
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
@@ -84,8 +86,8 @@ will only attend to keys between
 seqlen_q may be any length. seqlen_k must be a multiple of 128 unless causal=True or
 window_size[1] == 0.
 jax.grad runs the Pallas backward kernel for MHA and MQA/GQA with causal or full masks.
-window_size, softcap, rotary and heads_outer_fold are forward-only: their gradient raises
-NotImplementedError.
+window_size, softcap, rotary, heads_outer_fold and learnable_sink are forward-only: their
+gradient raises NotImplementedError.
 
 Arguments:
     q: (batch_size, nheads, seqlen_q, headdim)
@@ -115,6 +117,11 @@ Arguments:
     rotary_k: bool. If False, only q is rotated.
     heads_outer_fold: bool. q/k/v and out are (nheads, batch_size, seqlen, headdim) instead.
         Forward-only, with no return_softmax_lse and only q-only rotary (rotary_k=False).
+    learnable_sink [optional]: (nheads,), float. One sink logit per query head (gpt-oss
+        attention sinks), on the scale of the softcapped scores: exp(learnable_sink[h])
+        joins head h's softmax denominator with no value row, and lse includes it. A row
+        with no visible key returns out = 0 and lse = learnable_sink[h]. Each logit must be
+        finite or -inf (no sink). May be traced.
 Return:
     out: (batch_size, nheads, seqlen_q, headdim_v), or (batch_size, seqlen_q,
         nheads * headdim_v) with token_major=True.
@@ -130,7 +137,9 @@ flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_se
                        return_attn_probs=False, return_softmax_lse=False, interpret=False,
                        head_dim=None, token_major=False, block_sizes=None, *,
                        rotary_cos=None, rotary_sin=None, rotary_interleaved=False,
-                       rotary_k=True, block_table=None, seqused_k=None, num_active=None):
+                       rotary_k=True, block_table=None, seqused_k=None, num_active=None,
+                       k_descale=None, v_descale=None, nheads_k=None,
+                       learnable_sink=None):
 """Attention over sequences packed along the token axis. Unlike flash-attn, the default layout
 is head-major, (nheads, total, headdim), which is the kernel's own layout, so no operand is
 relaid out.
@@ -157,15 +166,19 @@ Arguments:
         forward tiles instead of the tuned or analytic ones; block_q and block_kv must be
         multiples of 128.
     block_table [optional]: (batch_size, max_num_blocks_per_seq), int. Reads k as a paged KV
-        cache, read-only: one merged (num_blocks, page_block_size, 2 * nheads_k, headdim)
-        cache whose token rows interleave each KV head's K row and V row, [k0, v0, k1, v1,
-        ...], with v and cu_seqlens_k None. page_block_size and headdim are multiples of 128;
-        any nheads_k. q stays head-major; token_major and rotary_k=True are not supported,
+        cache, read-only: one merged (num_blocks, page_block_size, cache_heads, headdim)
+        cache laid out as flash_attn_with_kvcache's, bf16 or fp8, with v and cu_seqlens_k
+        None. page_block_size and headdim are multiples of 128; any nheads_k. q stays
+        head-major; token_major and rotary_k=True are not supported,
         and window_size takes a right bound of -1 or 0 only (causal forces 0).
     seqused_k [optional]: (batch_size,), int. With block_table, each sequence's kv length,
         its new tokens included, which the cache must already hold; max_seqlen_k bounds it.
     num_active [optional]: int, may be traced. With block_table, only the first num_active
         sequences attend; rows past the last of them return out = 0 and lse = -inf.
+    k_descale, v_descale, nheads_k [optional]: with block_table, as in
+        flash_attn_with_kvcache. An fp8 cache needs nheads_k.
+    learnable_sink [optional]: as in flash_attn_func. Padding rows and rows past
+        num_active still return out = 0 and lse = -inf.
     The other arguments are as in flash_attn_func.
 Return:
     out: (nheads, total_q, headdim_v), or (total_q, nheads * headdim_v) with token_major=True.
@@ -178,7 +191,8 @@ flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, *, cache_seqlens,
                         cache_batch_idx=None, block_table=None, num_active=None,
                         cu_seqlens_q=None, max_seqlen_q=None, softmax_scale=None,
                         causal=False, window_size=(-1, -1), softcap=0.0,
-                        return_softmax_lse=False, interpret=False):
+                        return_softmax_lse=False, interpret=False, k_descale=None,
+                        v_descale=None, nheads_k=None, learnable_sink=None):
 """
 If k and v are not None, they are appended to the cache after each row's cache_seqlens
 entries, and attention runs against the updated cache, all in 1 kernel. This is useful for
@@ -198,7 +212,10 @@ the batch.
 Unlike flash_attn_func, q is token-major, as in flash-attn. Decode is q with seqlen_q = 1;
 seqlen_q > 1 or a packed q with cu_seqlens_q runs chunked prefill against the cache, which
 needs the paged cache (block_table): the new tokens are appended, then flash_attn_varlen_func's
-paged kernel attends the updated pages. The contiguous cache serves single-token decode only.
+paged kernel attends the updated pages. A short (batch_size, seqlen_q) window with no left
+window and at most 128 query rows per KV head (seqlen_q * nheads / nheads_k), such as a
+speculative verify window, runs on the decode kernel instead, folded into the query heads.
+The contiguous cache serves single-token decode only.
 
 Supports MQA/GQA as flash_attn_func does. The paged cache takes any nheads_k; the contiguous
 cache needs nheads_k even or 1, because its cache load packs two bf16 heads into one u32 lane.
@@ -217,8 +234,10 @@ Arguments:
     k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         seqlen_cache a multiple of 128,
         or (num_blocks, page_block_size, 2 * nheads_k, headdim) if there's a block_table
-        (i.e. paged KV cache). The paged cache merges K and V: each token row interleaves
-        each KV head's K row and V row, [k0, v0, k1, v1, ...] (RPA v3's head order).
+        (i.e. paged KV cache). The paged cache merges K and V: a bfloat16 cache interleaves
+        each KV head's K row and V row, [k0, v0, k1, v1, ...] (RPA v3's head order); a
+        float8_e4m3fn or float8_e5m2 cache holds each head pair's two K rows then its two
+        V rows, [k0, k1, v0, v1, ...], an odd nheads_k padded with one zero head.
         page_block_size must be a multiple of 128.
     v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         or None if there's a block_table.
@@ -241,8 +260,14 @@ Arguments:
     max_seqlen_q [optional]: int. Maximum query sequence length in the batch, required with
         cu_seqlens_q and rejected without it. Must be static: as in flash_attn_varlen_func it
         only caps the kernel's block sizes, so a bound off the true length is slow, not wrong.
-    softmax_scale, causal, window_size, softcap: as in flash_attn_func.
-    cache_seqlens, cache_batch_idx, block_table, num_active and cu_seqlens_q may be traced.
+    softmax_scale, causal, window_size, softcap, learnable_sink: as in flash_attn_func.
+    k_descale, v_descale [optional]: float. Per-tensor descales of an fp8 cache, default 1
+        (FlashAttention-3's): the cache stores K / k_descale and V / v_descale. k / v
+        appends must already be in the cache's dtype. q stays bfloat16.
+    nheads_k [optional]: int. The cache's KV head count. Defaults to k's heads, else to
+        half the cache's head axis, so an fp8 cache without k needs it.
+    cache_seqlens, cache_batch_idx, block_table, num_active, cu_seqlens_q, k_descale,
+    v_descale and learnable_sink may be traced.
 
 Return:
     out: (batch_size, seqlen_q, nheads, headdim), or (total_q, nheads, headdim) with
@@ -372,8 +397,11 @@ records of its recent tokens, computes its outputs from them without
 materializing the state, and writes a new checkpoint only when the records
 would overflow. Speculative tokens commit by moving `replay_lens`, so the
 recurrent state needs no per-position checkpoints. The paper implements GDN
-(and Mamba-2) in vLLM; the KDA variant is our extension. Their arguments are
-documented in their docstrings.
+(and Mamba-2) in vLLM; the KDA variant is our extension. The f32 checkpoint is
+stored as two 16-bit planes, so a decode step reads only the bf16 high plane;
+`replay_layout`, `split_checkpoint` and `merge_checkpoint` in each wrapper give
+the buffer shapes and convert the checkpoint from and to f32. Their arguments
+are documented in their docstrings.
 
 Their implementations are in
 [gdn/wrapper.py](flywheel_tpu/linear_attention/gdn/wrapper.py) and
