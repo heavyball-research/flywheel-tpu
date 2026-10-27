@@ -6,6 +6,8 @@
 </p>
 
 ## News
+- [2026/10] FlyWheel 0.4.0 is released: fp8 paged KV cache, speculative verify
+  windows on the decode kernel, and attention sinks (`learnable_sink`).
 - [2026/10] FlyWheel 0.3.0 is released: sliding window attention that skips
   masked tiles (up to 1.47x over Splash and 2.25x over RPA v3 on 16K windowed
   prefill, TPU v6e), sliding window and softcap on the paged KV cache, and
@@ -592,6 +594,6 @@ If you use FlyWheel in your research, please cite:
   author       = {Zishuo Bao and Zeshen Zhang and Yucheng Lu},
   year         = {2026},
   howpublished = {\url{https://github.com/heavyball-research/flywheel-tpu}},
-  note         = {Version 0.3.0}
+  note         = {Version 0.4.0}
 }
 ```

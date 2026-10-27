@@ -1,6 +1,6 @@
 [project]
 name = "flywheel-tpu"
-version = "0.3.0"
+version = "0.4.0"
 description = "FlyWheel: attention kernels for TPU, implemented in JAX Pallas"
 dynamic = ["readme"]
 requires-python = ">=3.12"
