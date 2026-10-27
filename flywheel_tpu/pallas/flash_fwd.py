@@ -30,28 +30,63 @@ MIN_Q_TILES_PER_BLOCK = 2
 
 
 def flash_fwd_kernel(
-    q_hbm: jax.Array,
-    k_hbm: jax.Array,
-    v_hbm: jax.Array,
     *refs: jax.Array,
+    has_sinks: bool,
     dense_params: DenseFwdParams,
     **body,
 ) -> None:
+  if has_sinks:
+    sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
+  else:
+    sinks_ref = None
+    q_hbm, k_hbm, v_hbm, *refs = refs
   fwd_body(
-      make_dense_fwd_schedule(dense_params), q_hbm, k_hbm, v_hbm, refs, **body)
+      make_dense_fwd_schedule(dense_params), q_hbm, k_hbm, v_hbm, refs,
+      sinks_ref=sinks_ref, **body)
+
+
+def check_dense_sinks(
+    sinks: jax.Array,
+    num_flat_heads: int,
+    heads_outer_batch: int | None,
+    token_major: TokenMajorInfo | None,
+) -> None:
+  """Raise unless sinks is (nheads,), one logit per sequence head."""
+  # Note (deepolar): a head-major kernel sees batch * nheads flat heads, so
+  # only heads-outer and token-major pin nheads. Batch-outer cannot tell
+  # nheads from batch, so it only checks that the length divides the flat
+  # heads: every flat head then reads inside the sinks, but a wrong length
+  # that divides them passes.
+  if token_major is not None:
+    is_valid = sinks.shape == (token_major.num_q_heads,)
+  elif heads_outer_batch is not None:
+    is_valid = sinks.shape == (num_flat_heads // heads_outer_batch,)
+  else:
+    is_valid = (sinks.ndim == 1 and sinks.shape[0] > 0
+                and num_flat_heads % sinks.shape[0] == 0)
+  if not is_valid:
+    raise ValueError(
+        "sinks must be (nheads,), one logit per sequence head, for"
+        f" {num_flat_heads} flat q heads; got {sinks.shape}.")
 
 
 def flash_attn_forward(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
+    sinks: jax.Array | None = None,
     *,
     dense_params: DenseFwdParams,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
+  if sinks is not None:
+    check_dense_sinks(sinks, q.shape[0], dense_params.heads_outer_batch,
+                      body.get("token_major"))
+  smem_operands = [] if sinks is None else [sinks.astype(jnp.float32) * LOG2E]
   return forward_common(
-      partial(flash_fwd_kernel, dense_params=dense_params),
-      [], q, k, v,
+      partial(flash_fwd_kernel, has_sinks=sinks is not None,
+              dense_params=dense_params),
+      smem_operands, q, k, v,
       kernel_name="flash_attn_mha_static_t1_guarded_fwd",
       **body,
   )
@@ -119,7 +154,12 @@ def make_flash_attn_mha(
   The returned callable takes (q, k, v), or (q, k, v, cu_seqlens_q,
   cu_seqlens_k) when varlen_max_seqlen_kv is set, or (q, k, v, causal_offset)
   under runtime_causal_offset, plus optional rotary and rotary_interleaved
-  kwargs, and returns o, or (o, lse) under return_lse.
+  kwargs, and returns o, or (o, lse) under return_lse. Except under
+  runtime_causal_offset, an optional sinks argument after those, (nheads,)
+  float sink logits, one per sequence head (flat q head f reads f % nheads,
+  or f // heads_outer_batch heads-outer), joins each head's softmax
+  denominator. Batch-outer only checks that the sinks' length divides the
+  flat q heads, so the caller must pass exactly nheads logits.
 
   num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;
     num_kv_heads=None is MHA and MQA is num_kv_heads=1.

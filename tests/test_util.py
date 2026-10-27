@@ -157,6 +157,7 @@ def attention_ref(
     softcap=0.0,
     upcast=True,
     reorder_ops=False,
+    sinks=None,
 ):
     """Naive softmax(q @ k^T / sqrt(d)) @ v on padded inputs.
 
@@ -167,9 +168,11 @@ def attention_ref(
     without it the math runs in the input dtype, and reorder_ops scales k instead of
     q, so the pair measures how far plain bf16 arithmetic drifts.
 
+    sinks (nheads,) joins each head's softmax as one more logit with no value row.
+
     Returns (out, lse): out (batch_size, seqlen_q, nheads, d_v) in q's dtype, zero
     on padded queries and on rows with no visible key; lse (batch_size, nheads,
-    seqlen_q) f32, -inf on rows with no visible key.
+    seqlen_q) f32, -inf on rows with no visible key, or the row's sink.
     """
     if causal:
         window_size = (window_size[0], 0)
@@ -203,11 +206,17 @@ def attention_ref(
     empty_row = masked.all(axis=-1, keepdims=True)
     # Note (david): the softmax accumulates in f32 even for bf16 scores, then rounds
     # to v's dtype.
-    attention = jax.nn.softmax(scores.astype(jnp.float32), axis=-1).astype(v.dtype)
+    logits = scores.astype(jnp.float32)
+    if sinks is not None:
+        sink_logits = jnp.broadcast_to(
+            sinks.astype(jnp.float32)[None, :, None, None], (*logits.shape[:3], 1)
+        )
+        logits = jnp.concatenate([jnp.where(masked, -jnp.inf, logits), sink_logits], axis=-1)
+    attention = jax.nn.softmax(logits, axis=-1)[..., :seqlen_k].astype(v.dtype)
     attention = jnp.where(empty_row, 0.0, attention)
-    lse = jnp.where(
-        empty_row[..., 0], -jnp.inf, jax.nn.logsumexp(scores.astype(jnp.float32), axis=-1)
-    )
+    lse = jax.nn.logsumexp(logits, axis=-1)
+    if sinks is None:
+        lse = jnp.where(empty_row[..., 0], -jnp.inf, lse)
     output = jnp.einsum("bhts,bshd->bthd", attention, v, precision=jax.lax.Precision.HIGHEST)
     if query_padding_mask is not None:
         output = jnp.where(~query_padding_mask[:, :, None, None], 0.0, output)

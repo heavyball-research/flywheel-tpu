@@ -8,8 +8,9 @@ causal or window edges around each sequence's own bottom-right diagonal.
 from functools import partial
 
 import jax
+import jax.numpy as jnp
 
-from .block_sizes import BlockSizes, QKVLayout, TokenMajorInfo
+from .block_sizes import LOG2E, BlockSizes, QKVLayout, TokenMajorInfo
 from .fwd_pipeline import forward_common, fwd_body
 from .loop_schedule import (
   ScheduleTableLayout,
@@ -22,10 +23,8 @@ from .seqlen_info import check_cu_seqlens_pair
 
 def flash_fwd_varlen_kernel(
     table_ref: jax.Array,
-    q_hbm: jax.Array,
-    k_hbm: jax.Array,
-    v_hbm: jax.Array,
     *refs: jax.Array,
+    has_sinks: bool,
     varlen_sched: VarlenSchedule,
     layout: ScheduleTableLayout,
     num_head_groups: int,
@@ -34,6 +33,11 @@ def flash_fwd_varlen_kernel(
     bkv_compute: int,
     **body,
 ) -> None:
+  if has_sinks:
+    sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
+  else:
+    sinks_ref = None
+    q_hbm, k_hbm, v_hbm, *refs = refs
   schedule = make_per_seq_fwd_schedule(
       table_ref,
       layout=layout,
@@ -44,7 +48,7 @@ def flash_fwd_varlen_kernel(
       left=varlen_sched.left, right=varlen_sched.right,
   )
   fwd_body(schedule, q_hbm, k_hbm, v_hbm, refs, bq=bq, bkv=bkv,
-           bkv_compute=bkv_compute, **body)
+           bkv_compute=bkv_compute, sinks_ref=sinks_ref, **body)
 
 
 def flash_attn_forward_varlen(
@@ -53,6 +57,7 @@ def flash_attn_forward_varlen(
     v: jax.Array,
     cu_seqlens_q: jax.Array,
     cu_seqlens_k: jax.Array,
+    sinks: jax.Array | None = None,
     *,
     varlen_sched: VarlenSchedule,
     block_sizes: BlockSizes,
@@ -81,15 +86,27 @@ def flash_attn_forward_varlen(
       cu_seqlens_q, cu_seqlens_k, varlen_sched=varlen_sched,
       bq=block_sizes.block_q, bkv=block_sizes.block_kv,
       bkv_compute=block_sizes.block_kv_compute)
+  smem_operands = [table]
+  if sinks is not None:
+    # Note (deepolar): packed rows carry no batch, so the flat q head is the
+    # sequence head itself.
+    num_seq_heads = (q.shape[0] if token_major is None
+                     else token_major.num_q_heads)
+    if sinks.shape != (num_seq_heads,):
+      raise ValueError(
+          f"sinks must be ({num_seq_heads},), one per q head; got"
+          f" {sinks.shape}.")
+    smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
 
   kernel = partial(
       flash_fwd_varlen_kernel,
+      has_sinks=sinks is not None,
       varlen_sched=varlen_sched,
       layout=layout,
       num_head_groups=num_q_heads // head_fold,
   )
   return forward_common(
-      kernel, [table], q, k, v,
+      kernel, smem_operands, q, k, v,
       block_sizes=block_sizes,
       head_fold=head_fold, transposed_pv=transposed_pv,
       kernel_name="flash_attn_mha_static_t1_guarded_fwd_varlen_per_seq",
