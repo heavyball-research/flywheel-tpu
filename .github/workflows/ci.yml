@@ -1,0 +1,74 @@
+# Every pull request into main runs the test suite on the commit GitHub would make by
+# merging it (refs/pull/N/merge), on CPU under the Pallas interpreter. The suite is split
+# into shards that run side by side; `cpu` is the one check for branch protection to
+# require. Nightly, the suite runs against the newest jax to catch upstream breakage
+# before a pin bump does.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  merge_group:
+  schedule:
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # The oldest jax pyproject.toml allows. Keep the two in step.
+  JAX_VERSION: "0.11.2"
+  JAX_PLATFORMS: cpu
+
+jobs:
+  test-cpu:
+    name: test-cpu (shard ${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    # The suite is about 1000 worker-minutes in the interpreter, so 20 shards of 4 workers
+    # each take 10 to 25 minutes. The count can change freely: each shard reads it from
+    # strategy.job-total.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          python-version: "3.12"
+          activate-environment: true
+      - name: Install
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then jax=jax; else jax="jax==${JAX_VERSION}"; fi
+          uv pip install -e . "$jax" "pytest>=8" pytest-xdist
+      # tests/conftest.py keeps every N-th test from the i-th on.
+      - name: Test
+        run: >
+          python -m pytest -n auto -rfE --durations=20
+          --shard=${{ matrix.shard }}/${{ strategy.job-total }}
+          --junitxml=junit-cpu-${{ matrix.shard }}.xml
+      - if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: junit-cpu-${{ matrix.shard }}
+          path: junit-cpu-${{ matrix.shard }}.xml
+
+  # One name for branch protection that does not change with the shard count. A shard that
+  # fails, times out or is cancelled fails it. It runs even on a cancelled run, because a
+  # skipped required check counts as passed.
+  cpu:
+    if: always()
+    needs: test-cpu
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - run: test "${{ needs.test-cpu.result }}" = success
