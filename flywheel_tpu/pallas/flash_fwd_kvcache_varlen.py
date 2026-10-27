@@ -161,6 +161,7 @@ def flash_attn_kvcache_varlen(
     block_table: jax.Array,
     num_active: int | jax.Array | None,
     *,
+    max_seqlen_q: int,
     q_scale: float,
     causal: bool,
     window_left: int | None,
@@ -178,9 +179,9 @@ def flash_attn_kvcache_varlen(
   q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
   merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
   head_dim) cache and block_table its flat (batch * pages_per_seq,) page
-  table. causal, window_left, softcap, q_scale, nheads_k, k_scale, v_scale
-  and sinks are flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse
-  (nheads, total_q) float32 when return_lse.
+  table. max_seqlen_q, causal, window_left, softcap, q_scale, nheads_k,
+  k_scale, v_scale and sinks are flash_attn_varlen_paged's. Returns (out,
+  kv_cache) plus lse (nheads, total_q) float32 when return_lse.
   """
   batch = cu_seqlens_q.shape[0] - 1
   num_query_heads = q.shape[1]
@@ -217,7 +218,7 @@ def flash_attn_kvcache_varlen(
     outputs = flash_attn_varlen_paged(
         q.transpose(1, 0, 2), updated_kv_cache, kept_cu_seqlens_q,
         total_lengths, block_table.reshape(batch, pages_per_seq), sinks,
-        max_seqlen_q=q.shape[0], max_seqlen_k=pages_per_seq * page_size,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=pages_per_seq * page_size,
         causal=causal, q_scale=q_scale, return_lse=return_lse,
         interpret=interpret, window_left=window_left, softcap=softcap,
         nheads_k=nheads_k, k_scale=k_scale, v_scale=v_scale,

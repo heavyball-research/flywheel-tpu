@@ -174,9 +174,9 @@ Return:
 ```python
 flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, *, cache_seqlens,
                         cache_batch_idx=None, block_table=None, num_active=None,
-                        cu_seqlens_q=None, softmax_scale=None, causal=False,
-                        window_size=(-1, -1), softcap=0.0, return_softmax_lse=False,
-                        interpret=False):
+                        cu_seqlens_q=None, max_seqlen_q=None, softmax_scale=None,
+                        causal=False, window_size=(-1, -1), softcap=0.0,
+                        return_softmax_lse=False, interpret=False):
 """
 If k and v are not None, they are appended to the cache after each row's cache_seqlens
 entries, and attention runs against the updated cache, all in 1 kernel. This is useful for
@@ -236,6 +236,9 @@ Arguments:
         unspecified on single-token decode.
     cu_seqlens_q [optional]: (batch_size + 1,), int. Nondecreasing query boundaries from 0 to
         at most total_q; buffer padding past cu_seqlens_q[-1] returns out = 0 and lse = -inf.
+    max_seqlen_q [optional]: int. Maximum query sequence length in the batch, required with
+        cu_seqlens_q and rejected without it. Must be static: as in flash_attn_varlen_func it
+        only caps the kernel's block sizes, so a bound off the true length is slow, not wrong.
     softmax_scale, causal, window_size, softcap: as in flash_attn_func.
     cache_seqlens, cache_batch_idx, block_table, num_active and cu_seqlens_q may be traced.
 

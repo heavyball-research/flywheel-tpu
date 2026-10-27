@@ -2153,10 +2153,10 @@ index 000000000..8b19479b3
 +                                  large_words[:num_tiles])
 diff --git a/tests/layers/common/test_flywheel_pcp_attention.py b/tests/layers/common/test_flywheel_pcp_attention.py
 new file mode 100644
-index 000000000..121037f8b
+index 000000000..234c2501c
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_pcp_attention.py
-@@ -0,0 +1,302 @@
+@@ -0,0 +1,303 @@
 +import jax
 +import jax.numpy as jnp
 +import numpy as np
@@ -2264,6 +2264,7 @@ index 000000000..121037f8b
 +        block_table=jnp.array([[0]], jnp.int32),
 +        num_active=1,
 +        cu_seqlens_q=jnp.array([0, 8], jnp.int32),
++        max_seqlen_q=8,
 +        softmax_scale=1 / np.sqrt(128),
 +        causal=False,
 +        return_softmax_lse=True,
@@ -2461,10 +2462,10 @@ index 000000000..121037f8b
 +                                  jnp.zeros_like(output[:, 1:]))
 diff --git a/tests/layers/common/test_flywheel_pcp_cache_layout.py b/tests/layers/common/test_flywheel_pcp_cache_layout.py
 new file mode 100644
-index 000000000..c1da39c51
+index 000000000..ffdd81735
 --- /dev/null
 +++ b/tests/layers/common/test_flywheel_pcp_cache_layout.py
-@@ -0,0 +1,86 @@
+@@ -0,0 +1,87 @@
 +# SPDX-License-Identifier: Apache-2.0
 +
 +from types import SimpleNamespace
@@ -2504,6 +2505,7 @@ index 000000000..c1da39c51
 +        block_table=jnp.array([[0]], jnp.int32),
 +        num_active=1,
 +        cu_seqlens_q=jnp.array([0, 8], jnp.int32),
++        max_seqlen_q=8,
 +        softmax_scale=1 / np.sqrt(head_dim),
 +        causal=False,
 +        return_softmax_lse=True,
@@ -7136,10 +7138,10 @@ index 7fdc9ed7c..cc8d3b7fd 100644
          # With nothing cached the current phase already IS the answer.
 diff --git a/tpu_inference/layers/common/flywheel_pcp_attention.py b/tpu_inference/layers/common/flywheel_pcp_attention.py
 new file mode 100644
-index 000000000..c41c23333
+index 000000000..2c282ec1f
 --- /dev/null
 +++ b/tpu_inference/layers/common/flywheel_pcp_attention.py
-@@ -0,0 +1,331 @@
+@@ -0,0 +1,332 @@
 +# Copyright 2025 Google LLC
 +#
 +# Licensed under the Apache License, Version 2.0 (the "License");
@@ -7347,6 +7349,7 @@ index 000000000..c41c23333
 +            block_table=jnp.reshape(block_table, (1, -1)),
 +            num_active=1,
 +            cu_seqlens_q=jnp.array([0, q.shape[0]], dtype=jnp.int32),
++            max_seqlen_q=q.shape[0],
 +            softmax_scale=sm_scale,
 +            causal=False,
 +            return_softmax_lse=True)

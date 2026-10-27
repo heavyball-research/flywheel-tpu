@@ -32,11 +32,17 @@ from .copy_utils import kv_word_rows, resolve_merged_kv_heads
 from .flash_fwd import MIN_Q_TILES_PER_BLOCK
 from .fwd_pipeline import (
   BF16_TILE_ROWS,
+  NUM_KV_STAGES,
+  NUM_O_SLOTS,
   forward_common,
   fwd_body,
   overflow_guard_threshold,
 )
-from .loop_schedule import make_paged_fwd_schedule, per_seq_qblk_prefix
+from .loop_schedule import (
+  ScheduleTableLayout,
+  make_paged_fwd_schedule,
+  paged_schedule_table,
+)
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # kv stream descriptor-bound.
@@ -65,6 +71,17 @@ MAX_FRAGMENT_ROWS = 1024
 # 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
 # 512 x 512.
 MAX_PAGED_BLOCK_AREA = 2048 * 1024
+# Note (david): a sequence shorter than block_q still fills a whole q block,
+# and a server pads cu_seqlens_q to its request slots, so block_q cannot
+# follow the longest sequence. v6e, 32:8 d128, 16K-128K token batches:
+# 512 x 1024 beat 1024 x 512 on every batch, by 1.35-1.6x on mostly short
+# sequences (3.56 against 5.69 ms).
+PAGED_MAX_BLOCK_Q = 512
+# Note (david): where the block area caps the pair, keeping block_kv and
+# shrinking block_q won: 256 x 1024 beat 512 x 512 by up to 1.5x at 32:4, and
+# 128 x 1024 beat 256 x 512 on six of seven batches at 32:2 (v6e).
+PAGED_KV_PER_Q_BLOCK = 4
+PAGED_MAX_BLOCK_KV = 1024
 # Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
 # dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
 # by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
@@ -73,20 +90,20 @@ PAGED_WINDOW_BLOCK = 512
 
 
 def flash_fwd_varlen_paged_kernel(
-    cu_q_ref: jax.Array,
-    seqused_k_ref: jax.Array,
-    cu_qblk_ref: jax.Array,
+    table_ref: jax.Array,
     block_table_ref: jax.Array,
     kv_scales_ref: jax.Array,
     *refs: jax.Array,
     has_sinks: bool,
     paged: PagedKVInfo,
+    layout: ScheduleTableLayout,
     causal: bool,
     window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
     bq: int,
     bkv: int,
+    bkv_compute: int,
     q_scale: float,
     **body,
 ) -> None:
@@ -96,18 +113,18 @@ def flash_fwd_varlen_paged_kernel(
     sinks_ref = None
     q_hbm, kv_hbm, *refs = refs
   schedule = make_paged_fwd_schedule(
-      cu_q_ref, seqused_k_ref, cu_qblk_ref, block_table_ref,
+      table_ref, block_table_ref,
+      layout=layout,
       num_head_groups=num_head_groups,
       q_heads_per_kv_head=q_heads_per_kv_head,
-      padded_total_q=q_hbm.shape[1],
-      bq=bq, bkv=bkv,
+      bq=bq, bkv=bkv, bkv_compute=bkv_compute,
       page_size=paged.page_size, pages_per_seq=paged.pages_per_seq,
       causal=causal, left=window_left,
-      num_rows=cu_qblk_ref[cu_qblk_ref.shape[0] - 1],
   )
   # Note (david): K and V share the one merged cache operand. The K and V
   # descales arrive in SMEM, so a new descale value compiles no new kernel.
-  fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv, paged=paged,
+  fwd_body(schedule, q_hbm, kv_hbm, kv_hbm, refs, bq=bq, bkv=bkv,
+           bkv_compute=bkv_compute, paged=paged,
            q_scale=q_scale * kv_scales_ref[0], v_scale=kv_scales_ref[1],
            sinks_ref=sinks_ref, **body)
 
@@ -141,9 +158,10 @@ def paged_scratch_shapes(
 ) -> list[tuple[tuple[int, ...], jnp.dtype]]:
   """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
   one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
-  bounds rows, Q rotary coefficients, out stage, row max, row sum, f32
-  accumulator, lse."""
+  bounds rows per kv compute tile, Q rotary coefficients, out stage, row max,
+  row sum, f32 accumulator, pending probs, pending V tile, lse."""
   bq, bkv = block_sizes.block_q, block_sizes.block_kv
+  bkv_compute = block_sizes.block_kv_compute
   num_stages = block_sizes.num_stages
   bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
   if gqa_fold > 1:
@@ -164,14 +182,17 @@ def paged_scratch_shapes(
     lse_shapes = []
   return [
       (stage_shape, bf16),
-      ((num_stages, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
+      ((NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
       ((2, bkv, head_dim), bf16),
-      ((1, 2, bkv), jnp.dtype(jnp.int32)),
+      ((bkv // bkv_compute, 2, bkv_compute), jnp.dtype(jnp.int32)),
       *rotary_shapes,
       (stage_shape, bf16),
       ((group_bq, NUM_LANES), f32),
       ((2, group_bq, NUM_LANES), f32),
-      ((2, group_bq, head_dim), f32),
+      ((NUM_O_SLOTS, group_bq, head_dim), f32),
+      ((gqa_fold * block_sizes.block_q_compute, block_sizes.block_kv_compute),
+       f32),
+      ((block_sizes.block_kv_compute, head_dim), bf16),
       *lse_shapes,
   ]
 
@@ -216,12 +237,16 @@ def resolve_paged_tiles(
 
   Among the builds whose TPU staging fits vmem_limit_bytes() and whose
   (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
-  one that streams the longest sequence's kv prefix the fewest times, then the
-  smaller q block, then the larger kv block. The q compute tile keeps a
-  fragment within MAX_FRAGMENT_ROWS rows. has_window caps both blocks at
-  PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page. A pinned
-  block_sizes is only checked against the budget.
+  largest kv block at most a kv target, then the largest q block at most a q
+  target; with none at most a target, the smallest above it. The q target is
+  the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
+  PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
+  tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
+  blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
+  A pinned block_sizes is only checked against the budget.
   """
+  target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
+  target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
   if block_sizes is not None:
     candidate_blocks = [block_sizes]
   else:
@@ -278,11 +303,12 @@ def resolve_paged_tiles(
         f" bytes at {head_dim=}."
     )
 
-  def _prefix_streams(blocks):
-    return (-(-max_seqlen_q_bucket // blocks.block_q), blocks.block_q,
-            -blocks.block_kv)
+  def _nearest_below(size, target):
+    return (size <= target, size if size <= target else -size)
 
-  return min(fitting, key=_prefix_streams)
+  return max(fitting, key=lambda blocks: (
+      _nearest_below(blocks.block_kv, target_kv),
+      _nearest_below(blocks.block_q, target_q)))
 
 
 def flash_attn_varlen_paged(
@@ -318,8 +344,9 @@ def flash_attn_varlen_paged(
   count, needs it. An fp8 pool is widened to bf16 once per staged block;
   k_scale multiplies every score and v_scale the output, both scalars that
   may be traced. seqused_k is each sequence's kv length with its new tokens,
-  which the cache must already hold; block_table entries past those tokens'
-  pages are never dereferenced.
+  which the cache must already hold; a block_table entry past those tokens'
+  pages is only read through a clamp into the pool, and the rows it names are
+  discarded.
   Causal rows align to the end of their sequence's keys; window_left (None
   unbounded) also hides the keys more than window_left positions before that
   diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
@@ -417,17 +444,6 @@ def flash_attn_varlen_paged(
       kv_dtype=kv_cache.dtype,
   )
   bq = block_sizes.block_q
-  bkv = block_sizes.block_kv
-  # Note (david): fwd_body keys a staged block by (sequence, kv head, kv
-  # block, loaded 8-row tiles) in one int32.
-  num_kv_keys = (batch * num_kv_heads * -(-capacity // bkv)
-                 * (bkv // NUM_SUBLANES + 1))
-  if num_kv_keys > 2**31 - 1:
-    raise ValueError(
-        f"{batch=} sequences of {num_kv_heads} kv heads and capacity"
-        f" {capacity} tokens in {bkv}-token blocks need {num_kv_keys} staging"
-        " keys, past int32."
-    )
   paged = PagedKVInfo(
       num_kv_heads=num_kv_heads, page_size=page_size,
       pages_per_seq=pages_per_seq, is_bitcast_load=not interpret)
@@ -441,11 +457,18 @@ def flash_attn_varlen_paged(
     padded_rotary = (
         jnp.pad(rotary[0], ((0, 0), (0, num_pad_q), (0, 0))), None)
 
-  cu_q = cu_seqlens_q.astype(jnp.int32)
+  # Note (david): resolving the schedule once per call spares every q block
+  # a search of the cu_seqlens and its window arithmetic.
+  table, layout = paged_schedule_table(
+      cu_seqlens_q, seqused_k,
+      padded_total_q=padded_total_q,
+      bq=bq, bkv=block_sizes.block_kv,
+      bkv_compute=block_sizes.block_kv_compute,
+      page_size=page_size, pages_per_seq=pages_per_seq,
+      causal=causal, left=window_left,
+  )
   smem_operands = [
-      cu_q,
-      seqused_k.astype(jnp.int32),
-      per_seq_qblk_prefix(cu_q, bq),
+      table,
       block_table.astype(jnp.int32).reshape(-1),
       jnp.stack([jnp.asarray(scale, jnp.float32).reshape(())
                  for scale in (k_scale, v_scale)]),
@@ -455,6 +478,7 @@ def flash_attn_varlen_paged(
   kernel = partial(
       flash_fwd_varlen_paged_kernel,
       has_sinks=sinks is not None,
+      layout=layout,
       causal=causal,
       window_left=window_left,
       num_head_groups=num_kv_heads,

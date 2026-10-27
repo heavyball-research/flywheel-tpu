@@ -1347,7 +1347,7 @@ def flash_attn_varlen_func(
 @functools.partial(
     jax.jit,
     static_argnames=(
-        "softmax_scale", "causal", "window_size", "softcap",
+        "max_seqlen_q", "softmax_scale", "causal", "window_size", "softcap",
         "return_softmax_lse", "interpret", "nheads_k",
     ),
     donate_argnames=("k_cache", "v_cache"),
@@ -1364,6 +1364,7 @@ def flash_attn_with_kvcache(
     block_table: jax.Array | None = None,
     num_active: jax.Array | int | None = None,
     cu_seqlens_q: jax.Array | None = None,
+    max_seqlen_q: int | None = None,
     softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple[int, int] = (-1, -1),
@@ -1416,6 +1417,10 @@ def flash_attn_with_kvcache(
   q: (batch, seqlen_q, nheads, head_dim), or packed (total_q, nheads,
   head_dim) with cu_seqlens_q, (batch + 1,) nondecreasing int boundaries from
   0 to at most total_q. Packed buffer padding returns out = 0 and lse = -inf.
+  With cu_seqlens_q, max_seqlen_q (required, a static positive int) is the
+  longest request's query length; as in flash_attn_varlen_func it only picks
+  the q tile, so a bound off the true length is slow, not wrong.
+  Without cu_seqlens_q, seqlen_q is the bound and max_seqlen_q must be None.
 
   k / v: new tokens in q's token layout with nheads_k heads, appended after
   each row's cache_seqlens (a paged append writes each token's whole K/V
@@ -1458,10 +1463,23 @@ def flash_attn_with_kvcache(
       raise ValueError(
           "With cu_seqlens_q, q must be (total_q, nheads, head_dim)."
       )
+    # Note (david): max_seqlen_q picks the q tile; q.shape[0] counts every
+    # packed request, so tiles sized by it compute mostly padding.
+    if type(max_seqlen_q) is not int or max_seqlen_q <= 0:
+      raise ValueError(
+          "With cu_seqlens_q, max_seqlen_q must be a positive static python"
+          f" int, the longest request's query length; got {max_seqlen_q!r}."
+      )
     cu_seqlens_q = cu_seqlens_q.astype(jnp.int32)
     batch = cu_seqlens_q.shape[0] - 1
     nheads, head_dim = q.shape[-2:]
     seqlen_q = None
+  elif max_seqlen_q is not None:
+    raise ValueError(
+        "max_seqlen_q is only for a packed q with cu_seqlens_q; a (batch,"
+        " seqlen_q, nheads, head_dim) q takes seqlen_q from its shape; got"
+        f" {max_seqlen_q=}."
+    )
   elif q.ndim != 4:
     raise ValueError(
         f"q must be (batch, seqlen_q, nheads, head_dim); got {q.shape=}."
@@ -1602,8 +1620,10 @@ def flash_attn_with_kvcache(
   if is_varlen:
     if is_ragged:
       packed_cu_seqlens_q = cu_seqlens_q
+      packed_max_seqlen_q = max_seqlen_q
     else:
       packed_cu_seqlens_q = jnp.arange(batch + 1, dtype=jnp.int32) * seqlen_q
+      packed_max_seqlen_q = seqlen_q
     packed_q = q.reshape(-1, nheads, head_dim)
     if has_new:
       packed_k = k.reshape(-1, nheads_k, head_dim)
@@ -1613,6 +1633,7 @@ def flash_attn_with_kvcache(
     kernel_outputs = flash_attn_kvcache_varlen(
         packed_q, k_cache, packed_k, packed_v, packed_cu_seqlens_q,
         row_cache_seqlens, flat_block_table, num_active,
+        max_seqlen_q=packed_max_seqlen_q,
         q_scale=float(fused_q_scale(softmax_scale, softcap)),
         causal=is_right_bounded, window_left=window_left,
         softcap=float(softcap), return_lse=bool(return_softmax_lse),
