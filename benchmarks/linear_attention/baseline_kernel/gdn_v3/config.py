@@ -70,7 +70,9 @@ class GDNConfig:
 
     @property
     def chunk_size(self) -> int:
-        return self.tile_size if self.mode == GDNMode.PER_SEQ else self.window_size
+        return (
+            self.tile_size if self.mode == GDNMode.PER_SEQ else self.window_size
+        )
 
     @property
     def seq_tile_size(self) -> int:

@@ -37,6 +37,10 @@ heuristic. A cell already recorded as ok in --output is skipped unless --trace
 is given.
 """
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse
@@ -77,6 +81,8 @@ TRACE_CALLS = 3
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
+    """One benchmark point: an attention implementation on one prefill shape."""
+
     impl: str
     heads: int
     heads_k: int
@@ -95,8 +101,10 @@ class Cell:
 
     @property
     def key(self):
-        return (f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
-                f"-{self.mask}-b{self.batch}-s{self.seq}")
+        return (
+            f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
+            f"-{self.mask}-b{self.batch}-s{self.seq}"
+        )
 
 
 def tuned_table(impl, device_kind):
@@ -107,10 +115,12 @@ def tuned_table(impl, device_kind):
     if chip not in TABLE_TAGS:
         raise ValueError(
             f"no tuned {impl} table for {device_kind!r} ({chip}): search one "
-            f"with tune_blocks.py and add the chip to TABLE_TAGS, or name a "
-            f"table with --{impl}-table.")
+            "with tune_blocks.py and add the chip to TABLE_TAGS, or name a "
+            f"table with --{impl}-table."
+        )
     return pathlib.Path(__file__).with_name(
-        f"{impl}_tuned_{TABLE_TAGS[chip]}.json")
+        f"{impl}_tuned_{TABLE_TAGS[chip]}.json"
+    )
 
 
 def table_entry(path, cell, per_mask):
@@ -121,8 +131,7 @@ def table_entry(path, cell, per_mask):
     if not path.exists():
         return None
     table = json.loads(path.read_text())
-    head = (f"q_head-{cell.heads}_kv_head-{cell.heads_k}"
-            f"_head-{cell.head_dim}")
+    head = f"q_head-{cell.heads}_kv_head-{cell.heads_k}_head-{cell.head_dim}"
     entry = table["configs"].get(head, {})
     if per_mask:
         entry = entry.get(cell.mask, {})
@@ -144,8 +153,7 @@ def make_weights(cell):
     import ml_dtypes
 
     seed = 0
-    for part in (cell.heads, cell.heads_k, cell.head_dim, cell.batch,
-                 cell.seq):
+    for part in (cell.heads, cell.heads_k, cell.head_dim, cell.batch, cell.seq):
         seed = (seed * 1000003 + part) % (2**31)
     generator = np.random.default_rng(seed)
 
@@ -165,6 +173,7 @@ def make_weights(cell):
 
 def build_flywheel(cell, w, args):
     """(step, fresh_state, info) for flash_attn_func on head-major q, k, v."""
+    del args  # Unused.
     import jax
     import jax.numpy as jnp
 
@@ -186,7 +195,8 @@ def build_flywheel(cell, w, args):
 
 
 def build_splash(cell, w, args):
-    """(step, fresh_state, info) for splash attention on (batch * heads, ...)."""
+    """(step, fresh_state, info) for splash attention on (batch * heads,
+    ...)."""
     import jax
     import jax.numpy as jnp
 
@@ -196,8 +206,10 @@ def build_splash(cell, w, args):
     if config is None:
         config, source = dict(HEURISTIC), "heuristic"
 
-    layouts = {"h": kernel.QKVLayout.HEAD_DIM_MINOR,
-               "s": kernel.QKVLayout.SEQ_MINOR}
+    layouts = {
+        "h": kernel.QKVLayout.HEAD_DIM_MINOR,
+        "s": kernel.QKVLayout.SEQ_MINOR,
+    }
     diag_grid = int(config["diag_grid"])
     splash_config = kernel.SplashConfig(
         block_q=int(config["block_q"]),
@@ -210,15 +222,18 @@ def build_splash(cell, w, args):
         use_experimental_scheduler=bool(config["scheduler"]),
         qk_diag_skip=diag_grid > 0,
         sv_diag_skip=diag_grid > 0,
-        qk_diag_grid=diag_grid or 2)
+        qk_diag_grid=diag_grid or 2,
+    )
     shape = (cell.seq, cell.seq)
-    mask = (mask_lib.CausalMask(shape) if cell.causal
-            else mask_lib.FullMask(shape))
+    mask = (
+        mask_lib.CausalMask(shape) if cell.causal else mask_lib.FullMask(shape)
+    )
     attention = kernel.make_splash_mha_single_device(mask, config=splash_config)
 
     # Splash takes no softmax scale, so it goes into wq, outside the clock.
-    wq = (w["wq"].astype(jnp.float32)
-          / math.sqrt(cell.head_dim)).astype(jnp.bfloat16)
+    wq = (w["wq"].astype(jnp.float32) / math.sqrt(cell.head_dim)).astype(
+        jnp.bfloat16
+    )
 
     def block(x, wq, wk, wv, wo):
         with jax.named_scope("qkv_proj"):
@@ -226,15 +241,18 @@ def build_splash(cell, w, args):
             k = jnp.einsum("btd,dnh->bnth", x, wk)
             v = jnp.einsum("btd,dnh->bnth", x, wv)
         with jax.named_scope("attn"):
-            out = attention(*(operand.reshape(-1, *operand.shape[2:])
-                              for operand in (q, k, v))).reshape(q.shape)
+            out = attention(*(
+                operand.reshape(-1, *operand.shape[2:]) for operand in (q, k, v)
+            )).reshape(q.shape)
         with jax.named_scope("out_proj"):
             return jnp.einsum("bnth,nhd->btd", out, wo)
 
     call = jax.jit(block)
     operands = (w["x"], wq, w["wk"], w["wv"], w["wo"])
-    info = {"config_source": source,
-            "config": [config[name] for name in SPLASH_FIELDS]}
+    info = {
+        "config_source": source,
+        "config": [config[name] for name in SPLASH_FIELDS],
+    }
     return (lambda state: (call(*operands), state)), (lambda: None), info
 
 
@@ -248,8 +266,9 @@ def build_rpa(cell, w, args):
     page_size = vllm_page_size(cell.seq, cell.batch)
     pages_per_seq = -(-cell.seq // page_size)
     num_pages = cell.batch * pages_per_seq
-    cache_shape = rpa.get_kv_cache_shape(num_pages, page_size, cell.heads_k,
-                                         cell.head_dim, jnp.bfloat16)
+    cache_shape = rpa.get_kv_cache_shape(
+        num_pages, page_size, cell.heads_k, cell.head_dim, jnp.bfloat16
+    )
     metadata = (
         jnp.full((cell.batch,), cell.seq, jnp.int32),
         jnp.arange(num_pages, dtype=jnp.int32),
@@ -261,9 +280,17 @@ def build_rpa(cell, w, args):
     source = "table"
     if blocks is None:
         formula = rpa.get_default_block_sizes(
-            jnp.bfloat16, jnp.bfloat16, cell.heads, cell.heads_k,
-            cell.head_dim, page_size, total, cell.batch, pages_per_seq,
-            case=rpa.RpaCase.MIXED)
+            jnp.bfloat16,
+            jnp.bfloat16,
+            cell.heads,
+            cell.heads_k,
+            cell.head_dim,
+            page_size,
+            total,
+            cell.batch,
+            pages_per_seq,
+            case=rpa.RpaCase.MIXED,
+        )
         blocks = {name: int(formula[name]) for name in RPA_FIELDS}
         source = "formula"
     block_sizes = tuple(int(blocks[name]) for name in RPA_FIELDS)
@@ -274,33 +301,53 @@ def build_rpa(cell, w, args):
     def block(x, wq, wk, wv, wo, cache):
         with jax.named_scope("qkv_proj"):
             q = jnp.einsum("btd,dnh->btnh", x, wq).reshape(
-                total, cell.heads, cell.head_dim)
+                total, cell.heads, cell.head_dim
+            )
             k = jnp.einsum("btd,dnh->btnh", x, wk).reshape(
-                total, cell.heads_k, cell.head_dim)
+                total, cell.heads_k, cell.head_dim
+            )
             v = jnp.einsum("btd,dnh->btnh", x, wv).reshape(
-                total, cell.heads_k, cell.head_dim)
+                total, cell.heads_k, cell.head_dim
+            )
         with jax.named_scope("attn"):
-            out, cache = kernel(q, k, v, cache, *metadata,
-                                use_causal_mask=cell.causal, sm_scale=scale,
-                                m_block_sizes=block_sizes)
+            out, cache = kernel(
+                q,
+                k,
+                v,
+                cache,
+                *metadata,
+                use_causal_mask=cell.causal,
+                sm_scale=scale,
+                m_block_sizes=block_sizes,
+            )
         with jax.named_scope("out_proj"):
             out = jnp.einsum(
                 "btnh,nhd->btd",
                 out.reshape(cell.batch, cell.seq, cell.heads, cell.head_dim),
-                wo)
+                wo,
+            )
         return out, cache
 
     # The call donates the cache, so every timing run starts from a fresh one.
     call = jax.jit(block, donate_argnums=(5,))
     operands = (w["x"], w["wq"], w["wk"], w["wv"], w["wo"])
-    info = {"block_source": source, "blocks": list(block_sizes),
-            "page_size": page_size}
-    return ((lambda state: call(*operands, state)),
-            (lambda: jnp.zeros(cache_shape, jnp.bfloat16)), info)
+    info = {
+        "block_source": source,
+        "blocks": list(block_sizes),
+        "page_size": page_size,
+    }
+    return (
+        (lambda state: call(*operands, state)),
+        (lambda: jnp.zeros(cache_shape, jnp.bfloat16)),
+        info,
+    )
 
 
-BUILDERS = {"flywheel": build_flywheel, "splash": build_splash,
-            "rpa": build_rpa}
+BUILDERS = {
+    "flywheel": build_flywheel,
+    "splash": build_splash,
+    "rpa": build_rpa,
+}
 
 
 def trace_cell(cell, step, state, directory):
@@ -320,32 +367,43 @@ def trace_cell(cell, step, state, directory):
 
 
 def run(cell, args):
-    import jax
-
     pair_count = cell.batch * cell.seq * cell.seq
     if cell.causal:
         pair_count //= 2
     attn_flops = 4 * pair_count * cell.heads * cell.head_dim
-    proj_flops = (2 * cell.batch * cell.seq * cell.d_model
-                  * (cell.heads + 2 * cell.heads_k) * cell.head_dim
-                  + 2 * cell.batch * cell.seq * cell.heads * cell.head_dim
-                  * cell.d_model)
-    record = {"key": cell.key, "cell": dataclasses.asdict(cell),
-              "d_model": cell.d_model, "attn_flops": attn_flops,
-              "proj_flops": proj_flops}
+    proj_flops = (
+        2
+        * cell.batch
+        * cell.seq
+        * cell.d_model
+        * (cell.heads + 2 * cell.heads_k)
+        * cell.head_dim
+        + 2 * cell.batch * cell.seq * cell.heads * cell.head_dim * cell.d_model
+    )
+    record = {
+        "key": cell.key,
+        "cell": dataclasses.asdict(cell),
+        "d_model": cell.d_model,
+        "attn_flops": attn_flops,
+        "proj_flops": proj_flops,
+    }
     try:
         weights = make_weights(cell)
         step, fresh, info = BUILDERS[cell.impl](cell, weights, args)
         record.update(info)
         timing, _ = time_call(step, fresh())
-    except Exception as error:
-        record.update(status="error",
-                      error=f"{type(error).__name__}: {str(error)[:300]}")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        record.update(
+            status="error", error=f"{type(error).__name__}: {str(error)[:300]}"
+        )
         return record
 
     ms = timing["median_ms"]
-    record.update(status="ok", **timing,
-                  block_tflops=(attn_flops + proj_flops) / (ms * 1e9))
+    record.update(
+        status="ok",
+        **timing,
+        block_tflops=(attn_flops + proj_flops) / (ms * 1e9),
+    )
     if args.trace:
         split = trace_cell(cell, step, fresh(), args.trace)
         if split is None:
@@ -356,15 +414,24 @@ def run(cell, args):
                 trace_module_ms=split["module_ms"],
                 segments_ms=split["ms"],
                 kernel_ms=kernel_ms,
-                kernel_tflops=(attn_flops / (kernel_ms * 1e9)
-                               if kernel_ms else None))
+                kernel_tflops=(
+                    attn_flops / (kernel_ms * 1e9) if kernel_ms else None
+                ),
+            )
     return record
 
 
 def main(argv=None):
     args = parse_args(argv)
-    cell = Cell(args.impl, args.heads, args.heads_k, args.head_dim, args.mask,
-                args.batch, args.seq)
+    cell = Cell(
+        args.impl,
+        args.heads,
+        args.heads_k,
+        args.head_dim,
+        args.mask,
+        args.batch,
+        args.seq,
+    )
     if not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded, skipped", flush=True)
         return 0
@@ -373,23 +440,30 @@ def main(argv=None):
 
     if jax.default_backend() != "tpu":
         raise RuntimeError(f"requires TPU; got {jax.default_backend()!r}.")
-    if (cell.impl in ("rpa", "splash")
-            and getattr(args, f"{cell.impl}_table") is None):
-        setattr(args, f"{cell.impl}_table",
-                tuned_table(cell.impl, jax.devices()[0].device_kind))
+    if (
+        cell.impl in ("rpa", "splash")
+        and getattr(args, f"{cell.impl}_table") is None
+    ):
+        setattr(
+            args,
+            f"{cell.impl}_table",
+            tuned_table(cell.impl, jax.devices()[0].device_kind),
+        )
 
     record = run(cell, args)
     write_record(args.output, record)
     if record["status"] != "ok":
-        print(f"{cell.key}: {record['status']} {record.get('error')}",
-              flush=True)
+        print(
+            f"{cell.key}: {record['status']} {record.get('error')}", flush=True
+        )
         return 1
     line = f"{cell.key}: block {record['median_ms']:.3f} ms"
     if "segments_ms" in record:
-        parts = "  ".join(f"{name} {value:.3f}"
-                          for name, value in record["segments_ms"].items())
-        line += (f" | {parts} | kernel {record['kernel_tflops']:.1f}"
-                 " TFLOP/s")
+        parts = "  ".join(
+            f"{name} {value:.3f}"
+            for name, value in record["segments_ms"].items()
+        )
+        line += f" | {parts} | kernel {record['kernel_tflops']:.1f} TFLOP/s"
     print(line, flush=True)
     return 0
 
@@ -397,7 +471,8 @@ def main(argv=None):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--impl", choices=IMPLS, required=True)
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--heads-k", type=int, default=32)
@@ -406,19 +481,33 @@ def parse_args(argv=None):
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq", type=int, default=16384)
     parser.add_argument("--output", type=pathlib.Path)
-    parser.add_argument("--trace", type=pathlib.Path,
-                        help="directory for the profiler traces, one "
-                             "subdirectory per cell")
-    parser.add_argument("--rpa-table", type=pathlib.Path,
-                        help="default: rpa_tuned_<chip>.json next to this "
-                             "file, for the chip the cell runs on")
-    parser.add_argument("--splash-table", type=pathlib.Path,
-                        help="default: splash_tuned_<chip>.json next to this "
-                             "file, for the chip the cell runs on")
-    parser.add_argument("--rpa-source", type=pathlib.Path,
-                        default=DEFAULT_RPA_SOURCE)
-    parser.add_argument("--splash-source", type=pathlib.Path,
-                        default=DEFAULT_SPLASH_SOURCE)
+    parser.add_argument(
+        "--trace",
+        type=pathlib.Path,
+        help="directory for the profiler traces, one subdirectory per cell",
+    )
+    parser.add_argument(
+        "--rpa-table",
+        type=pathlib.Path,
+        help=(
+            "default: rpa_tuned_<chip>.json next to this "
+            "file, for the chip the cell runs on"
+        ),
+    )
+    parser.add_argument(
+        "--splash-table",
+        type=pathlib.Path,
+        help=(
+            "default: splash_tuned_<chip>.json next to this "
+            "file, for the chip the cell runs on"
+        ),
+    )
+    parser.add_argument(
+        "--rpa-source", type=pathlib.Path, default=DEFAULT_RPA_SOURCE
+    )
+    parser.add_argument(
+        "--splash-source", type=pathlib.Path, default=DEFAULT_SPLASH_SOURCE
+    )
     return parser.parse_args(argv)
 
 

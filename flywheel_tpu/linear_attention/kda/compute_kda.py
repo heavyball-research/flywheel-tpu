@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""In-kernel KDA math: chunked, recurrent and ReplaySSM paths."""
 
 import contextlib
 import functools
@@ -49,7 +50,8 @@ def l2_norm(vectors: jax.Array) -> jax.Array:
     # the lane-padded [heads, chunk, 1] norms every EUP push costs a whole vreg.
     return vectors * jax.lax.rsqrt(
         jnp.sum(vectors * vectors, axis=-1, keepdims=True, dtype=vectors.dtype)
-        + L2_NORM_EPS)
+        + L2_NORM_EPS
+    )
 
 
 def log_decay(
@@ -106,15 +108,16 @@ def pack_width(chunk: int, num_v_heads: int) -> int:
 
 def pack_lanes(per_head: jax.Array) -> jax.Array:
     """[groups, pack, rows, cols] -> [groups, rows, pack * cols]."""
-    return jnp.concatenate([per_head[:, i] for i in range(per_head.shape[1])],
-                           axis=-1)
+    return jnp.concatenate(
+        [per_head[:, i] for i in range(per_head.shape[1])], axis=-1
+    )
 
 
 def unpack_lanes(packed: jax.Array, pack: int) -> jax.Array:
     """[groups, rows, pack * cols] -> [groups * pack, rows, cols]."""
     groups, rows, width = packed.shape
     cols = width // pack
-    per_head = [packed[..., i * cols:(i + 1) * cols] for i in range(pack)]
+    per_head = [packed[..., i * cols : (i + 1) * cols] for i in range(pack)]
     return jnp.stack(per_head, axis=1).reshape(groups * pack, rows, cols)
 
 
@@ -130,9 +133,13 @@ def block_diag(packed: jax.Array, block: int) -> jax.Array:
     else:
         lane = jax.lax.broadcasted_iota(jnp.int32, (groups, rows, cols), 2)
         lane_block = lane >> (block.bit_length() - 1)
-        return jnp.concatenate([
-            jnp.where(lane_block == i, packed, 0) for i in range(cols // block)
-        ], axis=1)
+        return jnp.concatenate(
+            [
+                jnp.where(lane_block == i, packed, 0)
+                for i in range(cols // block)
+            ],
+            axis=1,
+        )
 
 
 def batched_matmul(
@@ -144,7 +151,7 @@ def batched_matmul(
     return jax.lax.dot(
         lhs,
         rhs,
-        dimension_numbers=(((2, ), (1, )), ((0, ), (0, ))),
+        dimension_numbers=(((2,), (1,)), ((0,), (0,))),
         precision=precision,
         preferred_element_type=jnp.float32,
     )
@@ -162,8 +169,9 @@ def stacked_dots(
     if all(part.shape[1] % BF16_SUBLANE_ROWS == 0 for part in lhs_parts):
         part_rows = [part.shape[1] for part in lhs_parts]
         stacked = dot(jnp.concatenate(lhs_parts, axis=1), rhs)
-        return jnp.split(stacked, list(itertools.accumulate(part_rows))[:-1],
-                         axis=1)
+        return jnp.split(
+            stacked, list(itertools.accumulate(part_rows))[:-1], axis=1
+        )
     else:
         return [dot(part, rhs) for part in lhs_parts]
 
@@ -184,21 +192,26 @@ def dot_per_block(lhs: jax.Array, rhs: jax.Array, block: int) -> jax.Array:
     # (i + 1) * block), at pack - 1 extra weight pushes per head.
     per_head_outs = [batched_matmul(lhs[:, :, :block], rhs_per_head[:, 0])]
     for i in range(1, pack):
-        leading_zeros = jnp.zeros((groups, i * block, out_cols),
-                                  rhs_per_head.dtype)
+        leading_zeros = jnp.zeros(
+            (groups, i * block, out_cols), rhs_per_head.dtype
+        )
         if i + 1 < pack:
             padded_rhs_parts = [
                 leading_zeros,
                 rhs_per_head[:, i],
-                jnp.zeros((groups, (pack - 1 - i) * block, out_cols),
-                          rhs_per_head.dtype),
+                jnp.zeros(
+                    (groups, (pack - 1 - i) * block, out_cols),
+                    rhs_per_head.dtype,
+                ),
             ]
         else:
             padded_rhs_parts = [leading_zeros, rhs_per_head[:, i]]
         per_head_outs.append(
-            batched_matmul(lhs, jnp.concatenate(padded_rhs_parts, axis=1)))
-    return jnp.stack(per_head_outs, axis=1).reshape(groups * pack, rows,
-                                                    out_cols)
+            batched_matmul(lhs, jnp.concatenate(padded_rhs_parts, axis=1))
+        )
+    return jnp.stack(per_head_outs, axis=1).reshape(
+        groups * pack, rows, out_cols
+    )
 
 
 def invert_triangular_matrix(
@@ -246,7 +259,8 @@ def invert_triangular_matrix(
     levels = _chain_levels(level_sizes[0])
     num_slots = (levels + 1 if levels else 0) + sum(
         _chain_levels(hi // lo) + 2
-        for lo, hi in itertools.pairwise(level_sizes))
+        for lo, hi in itertools.pairwise(level_sizes)
+    )
     slot_counter = itertools.count()
 
     def _emit() -> None:
@@ -254,23 +268,26 @@ def invert_triangular_matrix(
             fill(next(slot_counter), num_slots)
 
     def _dot(lhs: jax.Array, rhs: jax.Array) -> jax.Array:
-        return batched_matmul(lhs.astype(operand_dtype),
-                              rhs.astype(operand_dtype),
-                              precision).astype(dtype)
+        return batched_matmul(
+            lhs.astype(operand_dtype), rhs.astype(operand_dtype), precision
+        ).astype(dtype)
 
-    def _product_chain(product: jax.Array, power: jax.Array, num_levels: int,
-                       block: int) -> jax.Array:
+    def _product_chain(
+        product: jax.Array, power: jax.Array, num_levels: int, block: int
+    ) -> jax.Array:
         # Note (david): the squaring for the next level shares the product's
         # weight, so both ride one stacked dot.
         for level in range(num_levels):
             power = power.astype(operand_dtype)
             power_diag = block_diag(power, block)
             if level + 1 < num_levels:
-                product_times_power, power = stacked_dots([product, power],
-                                                          power_diag, _dot)
+                product_times_power, power = stacked_dots(
+                    [product, power], power_diag, _dot
+                )
             else:
-                (product_times_power, ) = stacked_dots([product], power_diag,
-                                                       _dot)
+                (product_times_power,) = stacked_dots(
+                    [product], power_diag, _dot
+                )
             _emit()
             product = product + product_times_power
         return product
@@ -289,9 +306,11 @@ def invert_triangular_matrix(
             lane_block = _lane_iota(size) >> (size.bit_length() - 1)
             blocks = unit_lower[:, :size]
             for i in range(1, chunk // size):
-                blocks = jnp.where(lane_block == i,
-                                   unit_lower[:, i * size:(i + 1) * size],
-                                   blocks)
+                blocks = jnp.where(
+                    lane_block == i,
+                    unit_lower[:, i * size : (i + 1) * size],
+                    blocks,
+                )
             return blocks
 
     def _sub_block_index(rows: int, block: int, enclosing: int) -> jax.Array:
@@ -310,14 +329,16 @@ def invert_triangular_matrix(
     slab_lower = _diagonal_blocks(slab_rows) - identity
     if block_size < slab_rows:
         shift = block_size.bit_length() - 1
-        strictly_lower = jnp.where(row >> shift == lane_in_slab >> shift,
-                                   slab_lower, 0)
+        strictly_lower = jnp.where(
+            row >> shift == lane_in_slab >> shift, slab_lower, 0
+        )
     else:
         strictly_lower = slab_lower
     base_inverse = identity - strictly_lower
     if levels:
-        strictly_lower_diag = block_diag(strictly_lower.astype(operand_dtype),
-                                         slab_rows)
+        strictly_lower_diag = block_diag(
+            strictly_lower.astype(operand_dtype), slab_rows
+        )
         power = _dot(strictly_lower, strictly_lower_diag)
         _emit()
         inverse = _product_chain(base_inverse, power, levels, slab_rows)
@@ -332,32 +353,40 @@ def invert_triangular_matrix(
         if inverse.shape[1] == next_size:
             d_inv = inverse
         else:
-            inverse_lane_block = _sub_block_index(block_size, block_size,
-                                                  next_size)
-            d_inv = jnp.concatenate([
-                jnp.where(inverse_lane_block == i, inverse, 0)
-                for i in range(num_blocks)
-            ], axis=1)
-        strict_block_lower = jnp.where(row_block > lane_block,
-                                       _diagonal_blocks(next_size), 0)
+            inverse_lane_block = _sub_block_index(
+                block_size, block_size, next_size
+            )
+            d_inv = jnp.concatenate(
+                [
+                    jnp.where(inverse_lane_block == i, inverse, 0)
+                    for i in range(num_blocks)
+                ],
+                axis=1,
+            )
+        strict_block_lower = jnp.where(
+            row_block > lane_block, _diagonal_blocks(next_size), 0
+        )
         d_inv_operand = d_inv.astype(operand_dtype)
-        nilpotent = _dot(strict_block_lower,
-                         block_diag(d_inv_operand,
-                                    next_size)).astype(operand_dtype)
+        nilpotent = _dot(
+            strict_block_lower, block_diag(d_inv_operand, next_size)
+        ).astype(operand_dtype)
         _emit()
         nilpotent_diag = block_diag(nilpotent, next_size)
         block_levels = _chain_levels(num_blocks)
         # Note (david): D^-1 (I - N) and the N^2 the chain needs next share N's
         # weight, so they run as one stacked dot.
         if block_levels:
-            d_inv_nilpotent, power = stacked_dots([d_inv_operand, nilpotent],
-                                                  nilpotent_diag, _dot)
+            d_inv_nilpotent, power = stacked_dots(
+                [d_inv_operand, nilpotent], nilpotent_diag, _dot
+            )
             _emit()
-            inverse = _product_chain(d_inv - d_inv_nilpotent, power,
-                                     block_levels, next_size)
+            inverse = _product_chain(
+                d_inv - d_inv_nilpotent, power, block_levels, next_size
+            )
         else:
-            (d_inv_nilpotent, ) = stacked_dots([d_inv_operand], nilpotent_diag,
-                                               _dot)
+            (d_inv_nilpotent,) = stacked_dots(
+                [d_inv_operand], nilpotent_diag, _dot
+            )
             _emit()
             inverse = d_inv - d_inv_nilpotent
         block_size = next_size
@@ -378,13 +407,15 @@ def cumsum_rows(increments: jax.Array) -> jax.Array:
     shift = 1
     while shift < chunk:
         prefix_sums = prefix_sums + jnp.where(
-            row >= shift, pltpu.roll(prefix_sums, shift, 1), 0)
+            row >= shift, pltpu.roll(prefix_sums, shift, 1), 0
+        )
         shift *= 2
     return prefix_sums.astype(dtype)
 
 
-def fused_transpose_broadcast(values: jax.Array, src_dim: int,
-                              dst_dim: int) -> jax.Array:
+def fused_transpose_broadcast(
+    values: jax.Array, src_dim: int, dst_dim: int
+) -> jax.Array:
     """Moves axis src_dim of values into its size-1 axis dst_dim.
 
     Axis src_dim of the result has size 1; the masked reduction stays in the
@@ -398,9 +429,9 @@ def fused_transpose_broadcast(values: jax.Array, src_dim: int,
     src_iota = jax.lax.broadcasted_iota(mask_dtype, mask_shape, src_dim)
     dst_iota = jax.lax.broadcasted_iota(mask_dtype, mask_shape, dst_dim)
     is_same_index = src_iota == dst_iota
-    return jnp.where(is_same_index, values, 0).sum(axis=src_dim,
-                                                   keepdims=True,
-                                                   dtype=dtype)
+    return jnp.where(is_same_index, values, 0).sum(
+        axis=src_dim, keepdims=True, dtype=dtype
+    )
 
 
 def prepare_chunk(
@@ -430,10 +461,12 @@ def prepare_chunk(
 
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     token_iota = jax.lax.broadcasted_iota(
-        mask_dtype, (cfg.seq_tile_size, 1, cfg.compute_chunk_size, 1), 2)
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.compute_chunk_size, 1), 2
+    )
     is_real_token = jnp.logical_and(
         token_iota >= row_lo.reshape(-1, 1, 1, 1).astype(mask_dtype),
-        token_iota < row_hi.reshape(-1, 1, 1, 1).astype(mask_dtype))
+        token_iota < row_hi.reshape(-1, 1, 1, 1).astype(mask_dtype),
+    )
 
     with profile_scope("kda_mask"):
         q = jnp.where(is_real_token, q_chunked.astype(cfg.dtypes.compute), 0)
@@ -521,9 +554,11 @@ class ChunkKDA:
             # Note (david): the state decays per key row, so the chunk decay
             # exp(G_last) moves to [num_v_heads, kq_head_dim, 1].
             self.decay_chunk = fused_transpose_broadcast(
-                jnp.exp(g_last), src_dim=2, dst_dim=1)
-            beta_col = fused_transpose_broadcast(
-                beta, src_dim=2, dst_dim=0)[:cfg.num_v_heads]
+                jnp.exp(g_last), src_dim=2, dst_dim=1
+            )
+            beta_col = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)[
+                : cfg.num_v_heads
+            ]
 
         # Note (david): pair matrices are packed as [groups, chunk, pack *
         # chunk], entry [group, i, p * chunk + j] being head group * pack + p at
@@ -552,8 +587,9 @@ class ChunkKDA:
             self.k_t_weight = block_diag(self.k_t.astype(bf16), chunk)
             # Note (david): a per-channel gate cannot be folded in after the
             # transpose, so k is scaled by exp(G_last - G_j) before its own.
-            self.k_decayed_t = self.transposed(
-                k_repeat * decay_to_end).astype(bf16)
+            self.k_decayed_t = self.transposed(k_repeat * decay_to_end).astype(
+                bf16
+            )
 
         with profile_scope("l2norm_q"):
             q_normed = l2_norm(q_chunked) * cfg.kq_head_dim**-0.5
@@ -565,17 +601,19 @@ class ChunkKDA:
         # concat / split is free when v_head_dim is a multiple of the lane
         # count.
         self.uw_rhs = jnp.concatenate(
-            [v_chunked * beta_col, k_beta * self.decay_from_start],
-            axis=-1).astype(bf16)
+            [v_chunked * beta_col, k_beta * self.decay_from_start], axis=-1
+        ).astype(bf16)
         with profile_scope("qk_kk_operands"):
             self.qk_kk_operands = self.prepare_qk_kk_operands(
-                self.q_repeat, k_beta, k_repeat, g_cumsum)
+                self.q_repeat, k_beta, k_repeat, g_cumsum
+            )
         self.akk_parts: list[jax.Array] = []
         self.aqk_parts: list[jax.Array] = []
         self.num_kkt_groups_done = 0
         self.uw_parts: dict[tuple[int, int], list[jax.Array]] = {}
-        self.state_read_parts: dict[tuple[int, int],
-                                    tuple[jax.Array, jax.Array]] = {}
+        self.state_read_parts: dict[
+            tuple[int, int], tuple[jax.Array, jax.Array]
+        ] = {}
         self.out_parts: dict[tuple[int, int], tuple[jax.Array, jax.Array]] = {}
 
     def transposed(self, per_head: jax.Array) -> jax.Array:
@@ -585,7 +623,11 @@ class ChunkKDA:
         """
         return jnp.swapaxes(
             per_head.reshape(self.groups, self.pack, self.chunk, -1).reshape(
-                self.groups, self.pack * self.chunk, -1), 1, 2)
+                self.groups, self.pack * self.chunk, -1
+            ),
+            1,
+            2,
+        )
 
     def prepare_qk_kk_operands(
         self,
@@ -631,8 +673,9 @@ class ChunkKDA:
 
         def _g_reference(block: int, offset: int) -> jax.Array:
             ref_rows = [
-                jnp.broadcast_to(g_cumsum[:, ref_row:ref_row + 1],
-                                 (heads, block, key_dim))
+                jnp.broadcast_to(
+                    g_cumsum[:, ref_row : ref_row + 1], (heads, block, key_dim)
+                )
                 for ref_row in range(offset, chunk, block)
             ]
             if len(ref_rows) == 1:
@@ -652,45 +695,63 @@ class ChunkKDA:
                 k_decayed_t = self.k_t_weight
             else:
                 k_decayed = k * jnp.exp(
-                    _g_reference(sub_chunk_size, sub_chunk_size - 1) - g_cumsum)
+                    _g_reference(sub_chunk_size, sub_chunk_size - 1) - g_cumsum
+                )
                 k_decayed_t = block_diag(
-                    self.transposed(k_decayed).astype(bf16), chunk)
-            query_sub_chunk_rows = _block_index(query_rows & (block_size - 1),
-                                                sub_chunk_size)
-            query_sub_chunk = _block_index(row & (block_size - 1),
-                                           sub_chunk_size)
+                    self.transposed(k_decayed).astype(bf16), chunk
+                )
+            query_sub_chunk_rows = _block_index(
+                query_rows & (block_size - 1), sub_chunk_size
+            )
+            query_sub_chunk = _block_index(
+                row & (block_size - 1), sub_chunk_size
+            )
             key_sub_chunk = _block_index(col & (block_size - 1), sub_chunk_size)
-            is_same_enclosing_block = (_block_index(row, block_size)
-                                       == _block_index(col, block_size))
+            is_same_enclosing_block = _block_index(
+                row, block_size
+            ) == _block_index(col, block_size)
             num_sub_chunks = block_size // sub_chunk_size
             # Note (david): higher levels cover only pairs across sub-chunks,
             # so their last key sub-chunk has no later query sub-chunk; the
             # bottom level also covers i == j, so every causal pair appears
             # once.
-            num_key_sub_chunks = (num_sub_chunks
-                                  if is_bottom_level else num_sub_chunks - 1)
+            num_key_sub_chunks = (
+                num_sub_chunks if is_bottom_level else num_sub_chunks - 1
+            )
             for key_sub_chunk_idx in range(num_key_sub_chunks):
                 is_valid_query_row = (
                     query_sub_chunk_rows >= key_sub_chunk_idx
-                    if is_bottom_level else
-                    query_sub_chunk_rows > key_sub_chunk_idx)
+                    if is_bottom_level
+                    else query_sub_chunk_rows > key_sub_chunk_idx
+                )
                 is_pair_in_dot = (
                     is_same_enclosing_block
                     & (key_sub_chunk == key_sub_chunk_idx)
-                    & (query_sub_chunk >= key_sub_chunk_idx
-                       if is_bottom_level else
-                       query_sub_chunk > key_sub_chunk_idx))
+                    & (
+                        query_sub_chunk >= key_sub_chunk_idx
+                        if is_bottom_level
+                        else query_sub_chunk > key_sub_chunk_idx
+                    )
+                )
                 g_ref = _g_reference(
-                    block_size, sub_chunk_size * (key_sub_chunk_idx + 1) - 1)
+                    block_size, sub_chunk_size * (key_sub_chunk_idx + 1) - 1
+                )
                 decay = jnp.exp(
-                    jnp.where(is_valid_query_row, g_cumsum - g_ref, 0))
-                q_decayed = pack_lanes((q * decay).astype(bf16).reshape(
-                    self.groups, pack, chunk, -1))
+                    jnp.where(is_valid_query_row, g_cumsum - g_ref, 0)
+                )
+                q_decayed = pack_lanes(
+                    (q * decay)
+                    .astype(bf16)
+                    .reshape(self.groups, pack, chunk, -1)
+                )
                 k_beta_decayed = pack_lanes(
-                    (k_beta * decay).astype(bf16).reshape(
-                        self.groups, pack, chunk, -1))
+                    (k_beta * decay)
+                    .astype(bf16)
+                    .reshape(self.groups, pack, chunk, -1)
+                )
                 operands.append(
-                    (q_decayed, k_beta_decayed, k_decayed_t, is_pair_in_dot))
+                    (q_decayed, k_beta_decayed, k_decayed_t, is_pair_in_dot)
+                )
         return operands
 
     def kkt_qk(self, hi: int | None = None) -> None:
@@ -700,12 +761,16 @@ class ChunkKDA:
         if hi <= lo:
             return
         with profile_scope("kkt_qk"):
-            for operand_idx, (q_decayed, k_beta_decayed, k_decayed_t,
-                              is_pair_in_dot) in enumerate(
-                                  self.qk_kk_operands):
+            for operand_idx, (
+                q_decayed,
+                k_beta_decayed,
+                k_decayed_t,
+                is_pair_in_dot,
+            ) in enumerate(self.qk_kk_operands):
                 akk_part, aqk_part = stacked_dots(
                     [k_beta_decayed[lo:hi], q_decayed[lo:hi]],
-                    k_decayed_t[lo:hi])
+                    k_decayed_t[lo:hi],
+                )
                 akk_part = jnp.where(is_pair_in_dot, akk_part, 0)
                 aqk_part = jnp.where(is_pair_in_dot, aqk_part, 0)
                 if operand_idx == 0:
@@ -725,16 +790,18 @@ class ChunkKDA:
         with profile_scope("kkt_gate"):
             # Note (david): Akk and Aqk arrive gated and lower triangular, so
             # only Akk's k_i . k_i diagonal gives way to T's unit diagonal.
-            akk = jnp.concatenate(self.akk_parts,
-                                  axis=0).astype(self.compute_dtype)
+            akk = jnp.concatenate(self.akk_parts, axis=0).astype(
+                self.compute_dtype
+            )
             t_matrix = jnp.where(self.is_diagonal, 1, akk)
 
         with profile_scope("tinv"):
             self.t_inv = invert_triangular_matrix(t_matrix, self.pack, fill)
 
         with profile_scope("qk_gate"):
-            self.aqk = jnp.concatenate(self.aqk_parts,
-                                       axis=0).astype(self.compute_dtype)
+            self.aqk = jnp.concatenate(self.aqk_parts, axis=0).astype(
+                self.compute_dtype
+            )
 
     def value_head_slice(self, lo: int, hi: int) -> slice:
         """Value heads of head groups [lo, hi)."""
@@ -746,10 +813,11 @@ class ChunkKDA:
             uw_concat = dot_per_block(
                 self.t_inv[lo:hi].astype(jnp.bfloat16),
                 self.uw_rhs[self.value_head_slice(lo, hi)],
-                self.chunk).astype(self.compute_dtype)
-            self.uw_parts[(lo, hi)] = jnp.split(uw_concat,
-                                                [self.cfg.v_head_dim],
-                                                axis=-1)
+                self.chunk,
+            ).astype(self.compute_dtype)
+            self.uw_parts[(lo, hi)] = jnp.split(
+                uw_concat, [self.cfg.v_head_dim], axis=-1
+            )
 
     def state(self, state_prev: jax.Array, lo: int, hi: int) -> None:
         """Reads the incoming state S for groups [lo, hi), after their uw.
@@ -761,13 +829,15 @@ class ChunkKDA:
         self.state_prev = state_prev
         with profile_scope("state"):
             u, w = self.uw_parts[(lo, hi)]
-            q_decayed = (self.q_repeat[head_slice]
-                         * self.decay_from_start[head_slice])
+            q_decayed = (
+                self.q_repeat[head_slice] * self.decay_from_start[head_slice]
+            )
             # Note (david): only the MXU copy of S is bf16; state_out decays the
             # original S.
             state_reads = batched_matmul(
                 jnp.concatenate([w, q_decayed], axis=1).astype(bf16),
-                state_prev[head_slice].astype(bf16))
+                state_prev[head_slice].astype(bf16),
+            )
             w_state, out_inter = jnp.split(state_reads, 2, axis=1)
             # Note (david): the residual is formed in the compute dtype before
             # it is rounded to bf16.
@@ -794,15 +864,24 @@ class ChunkKDA:
             # (vreg naming) rather than block_diag's selects.
             v_new_per_head = v_new.reshape(hi - lo, self.pack, self.chunk, -1)
             zeros = jnp.zeros_like(v_new_per_head[:, 0])
-            v_new_block_diag = jnp.concatenate([
-                jnp.concatenate([zeros] * i + [v_new_per_head[:, i]]
-                                + [zeros] * (self.pack - 1 - i),
-                                axis=-1) for i in range(self.pack)
-            ], axis=1)
-            state_update, out_intra = stacked_dots([k_decayed_t, aqk_operand],
-                                                   v_new_block_diag)
-            state = (self.state_prev[head_slice] * self.decay_chunk[head_slice]
-                     + unpack_lanes(state_update, self.pack))
+            v_new_block_diag = jnp.concatenate(
+                [
+                    jnp.concatenate(
+                        [zeros] * i
+                        + [v_new_per_head[:, i]]
+                        + [zeros] * (self.pack - 1 - i),
+                        axis=-1,
+                    )
+                    for i in range(self.pack)
+                ],
+                axis=1,
+            )
+            state_update, out_intra = stacked_dots(
+                [k_decayed_t, aqk_operand], v_new_block_diag
+            )
+            state = self.state_prev[head_slice] * self.decay_chunk[
+                head_slice
+            ] + unpack_lanes(state_update, self.pack)
             out = out_inter + unpack_lanes(out_intra, self.pack)
             self.out_parts[(lo, hi)] = (out, state)
 
@@ -826,8 +905,9 @@ def run_pipelined(
     chunk_outputs: list[jax.Array] = []
     state_carry = state_prev
 
-    def _build_state_steps(chunk: ChunkKDA,
-                           num_slots: int) -> list[Callable[[], None]]:
+    def _build_state_steps(
+        chunk: ChunkKDA, num_slots: int
+    ) -> list[Callable[[], None]]:
         num_pieces = max(1, num_slots // NUM_STATE_PHASES)
         group_bounds = sorted({
             piece * chunk.groups // num_pieces
@@ -851,29 +931,41 @@ def run_pipelined(
         def _finish_chunk() -> None:
             nonlocal state_carry
             done_ranges = sorted(chunk.out_parts)
-            assert sum(hi - lo for lo, hi in done_ranges) == chunk.groups, (
-                done_ranges)
+            assert (
+                sum(hi - lo for lo, hi in done_ranges) == chunk.groups
+            ), done_ranges
             chunk_outputs.append(
                 jnp.concatenate(
-                    [chunk.out_parts[group_range][0]
-                     for group_range in done_ranges], axis=0))
+                    [
+                        chunk.out_parts[group_range][0]
+                        for group_range in done_ranges
+                    ],
+                    axis=0,
+                )
+            )
             state_carry = jnp.concatenate(
-                [chunk.out_parts[group_range][1]
-                 for group_range in done_ranges], axis=0)
+                [
+                    chunk.out_parts[group_range][1]
+                    for group_range in done_ranges
+                ],
+                axis=0,
+            )
 
         return state_steps + [_finish_chunk]
 
     chunks[0].kkt_qk()
     for chunk_idx, chunk in enumerate(chunks):
         previous_chunk = chunks[chunk_idx - 1] if chunk_idx > 0 else None
-        next_chunk = (chunks[chunk_idx + 1]
-                      if chunk_idx + 1 < len(chunks) else None)
+        next_chunk = (
+            chunks[chunk_idx + 1] if chunk_idx + 1 < len(chunks) else None
+        )
         pending_state_steps: list[Callable[[], None]] | None = None
         pending_kkt_groups: list[int] = []
 
         # Note (david): tinv calls _fill synchronously within this iteration,
         # so closing over this iteration's chunks is safe.
         def _fill(slot: int, num_slots: int) -> None:
+            # pylint: disable=cell-var-from-loop
             nonlocal pending_state_steps, pending_kkt_groups
             # Note (david): the chain reports its gap count only at slot 0, so
             # both queues are sized, and the incoming state bound, there.
@@ -882,7 +974,8 @@ def run_pipelined(
                     pending_state_steps = []
                 else:
                     pending_state_steps = _build_state_steps(
-                        previous_chunk, num_slots)
+                        previous_chunk, num_slots
+                    )
                 if next_chunk is not None and num_slots > 1:
                     pending_kkt_groups = sorted({
                         piece * next_chunk.groups // (num_slots - 1)
@@ -901,8 +994,9 @@ def run_pipelined(
         if pending_state_steps is not None:
             remaining_state_steps = pending_state_steps
         elif previous_chunk is not None:
-            remaining_state_steps = _build_state_steps(previous_chunk,
-                                                       NUM_STATE_PHASES)
+            remaining_state_steps = _build_state_steps(
+                previous_chunk, NUM_STATE_PHASES
+            )
         else:
             remaining_state_steps = []
         for step in remaining_state_steps:
@@ -934,21 +1028,38 @@ def chunked_kda(
     recurrent checkpoint. Only the final state is produced, so this path is
     never taken when a sequence needs more than one checkpoint.
     """
-    q, k, v, g, beta = prepare_chunk(row_lo, row_hi, q_chunked, k_chunked,
-                                     v_chunked, b_chunked, g_chunked, a_log,
-                                     dt_bias, cfg)
+    q, k, v, g, beta = prepare_chunk(
+        row_lo,
+        row_hi,
+        q_chunked,
+        k_chunked,
+        v_chunked,
+        b_chunked,
+        g_chunked,
+        a_log,
+        dt_bias,
+        cfg,
+    )
 
     seq_outs = []
     seq_states = []
     for seq_idx in range(cfg.seq_tile_size):
         with profile_scope("kda"):
-            chunk = ChunkKDA(q[seq_idx], k[seq_idx], v[seq_idx], g[seq_idx],
-                             beta[seq_idx], cfg)
+            chunk = ChunkKDA(
+                q[seq_idx],
+                k[seq_idx],
+                v[seq_idx],
+                g[seq_idx],
+                beta[seq_idx],
+                cfg,
+            )
             chunk_outputs, state = run_pipelined([chunk], state_prev[seq_idx])
         seq_outs.append(pack_out(chunk_outputs[0], cfg))
         seq_states.append(state)
-    return (jnp.stack(seq_outs, axis=0),
-            jnp.stack(seq_states, axis=0)[:, jnp.newaxis])
+    return (
+        jnp.stack(seq_outs, axis=0),
+        jnp.stack(seq_states, axis=0)[:, jnp.newaxis],
+    )
 
 
 def recurrent_kda_per_seq(
@@ -979,14 +1090,16 @@ def recurrent_kda_per_seq(
         q_curr = jnp.repeat(q_token[:, token_idx], cfg.v_per_kq_head, axis=0)
         k_curr = jnp.repeat(k_token[:, token_idx], cfg.v_per_kq_head, axis=0)
         v_curr = v_token[:, token_idx]
-        k_curr_t = jnp.repeat(k_token_t[:, token_idx], cfg.v_per_kq_head,
-                              axis=0)
+        k_curr_t = jnp.repeat(
+            k_token_t[:, token_idx], cfg.v_per_kq_head, axis=0
+        )
         beta_curr = beta[:, token_idx]
         decay_curr = decay[:, token_idx]
 
         state_decayed = state * decay_curr
-        v_pred = batched_matmul(k_curr,
-                                state_decayed).astype(cfg.dtypes.compute)
+        v_pred = batched_matmul(k_curr, state_decayed).astype(
+            cfg.dtypes.compute
+        )
         v_new = beta_curr * (v_curr - v_pred)
         # Note (david): the outer product with k_curr_t expands the operand by
         # kq_head_dim, so it comes as late as possible.
@@ -1023,9 +1136,11 @@ def recurrent_kda(
     """
     mask_dtype = get_mask_dtype(cfg.dtypes.compute)
     token_iota = jax.lax.broadcasted_iota(
-        mask_dtype, (cfg.seq_tile_size, 1, cfg.compute_chunk_size, 1, 1), 2)
-    is_real_token = token_iota < real_sizes.reshape(-1, 1, 1, 1,
-                                                    1).astype(mask_dtype)
+        mask_dtype, (cfg.seq_tile_size, 1, cfg.compute_chunk_size, 1, 1), 2
+    )
+    is_real_token = token_iota < real_sizes.reshape(-1, 1, 1, 1, 1).astype(
+        mask_dtype
+    )
 
     q_token = jnp.where(is_real_token, q_token.astype(cfg.dtypes.compute), 0)
     k_token = jnp.where(is_real_token, k_token.astype(cfg.dtypes.compute), 0)
@@ -1050,8 +1165,9 @@ def recurrent_kda(
     g = jnp.where(is_real_token, g, 0)
     decay = jnp.exp(g)
 
-    beta = fused_transpose_broadcast(beta, src_dim=4,
-                                     dst_dim=1)[:, :cfg.num_v_heads]
+    beta = fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)[
+        :, : cfg.num_v_heads
+    ]
     decay = fused_transpose_broadcast(decay, src_dim=4, dst_dim=3)
 
     seq_outs = []
@@ -1084,8 +1200,9 @@ def split_checkpoint_planes(state: jax.Array) -> tuple[jax.Array, jax.Array]:
 
     def _pack_rows(halves):
         num_rows = halves.shape[-2] // 2
-        return (halves[..., :num_rows, :] |
-                (halves[..., num_rows:, :] << HALF_WORD_BITS))
+        return halves[..., :num_rows, :] | (
+            halves[..., num_rows:, :] << HALF_WORD_BITS
+        )
 
     # Note (david): only integer ops and same-width bitcasts touch the bits,
     # so no float op can flush a subnormal or quiet a NaN. Round half up
@@ -1094,34 +1211,45 @@ def split_checkpoint_planes(state: jax.Array) -> tuple[jax.Array, jax.Array]:
     # into the exponent is correct rounding.
     bits = jax.lax.bitcast_convert_type(state, jnp.int32)
     hi_rounding_bias = 1 << (HALF_WORD_BITS - 1)
-    hi_halves = jax.lax.shift_right_logical(bits + hi_rounding_bias,
-                                            jnp.int32(HALF_WORD_BITS))
+    hi_halves = jax.lax.shift_right_logical(
+        bits + hi_rounding_bias, jnp.int32(HALF_WORD_BITS)
+    )
     return _pack_rows(hi_halves), _pack_rows(bits & LOW_HALF_MASK)
 
 
-def merge_checkpoint_planes(hi_words: jax.Array,
-                            lo_words: jax.Array) -> jax.Array:
+def merge_checkpoint_planes(
+    hi_words: jax.Array, lo_words: jax.Array
+) -> jax.Array:
     """The f32 checkpoint whose planes split_checkpoint_planes made, bit for
     bit."""
 
     def _unpack_rows(hi_bits, lo_bits):
         # Note (david): hi was rounded up exactly when lo has its top bit set.
         upper_bits = hi_bits - jax.lax.shift_right_logical(
-            lo_bits, jnp.int32(HALF_WORD_BITS - 1))
+            lo_bits, jnp.int32(HALF_WORD_BITS - 1)
+        )
         return (upper_bits << HALF_WORD_BITS) | lo_bits
 
     half_shift = jnp.int32(HALF_WORD_BITS)
-    rows = jnp.concatenate([
-        _unpack_rows(hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
-        _unpack_rows(jax.lax.shift_right_logical(hi_words, half_shift),
-                     jax.lax.shift_right_logical(lo_words, half_shift)),
-    ], axis=-2)
+    rows = jnp.concatenate(
+        [
+            _unpack_rows(hi_words & LOW_HALF_MASK, lo_words & LOW_HALF_MASK),
+            _unpack_rows(
+                jax.lax.shift_right_logical(hi_words, half_shift),
+                jax.lax.shift_right_logical(lo_words, half_shift),
+            ),
+        ],
+        axis=-2,
+    )
     return jax.lax.bitcast_convert_type(rows, jnp.float32)
 
 
 def replay_record_parts(
-        records: jax.Array, gates: jax.Array, num_records: jax.Array,
-        cfg: config.KDAConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    records: jax.Array,
+    gates: jax.Array,
+    num_records: jax.Array,
+    cfg: config.KDAConfig,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Split a [replay_window, record_dim] record buffer into u [num_v_heads,
     rows, v_head_dim] and k [num_kq_heads, rows, kq_head_dim], and its
     [replay_window, gate_dim] gates into g [num_v_heads, rows, kq_head_dim];
@@ -1134,16 +1262,20 @@ def replay_record_parts(
     gate_record_row = jax.lax.broadcasted_iota(jnp.int32, gates.shape, 0)
     gates = jnp.where(gate_record_row < num_records, gates, 0)
     u_records = jnp.stack([
-        records[:, head * d_v:(head + 1) * d_v]
+        records[:, head * d_v : (head + 1) * d_v]
         for head in range(cfg.num_v_heads)
     ])
     k_records = jnp.stack([
-        records[:, cfg.record_k_offset + head * d_k:
-                cfg.record_k_offset + (head + 1) * d_k]
+        records[
+            :,
+            cfg.record_k_offset
+            + head * d_k : cfg.record_k_offset
+            + (head + 1) * d_k,
+        ]
         for head in range(cfg.num_kq_heads)
     ])
     g_records = jnp.stack([
-        gates[:, head * d_k:(head + 1) * d_k]
+        gates[:, head * d_k : (head + 1) * d_k]
         for head in range(cfg.num_v_heads)
     ])
     return u_records, k_records, g_records
@@ -1196,34 +1328,45 @@ def replay_kda(
     # cumulative decay of the rows after them unchanged.
     g = jnp.where(
         is_token,
-        log_decay(g_chunked.astype(compute), a_log.astype(compute),
-                  dt_bias.astype(compute), cfg.lower_bound), 0)
+        log_decay(
+            g_chunked.astype(compute),
+            a_log.astype(compute),
+            dt_bias.astype(compute),
+            cfg.lower_bound,
+        ),
+        0,
+    )
 
     u_records, k_records, g_records = replay_record_parts(
-        records, gates, num_records, cfg)
+        records, gates, num_records, cfg
+    )
 
     q = l2_norm(q) * d_k**-0.5
     k = l2_norm(k)
-    beta_col = fused_transpose_broadcast(beta, src_dim=2,
-                                         dst_dim=0)[:num_v_heads]
+    beta_col = fused_transpose_broadcast(beta, src_dim=2, dst_dim=0)[
+        :num_v_heads
+    ]
 
     g_records_cumsum = cumsum_rows(g_records)
     g_records_total = g_records_cumsum[:, -1:]
     g_new_cumsum = cumsum_rows(g)
     decay_new = jnp.exp(g_new_cumsum)
-    k_records_decayed = (jnp.repeat(k_records, cfg.v_per_kq_head, axis=0) *
-                         jnp.exp(g_records_total - g_records_cumsum))
+    k_records_decayed = jnp.repeat(
+        k_records, cfg.v_per_kq_head, axis=0
+    ) * jnp.exp(g_records_total - g_records_cumsum)
 
     k_repeat = jnp.repeat(k, cfg.v_per_kq_head, axis=0)
     q_repeat = jnp.repeat(q, cfg.v_per_kq_head, axis=0)
     # Note (david): k and q rows share each head's weight push, of S here and
     # of the records' k and u below.
-    kq_decayed = jnp.concatenate([k_repeat * decay_new, q_repeat * decay_new],
-                                 axis=1)
+    kq_decayed = jnp.concatenate(
+        [k_repeat * decay_new, q_repeat * decay_new], axis=1
+    )
 
     with profile_scope("replay_ckpt_read"):
-        ckpt_query = (kq_decayed *
-                      jnp.exp(g_records_total)).astype(jnp.bfloat16)
+        ckpt_query = (kq_decayed * jnp.exp(g_records_total)).astype(
+            jnp.bfloat16
+        )
         # Note (david): a default-precision f32 dot rounds both operands to
         # bf16 anyway (v6e), so S is read as the bf16 of its hi plane. A hi
         # value in the high half of an f32 word is exactly a bf16, so the cast
@@ -1231,14 +1374,19 @@ def replay_kda(
         hi_words = checkpoint_hi_ref[...]
         checkpoint_bf16 = jax.lax.bitcast_convert_type(
             jnp.concatenate(
-                [hi_words << HALF_WORD_BITS, hi_words & ~LOW_HALF_MASK],
-                axis=-2), jnp.float32).astype(jnp.bfloat16)
+                [hi_words << HALF_WORD_BITS, hi_words & ~LOW_HALF_MASK], axis=-2
+            ),
+            jnp.float32,
+        ).astype(jnp.bfloat16)
         ckpt_reads = batched_matmul(ckpt_query, checkpoint_bf16)
 
     with profile_scope("replay_record_read"):
         record_coeffs = jax.lax.dot_general(
-            kq_decayed, k_records_decayed, (((2, ), (2, )), ((0, ), (0, ))),
-            preferred_element_type=jnp.float32)
+            kq_decayed,
+            k_records_decayed,
+            (((2,), (2,)), ((0,), (0,))),
+            preferred_element_type=jnp.float32,
+        )
         record_reads = batched_matmul(record_coeffs, u_records)
 
     reads = ckpt_reads + record_reads
@@ -1258,18 +1406,24 @@ def replay_kda(
             u_rows = []
             out_rows = []
             for token in range(window):
-                k_token = k_repeat[:, token:token + 1]
-                q_token = q_repeat[:, token:token + 1]
-                u_token = (beta_col[:, token:token + 1] *
-                           residual[:, token:token + 1])
-                out_token = q_reads[:, token:token + 1]
+                k_token = k_repeat[:, token : token + 1]
+                q_token = q_repeat[:, token : token + 1]
+                u_token = (
+                    beta_col[:, token : token + 1]
+                    * residual[:, token : token + 1]
+                )
+                out_token = q_reads[:, token : token + 1]
                 for prev in range(token):
-                    decay_pair = jnp.exp(g_new_cumsum[:, token:token + 1] -
-                                         g_new_cumsum[:, prev:prev + 1])
-                    k_prev = k_repeat[:, prev:prev + 1] * decay_pair
+                    decay_pair = jnp.exp(
+                        g_new_cumsum[:, token : token + 1]
+                        - g_new_cumsum[:, prev : prev + 1]
+                    )
+                    k_prev = k_repeat[:, prev : prev + 1] * decay_pair
                     k_dot = jnp.sum(k_token * k_prev, axis=-1, keepdims=True)
-                    u_token = (u_token - beta_col[:, token:token + 1] * k_dot *
-                               u_rows[prev])
+                    u_token = (
+                        u_token
+                        - beta_col[:, token : token + 1] * k_dot * u_rows[prev]
+                    )
                     q_dot = jnp.sum(q_token * k_prev, axis=-1, keepdims=True)
                     out_token = out_token + q_dot * u_rows[prev]
                 q_dot_self = jnp.sum(q_token * k_token, axis=-1, keepdims=True)
@@ -1279,10 +1433,13 @@ def replay_kda(
             out = jnp.concatenate(out_rows, axis=1)
 
     new_records = jnp.concatenate(
-        [u[head] for head in range(num_v_heads)] +
-        [k[head] for head in range(cfg.num_kq_heads)], axis=-1)
-    new_gates = jnp.concatenate([g[head] for head in range(num_v_heads)],
-                                axis=-1)
+        [u[head] for head in range(num_v_heads)]
+        + [k[head] for head in range(cfg.num_kq_heads)],
+        axis=-1,
+    )
+    new_gates = jnp.concatenate(
+        [g[head] for head in range(num_v_heads)], axis=-1
+    )
 
     return pack_out(out, cfg), new_records, new_gates
 
@@ -1303,21 +1460,26 @@ def replay_flush(
     caller can wait for its DMA there.
     """
     u_records, k_records, g_records = replay_record_parts(
-        records, gates, num_records, cfg)
+        records, gates, num_records, cfg
+    )
     # Note (david): the fold is the only place record error enters the
     # recurrence, and it runs once per flush, so it pays for f32 precision.
     with profile_scope("replay_flush"):
         g_records_cumsum = cumsum_rows(g_records)
         g_records_total = g_records_cumsum[:, -1:]
-        k_records_decayed = (
-            jnp.repeat(k_records, cfg.v_per_kq_head, axis=0) *
-            jnp.exp(g_records_total - g_records_cumsum))
-        update = batched_matmul(jnp.swapaxes(k_records_decayed, 1, 2),
-                                u_records,
-                                precision=jax.lax.Precision.HIGHEST)
+        k_records_decayed = jnp.repeat(
+            k_records, cfg.v_per_kq_head, axis=0
+        ) * jnp.exp(g_records_total - g_records_cumsum)
+        update = batched_matmul(
+            jnp.swapaxes(k_records_decayed, 1, 2),
+            u_records,
+            precision=jax.lax.Precision.HIGHEST,
+        )
         decay_total = fused_transpose_broadcast(
-            jnp.exp(g_records_total), src_dim=2, dst_dim=1)
+            jnp.exp(g_records_total), src_dim=2, dst_dim=1
+        )
         wait_checkpoint_lo()
-        checkpoint = merge_checkpoint_planes(checkpoint_hi_ref[...],
-                                             checkpoint_lo_ref[...])
+        checkpoint = merge_checkpoint_planes(
+            checkpoint_hi_ref[...], checkpoint_lo_ref[...]
+        )
         return checkpoint.astype(cfg.dtypes.compute) * decay_total + update

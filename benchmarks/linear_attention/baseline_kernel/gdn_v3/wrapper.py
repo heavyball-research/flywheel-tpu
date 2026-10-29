@@ -77,7 +77,8 @@ def inner_kernel(
             carry_conv_scratch_ref=carry_conv_scratch_ref,
             carry_recurrent_scratch_ref=carry_recurrent_scratch_ref,
             cfg=cfg,
-        ))
+        )
+    )
 
     # Note (david): Conv1D slides its window across rows. The 2D layout packs
     # several rows per register and would shuffle on every slide, while the
@@ -114,7 +115,8 @@ def inner_kernel(
     qkv_slot_ref[...] = qkv_out_compact
     if cfg.use_recurrent:
         q_compact, k_compact, v_compact = vmem_ldst.load_as_qkv_compact(
-            qkv_slot_ref, cfg)
+            qkv_slot_ref, cfg
+        )
         b_compact = jnp.expand_dims(b_slot_ref[...], axis=1)
         a_compact = jnp.expand_dims(a_slot_ref[...], axis=1)
 
@@ -137,7 +139,8 @@ def inner_kernel(
                 b_vmem_ref=b_slot_ref,
                 a_vmem_ref=a_slot_ref,
                 cfg=cfg,
-            ))
+            )
+        )
 
         out, new_recurrent_state = compute_gdn.chunked_gdn(
             q_large=q_large,
@@ -154,7 +157,8 @@ def inner_kernel(
 
     out_slot_ref[...] = out.astype(out_slot_ref.dtype)
     recurrent_slot_ref[...] = new_recurrent_state.astype(
-        recurrent_slot_ref.dtype)
+        recurrent_slot_ref.dtype
+    )
 
     if carry_recurrent_scratch_ref is not None:
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
@@ -189,7 +193,8 @@ def outer_kernel(
             conv_state_ref=conv_state_ref,
             recurrent_state_ref=recurrent_state_ref,
             cfg=cfg,
-        ))
+        )
+    )
 
     num_tiles = metadata_ref.num_tiles[...]
 
@@ -198,7 +203,7 @@ def outer_kernel(
             inner_kernel,
             cfg=cfg,
         ),
-        grid=(num_tiles, ),
+        grid=(num_tiles,),
         in_specs=(
             qkv_alloc.spec,
             b_alloc.spec,
@@ -206,17 +211,19 @@ def outer_kernel(
             conv_alloc.spec,
             recurrent_alloc.spec,
         ),
-        out_specs=(out_alloc.spec, ),
+        out_specs=(out_alloc.spec,),
     )
 
-    @pl.with_scoped(allocations=(
-        qkv_alloc,
-        b_alloc,
-        a_alloc,
-        conv_alloc,
-        recurrent_alloc,
-        out_alloc,
-    ))
+    @pl.with_scoped(
+        allocations=(
+            qkv_alloc,
+            b_alloc,
+            a_alloc,
+            conv_alloc,
+            recurrent_alloc,
+            out_alloc,
+        )
+    )
     def _run_pipeline(allocations):
         pipeline(
             qkv_ref,
@@ -345,19 +352,20 @@ def fused_conv1d_gdn(
     batch_size, dim = qkv.shape
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
-        assert conv_bias.shape == (dim, )
-    assert query_start_loc.shape == (num_seqs + 1, )
-    assert state_indices.shape == (num_seqs, )
-    assert distribution.shape == (3, )
+        assert conv_bias.shape == (dim,)
+    assert query_start_loc.shape == (num_seqs + 1,)
+    assert state_indices.shape == (num_seqs,)
+    assert distribution.shape == (3,)
     if num_spec_tokens > 0:
-        assert read_offsets is not None, (
-            "read_offsets is required when num_spec_tokens > 0")
+        assert (
+            read_offsets is not None
+        ), "read_offsets is required when num_spec_tokens > 0"
     if read_offsets is None:
-        read_offsets = jnp.zeros((num_seqs, ), dtype=jnp.int32)
+        read_offsets = jnp.zeros((num_seqs,), dtype=jnp.int32)
     else:
         read_offsets = read_offsets.astype(jnp.int32)
-    assert read_offsets.shape == (num_seqs, )
-    assert read_state_indices.shape == (num_seqs, )
+    assert read_offsets.shape == (num_seqs,)
+    assert read_state_indices.shape == (num_seqs,)
     read_state_indices = read_state_indices.astype(state_indices.dtype)
     act_in_dtype = qkv.dtype
 
@@ -376,16 +384,20 @@ def fused_conv1d_gdn(
         # weights, activation scratch and compiler temporaries.
         verify_window_size = num_spec_tokens + 1
         bytes_per_seq = verify_window_size * (
-            n_v * d_k * d_v * F32_BYTES + (kernel_size - 1) * dim * F32_BYTES +
-            dim * F32_BYTES + 2 * aligned_num_v_heads * F32_BYTES +
-            n_v * d_v * BF16_BYTES)
-        vmem_budget = int(WINDOWED_VMEM_FRACTION *
-                          tpu_info.vmem_capacity_bytes)
+            n_v * d_k * d_v * F32_BYTES
+            + (kernel_size - 1) * dim * F32_BYTES
+            + dim * F32_BYTES
+            + 2 * aligned_num_v_heads * F32_BYTES
+            + n_v * d_v * BF16_BYTES
+        )
+        vmem_budget = int(WINDOWED_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
         spec_tile_budget = (vmem_budget // 2) // config.NUM_BUFFERS
         decode_tile_size = max(
             1,
-            min(decode_tile_size, batch_size,
-                spec_tile_budget // bytes_per_seq))
+            min(
+                decode_tile_size, batch_size, spec_tile_budget // bytes_per_seq
+            ),
+        )
     else:
         decode_tile_size = min(decode_tile_size, batch_size)
 
@@ -465,11 +477,18 @@ def fused_conv1d_gdn(
             # it carries state from one tile to the next.
             scratch_shapes = dict(
                 carry_conv_scratch_ref=pltpu.VMEM(
-                    (cfg.seq_tile_size, cfg.prev_kernel_size, 1,
-                     cfg.dim_size), jnp.float32),
+                    (cfg.seq_tile_size, cfg.prev_kernel_size, 1, cfg.dim_size),
+                    jnp.float32,
+                ),
                 carry_recurrent_scratch_ref=pltpu.VMEM(
-                    (cfg.seq_tile_size, cfg.num_v_heads, cfg.kq_head_dim,
-                     cfg.v_head_dim), jnp.float32),
+                    (
+                        cfg.seq_tile_size,
+                        cfg.num_v_heads,
+                        cfg.kq_head_dim,
+                        cfg.v_head_dim,
+                    ),
+                    jnp.float32,
+                ),
             )
         else:
             seq_metadata = metadata.compute_batched_seq_metadata(
@@ -524,7 +543,8 @@ def fused_conv1d_gdn(
 
         kernel_metadata = {}
         for path, leaf in jax.tree_util.tree_leaves_with_path(
-                dataclasses.asdict(cfg)):
+            dataclasses.asdict(cfg)
+        ):
             key = jax.tree_util.keystr(path, simple=True, separator=".")
             if isinstance(leaf, str | int | float):
                 kernel_metadata[key] = leaf
@@ -549,8 +569,9 @@ def fused_conv1d_gdn(
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
-                vmem_limit_bytes=int(vmem_fraction *
-                                     tpu_info.vmem_capacity_bytes),
+                vmem_limit_bytes=int(
+                    vmem_fraction * tpu_info.vmem_capacity_bytes
+                ),
             ),
             name=f"fused_conv1d_gdn_{mode.value}{kernel_name_suffix}",
             metadata=kernel_metadata,
@@ -566,9 +587,11 @@ def fused_conv1d_gdn(
         )
 
     out_act, out_conv_state, out_recurrent_state = _call_kernel(
-        conv_state, recurrent_state, None, config.GDNMode.BATCHED)
+        conv_state, recurrent_state, None, config.GDNMode.BATCHED
+    )
     out_act, out_conv_state, out_recurrent_state = _call_kernel(
-        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ)
+        out_conv_state, out_recurrent_state, out_act, config.GDNMode.PER_SEQ
+    )
 
     out_act = out_act.reshape(padded_batch_size, -1)[:batch_size]
     out_conv_state = out_conv_state.astype(conv_out_dtype)

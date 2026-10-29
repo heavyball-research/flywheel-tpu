@@ -31,10 +31,19 @@ Issues = "https://github.com/heavyball-research/flywheel-tpu/issues"
 tpu = ["jax[tpu]>=0.11.2"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pre-commit>=4.3"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+
+# Google style as tokamax formats it, but with 4-space indentation. The pyink
+# version is pinned in .pre-commit-config.yaml.
+[tool.pyink]
+line-length = 80
+target-version = ["py312"]
+unstable = true
+pyink-indentation = 4
+pyink-use-majority-quotes = true
 
 [build-system]
 requires = ["hatchling>=1.27", "hatch-fancy-pypi-readme"]

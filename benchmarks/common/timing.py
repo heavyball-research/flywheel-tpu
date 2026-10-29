@@ -1,6 +1,10 @@
 """The timing protocol every benchmark shares: queued calls, one block per
 round, median of the rounds."""
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import math
@@ -47,9 +51,13 @@ def time_call(step, state):
             out, state = step(state)
         jax.block_until_ready(out)
         samples.append((time.perf_counter() - start) * 1e3 / iters)
-    return {"compile_s": compile_s, "warmup_calls": warmup, "iters": iters,
-            "samples_ms": samples,
-            "median_ms": statistics.median(samples)}, out
+    return {
+        "compile_s": compile_s,
+        "warmup_calls": warmup,
+        "iters": iters,
+        "samples_ms": samples,
+        "median_ms": statistics.median(samples),
+    }, out
 
 
 def time_stateful(
@@ -59,7 +67,8 @@ def time_stateful(
     iters: int,
     repeats: int,
 ) -> tuple[float, jax.Array]:
-    """Median ms per call; step(*state) -> (new_state, out) chains donated buffers."""
+    """Median ms per call; step(*state) -> (new_state, out) chains donated
+    buffers."""
     import jax
 
     out = None

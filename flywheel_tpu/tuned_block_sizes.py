@@ -58,9 +58,7 @@ KVCacheConfig = tuple[int, int, int]
 # this table cannot live in tuned_configs.json's exact-shape key space.
 # Measured on TPU v6 lite with 16384 packed tokens, 16 heads, bf16 and uniform
 # block-aligned sequences.
-TUNED_VARLEN_FWD_HEAD_FOLD: dict[
-    str, dict[tuple[int, int, bool], int]
-] = {
+TUNED_VARLEN_FWD_HEAD_FOLD: dict[str, dict[tuple[int, int, bool], int]] = {
     "TPU v6": {
         (128, 512, True): 8,
         (128, 512, False): 8,
@@ -71,49 +69,54 @@ TUNED_VARLEN_FWD_HEAD_FOLD: dict[
 
 
 def get_device_variant_name(device_kind: str | None = None) -> str:
-  """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p).
+    """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p).
 
-  device_kind defaults to the chip JAX runs on.
-  """
-  if device_kind is None:
-    device_kind = jax.devices()[0].device_kind
-  kind_match = re.fullmatch(r"TPU\s*v?(\d+)(?:(e|p)|\s+(lite))?", device_kind)
-  if device_kind == "TPU7x":
-    return "TPU v7"
-  elif kind_match is None:
-    return device_kind
-  elif kind_match.group(2):
-    return f"TPU v{kind_match.group(1)}{kind_match.group(2)}"
-  elif kind_match.group(3):
-    return f"TPU v{kind_match.group(1)}e"
-  else:
-    return f"TPU v{kind_match.group(1)}"
+    device_kind defaults to the chip JAX runs on.
+    """
+    if device_kind is None:
+        device_kind = jax.devices()[0].device_kind
+    kind_match = re.fullmatch(r"TPU\s*v?(\d+)(?:(e|p)|\s+(lite))?", device_kind)
+    if device_kind == "TPU7x":
+        return "TPU v7"
+    elif kind_match is None:
+        return device_kind
+    elif kind_match.group(2):
+        return f"TPU v{kind_match.group(1)}{kind_match.group(2)}"
+    elif kind_match.group(3):
+        return f"TPU v{kind_match.group(1)}e"
+    else:
+        return f"TPU v{kind_match.group(1)}"
 
 
 def get_device_name(device_kind: str | None = None) -> str:
-  """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX does)."""
-  return re.sub(
-      r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind))
+    """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX
+    does)."""
+    return re.sub(
+        r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind)
+    )
 
 
 def get_varlen_head_fold(
-    key: tuple[int, int, bool], num_heads: int, head_dim: int, head_dim_v: int,
+    key: tuple[int, int, bool],
+    num_heads: int,
+    head_dim: int,
+    head_dim_v: int,
 ) -> int:
-  """Measured varlen forward head_fold for key, halved until it divides
-  num_heads; 1 when untuned.
+    """Measured varlen forward head_fold for key, halved until it divides
+    num_heads; 1 when untuned.
 
-  Every entry was measured at head_dim_v == head_dim; the folded scratch
-  scales with head_dim_v, so a wider value head is a different shape and gets
-  no fold.
-  """
-  if head_dim_v == head_dim:
-    device_table = TUNED_VARLEN_FWD_HEAD_FOLD.get(get_device_name(), {})
-  else:
-    device_table = {}
-  head_fold = device_table.get(key, 1)
-  while head_fold > 1 and num_heads % head_fold:
-    head_fold //= 2
-  return head_fold
+    Every entry was measured at head_dim_v == head_dim; the folded scratch
+    scales with head_dim_v, so a wider value head is a different shape and gets
+    no fold.
+    """
+    if head_dim_v == head_dim:
+        device_table = TUNED_VARLEN_FWD_HEAD_FOLD.get(get_device_name(), {})
+    else:
+        device_table = {}
+    head_fold = device_table.get(key, 1)
+    while head_fold > 1 and num_heads % head_fold:
+        head_fold //= 2
+    return head_fold
 
 
 def tuned_config_key(
@@ -130,78 +133,79 @@ def tuned_config_key(
     num_kv_heads: int | None = None,
     heads_outer_batch: int | None = None,
 ) -> str:
-  """The tuned_configs.json key for one kernel build.
+    """The tuned_configs.json key for one kernel build.
 
-  Every field is what the kernel sees: num_heads is the flat batch * heads
-  count head-major and the per-row count token-major, batch is set only for
-  3-D token-major refs, seq_len is the padded q axis (the whole packed buffer
-  on varlen), and max_seqlen is the varlen schedule's bucket (None on dense).
-  num_kv_heads (when it differs from num_heads) and heads_outer_batch extend
-  the key only when present, so a GQA or heads-outer build never hits an entry
-  measured on another head map.
-  """
-  base_key = (
-      f"{direction}|{'tm' if token_major else 'hm'}|bfloat16"
-      f"|h{num_heads}|b{'-' if batch is None else batch}|s{seq_len}|d{head_dim}"
-      f"|c{int(bool(causal))}|m{'-' if max_seqlen is None else max_seqlen}"
-      f"|l{int(bool(return_lse))}"
-  )
-  if num_kv_heads is not None and num_kv_heads != num_heads:
-    kv_heads_suffix = f"|k{num_kv_heads}"
-  else:
-    kv_heads_suffix = ""
-  if heads_outer_batch is not None:
-    heads_outer_suffix = f"|o{heads_outer_batch}"
-  else:
-    heads_outer_suffix = ""
-  return base_key + kv_heads_suffix + heads_outer_suffix
+    Every field is what the kernel sees: num_heads is the flat batch * heads
+    count head-major and the per-row count token-major, batch is set only for
+    3-D token-major refs, seq_len is the padded q axis (the whole packed buffer
+    on varlen), and max_seqlen is the varlen schedule's bucket (None on dense).
+    num_kv_heads (when it differs from num_heads) and heads_outer_batch extend
+    the key only when present, so a GQA or heads-outer build never hits an entry
+    measured on another head map.
+    """
+    base_key = (
+        f"{direction}|{'tm' if token_major else 'hm'}|bfloat16"
+        f"|h{num_heads}|b{'-' if batch is None else batch}"
+        f"|s{seq_len}|d{head_dim}"
+        f"|c{int(bool(causal))}|m{'-' if max_seqlen is None else max_seqlen}"
+        f"|l{int(bool(return_lse))}"
+    )
+    if num_kv_heads is not None and num_kv_heads != num_heads:
+        kv_heads_suffix = f"|k{num_kv_heads}"
+    else:
+        kv_heads_suffix = ""
+    if heads_outer_batch is not None:
+        heads_outer_suffix = f"|o{heads_outer_batch}"
+    else:
+        heads_outer_suffix = ""
+    return base_key + kv_heads_suffix + heads_outer_suffix
 
 
 @functools.cache
 def load_tuned_configs() -> dict[str, dict[str, list[int | str | bool]]]:
-  return json.loads(TUNED_CONFIGS_PATH.read_text())
+    return json.loads(TUNED_CONFIGS_PATH.read_text(encoding="utf-8"))
 
 
 @functools.cache
 def _warn_untuned_once(device_name: str, key: str, reason: str) -> None:
-  detail = f" ({reason})" if reason else ""
-  warnings.warn(
-      f"flywheel_tpu: no usable tuned config for {key} on {device_name} in"
-      f" {TUNED_CONFIGS_PATH.name}{detail}; falling back to the default"
-      " config."
-  )
+    detail = f" ({reason})" if reason else ""
+    warnings.warn(
+        f"flywheel_tpu: no usable tuned config for {key} on {device_name} in"
+        f" {TUNED_CONFIGS_PATH.name}{detail}; falling back to the default"
+        " config."
+    )
 
 
 def warn_untuned(key: str, reason: str = "") -> None:
-  """Warn, once per device, key and reason, that a kernel build on a TPU
-  falls back to its default config. Off TPU there are no tables to miss."""
-  device_name = get_device_name()
-  if device_name.startswith("TPU"):
-    _warn_untuned_once(device_name, key, reason)
+    """Warn, once per device, key and reason, that a kernel build on a TPU
+    falls back to its default config. Off TPU there are no tables to miss."""
+    device_name = get_device_name()
+    if device_name.startswith("TPU"):
+        _warn_untuned_once(device_name, key, reason)
 
 
 def lookup_tuned_config(key: str) -> list[int | str | bool] | None:
-  """The current device's tuned_configs.json entry for key, warning when
-  there is none."""
-  config = load_tuned_configs().get(get_device_name(), {}).get(key)
-  if config is None:
-    warn_untuned(key)
-  return config
+    """The current device's tuned_configs.json entry for key, warning when
+    there is none."""
+    config = load_tuned_configs().get(get_device_name(), {}).get(key)
+    if config is None:
+        warn_untuned(key)
+    return config
 
 
 def get_tuned_config(
     direction: str, *, head_dim_v: int, **key_fields: int | bool | None
 ) -> TunedConfig | None:
-  """Return the measured config tuple (CONFIG_FIELDS order), or None.
+    """Return the measured config tuple (CONFIG_FIELDS order), or None.
 
-  head_dim_v is checked, not keyed: every entry was measured at
-  head_dim_v == head_dim.
-  """
-  if head_dim_v != key_fields["head_dim"]:
-    return None
-  else:
-    config = lookup_tuned_config(tuned_config_key(direction, **key_fields))
-    return None if config is None else tuple(config)
+    head_dim_v is checked, not keyed: every entry was measured at
+    head_dim_v == head_dim.
+    """
+    if head_dim_v != key_fields["head_dim"]:
+        return None
+    else:
+        config = lookup_tuned_config(tuned_config_key(direction, **key_fields))
+        return None if config is None else tuple(config)
 
 
 def kvcache_config_key(
@@ -216,17 +220,17 @@ def kvcache_config_key(
     sliding_window: int | None,
     return_lse: bool,
 ) -> str:
-  """The tuned_configs.json key for one contiguous KV-cache decode build."""
-  return (
-      f"kvcache|{jnp.dtype(dtype).name}|h{num_query_heads}|k{num_kv_heads}"
-      f"|b{batch}|s{capacity}|d{head_dim}|a{int(bool(append))}"
-      f"|w{'-' if sliding_window is None else sliding_window}"
-      f"|l{int(bool(return_lse))}"
-  )
+    """The tuned_configs.json key for one contiguous KV-cache decode build."""
+    return (
+        f"kvcache|{jnp.dtype(dtype).name}|h{num_query_heads}|k{num_kv_heads}"
+        f"|b{batch}|s{capacity}|d{head_dim}|a{int(bool(append))}"
+        f"|w{'-' if sliding_window is None else sliding_window}"
+        f"|l{int(bool(return_lse))}"
+    )
 
 
 def get_tuned_kvcache_config(
     **key_fields: DTypeLike | int | bool | None,
 ) -> KVCacheConfig | None:
-  config = lookup_tuned_config(kvcache_config_key(**key_fields))
-  return None if config is None else tuple(config)
+    config = lookup_tuned_config(kvcache_config_key(**key_fields))
+    return None if config is None else tuple(config)

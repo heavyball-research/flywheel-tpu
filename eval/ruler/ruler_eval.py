@@ -22,6 +22,10 @@ returns the vLLM outputs, so both halves of tokens/s are exact and cost nothing
 extra to collect.
 """
 
+# The serving stack (vllm, lm_eval, tpu_inference) and the task repos on
+# sys.path are imported where they are used.
+# pylint: disable=import-outside-toplevel
+
 import argparse
 import importlib.util
 import json
@@ -42,8 +46,9 @@ def _load_glue():
     if package is None:
         raise ModuleNotFoundError("tpu_inference is not installed")
     root = Path(package.origin).resolve().parents[1]
-    spec = importlib.util.spec_from_file_location("lm_eval_accuracy",
-                                                  root / GLUE)
+    spec = importlib.util.spec_from_file_location(
+        "lm_eval_accuracy", root / GLUE
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -70,9 +75,9 @@ class GenerationMeter:
     def install(self):
         from lm_eval.models.vllm_causallms import VLLM
 
-        original = VLLM._model_generate
+        original = VLLM._model_generate  # pylint: disable=protected-access
 
-        def instrumented(inner_self, requests=None, *args, **kwargs):
+        def instrumented(inner_self, requests=None, *args, **kwargs):  # pylint: disable=keyword-arg-before-vararg
             if self.before_generate is not None:
                 self.before_generate(requests)
             start = time.perf_counter()
@@ -82,11 +87,13 @@ class GenerationMeter:
             self.requests += len(requests)
             self.prompt_tokens += sum(len(request) for request in requests)
             self.generated_tokens += sum(
-                len(completion.token_ids) for output in outputs
-                for completion in output.outputs)
+                len(completion.token_ids)
+                for output in outputs
+                for completion in output.outputs
+            )
             return outputs
 
-        VLLM._model_generate = instrumented
+        VLLM._model_generate = instrumented  # pylint: disable=protected-access
 
     def report(self) -> dict:
         return {
@@ -96,8 +103,9 @@ class GenerationMeter:
             "generated_tokens": self.generated_tokens,
             "generate_seconds": self.seconds,
             "prefill_tokens_per_second": self.prompt_tokens / self.seconds,
-            "total_tokens_per_second":
-            (self.prompt_tokens + self.generated_tokens) / self.seconds,
+            "total_tokens_per_second": (
+                (self.prompt_tokens + self.generated_tokens) / self.seconds
+            ),
             "seconds_per_request": self.seconds / self.requests,
         }
 
@@ -125,21 +133,27 @@ def compile_signature(num_tokens: int, flywheel: bool, cp_size: int) -> tuple:
     """
     bucket = prefill_bucket(num_tokens)
     if not flywheel or cp_size > 1:
-        return (bucket, )
+        return (bucket,)
     from tpu_inference.layers.common.flywheel_tpu_attention import (
-        dense_prefill_shape, varlen_block_span)
+        dense_prefill_shape,
+        varlen_block_span,
+    )
+
     dense_shape = dense_prefill_shape([[num_tokens]], bucket)
-    span = (varlen_block_span([[num_tokens]], bucket)
-            if dense_shape[0] < 0 else -1)
+    span = (
+        varlen_block_span([[num_tokens]], bucket) if dense_shape[0] < 0 else -1
+    )
     return (bucket, dense_shape, span)
 
 
-def signature_groups(lengths: list[int], flywheel: bool,
-                     cp_size: int) -> dict[tuple, list[int]]:
+def signature_groups(
+    lengths: list[int], flywheel: bool, cp_size: int
+) -> dict[tuple, list[int]]:
     groups = {}
     for num_tokens in lengths:
-        groups.setdefault(compile_signature(num_tokens, flywheel, cp_size),
-                          []).append(num_tokens)
+        groups.setdefault(
+            compile_signature(num_tokens, flywheel, cp_size), []
+        ).append(num_tokens)
     return groups
 
 
@@ -163,26 +177,35 @@ def warmup(model, args, prompts: list[list[int]], warmed: set) -> None:
     from vllm import SamplingParams, TokensPrompt
 
     flywheel = os.environ["USE_FLYWHEEL_TPU_KERNEL"] == "1"
-    groups = signature_groups([len(prompt) for prompt in prompts], flywheel,
-                              args.cp_size)
+    groups = signature_groups(
+        [len(prompt) for prompt in prompts], flywheel, args.cp_size
+    )
     unit = model.tokenizer(" the", add_special_tokens=False).input_ids
-    sampling_params = SamplingParams(temperature=0.0,
-                                     max_tokens=args.max_gen_toks,
-                                     ignore_eos=True)
+    sampling_params = SamplingParams(
+        temperature=0.0, max_tokens=args.max_gen_toks, ignore_eos=True
+    )
     for signature, lengths in sorted(groups.items()):
         if signature in warmed:
             continue
         num_tokens = max(lengths)
         token_ids = (unit * (num_tokens // len(unit) + 1))[:num_tokens]
         start = time.perf_counter()
-        model.model.generate([TokensPrompt(prompt_token_ids=token_ids)],
-                             sampling_params=sampling_params,
-                             use_tqdm=False)
+        model.model.generate(
+            [TokensPrompt(prompt_token_ids=token_ids)],
+            sampling_params=sampling_params,
+            use_tqdm=False,
+        )
         warmed.add(signature)
-        print("warmup %s (%d tokens, %d prompts): %.1f s" %
-              (signature, num_tokens, len(lengths),
-               time.perf_counter() - start),
-              flush=True)
+        print(
+            "warmup %s (%d tokens, %d prompts): %.1f s"
+            % (
+                signature,
+                num_tokens,
+                len(lengths),
+                time.perf_counter() - start,
+            ),
+            flush=True,
+        )
 
 
 def kv_block_budget(max_model_len: int, max_num_seqs: int) -> int:
@@ -197,8 +220,7 @@ def kv_block_budget(max_model_len: int, max_num_seqs: int) -> int:
     prefill context parallelism too (a 5120-token request needs 40 blocks at
     pcp=2), so the budget never divides by the PCP size.
     """
-    blocks_per_request = (-(-max_model_len // BLOCK_SIZE) +
-                          KV_POOL_SLACK_BLOCKS)
+    blocks_per_request = -(-max_model_len // BLOCK_SIZE) + KV_POOL_SLACK_BLOCKS
     return max_num_seqs * blocks_per_request + 1
 
 
@@ -215,11 +237,13 @@ def yarn_rope_overrides(tokenizer_dir: str, factor: float) -> dict:
     rope = dict(text_config["rope_parameters"])
     if rope["rope_type"] != "default":
         raise ValueError(
-            f"expected a default RoPE checkpoint, got {rope['rope_type']}")
-    rope.update(rope_type="yarn",
-                factor=factor,
-                original_max_position_embeddings=text_config[
-                    "max_position_embeddings"])
+            f"expected a default RoPE checkpoint, got {rope['rope_type']}"
+        )
+    rope.update(
+        rope_type="yarn",
+        factor=factor,
+        original_max_position_embeddings=text_config["max_position_embeddings"],
+    )
     return {"text_config": {"rope_parameters": rope}}
 
 
@@ -227,11 +251,12 @@ def build_model_args(args) -> dict:
     # Chunked prefill off means the engine has to admit a whole prompt in one
     # step, so the token budget has to cover max_model_len.
     max_model_len = args.seqlen + args.headroom
-    max_num_batched_tokens = ((max_model_len + BLOCK_SIZE - 1) //
-                              BLOCK_SIZE) * BLOCK_SIZE
-    num_gpu_blocks_override = (args.num_gpu_blocks_override
-                               or kv_block_budget(max_model_len,
-                                                  args.max_num_seqs))
+    max_num_batched_tokens = (
+        (max_model_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    ) * BLOCK_SIZE
+    num_gpu_blocks_override = args.num_gpu_blocks_override or kv_block_budget(
+        max_model_len, args.max_num_seqs
+    )
     model_args = {
         "num_gpu_blocks_override": num_gpu_blocks_override,
         "pretrained": args.model,
@@ -251,10 +276,7 @@ def build_model_args(args) -> dict:
         "enable_chunked_prefill": False,
         "async_scheduling": False,
         "language_model_only": True,
-        "limit_mm_per_prompt": {
-            "image": 0,
-            "video": 0
-        },
+        "limit_mm_per_prompt": {"image": 0, "video": 0},
         "enable_thinking": False,
         "disable_log_stats": True,
     }
@@ -264,7 +286,8 @@ def build_model_args(args) -> dict:
         }
     if args.yarn_factor is not None:
         model_args["hf_overrides"] = yarn_rope_overrides(
-            args.tokenizer_dir, args.yarn_factor)
+            args.tokenizer_dir, args.yarn_factor
+        )
     return model_args
 
 
@@ -275,8 +298,11 @@ def main() -> None:
     parser.add_argument(
         "--tokenizer-dir",
         required=True,
-        help="Snapshot directory RULER's own tokenizer lookup reads; it takes "
-        "no revision, and the cache has no refs/main to resolve offline.")
+        help=(
+            "Snapshot directory RULER's own tokenizer lookup reads; it takes "
+            "no revision, and the cache has no refs/main to resolve offline."
+        ),
+    )
     parser.add_argument("--seqlen", type=int, required=True)
     parser.add_argument("--tasks", default="ruler")
     parser.add_argument("--limit", type=float)
@@ -286,8 +312,11 @@ def main() -> None:
     parser.add_argument(
         "--yarn-factor",
         type=float,
-        help="Serve with YaRN RoPE scaling of this factor over the "
-        "checkpoint's native context.")
+        help=(
+            "Serve with YaRN RoPE scaling of this factor over the "
+            "checkpoint's native context."
+        ),
+    )
     parser.add_argument("--max-num-seqs", type=int, default=1)
     parser.add_argument("--max-gen-toks", type=int, default=128)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -295,14 +324,20 @@ def main() -> None:
     parser.add_argument(
         "--num-gpu-blocks-override",
         type=int,
-        help="KV blocks to pin; defaults to exactly what max_num_seqs "
-        "sequences of max_model_len need.")
+        help=(
+            "KV blocks to pin; defaults to exactly what max_num_seqs "
+            "sequences of max_model_len need."
+        ),
+    )
     parser.add_argument(
         "--headroom",
         type=int,
         default=1024,
-        help="Tokens reserved above the target length for the chat template "
-        "wrapper and the generated answer.")
+        help=(
+            "Tokens reserved above the target length for the chat template "
+            "wrapper and the generated answer."
+        ),
+    )
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
     if args.cp_size < 1 or (args.cp_size > 1 and args.cp_size % 2):
@@ -325,10 +360,9 @@ def main() -> None:
 
     import lm_eval
 
-    model = glue._create_vllm_model(model_args, "auto", None, None)
+    model = glue._create_vllm_model(model_args, "auto", None, None)  # pylint: disable=protected-access
     warmed = set()
-    meter.before_generate = (
-        lambda prompts: warmup(model, args, prompts, warmed))
+    meter.before_generate = lambda prompts: warmup(model, args, prompts, warmed)
     started = time.perf_counter()
     try:
         results = lm_eval.simple_evaluate(
@@ -347,21 +381,23 @@ def main() -> None:
 
     args.out.mkdir(parents=True, exist_ok=True)
     scores = {
-        task: {
-            metric: value
-            for metric, value in task_results.items()
-        }
+        task: {metric: value for metric, value in task_results.items()}
         for task, task_results in results["results"].items()
     }
     # The kernel selection lives in the environment, so record it with the
     # numbers it produced.
     kernel_env = {
         name: os.environ.get(name, "")
-        for name in ("USE_FLYWHEEL_TPU_KERNEL",
-                     "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
-                     "RPA_V3_MIXED_BLOCK_SIZES", "RPA_V3_PREFILL_BLOCK_SIZES",
-                     "RPA_V3_DECODE_BLOCK_SIZES", "MODEL_IMPL_TYPE",
-                     "NEW_MODEL_DESIGN", "TPU_MULTIHOST_BACKEND")
+        for name in (
+            "USE_FLYWHEEL_TPU_KERNEL",
+            "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
+            "RPA_V3_MIXED_BLOCK_SIZES",
+            "RPA_V3_PREFILL_BLOCK_SIZES",
+            "RPA_V3_DECODE_BLOCK_SIZES",
+            "MODEL_IMPL_TYPE",
+            "NEW_MODEL_DESIGN",
+            "TPU_MULTIHOST_BACKEND",
+        )
     }
     record = {
         "model": args.model,

@@ -71,8 +71,12 @@ REQUIRED_ENGINE_ARGS = {
     "async_scheduling": False,
 }
 # These follow from the request shape, so the backend sets them itself.
-OWNED_ENGINE_ARGS = ("limit_mm_per_prompt", "mm_processor_kwargs",
-                     "mm_processor_cache_gb", "compilation_config")
+OWNED_ENGINE_ARGS = (
+    "limit_mm_per_prompt",
+    "mm_processor_kwargs",
+    "mm_processor_cache_gb",
+    "compilation_config",
+)
 
 # Tracing, compiling or loading a compiled program marks the call it happened
 # in as unrepresentative of steady-state latency.
@@ -82,10 +86,16 @@ COMPILE_EVENTS = frozenset({
     "/jax/compilation_cache/cache_retrieval_time_sec",
 })
 
-KERNEL_ENV = ("USE_FLYWHEEL_TPU_KERNEL", "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
-              "VIT_SDPA_SEGMENTS_AS_BATCH", "RPA_V3_MIXED_BLOCK_SIZES",
-              "RPA_V3_PREFILL_BLOCK_SIZES", "RPA_V3_DECODE_BLOCK_SIZES",
-              "VLLM_TPU_BUCKET_PADDING_GAP", "MODEL_IMPL_TYPE")
+KERNEL_ENV = (
+    "USE_FLYWHEEL_TPU_KERNEL",
+    "USE_FLYWHEEL_TPU_LINEAR_KERNEL",
+    "VIT_SDPA_SEGMENTS_AS_BATCH",
+    "RPA_V3_MIXED_BLOCK_SIZES",
+    "RPA_V3_PREFILL_BLOCK_SIZES",
+    "RPA_V3_DECODE_BLOCK_SIZES",
+    "VLLM_TPU_BUCKET_PADDING_GAP",
+    "MODEL_IMPL_TYPE",
+)
 
 
 def _refuse_torchvision_reader(ele: dict) -> Any:
@@ -95,12 +105,16 @@ def _refuse_torchvision_reader(ele: dict) -> Any:
 
 
 def _visual_tokens(nframes: int, height: int, width: int) -> int:
-    return (nframes // TEMPORAL_PATCH_SIZE) * (height // TOKEN_EDGE) * (
-        width // TOKEN_EDGE)
+    return (
+        (nframes // TEMPORAL_PATCH_SIZE)
+        * (height // TOKEN_EDGE)
+        * (width // TOKEN_EDGE)
+    )
 
 
-def _encoder_token_budgets(video_dir: str, nframes: int, min_pixels: int,
-                           max_pixels: int) -> list[int]:
+def _encoder_token_budgets(
+    video_dir: str, nframes: int, min_pixels: int, max_pixels: int
+) -> list[int]:
     """The visual token count of every video in `video_dir`.
 
     Frames are sized by the same smart_resize fetch_video applies, from the
@@ -114,11 +128,13 @@ def _encoder_token_budgets(video_dir: str, nframes: int, min_pixels: int,
         capture.release()
         if not height or not width:
             raise RuntimeError(f"cannot read the frame size of {name}")
-        height, width = vision_process.smart_resize(height,
-                                                    width,
-                                                    factor=TOKEN_EDGE,
-                                                    min_pixels=min_pixels,
-                                                    max_pixels=max_pixels)
+        height, width = vision_process.smart_resize(
+            height,
+            width,
+            factor=TOKEN_EDGE,
+            min_pixels=min_pixels,
+            max_pixels=max_pixels,
+        )
         budgets.add(_visual_tokens(nframes, height, width))
     return sorted(budgets)
 
@@ -141,42 +157,56 @@ class RequestPlan:
 
 
 class VLLMGenerateTPU(VLLMGenerate):
+    """VLLMGenerate with the Video-MME timing changes the module lists."""
 
-    def __init__(self,
-                 request_log: str,
-                 nframes: int,
-                 max_pixels: int,
-                 min_image_pixels: int = 28,
-                 batch_size: int = 1,
-                 max_new_tokens: int = 1,
-                 fps: float | None = None,
-                 **kwargs):
+    def __init__(
+        self,
+        request_log: str,
+        nframes: int,
+        max_pixels: int,
+        min_image_pixels: int = 28,
+        batch_size: int = 1,
+        max_new_tokens: int = 1,
+        fps: float | None = None,
+        **kwargs,
+    ):
         if fps is not None:
-            raise ValueError("Sample a fixed frame count with nframes; fps "
-                             "sampling gives every video its own length.")
+            raise ValueError(
+                "Sample a fixed frame count with nframes; fps "
+                "sampling gives every video its own length."
+            )
         if int(batch_size) != 1 or int(max_new_tokens) != 1:
-            raise ValueError("One request per step and one output token make "
-                             "each request exactly one timed engine step; got "
-                             f"batch_size={batch_size}, "
-                             f"max_new_tokens={max_new_tokens}.")
+            raise ValueError(
+                "One request per step and one output token make "
+                "each request exactly one timed engine step; got "
+                f"batch_size={batch_size}, "
+                f"max_new_tokens={max_new_tokens}."
+            )
         for name, value in REQUIRED_ENGINE_ARGS.items():
             if kwargs.get(name, None) != value:
-                raise ValueError(f"model_args must set {name}={value}; got "
-                                 f"{kwargs.get(name)!r}.")
+                raise ValueError(
+                    f"model_args must set {name}={value}; got "
+                    f"{kwargs.get(name)!r}."
+                )
         for name in OWNED_ENGINE_ARGS:
             if name in kwargs:
                 raise ValueError(f"{name} is set by this backend.")
         if kwargs.get("disable_log_stats"):
-            raise ValueError("Per-request TTFT comes from vLLM's request "
-                             "stats; leave disable_log_stats off.")
+            raise ValueError(
+                "Per-request TTFT comes from vLLM's request "
+                "stats; leave disable_log_stats off."
+            )
         self._step_log_path = os.environ.get("STEP_TIMING_LOG_PATH", "")
         if not self._step_log_path:
-            raise ValueError("STEP_TIMING_LOG_PATH must name the log the "
-                             "runner writes its per-step timing to.")
+            raise ValueError(
+                "STEP_TIMING_LOG_PATH must name the log the "
+                "runner writes its per-step timing to."
+            )
         if vision_process.get_video_reader_backend() != "decord":
             raise ValueError("Set FORCE_QWENVL_VIDEO_READER=decord.")
-        vision_process.VIDEO_READER_BACKENDS[
-            "torchvision"] = _refuse_torchvision_reader
+        vision_process.VIDEO_READER_BACKENDS["torchvision"] = (
+            _refuse_torchvision_reader
+        )
 
         nframes = int(nframes)
         max_pixels = int(max_pixels)
@@ -185,24 +215,25 @@ class VLLMGenerateTPU(VLLMGenerate):
         # a multiple of 32 and at most max_pixels each, so a cap of exactly
         # nframes * max_pixels leaves them as they are. `model` is the local
         # snapshot, whose own config supplies the rest of the size.
-        with open(os.path.join(kwargs["model"],
-                               "video_preprocessor_config.json"),
-                  encoding="utf-8") as f:
+        with open(
+            os.path.join(kwargs["model"], "video_preprocessor_config.json"),
+            encoding="utf-8",
+        ) as f:
             size = json.load(f)["size"]
         size["longest_edge"] = nframes * max_pixels
         encoder_budgets = _encoder_token_budgets(
-            os.environ["VIDEOMME_VIDEO_DIR"], nframes, int(min_image_pixels),
-            max_pixels)
+            os.environ["VIDEOMME_VIDEO_DIR"],
+            nframes,
+            int(min_image_pixels),
+            max_pixels,
+        )
         super().__init__(
             batch_size=1,
             max_new_tokens=1,
             nframes=nframes,
             max_pixels=max_pixels,
             min_image_pixels=int(min_image_pixels),
-            limit_mm_per_prompt={
-                "image": 0,
-                "video": 1
-            },
+            limit_mm_per_prompt={"image": 0, "video": 1},
             mm_processor_kwargs={"size": size},
             # Every request's UUID is new, so a processed-input cache never
             # hits and only holds a ~3 GB entry per request.
@@ -213,37 +244,34 @@ class VLLMGenerateTPU(VLLMGenerate):
                 "encoder_cudagraph_max_vision_items_per_batch": 1,
                 # The ViT attends within each temporal patch, and this sizes
                 # its per-sequence metadata: a clip holds nframes / 2 of them.
-                "encoder_cudagraph_max_frames_per_batch":
-                nframes // TEMPORAL_PATCH_SIZE,
+                "encoder_cudagraph_max_frames_per_batch": (
+                    nframes // TEMPORAL_PATCH_SIZE
+                ),
             },
-            **kwargs)
+            **kwargs,
+        )
         if self._world_size != 1:
             raise ValueError("This backend serves from a single process.")
 
         self._encoder_budgets = frozenset(encoder_budgets)
-        self._video_token_id = (self.client.llm_engine.vllm_config.
-                                model_config.hf_config.video_token_id)
+        hf_config = self.client.llm_engine.vllm_config.model_config.hf_config
+        self._video_token_id = hf_config.video_token_id
         self._request_log_path = request_log
         self._compile_seconds = 0.0
-        jax.monitoring.register_event_duration_secs_listener(
-            self._on_jax_event)
+        jax.monitoring.register_event_duration_secs_listener(self._on_jax_event)
         self._check_run_config({
             "nframes": nframes,
             "max_pixels": max_pixels,
             "processor_size": size,
             "encoder_token_budgets": encoder_budgets,
-            "engine_args": {
-                name: value
-                for name, value in kwargs.items()
-            },
+            "engine_args": {name: value for name, value in kwargs.items()},
             "kernel_env": {
-                name: os.environ.get(name, "")
-                for name in KERNEL_ENV
+                name: os.environ.get(name, "") for name in KERNEL_ENV
             },
         })
 
-    def _on_jax_event(self, event: str, duration_secs: float,
-                      **kwargs) -> None:
+    def _on_jax_event(self, event: str, duration_secs: float, **kwargs) -> None:
+        del kwargs  # Unused.
         if event in COMPILE_EVENTS:
             self._compile_seconds += duration_secs
 
@@ -257,7 +285,8 @@ class VLLMGenerateTPU(VLLMGenerate):
             if previous != config:
                 raise ValueError(
                     f"{self._request_log_path} was started with a different "
-                    f"configuration:\n{previous}\nnow:\n{config}")
+                    f"configuration:\n{previous}\nnow:\n{config}"
+                )
             return
         with open(path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
@@ -278,27 +307,36 @@ class VLLMGenerateTPU(VLLMGenerate):
         chat = ChatMessages(messages=doc_to_messages(doc))
         images, videos, audios = chat.extract_media()
         if images or audios or len(videos) != 1:
-            raise ValueError(f"{doc['question_id']} must carry exactly one "
-                             "video and no other media.")
+            raise ValueError(
+                f"{doc['question_id']} must carry exactly one "
+                "video and no other media."
+            )
         gen = dict(gen_kwargs or {})
         gen["max_new_tokens"] = self._select_max_new_tokens(
-            gen.get("max_new_tokens"))
+            gen.get("max_new_tokens")
+        )
         gen.setdefault("temperature", 0)
         gen.setdefault("top_p", 0.95)
         params = self._build_sampling_params_dict(gen)
-        messages = chat.to_hf_messages(video_kwargs={
-            "nframes": self.nframes,
-            "max_pixels": self.max_pixels,
-        })
-        prompt = self.processor.apply_chat_template(messages,
-                                                    tokenize=False,
-                                                    add_generation_prompt=True,
-                                                    enable_thinking=False)
-        return RequestPlan(question_id=doc["question_id"],
-                           doc=doc,
-                           video_path=videos[0],
-                           prompt=prompt,
-                           params=params)
+        messages = chat.to_hf_messages(
+            video_kwargs={
+                "nframes": self.nframes,
+                "max_pixels": self.max_pixels,
+            }
+        )
+        prompt = self.processor.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        return RequestPlan(
+            question_id=doc["question_id"],
+            doc=doc,
+            video_path=videos[0],
+            prompt=prompt,
+            params=params,
+        )
 
     def _decode(self, path: str) -> DecodedVideo:
         started = time.perf_counter()
@@ -315,12 +353,15 @@ class VLLMGenerateTPU(VLLMGenerate):
             },
             image_patch_size=IMAGE_PATCH_SIZE,
             return_video_sample_fps=True,
-            return_video_metadata=True)
+            return_video_metadata=True,
+        )
         metadata["do_sample_frames"] = False
-        return DecodedVideo(frames=frames,
-                            metadata=metadata,
-                            sample_fps=sample_fps,
-                            decode_seconds=time.perf_counter() - started)
+        return DecodedVideo(
+            frames=frames,
+            metadata=metadata,
+            sample_fps=sample_fps,
+            decode_seconds=time.perf_counter() - started,
+        )
 
     def _read_steps(self, offset: int) -> list[dict]:
         with open(self._step_log_path, encoding="utf-8") as f:
@@ -331,12 +372,10 @@ class VLLMGenerateTPU(VLLMGenerate):
     def _serve(self, plan: RequestPlan, video: DecodedVideo) -> dict:
         inputs = {
             "prompt": plan.prompt,
-            "multi_modal_data": {
-                "video": [(video.frames, video.metadata)]
-            },
+            "multi_modal_data": {"video": [(video.frames, video.metadata)]},
             "mm_processor_kwargs": {
                 "fps": video.sample_fps,
-                "do_sample_frames": False
+                "do_sample_frames": False,
             },
             "multi_modal_uuids": {
                 "video": [f"{plan.question_id}-{uuid.uuid4().hex}"]
@@ -345,9 +384,9 @@ class VLLMGenerateTPU(VLLMGenerate):
         offset = os.path.getsize(self._step_log_path)
         self._compile_seconds = 0.0
         started = time.perf_counter()
-        (output, ) = self.client.generate([inputs],
-                                          [SamplingParams(**plan.params)],
-                                          use_tqdm=False)
+        (output,) = self.client.generate(
+            [inputs], [SamplingParams(**plan.params)], use_tqdm=False
+        )
         wall_seconds = time.perf_counter() - started
         compile_seconds = self._compile_seconds
 
@@ -355,36 +394,44 @@ class VLLMGenerateTPU(VLLMGenerate):
         if len(steps) != 1:
             raise RuntimeError(
                 f"{plan.question_id} took {len(steps)} token-scheduling steps; "
-                "a one-token request without chunked prefill takes one.")
-        (step, ) = steps
-        (prefill_tokens, ) = step["num_scheduled_tokens"].values()
+                "a one-token request without chunked prefill takes one."
+            )
+        (step,) = steps
+        (prefill_tokens,) = step["num_scheduled_tokens"].values()
         if step["encoder_device_s"] is None:
             raise RuntimeError(
                 f"{plan.question_id} ran its encoder outside the compiled "
-                "budgets, so its device time was not recorded.")
+                "budgets, so its device time was not recorded."
+            )
 
         prompt_ids = output.prompt_token_ids
-        visual_tokens = sum(1 for token_id in prompt_ids
-                            if token_id == self._video_token_id)
+        visual_tokens = sum(
+            1 for token_id in prompt_ids if token_id == self._video_token_id
+        )
         num_frames, _, height, width = video.frames.shape
         if height % TOKEN_EDGE or width % TOKEN_EDGE:
-            raise RuntimeError(f"{plan.video_path} frames are {height}x{width}"
-                               f", not a multiple of {TOKEN_EDGE}.")
+            raise RuntimeError(
+                f"{plan.video_path} frames are {height}x{width}"
+                f", not a multiple of {TOKEN_EDGE}."
+            )
         expected_tokens = _visual_tokens(num_frames, height, width)
         # The processor must neither resize the frames nor lose any of them,
         # the clip must fill a compiled encoder budget exactly, and the step
         # must prefill the prompt the engine reports.
-        if (visual_tokens != expected_tokens
-                or visual_tokens not in self._encoder_budgets
-                or step["encoder_output_tokens"] != visual_tokens
-                or prefill_tokens != len(prompt_ids)):
+        if (
+            visual_tokens != expected_tokens
+            or visual_tokens not in self._encoder_budgets
+            or step["encoder_output_tokens"] != visual_tokens
+            or prefill_tokens != len(prompt_ids)
+        ):
             raise RuntimeError(
                 f"{plan.question_id}: {num_frames} frames of {height}x{width} "
                 f"should be {expected_tokens} visual tokens; the prompt holds "
                 f"{visual_tokens} (budgets {sorted(self._encoder_budgets)}), "
                 f"the encoder produced {step['encoder_output_tokens']}, and "
                 f"the step prefilled {prefill_tokens} of {len(prompt_ids)} "
-                "prompt tokens.")
+                "prompt tokens."
+            )
 
         stats = output.metrics
         return {
@@ -408,8 +455,9 @@ class VLLMGenerateTPU(VLLMGenerate):
             # The compiled ViT from on-device inputs, and the rest of the
             # encoder phase: replay buffers and their host-to-device copies.
             "vision_encoder_device_s": step["encoder_device_s"],
-            "vision_encoder_host_s":
-            step["encoder_s"] - step["encoder_device_s"],
+            "vision_encoder_host_s": (
+                step["encoder_s"] - step["encoder_device_s"]
+            ),
             # Scattering the encoder output into the text embeddings, between
             # the encoder and the prefill.
             "embed_merge_s": step["embed_s"],
@@ -458,11 +506,18 @@ class VLLMGenerateTPU(VLLMGenerate):
                     retimed = self._serve(plan, video)
                     first_pass = {
                         key: record[key]
-                        for key in ("vision_encoder_s",
-                                    "vision_encoder_device_s",
-                                    "vision_encoder_host_s", "embed_merge_s",
-                                    "llm_prefill_s", "ttft_s", "engine_ttft_s",
-                                    "queue_s", "generate_wall_s", "compile_s")
+                        for key in (
+                            "vision_encoder_s",
+                            "vision_encoder_device_s",
+                            "vision_encoder_host_s",
+                            "embed_merge_s",
+                            "llm_prefill_s",
+                            "ttft_s",
+                            "engine_ttft_s",
+                            "queue_s",
+                            "generate_wall_s",
+                            "compile_s",
+                        )
                     }
                     record = {
                         **retimed,

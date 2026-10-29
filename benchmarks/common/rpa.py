@@ -13,8 +13,14 @@ load_batched_rpa takes a vllm-torchtpu checkout (--torchtpu-source) and loads
 src/vllm_torchtpu/kernels/experimental/batched_rpa, every file verified
 against its SHA-256 at BATCHED_RPA_GIT_SHA.
 
-    PYTHONPATH=. uv run --no-sync python benchmarks/common/rpa.py   # host-only self-test
+Host-only self-test:
+
+    PYTHONPATH=. uv run --no-sync python benchmarks/common/rpa.py
 """
+
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
 
 from __future__ import annotations
 
@@ -24,15 +30,18 @@ import sys
 import types
 from pathlib import Path
 
-DEFAULT_RPA_SOURCE = Path(__file__).resolve().parents[2] / "third_party" / (
-    "tpu-inference")
+DEFAULT_RPA_SOURCE = (
+    Path(__file__).resolve().parents[2] / "third_party" / "tpu-inference"
+)
 RPA_V3_GIT_SHA = "4420cae3615711b3b8f66bac1c802ae3f9fa3439"
 RPA_V3_PACKAGE = "tpu_inference.kernels.ragged_paged_attention.v3"
 RPA_V3_SOURCE_SHA256 = {
-    "kernel.py":
-        "bcd21fdaff6b333903a09991d0ad57f3683fef18bf8abef449c0f10d6879609c",
-    "util.py":
-        "f9a1c1f189ef0b5d9e9babaa9d221faf01f12bc9bb809fe227d17901867b56c0",
+    "kernel.py": (
+        "bcd21fdaff6b333903a09991d0ad57f3683fef18bf8abef449c0f10d6879609c"
+    ),
+    "util.py": (
+        "f9a1c1f189ef0b5d9e9babaa9d221faf01f12bc9bb809fe227d17901867b56c0"
+    ),
 }
 FIELDS = ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz")
 # vllm-torchtpu's batched RPA, the kernel its CUSTOM attention backend serves
@@ -40,28 +49,39 @@ FIELDS = ("bq_sz", "bkv_sz", "bq_csz", "bkv_csz")
 BATCHED_RPA_GIT_SHA = "6f66b7babaec12e98e241320c7f46ff406d3f7de"
 BATCHED_RPA_PACKAGE = "vllm_torchtpu.kernels.experimental.batched_rpa"
 BATCHED_RPA_SOURCE_SHA256 = {
-    "__init__.py":
-        "dae715a4f8e5c127d40a795ddf630d294563ac44234e333077f4aa9cbeae3e05",
-    "bref_override.py":
-        "447be6f37e5b2bf5632a0bd9f8e9724e4b9373c2f6bf452fa9165e8dccb5b380",
-    "configs.py":
-        "dfa7df3e22eda2ae12d93b56a02facef4d7c0c0bfbeff03af4c9dc6253b408fd",
-    "flash_attention.py":
-        "b490517cfc503ccc298d5d511469370730fbe50c82288048337810f54dedb804",
-    "kernel.py":
-        "522246e55347638f05aa060722612294ca54bc63631c78d5aa74a53cc93718e7",
-    "pipeline.py":
-        "ee702226a72f5db5eab4bdbe90fefef1ec43a4cb027105b8923276880a53ef34",
-    "schedule_cp.py":
-        "fab697e2e4af64f58704f8056431140a527c418bd99e43b40c0f2e843e35b577",
-    "schedule.py":
-        "3e77d06c7669ea83869f3fa19cacc98608c891357517b91a736551335c2a429b",
-    "stitch_utils.py":
-        "221b32d923a22dd12dd5d2a268defceb62936d237cc035bd0f3962e988d3e9ce",
-    "utils.py":
-        "1c917940957aef3c04f24e6125b78a31e1229c2221dbf6ad6dd2c519947858d5",
-    "wrapper.py":
-        "67380581df5ac1bdc67e403e36b264c9248fcc7946814653a2c099eafdb782ff",
+    "__init__.py": (
+        "dae715a4f8e5c127d40a795ddf630d294563ac44234e333077f4aa9cbeae3e05"
+    ),
+    "bref_override.py": (
+        "447be6f37e5b2bf5632a0bd9f8e9724e4b9373c2f6bf452fa9165e8dccb5b380"
+    ),
+    "configs.py": (
+        "dfa7df3e22eda2ae12d93b56a02facef4d7c0c0bfbeff03af4c9dc6253b408fd"
+    ),
+    "flash_attention.py": (
+        "b490517cfc503ccc298d5d511469370730fbe50c82288048337810f54dedb804"
+    ),
+    "kernel.py": (
+        "522246e55347638f05aa060722612294ca54bc63631c78d5aa74a53cc93718e7"
+    ),
+    "pipeline.py": (
+        "ee702226a72f5db5eab4bdbe90fefef1ec43a4cb027105b8923276880a53ef34"
+    ),
+    "schedule_cp.py": (
+        "fab697e2e4af64f58704f8056431140a527c418bd99e43b40c0f2e843e35b577"
+    ),
+    "schedule.py": (
+        "3e77d06c7669ea83869f3fa19cacc98608c891357517b91a736551335c2a429b"
+    ),
+    "stitch_utils.py": (
+        "221b32d923a22dd12dd5d2a268defceb62936d237cc035bd0f3962e988d3e9ce"
+    ),
+    "utils.py": (
+        "1c917940957aef3c04f24e6125b78a31e1229c2221dbf6ad6dd2c519947858d5"
+    ),
+    "wrapper.py": (
+        "67380581df5ac1bdc67e403e36b264c9248fcc7946814653a2c099eafdb782ff"
+    ),
 }
 
 
@@ -69,19 +89,24 @@ def validate_rpa_source(source_root: Path) -> Path:
     """The pinned v3 package directory inside a tpu-inference checkout."""
     source_root = Path(source_root).expanduser().resolve()
     module_root = source_root.joinpath(*RPA_V3_PACKAGE.split("."))
-    missing = [name for name in RPA_V3_SOURCE_SHA256
-               if not (module_root / name).is_file()]
+    missing = [
+        name
+        for name in RPA_V3_SOURCE_SHA256
+        if not (module_root / name).is_file()
+    ]
     if missing:
         raise FileNotFoundError(
             f"{module_root} is missing {missing}; --rpa-source must be a "
             f"tpu-inference checkout at {RPA_V3_GIT_SHA} (for the default, run "
-            f"git submodule update --init third_party/tpu-inference).")
+            "git submodule update --init third_party/tpu-inference)."
+        )
     for name, expected in RPA_V3_SOURCE_SHA256.items():
         digest = hashlib.sha256((module_root / name).read_bytes()).hexdigest()
         if digest != expected:
             raise ValueError(
                 f"{module_root / name} does not match tpu-inference "
-                f"{RPA_V3_GIT_SHA}; got sha256 {digest}.")
+                f"{RPA_V3_GIT_SHA}; got sha256 {digest}."
+            )
     return module_root
 
 
@@ -93,14 +118,18 @@ def load_rpa_v3(source_root: Path):
     if "tpu_inference" in sys.modules:
         raise RuntimeError(
             "tpu_inference was imported before the pinned RPA v3 source; "
-            "refusing to benchmark an ambiguous baseline.")
+            "refusing to benchmark an ambiguous baseline."
+        )
 
     parts = RPA_V3_PACKAGE.split(".")
     for depth in range(1, len(parts) + 1):
         name = ".".join(parts[:depth])
         package = types.ModuleType(name)
-        path = (module_root if depth == len(parts)
-                else module_root.parents[len(parts) - depth - 1])
+        path = (
+            module_root
+            if depth == len(parts)
+            else module_root.parents[len(parts) - depth - 1]
+        )
         package.__path__ = [str(path)]
         package.__package__ = name
         sys.modules[name] = package
@@ -120,16 +149,19 @@ def load_batched_rpa(source_root: Path):
         if not path.is_file():
             raise FileNotFoundError(
                 f"{path} is missing; --torchtpu-source must be a "
-                f"vllm-torchtpu checkout at {BATCHED_RPA_GIT_SHA}.")
+                f"vllm-torchtpu checkout at {BATCHED_RPA_GIT_SHA}."
+            )
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         if digest != expected:
             raise ValueError(
                 f"{path} does not match vllm-torchtpu {BATCHED_RPA_GIT_SHA}; "
-                f"got sha256 {digest}.")
+                f"got sha256 {digest}."
+            )
     if "vllm_torchtpu" in sys.modules:
         raise RuntimeError(
             "vllm_torchtpu was imported before the pinned batched RPA source; "
-            "refusing to benchmark an ambiguous baseline.")
+            "refusing to benchmark an ambiguous baseline."
+        )
 
     for depth in range(1, len(parts) + 1):
         name = ".".join(parts[:depth])
@@ -165,8 +197,9 @@ def unjitted_kernel(rpa):
     """ragged_paged_attention without its own jax.jit, which donates q, k and v
     as well as the cache; the benchmarks jit it themselves, donating only the
     cache, so the same q, k and v serve every call."""
-    return getattr(rpa.ragged_paged_attention, "__wrapped__",
-                   rpa.ragged_paged_attention)
+    return getattr(
+        rpa.ragged_paged_attention, "__wrapped__", rpa.ragged_paged_attention
+    )
 
 
 def request_distribution(*, num_decode: int, num_seqs: int):

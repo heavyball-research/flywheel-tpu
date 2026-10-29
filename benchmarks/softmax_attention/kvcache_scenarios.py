@@ -46,6 +46,10 @@ reused, so a step's inputs cost nothing. With --trace the scenario also runs
 under jax.profiler, and every device op of one scenario is summed by name.
 """
 
+# jax loads only where a TPU run needs it, so the host-only paths never
+# claim the TPU.
+# pylint: disable=import-outside-toplevel
+
 from __future__ import annotations
 
 import argparse
@@ -75,6 +79,8 @@ KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
+    """One benchmark point: an implementation on one KV cache scenario."""
+
     impl: str
     scenario: str
     heads: int
@@ -101,14 +107,18 @@ class Cell:
         else:
             window_tag = f"-w{self.sliding_window}"
         kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
-        shape = (f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
-                 f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}"
-                 f"{kv_tag}")
+        shape = (
+            f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
+            f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}"
+            f"{kv_tag}"
+        )
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
         elif self.scenario == "verify":
-            return (f"{shape}-b{self.batch}-t{self.verify_tokens}"
-                    f"-n{self.decode_tokens}")
+            return (
+                f"{shape}-b{self.batch}-t{self.verify_tokens}"
+                f"-n{self.decode_tokens}"
+            )
         return f"{shape}-b{self.batch}-n{self.decode_tokens}"
 
     @property
@@ -166,8 +176,9 @@ def attention_pairs(cell):
         first_query, num_queries = 0, cell.seq
     else:
         first_query, num_queries = cell.context, cell.decode_tokens
-    causal_keys = np.arange(first_query + 1, first_query + num_queries + 1,
-                            dtype=np.int64)
+    causal_keys = np.arange(
+        first_query + 1, first_query + num_queries + 1, dtype=np.int64
+    )
     if cell.sliding_window is None:
         visible_keys = causal_keys
     else:
@@ -191,35 +202,49 @@ def make_inputs(cell):
     generator = np.random.default_rng(cell.heads * 1000 + cell.heads_k)
     if cell.scenario == "chunked_prefill":
         q = draw(generator, cell.dtype, cell.seq, cell.heads, cell.head_dim)
-        k = draw(generator, cell.kv_dtype, cell.seq, cell.heads_k,
-                 cell.head_dim)
-        v = draw(generator, cell.kv_dtype, cell.seq, cell.heads_k,
-                 cell.head_dim)
-        calls = [(q[i * cell.chunk:(i + 1) * cell.chunk],
-                  k[i * cell.chunk:(i + 1) * cell.chunk],
-                  v[i * cell.chunk:(i + 1) * cell.chunk])
-                 for i in range(cell.num_calls)]
+        k = draw(
+            generator, cell.kv_dtype, cell.seq, cell.heads_k, cell.head_dim
+        )
+        v = draw(
+            generator, cell.kv_dtype, cell.seq, cell.heads_k, cell.head_dim
+        )
+        calls = [
+            (
+                q[i * cell.chunk : (i + 1) * cell.chunk],
+                k[i * cell.chunk : (i + 1) * cell.chunk],
+                v[i * cell.chunk : (i + 1) * cell.chunk],
+            )
+            for i in range(cell.num_calls)
+        ]
     elif cell.scenario == "verify":
-        def window_tokens(heads, dtype):
-            return draw(generator, dtype, cell.query_tokens, heads,
-                        cell.head_dim)
 
-        step = (window_tokens(cell.heads, cell.dtype),
-                window_tokens(cell.heads_k, cell.kv_dtype),
-                window_tokens(cell.heads_k, cell.kv_dtype))
+        def window_tokens(heads, dtype):
+            return draw(
+                generator, dtype, cell.query_tokens, heads, cell.head_dim
+            )
+
+        step = (
+            window_tokens(cell.heads, cell.dtype),
+            window_tokens(cell.heads_k, cell.kv_dtype),
+            window_tokens(cell.heads_k, cell.kv_dtype),
+        )
         calls = [step] * cell.num_calls
     else:
+
         def one_token(heads, dtype):
             return draw(generator, dtype, cell.batch, heads, cell.head_dim)
 
-        step = (one_token(cell.heads, cell.dtype),
-                one_token(cell.heads_k, cell.kv_dtype),
-                one_token(cell.heads_k, cell.kv_dtype))
+        step = (
+            one_token(cell.heads, cell.dtype),
+            one_token(cell.heads_k, cell.kv_dtype),
+            one_token(cell.heads_k, cell.kv_dtype),
+        )
         calls = [step] * cell.num_calls
     pages_per_seq = -(-cell.seq // cell.page_size)
     table = generator.permutation(cell.num_seqs * pages_per_seq)
     block_table = jnp.asarray(
-        table.reshape(cell.num_seqs, pages_per_seq).astype(np.int32))
+        table.reshape(cell.num_seqs, pages_per_seq).astype(np.int32)
+    )
     # Cached tokens per sequence before each call.
     if cell.scenario == "chunked_prefill":
         advance = cell.chunk
@@ -227,9 +252,10 @@ def make_inputs(cell):
         advance = 0
     else:
         advance = 1
-    starts = [jnp.full((cell.num_seqs,), cell.context + i * advance,
-                       jnp.int32)
-              for i in range(cell.num_calls)]
+    starts = [
+        jnp.full((cell.num_seqs,), cell.context + i * advance, jnp.int32)
+        for i in range(cell.num_calls)
+    ]
     return jax.block_until_ready((calls, block_table, starts))
 
 
@@ -244,13 +270,17 @@ def fill_cache(shape, dtype, generator):
 
     base_pages = math.gcd(shape[0], 64)
     base = draw(generator, dtype, base_pages, *shape[1:])
-    tile = jax.jit(lambda base: jnp.tile(
-        base, (shape[0] // base_pages,) + (1,) * (len(shape) - 1)))
+    tile = jax.jit(
+        lambda base: jnp.tile(
+            base, (shape[0] // base_pages,) + (1,) * (len(shape) - 1)
+        )
+    )
     return jax.block_until_ready(tile(base))
 
 
 def build_flywheel(cell, inputs, args):
     """(step, fresh_state, info) running flash_attn_with_kvcache."""
+    del args  # Unused.
     import jax
 
     from flywheel_tpu import flash_attn_with_kvcache
@@ -259,8 +289,12 @@ def build_flywheel(cell, inputs, args):
     calls, block_table, starts = inputs
     # Note (david): the merged cache interleaves each kv head's K row and V
     # row (an fp8 cache pads an odd head count).
-    shape = (cell.num_seqs * block_table.shape[1], cell.page_size,
-             merged_cache_heads(cell.heads_k, cell.kv_dtype), cell.head_dim)
+    shape = (
+        cell.num_seqs * block_table.shape[1],
+        cell.page_size,
+        merged_cache_heads(cell.heads_k, cell.kv_dtype),
+        cell.head_dim,
+    )
     if cell.sliding_window is None:
         window_size = (-1, -1)
     else:
@@ -270,14 +304,24 @@ def build_flywheel(cell, inputs, args):
         if cell.scenario == "chunked_prefill":
             q, k, v = q[None], k[None], v[None]
         elif cell.scenario == "verify":
-            q, k, v = (x.reshape(cell.batch, cell.verify_tokens, *x.shape[1:])
-                       for x in (q, k, v))
+            q, k, v = (
+                x.reshape(cell.batch, cell.verify_tokens, *x.shape[1:])
+                for x in (q, k, v)
+            )
         else:
             q, k, v = q[:, None], k[:, None], v[:, None]
         out, cache = flash_attn_with_kvcache(
-            q, cache, None, k, v, cache_seqlens=start,
-            block_table=block_table, causal=True, window_size=window_size,
-            nheads_k=cell.heads_k)
+            q,
+            cache,
+            None,
+            k,
+            v,
+            cache_seqlens=start,
+            block_table=block_table,
+            causal=True,
+            window_size=window_size,
+            nheads_k=cell.heads_k,
+        )
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -292,8 +336,6 @@ def build_flywheel(cell, inputs, args):
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {}
 
 
-
-
 def build_rpa(cell, inputs, args):
     """(step, fresh_state, info) running ragged_paged_attention."""
     import jax
@@ -301,9 +343,13 @@ def build_rpa(cell, inputs, args):
 
     rpa = load_rpa_v3(args.rpa_source)
     calls, block_table, starts = inputs
-    shape = rpa.get_kv_cache_shape(cell.num_seqs * block_table.shape[1],
-                                   cell.page_size, cell.heads_k,
-                                   cell.head_dim, jnp.dtype(cell.kv_dtype))
+    shape = rpa.get_kv_cache_shape(
+        cell.num_seqs * block_table.shape[1],
+        cell.page_size,
+        cell.heads_k,
+        cell.head_dim,
+        jnp.dtype(cell.kv_dtype),
+    )
     page_indices = block_table.reshape(-1)
     if cell.scenario == "chunked_prefill":
         cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
@@ -314,24 +360,31 @@ def build_rpa(cell, inputs, args):
         # Note (david): tpu-inference's runner counts a request as decode only
         # at num_scheduled_tokens <= max_decode_tokens, which is 1, so a
         # verify window is mixed.
-        cu_q_lens = (jnp.arange(cell.batch + 1, dtype=jnp.int32)
-                     * cell.verify_tokens)
-        distribution = request_distribution(
-            num_decode=0, num_seqs=cell.batch)
+        cu_q_lens = (
+            jnp.arange(cell.batch + 1, dtype=jnp.int32) * cell.verify_tokens
+        )
+        distribution = request_distribution(num_decode=0, num_seqs=cell.batch)
         new_tokens = cell.verify_tokens
         blocks_arg = "m_block_sizes"
     else:
         cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32)
         distribution = request_distribution(
-            num_decode=cell.batch, num_seqs=cell.batch)
+            num_decode=cell.batch, num_seqs=cell.batch
+        )
         new_tokens = 1
         blocks_arg = "d_block_sizes"
-    blocks = (tuple(int(b) for b in args.rpa_blocks.split(","))
-              if args.rpa_blocks else None)
+    blocks = (
+        tuple(int(b) for b in args.rpa_blocks.split(","))
+        if args.rpa_blocks
+        else None
+    )
     # A decode call compiles RPA's mixed kernel too, whose default blocks can
     # run out of VMEM even when no request takes that path.
-    mixed_blocks = (tuple(int(b) for b in args.rpa_mixed_blocks.split(","))
-                    if args.rpa_mixed_blocks else None)
+    mixed_blocks = (
+        tuple(int(b) for b in args.rpa_mixed_blocks.split(","))
+        if args.rpa_mixed_blocks
+        else None
+    )
     block_kwargs = {blocks_arg: blocks}
     if blocks_arg == "d_block_sizes":
         block_kwargs["m_block_sizes"] = mixed_blocks
@@ -340,9 +393,19 @@ def build_rpa(cell, inputs, args):
 
     def call(cache, q, k, v, start):
         out, cache = kernel_fn(
-            q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
-            distribution, use_causal_mask=True, sm_scale=scale,
-            sliding_window=cell.sliding_window, **block_kwargs)
+            q,
+            k,
+            v,
+            cache,
+            start + new_tokens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            use_causal_mask=True,
+            sm_scale=scale,
+            sliding_window=cell.sliding_window,
+            **block_kwargs,
+        )
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -354,10 +417,12 @@ def build_rpa(cell, inputs, args):
         return out, cache
 
     generator = np.random.default_rng(1)
-    info = {"blocks": list(blocks) if blocks else None,
-            "block_source": "--rpa-blocks" if blocks else "rpa default",
-            "block_case": blocks_arg,
-            "mixed_blocks": list(mixed_blocks) if mixed_blocks else None}
+    info = {
+        "blocks": list(blocks) if blocks else None,
+        "block_source": "--rpa-blocks" if blocks else "rpa default",
+        "block_case": blocks_arg,
+        "mixed_blocks": list(mixed_blocks) if mixed_blocks else None,
+    }
     return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
 
 
@@ -371,8 +436,12 @@ def build_batched_rpa(cell, inputs, args):
     wrapper = load_batched_rpa(args.torchtpu_source)
     calls, block_table, starts = inputs
     shape = wrapper.get_kv_cache_shape(
-        cell.num_seqs * block_table.shape[1], cell.page_size, cell.heads_k,
-        cell.head_dim, jnp.dtype(cell.kv_dtype))
+        cell.num_seqs * block_table.shape[1],
+        cell.page_size,
+        cell.heads_k,
+        cell.head_dim,
+        jnp.dtype(cell.kv_dtype),
+    )
     page_indices = block_table.reshape(-1)
     if cell.scenario == "chunked_prefill":
         cu_q_lens = jnp.array([0, cell.chunk], jnp.int32)
@@ -380,20 +449,29 @@ def build_batched_rpa(cell, inputs, args):
         new_tokens = cell.chunk
         decode_query_size = 1
     else:
-        new_tokens = (cell.verify_tokens if cell.scenario == "verify"
-                      else 1)
+        new_tokens = cell.verify_tokens if cell.scenario == "verify" else 1
         cu_q_lens = jnp.arange(cell.batch + 1, dtype=jnp.int32) * new_tokens
         distribution = request_distribution(
-            num_decode=cell.batch, num_seqs=cell.batch)
+            num_decode=cell.batch, num_seqs=cell.batch
+        )
         decode_query_size = new_tokens
     kernel_fn = unjitted_kernel(wrapper)
     scale = 1.0 / math.sqrt(cell.head_dim)
 
     def call(cache, q, k, v, start):
         out, cache = kernel_fn(
-            q, k, v, cache, start + new_tokens, page_indices, cu_q_lens,
-            distribution, sm_scale=scale, sliding_window=cell.sliding_window,
-            decode_query_size=decode_query_size)
+            q,
+            k,
+            v,
+            cache,
+            start + new_tokens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=scale,
+            sliding_window=cell.sliding_window,
+            decode_query_size=decode_query_size,
+        )
         return out, cache
 
     kernel = jax.jit(call, donate_argnums=(0,))
@@ -405,13 +483,21 @@ def build_batched_rpa(cell, inputs, args):
         return out, cache
 
     generator = np.random.default_rng(1)
-    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), {
-        "block_source": "batched rpa default",
-        "decode_query_size": decode_query_size}
+    return (
+        step,
+        (lambda: fill_cache(shape, cell.kv_dtype, generator)),
+        {
+            "block_source": "batched rpa default",
+            "decode_query_size": decode_query_size,
+        },
+    )
 
 
-BUILDERS = {"flywheel": build_flywheel, "rpa": build_rpa,
-            "batched_rpa": build_batched_rpa}
+BUILDERS = {
+    "flywheel": build_flywheel,
+    "rpa": build_rpa,
+    "batched_rpa": build_batched_rpa,
+}
 
 
 def trace_scenario(cell, step, state, directory):
@@ -431,9 +517,12 @@ def trace_scenario(cell, step, state, directory):
     pids = segments_lib.device_pids(trace)
     per_op = {}
     for event in trace["traceEvents"]:
-        if (event.get("ph") != "X" or "dur" not in event
-                or event.get("pid") not in pids
-                or event["name"].startswith("jit_")):
+        if (
+            event.get("ph") != "X"
+            or "dur" not in event
+            or event.get("pid") not in pids
+            or event["name"].startswith("jit_")
+        ):
             continue
         name = event["name"].split(".")[0]
         per_op[name] = per_op.get(name, 0.0) + event["dur"] / 1e3
@@ -453,66 +542,97 @@ def run(cell, args):
         kv_tokens_read = cell.num_calls * cell.batch * cell.seq
     elif cell.sliding_window is None:
         kv_tokens_read = sum(
-            (i + 1) * cell.chunk for i in range(cell.num_calls))
+            (i + 1) * cell.chunk for i in range(cell.num_calls)
+        )
     else:
         # Note (david): call i reads from its first query's window edge,
         # sliding_window - 1 keys back, not from token 0.
         kv_tokens_read = sum(
             (i + 1) * cell.chunk
             - max(0, i * cell.chunk - cell.sliding_window + 1)
-            for i in range(cell.num_calls))
+            for i in range(cell.num_calls)
+        )
     kv_bytes_read = kv_tokens_read * cell.kv_token_bytes
-    record = {"key": cell.key, "cell": dataclasses.asdict(cell),
-              "num_calls": cell.num_calls, "attention_pairs": pairs,
-              "attn_flops": attn_flops, "kv_bytes_read": kv_bytes_read,
-              "cache_bytes": cell.cache_bytes}
+    record = {
+        "key": cell.key,
+        "cell": dataclasses.asdict(cell),
+        "num_calls": cell.num_calls,
+        "attention_pairs": pairs,
+        "attn_flops": attn_flops,
+        "kv_bytes_read": kv_bytes_read,
+        "cache_bytes": cell.cache_bytes,
+    }
     hbm = jax.devices()[0].memory_stats().get("bytes_limit")
     if hbm and cell.cache_bytes > 0.9 * hbm:
-        record.update(status="error", error=(
-            f"the KV cache needs {cell.cache_bytes / 2**30:.1f} GiB, more "
-            f"than 90% of the device's {hbm / 2**30:.1f} GiB of HBM"))
+        record.update(
+            status="error",
+            error=(
+                f"the KV cache needs {cell.cache_bytes / 2**30:.1f} GiB, more "
+                f"than 90% of the device's {hbm / 2**30:.1f} GiB of HBM"
+            ),
+        )
         return record
     try:
         inputs = make_inputs(cell)
         step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
         record.update(info)
         timing, _ = time_call(step, fresh())
-    except Exception as error:
-        record.update(status="error",
-                      error=f"{type(error).__name__}: {str(error)[:400]}")
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        record.update(
+            status="error", error=f"{type(error).__name__}: {str(error)[:400]}"
+        )
         return record
 
     ms = timing["median_ms"]
-    record.update(status="ok", **timing,
-                  ms_per_call=ms / cell.num_calls,
-                  tflops=attn_flops / (ms * 1e9),
-                  kv_read_gbps=kv_bytes_read / (ms * 1e6))
+    record.update(
+        status="ok",
+        **timing,
+        ms_per_call=ms / cell.num_calls,
+        tflops=attn_flops / (ms * 1e9),
+        kv_read_gbps=kv_bytes_read / (ms * 1e6),
+    )
     if cell.scenario in ("decode", "verify"):
-        record["tokens_per_s"] = (cell.num_calls * cell.query_tokens
-                                  / (ms / 1e3))
+        record["tokens_per_s"] = cell.num_calls * cell.query_tokens / (ms / 1e3)
     if args.trace:
         per_op = trace_scenario(cell, step, fresh(), args.trace)
         if per_op is None:
             record["trace_error"] = "no device events in the trace"
         else:
-            kernel_ms = sum(t for name, t in per_op.items()
-                            if any(m in name for m in KERNEL_MARKERS))
+            kernel_ms = sum(
+                t
+                for name, t in per_op.items()
+                if any(m in name for m in KERNEL_MARKERS)
+            )
             record.update(
-                trace_ops_ms=dict(sorted(per_op.items(),
-                                         key=lambda item: -item[1])[:8]),
+                trace_ops_ms=dict(
+                    sorted(per_op.items(), key=lambda item: -item[1])[:8]
+                ),
                 trace_device_ms=sum(per_op.values()),
                 kernel_ms=kernel_ms,
-                kernel_tflops=attn_flops / (kernel_ms * 1e9) if kernel_ms
-                else None)
+                kernel_tflops=attn_flops / (kernel_ms * 1e9)
+                if kernel_ms
+                else None,
+            )
     return record
 
 
 def main(argv=None):
     args = parse_args(argv)
-    cell = Cell(args.impl, args.scenario, args.heads, args.heads_k,
-                args.head_dim, args.seq, args.chunk, args.batch,
-                args.decode_tokens, args.page_size, args.sliding_window,
-                args.verify_tokens, kv_dtype=args.kv_dtype)
+    cell = Cell(
+        args.impl,
+        args.scenario,
+        args.heads,
+        args.heads_k,
+        args.head_dim,
+        args.seq,
+        args.chunk,
+        args.batch,
+        args.decode_tokens,
+        args.page_size,
+        args.sliding_window,
+        args.verify_tokens,
+        kv_dtype=args.kv_dtype,
+    )
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
     if args.output and not args.trace and recorded(args.output, cell.key):
@@ -528,44 +648,81 @@ def main(argv=None):
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("--impl", choices=IMPLS, required=True)
     parser.add_argument("--scenario", choices=SCENARIOS, required=True)
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--heads-k", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=256)
-    parser.add_argument("--seq", type=int, default=16384,
-                        help="total tokens per sequence")
-    parser.add_argument("--chunk", type=int, default=1024,
-                        help="chunked_prefill: query tokens per prefill call")
-    parser.add_argument("--batch", type=int, default=256,
-                        help="decode: concurrent sequences")
-    parser.add_argument("--decode-tokens", type=int, default=1024,
-                        help="decode: steps, the last tokens of --seq; "
-                             "verify: steps")
-    parser.add_argument("--verify-tokens", type=int, default=1,
-                        help="verify: query tokens per sequence per step")
+    parser.add_argument(
+        "--seq", type=int, default=16384, help="total tokens per sequence"
+    )
+    parser.add_argument(
+        "--chunk",
+        type=int,
+        default=1024,
+        help="chunked_prefill: query tokens per prefill call",
+    )
+    parser.add_argument(
+        "--batch", type=int, default=256, help="decode: concurrent sequences"
+    )
+    parser.add_argument(
+        "--decode-tokens",
+        type=int,
+        default=1024,
+        help="decode: steps, the last tokens of --seq; verify: steps",
+    )
+    parser.add_argument(
+        "--verify-tokens",
+        type=int,
+        default=1,
+        help="verify: query tokens per sequence per step",
+    )
     parser.add_argument("--page-size", type=int, default=128)
-    parser.add_argument("--kv-dtype", default="bfloat16",
-                        choices=("bfloat16", "float8_e4m3fn", "float8_e5m2"),
-                        help="k, v and KV cache dtype; q stays bfloat16")
-    parser.add_argument("--sliding-window", type=int,
-                        help="keys each query attends, its own included "
-                             "(RPA's sliding_window; flywheel's window_size "
-                             "is (W - 1, 0)); default: full causal")
-    parser.add_argument("--rpa-blocks",
-                        help="bq_sz,bkv_sz,bq_csz,bkv_csz for RPA's case; "
-                             "default: RPA's own formula")
-    parser.add_argument("--rpa-mixed-blocks",
-                        help="decode: m_block_sizes for the mixed kernel RPA "
-                             "compiles alongside; default: RPA's formula")
-    parser.add_argument("--rpa-source", type=pathlib.Path,
-                        default=DEFAULT_RPA_SOURCE)
-    parser.add_argument("--torchtpu-source", type=pathlib.Path,
-                        help="batched_rpa: a vllm-torchtpu checkout")
+    parser.add_argument(
+        "--kv-dtype",
+        default="bfloat16",
+        choices=("bfloat16", "float8_e4m3fn", "float8_e5m2"),
+        help="k, v and KV cache dtype; q stays bfloat16",
+    )
+    parser.add_argument(
+        "--sliding-window",
+        type=int,
+        help=(
+            "keys each query attends, its own included "
+            "(RPA's sliding_window; flywheel's window_size "
+            "is (W - 1, 0)); default: full causal"
+        ),
+    )
+    parser.add_argument(
+        "--rpa-blocks",
+        help=(
+            "bq_sz,bkv_sz,bq_csz,bkv_csz for RPA's case; "
+            "default: RPA's own formula"
+        ),
+    )
+    parser.add_argument(
+        "--rpa-mixed-blocks",
+        help=(
+            "decode: m_block_sizes for the mixed kernel RPA "
+            "compiles alongside; default: RPA's formula"
+        ),
+    )
+    parser.add_argument(
+        "--rpa-source", type=pathlib.Path, default=DEFAULT_RPA_SOURCE
+    )
+    parser.add_argument(
+        "--torchtpu-source",
+        type=pathlib.Path,
+        help="batched_rpa: a vllm-torchtpu checkout",
+    )
     parser.add_argument("--output", type=pathlib.Path)
-    parser.add_argument("--trace", type=pathlib.Path,
-                        help="also trace one scenario into this directory")
+    parser.add_argument(
+        "--trace",
+        type=pathlib.Path,
+        help="also trace one scenario into this directory",
+    )
     return parser.parse_args(argv)
 
 

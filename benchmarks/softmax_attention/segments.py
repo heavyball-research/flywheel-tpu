@@ -35,14 +35,25 @@ from collections import defaultdict
 
 SEGMENTS = ("qkv_proj", "layout", "attn_kernel", "out_proj", "other")
 KERNEL_NAMES = ("flash_attn", "splash_mha", "RPAm", "ragged_paged")
-MOVERS = ("copy", "reshape", "transpose", "slice", "concatenate", "pad",
-          "bitcast", "broadcast_in_dim", "convert_element_type")
+MOVERS = (
+    "copy",
+    "reshape",
+    "transpose",
+    "slice",
+    "concatenate",
+    "pad",
+    "bitcast",
+    "broadcast_in_dim",
+    "convert_element_type",
+)
 
 
 def load(directory):
     """The newest trace under directory, or None."""
-    hits = sorted(pathlib.Path(directory).rglob("*.trace.json.gz"),
-                  key=lambda path: path.stat().st_mtime)
+    hits = sorted(
+        pathlib.Path(directory).rglob("*.trace.json.gz"),
+        key=lambda path: path.stat().st_mtime,
+    )
     if not hits:
         return None
     with gzip.open(hits[-1], "rt") as handle:
@@ -62,8 +73,11 @@ def device_pids(trace):
     for event in trace.get("traceEvents", []):
         if event.get("ph") == "M" and event.get("name") == "process_name":
             name = event.get("args", {}).get("name", "")
-            if (re.search(r"TPU|Device|/device:", name, re.I)
-                    and "Host" not in name and "SparseCore" not in name):
+            if (
+                re.search(r"TPU|Device|/device:", name, re.I)
+                and "Host" not in name
+                and "SparseCore" not in name
+            ):
                 keep.add(event["pid"])
     return keep
 
@@ -74,8 +88,9 @@ def segment_of(event):
         return "attn_kernel"
     tf_op = (event.get("args") or {}).get("tf_op", "")
     primitive = tf_op.rstrip(":").rsplit("/", 1)[-1] if tf_op else ""
-    if (any(primitive.startswith(m) for m in MOVERS)
-            or name.startswith(("copy", "sparse-core-data-format-call"))):
+    if any(primitive.startswith(m) for m in MOVERS) or name.startswith(
+        ("copy", "sparse-core-data-format-call")
+    ):
         return "layout"
     if "/qkv_proj/" in tf_op:
         return "qkv_proj"
@@ -102,15 +117,18 @@ def segments(trace):
         per_segment[segment_of(event)] += event["dur"] / 1e3
     if not calls:
         return None
-    return {"calls": calls, "module_ms": module_ms / calls,
-            "ms": {name: per_segment.get(name, 0.0) / calls
-                   for name in SEGMENTS}}
+    return {
+        "calls": calls,
+        "module_ms": module_ms / calls,
+        "ms": {name: per_segment.get(name, 0.0) / calls for name in SEGMENTS},
+    }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
-        formatter_class=argparse.RawDescriptionHelpFormatter)
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
     parser.add_argument("traces", type=pathlib.Path)
     args = parser.parse_args(argv)
 
@@ -122,8 +140,9 @@ def main(argv=None):
         if split is None:
             print(f"{directory.name}: no trace")
             continue
-        parts = "  ".join(f"{name} {split['ms'][name]:.3f}"
-                          for name in SEGMENTS)
+        parts = "  ".join(
+            f"{name} {split['ms'][name]:.3f}" for name in SEGMENTS
+        )
         print(f"{directory.name}: {split['module_ms']:.3f} ms | {parts}")
 
 
