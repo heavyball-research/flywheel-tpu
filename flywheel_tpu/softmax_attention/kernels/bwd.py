@@ -36,8 +36,8 @@ from ..config import (
     NT_DIM_NUMBERS,
     PAIRED_HEAD_DIM,
     TokenMajorInfo,
+    TunedConfig,
 )
-from ..dispatch import get_tuned_config
 from ..dma import advance, drain, hbm_tm_slice
 from ..mask import apply_causal_kv_major
 from ..schedule import (
@@ -492,6 +492,7 @@ def flash_attn_bwd(
     interpret: bool = False,
     token_major: bool = False,
     head_dim: int | None = None,
+    tuned_config: TunedConfig | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Splash-attention backward -> (dq, dk, dv), laid out like q, k and v.
 
@@ -506,10 +507,11 @@ def flash_attn_bwd(
 
     head_fold heads share one schedule step: an explicit MHA fold runs the
     single-block kernel (square, zero offset, block == seq_len). GQA/MQA always
-    folds each kv head's q heads and rejects an explicit head_fold. Leaving
-    block, block_kv, block_q_compute, block_kv_compute, head_fold and num_stages
-    all None lets the tuned table set them together. A build whose f32 dq
-    accumulator overflows VMEM runs as q-row chunks.
+    folds each kv head's q heads and rejects an explicit head_fold.
+    tuned_config, the entry dispatch.resolve_tuned_bwd_config found for this
+    build, sets block, block_kv, block_q_compute, block_kv_compute, head_fold
+    and num_stages together, so they must all be None with it. A build whose
+    f32 dq accumulator overflows VMEM runs as q-row chunks.
     """
     if num_stages is not None and (
         type(num_stages) is not int or num_stages < MIN_NUM_STAGES
@@ -666,34 +668,22 @@ def flash_attn_bwd(
     # (head_fold > 1 needs block == seq_len, block_kv_compute must divide
     # block), so the table applies only when all of them are unset. It is keyed
     # on square, zero-offset MHA shapes.
-    is_tunable = (
-        block is None
-        and block_kv is None
-        and block_q_compute is None
-        and block_kv_compute is None
-        and head_fold is None
-        and num_stages is None
-        and not is_rectangular
-        and causal_offset == 0
-        and not is_gqa
-    )
-    if is_tunable:
-        tuned_config = get_tuned_config(
-            "bwd",
-            token_major=token_major,
-            num_heads=token_major_info.num_q_heads
-            if token_major
-            else num_heads,
-            batch=token_major_info.batch if token_major else None,
-            seq_len=q_seq_len,
-            head_dim=head_dim_qk,
-            head_dim_v=head_dim_v,
-            causal=causal,
-            max_seqlen=None,
-            return_lse=False,
+    if tuned_config is not None and any(
+        knob is not None
+        for knob in (
+            block,
+            block_kv,
+            block_q_compute,
+            block_kv_compute,
+            head_fold,
+            num_stages,
         )
-    else:
-        tuned_config = None
+    ):
+        raise ValueError(
+            "tuned_config sets block, block_kv, block_q_compute,"
+            " block_kv_compute, head_fold and num_stages together; pass it"
+            " with all of them None."
+        )
     if tuned_config is None:
         num_stages = MIN_NUM_STAGES if num_stages is None else num_stages
     else:

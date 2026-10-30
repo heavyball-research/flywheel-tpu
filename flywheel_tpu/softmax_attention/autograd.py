@@ -5,6 +5,7 @@ from collections.abc import Callable
 
 import jax
 
+from .dispatch import resolve_tuned_bwd_config
 from .kernels.bwd import flash_attn_bwd
 
 
@@ -42,6 +43,13 @@ def attn_with_vjp(
                 f"The TPU backward kernel does not support {bwd_unsupported};"
                 " that configuration is forward-only."
             )
+        tuned_config = resolve_tuned_bwd_config(
+            *residuals[:3],
+            causal=causal,
+            causal_offset=causal_offset,
+            token_major=token_major,
+            head_dim=head_dim,
+        )
         return flash_attn_bwd(
             *residuals,
             dout,
@@ -51,6 +59,7 @@ def attn_with_vjp(
             interpret=interpret,
             token_major=token_major,
             head_dim=head_dim,
+            tuned_config=tuned_config,
         )
 
     _attn.defvjp(_attn_fwd, _attn_bwd)

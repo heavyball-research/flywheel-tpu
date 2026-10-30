@@ -19,13 +19,12 @@ from ...core.tpu import (
     NUM_SUBLANES,
     vmem_limit_bytes,
 )
-from ...core.tuning import warn_untuned
-from ..config import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
-from ..dispatch import (
-    TUNED_CONFIGS_PATH,
+from ..config import (
+    LOG2E,
+    NN_DIM_NUMBERS,
+    NT_DIM_NUMBERS,
+    STAGES,
     KVCacheConfig,
-    get_tuned_kvcache_config,
-    kvcache_config_key,
 )
 from ..kv_layout import (
     MIN_BLOCK_KV,
@@ -1280,6 +1279,7 @@ def flash_attn_kvcache_pallas(
     left: int | None,
     return_lse: bool,
     interpret: bool,
+    tuned_config: KVCacheConfig | None,
     block_table: jax.Array | None = None,
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
@@ -1322,6 +1322,10 @@ def flash_attn_kvcache_pallas(
 
     sinks: None or (num_query_heads,) float sink logits, on the scale of the
     softcapped scores; exp(sinks[h]) joins head h's softmax denominator.
+
+    tuned_config: the (block_kv, block_kv_compute, num_kv_stages) entry
+    dispatch.resolve_tuned_kvcache_config found for this build, validated
+    here, or None for the default config.
     """
     assert (
         v_cache is None
@@ -1426,35 +1430,6 @@ def flash_attn_kvcache_pallas(
         raise ValueError(
             f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
         )
-    # Note (david): softcap stays out of the tuned key because decode is bound
-    # by the cache read; the tanh did not move the v6e step time. q is always
-    # bf16, so the key's dtype is the cache's.
-    tuned_key_fields = dict(
-        dtype=k_cache.dtype,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        capacity=capacity,
-        batch=batch,
-        append=has_new,
-        sliding_window=left,
-        return_lse=return_lse,
-    )
-    tuned_config = get_tuned_kvcache_config(**tuned_key_fields)
-    # Note (david): a paged block is whole pages, so a tuned block_kv that does
-    # not tile the page cannot be used as-is.
-    if (
-        tuned_config is not None
-        and page_size is not None
-        and tuned_config[0] % page_size
-    ):
-        warn_untuned(
-            TUNED_CONFIGS_PATH,
-            kvcache_config_key(**tuned_key_fields),
-            f"the entry's block_kv {tuned_config[0]} is not a multiple of the"
-            f" page size {page_size}, and a paged block must be whole pages",
-        )
-        tuned_config = None
     if tuned_config is not None:
         block_kv, block_kv_compute, num_kv_stages = validate_kvcache_config(
             tuned_config,

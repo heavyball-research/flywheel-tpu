@@ -10,6 +10,7 @@ import math
 import jax
 import jax.numpy as jnp
 
+from .dispatch import resolve_tuned_kvcache_config
 from .inputs import (
     check_common_kwargs,
     check_sinks,
@@ -510,6 +511,28 @@ def flash_attn_with_kvcache(
             # it still needs correctly shaped operands to build its BlockSpecs.
             k_new = v_new = jnp.zeros(new_token_shape, k_cache.dtype)
         window_left = None if window_size[0] == -1 else window_size[0]
+        if is_paged:
+            page_size = k_cache.shape[1]
+            capacity = flat_block_table.shape[0] // batch * page_size
+        else:
+            page_size = None
+            capacity = k_cache.shape[1]
+        # Note (david): softcap stays out of the tuned key because decode is
+        # bound by the cache read; the tanh did not move the v6e step time. q is
+        # always bf16, so the key's dtype is the cache's.
+        tuned_config = resolve_tuned_kvcache_config(
+            page_size=page_size,
+            dtype=k_cache.dtype,
+            # A folded window's tokens are query heads of the decode kernel.
+            num_query_heads=seqlen_q * nheads,
+            num_kv_heads=nheads_k,
+            head_dim=head_dim,
+            capacity=capacity,
+            batch=batch,
+            append=kernel_has_new,
+            sliding_window=window_left,
+            return_lse=bool(return_softmax_lse),
+        )
         kernel_outputs = flash_attn_kvcache_pallas(
             kernel_q,
             k_cache,
@@ -523,6 +546,7 @@ def flash_attn_with_kvcache(
             left=window_left,
             return_lse=bool(return_softmax_lse),
             interpret=bool(interpret),
+            tuned_config=tuned_config,
             block_table=flat_block_table,
             num_active=num_active_array,
             merged_cache=is_paged,

@@ -9,7 +9,6 @@ import pytest
 from flywheel_tpu import flash_attn_with_kvcache
 from flywheel_tpu.core import tuning
 from flywheel_tpu.softmax_attention import dispatch
-from flywheel_tpu.softmax_attention.kernels import decode
 from tests.test_flash_attn import INTERPRET, generate_block_kvcache
 from tests.test_util import merge_kv_heads, randn
 
@@ -91,7 +90,7 @@ def test_tuned_block_kv_not_a_multiple_of_the_page_size_warns(
 ):
     warnings = run_on("TPU v7")
     monkeypatch.setattr(
-        decode, "get_tuned_kvcache_config", lambda **_: (128, 128, 2)
+        dispatch, "get_tuned_kvcache_config", lambda **_: (128, 128, 2)
     )
     # The lookup runs while the kernel is traced.
     jax.clear_caches()

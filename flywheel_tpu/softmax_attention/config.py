@@ -38,6 +38,12 @@ MIN_Q_TILES_PER_BLOCK = 2
 # vmul jnp.exp lowers to on TPU. Gradient matmuls keep the true scale.
 LOG2E = math.log2(math.e)
 
+# A tuned_configs.json entry as dispatch passes it to a kernel: a dense fwd /
+# bwd config in dispatch.CONFIG_FIELDS order, or a KV-cache decode config
+# (block_kv, block_kv_compute, num_kv_stages).
+TunedConfig = tuple[int | str | bool, ...]
+KVCacheConfig = tuple[int, int, int]
+
 
 def default_block(
     seqlen: int,

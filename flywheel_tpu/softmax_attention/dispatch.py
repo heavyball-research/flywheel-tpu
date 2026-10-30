@@ -12,7 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Measured kernel configs per TPU generation and exact problem shape.
+"""Kernel choice for softmax attention: block sizes and tuned configs.
+
+get_kernel builds the dense and packed forward kernels from a tuned config or
+the analytic default_block_sizes; resolve_tuned_bwd_config and
+resolve_tuned_kvcache_config find the configs the backward and the KV-cache
+decode kernels take. This is the only module that reads tuned_configs.json,
+the family's kernel configs measured per TPU generation and exact problem
+shape; the kernels never read it.
 
 Keys are exact, not bucketed: q_block must divide the real seq_len and
 head_fold the real num_heads, so a rounded-up entry could hand back a config
@@ -26,6 +33,7 @@ CONFIG_FIELDS tuple.
 import functools
 import pathlib
 
+import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
@@ -38,8 +46,10 @@ from .config import (
     FWD_Q_COMPUTE_BLOCKS,
     MIN_Q_TILES_PER_BLOCK,
     BlockSizes,
+    KVCacheConfig,
     QKVLayout,
     TokenMajorInfo,
+    TunedConfig,
     default_block,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
@@ -58,9 +68,6 @@ CONFIG_FIELDS = (
     "qkv_layout",
     "transposed_pv",
 )
-
-TunedConfig = tuple[int | str | bool, ...]
-KVCacheConfig = tuple[int, int, int]
 
 # Note (david): varlen runs a runtime multi-step schedule whose best fold
 # differs from a dense single-block kernel at the same physical block span.
@@ -204,6 +211,85 @@ def get_tuned_kvcache_config(
 ) -> KVCacheConfig | None:
     config = tuning.lookup(TUNED_CONFIGS_PATH, kvcache_config_key(**key_fields))
     return None if config is None else tuple(config)
+
+
+def resolve_tuned_kvcache_config(
+    *, page_size: int | None, **key_fields: DTypeLike | int | bool | None
+) -> KVCacheConfig | None:
+    """The tuned config of one KV-cache decode build, or None for the
+    kernel's default config.
+
+    key_fields are kvcache_config_key's; page_size is the paged cache's, None
+    for the contiguous pair. A paged build rejects an entry whose block_kv is
+    not whole pages, with a warning.
+    """
+    tuned_config = get_tuned_kvcache_config(**key_fields)
+    # Note (david): a paged block is whole pages, so a tuned block_kv that does
+    # not tile the page cannot be used as-is.
+    if (
+        tuned_config is not None
+        and page_size is not None
+        and tuned_config[0] % page_size
+    ):
+        tuning.warn_untuned(
+            TUNED_CONFIGS_PATH,
+            kvcache_config_key(**key_fields),
+            f"the entry's block_kv {tuned_config[0]} is not a multiple of the"
+            f" page size {page_size}, and a paged block must be whole pages",
+        )
+        return None
+    else:
+        return tuned_config
+
+
+def resolve_tuned_bwd_config(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    *,
+    causal: bool,
+    causal_offset: int,
+    token_major: bool,
+    head_dim: int | None,
+) -> TunedConfig | None:
+    """The tuned config of a flash_attn_bwd build with every block knob
+    unset, or None.
+
+    q, k, v, causal, causal_offset, token_major and head_dim are
+    flash_attn_bwd's. The table is keyed on square, zero-offset MHA shapes, so
+    any other backward gets None without a lookup.
+    """
+    if token_major:
+        num_heads = q.shape[-1] // head_dim
+        num_kv_heads = k.shape[-1] // head_dim
+        batch = q.shape[0]
+        head_dim_qk = head_dim
+        head_dim_v = v.shape[-1] // num_kv_heads
+    else:
+        num_heads, _, head_dim_qk = q.shape
+        num_kv_heads = k.shape[0]
+        batch = None
+        head_dim_v = v.shape[-1]
+    q_seq_len = q.shape[-2]
+    if (
+        q_seq_len != k.shape[-2]
+        or causal_offset != 0
+        or num_heads != num_kv_heads
+    ):
+        return None
+    else:
+        return get_tuned_config(
+            "bwd",
+            token_major=token_major,
+            num_heads=num_heads,
+            batch=batch,
+            seq_len=q_seq_len,
+            head_dim=head_dim_qk,
+            head_dim_v=head_dim_v,
+            causal=causal,
+            max_seqlen=None,
+            return_lse=False,
+        )
 
 
 def default_block_sizes(
