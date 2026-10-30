@@ -10,7 +10,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import next_pow2, round_up
+from ...core.tiling import round_up
 from ...core.tpu import (
     BF16_BYTES,
     BF16_TILE_ROWS,
@@ -41,7 +41,6 @@ from ..kv_layout import (
 from ..softmax import fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
-DEFAULT_NUM_KV_STAGES = 2
 NUM_IO_STAGES = 2
 SEM_K = 0
 SEM_V = 1
@@ -50,15 +49,6 @@ SEM_V_WRITE = 3
 SEM_Q = 4
 SEM_OUT = 5
 NUM_SEMS = 6
-BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 384, 256, 128)
-STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
-# Note (david): a row runs only the kv compute tiles that hold its keys, but a
-# bigger block still issues a copy for every page in it. At Qwen3-4B's 32:8
-# heads of 128 with a 32K-token table row on v6e, 256 rows of 64-1024 tokens
-# took 1.15 ms with 4096-token blocks against 1.08 ms with 1024-token ones
-# (1.82 ms when every tile of the block ran), while a 16K context took 15.53
-# against 15.33 ms.
-MAX_BLOCK_KV = 1024
 
 
 def lane_broadcast(value: jax.Array, width: int) -> jax.Array:
@@ -1204,14 +1194,6 @@ def kvcache_kernel(
         _drain(num_kv_stages, _wait_cache_write)
 
 
-def resolve_block_kv_compute(block_kv: int) -> int:
-    return next(
-        candidate
-        for candidate in BLOCK_KV_COMPUTE_CANDIDATES
-        if block_kv % candidate == 0
-    )
-
-
 def validate_kvcache_config(
     config: KVCacheConfig,
     *,
@@ -1221,7 +1203,8 @@ def validate_kvcache_config(
     capacity: int,
     kv_itemsize: int,
 ) -> KVCacheConfig:
-    """Validate a (block_kv, block_kv_compute, num_kv_stages) config."""
+    """Validate a (block_kv, block_kv_compute, num_kv_stages) config;
+    dispatch runs it on a tuned entry."""
     block_kv, block_kv_compute, num_kv_stages = config
     if block_kv % MIN_BLOCK_KV or capacity % block_kv:
         raise ValueError(
@@ -1278,7 +1261,7 @@ def flash_attn_kvcache_pallas(
     left: int | None,
     return_lse: bool,
     interpret: bool,
-    tuned_config: KVCacheConfig | None,
+    kv_config: KVCacheConfig,
     block_table: jax.Array | None = None,
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
@@ -1321,9 +1304,8 @@ def flash_attn_kvcache_pallas(
     sinks: None or (num_query_heads,) float sink logits, on the scale of the
     softcapped scores; exp(sinks[h]) joins head h's softmax denominator.
 
-    tuned_config: the (block_kv, block_kv_compute, num_kv_stages) entry
-    dispatch.resolve_tuned_kvcache_config found for this build, validated
-    here, or None for the default config.
+    kv_config: the (block_kv, block_kv_compute, num_kv_stages) that
+    dispatch.resolve_kvcache_config picked for this build.
     """
     assert (
         v_cache is None
@@ -1424,38 +1406,7 @@ def flash_attn_kvcache_pallas(
         raise ValueError(
             f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
         )
-    if tuned_config is not None:
-        block_kv, block_kv_compute, num_kv_stages = validate_kvcache_config(
-            tuned_config,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            capacity=capacity,
-            kv_itemsize=k_cache.dtype.itemsize,
-        )
-    else:
-        granule = MIN_BLOCK_KV if page_size is None else page_size
-        target_block_kv = min(
-            capacity,
-            STAGED_KV_ELEMENT_BUDGET // head_dim // next_pow2(2 * num_kv_heads),
-            MAX_BLOCK_KV,
-        )
-        aligned_target = max(target_block_kv // granule * granule, granule)
-        if page_size is None:
-            # Note (david): capacity is a multiple of granule, so the divisor
-            # search always ends.
-            block_kv = next(
-                block
-                for block in range(aligned_target, 0, -granule)
-                if capacity % block == 0
-            )
-        else:
-            # Note (david): the table is padded to whole blocks below, so a page
-            # count with few factors (37 pages of 256 tokens) keeps the target
-            # block instead of one page per pipeline step.
-            block_kv = aligned_target
-        block_kv_compute = resolve_block_kv_compute(block_kv)
-        num_kv_stages = DEFAULT_NUM_KV_STAGES
+    block_kv, block_kv_compute, num_kv_stages = kv_config
     # Note (david): a row's keys stay within the caller's capacity, which the
     # padded table does not raise, so the guard is sized on it.
     guard_threshold = overflow_guard_threshold(capacity)

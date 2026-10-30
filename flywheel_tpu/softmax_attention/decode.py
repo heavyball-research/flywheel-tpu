@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from .config import PAGE_SIZE_MULTIPLE
-from .dispatch import resolve_paged_block_sizes, resolve_tuned_kvcache_config
+from .dispatch import resolve_kvcache_config, resolve_paged_block_sizes
 from .inputs import (
     check_common_kwargs,
     check_sinks,
@@ -544,7 +544,7 @@ def flash_attn_with_kvcache(
         # Note (david): softcap stays out of the tuned key because decode is
         # bound by the cache read; the tanh did not move the v6e step time. q is
         # always bf16, so the key's dtype is the cache's.
-        tuned_config = resolve_tuned_kvcache_config(
+        kv_config = resolve_kvcache_config(
             page_size=page_size,
             dtype=k_cache.dtype,
             # A folded window's tokens are query heads of the decode kernel.
@@ -569,7 +569,7 @@ def flash_attn_with_kvcache(
             left=window_left,
             return_lse=bool(return_softmax_lse),
             interpret=bool(interpret),
-            tuned_config=tuned_config,
+            kv_config=kv_config,
             block_table=flat_block_table,
             num_active=num_active_array,
             merged_cache=is_paged,

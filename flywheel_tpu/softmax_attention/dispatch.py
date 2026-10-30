@@ -16,16 +16,16 @@
 
 get_kernel builds the dense and packed forward kernels from a tuned config or
 the analytic default_block_sizes; resolve_paged_block_sizes picks the paged
-forward kernel's tiles; resolve_tuned_bwd_config and
-resolve_tuned_kvcache_config find the configs the backward and the KV-cache
-decode kernels take. This is the only module that reads tuned_configs.json,
-the family's kernel configs measured per TPU generation and exact problem
-shape; the kernels never read it.
+forward kernel's tiles; resolve_tuned_bwd_config finds the backward's tuned
+config and resolve_kvcache_config the KV-cache decode kernel's config. This
+is the only module that reads tuned_configs.json, the family's kernel configs
+measured per TPU generation and exact problem shape; the kernels never read
+it.
 
 Keys are exact, not bucketed: q_block must divide the real seq_len and
 head_fold the real num_heads, so a rounded-up entry could hand back a config
-the shape cannot build. A missing key returns None and the caller uses its
-analytic defaults; on a TPU that issues a UserWarning, once per key. A
+the shape cannot build. A missing key returns None and the build takes its
+analytic default config; on a TPU that issues a UserWarning, once per key. A
 kvcache| key holds the contiguous KV-cache decode kernel's (block_kv,
 block_kv_compute, num_kv_stages); every other key holds a dense fwd / bwd
 CONFIG_FIELDS tuple.
@@ -59,7 +59,9 @@ from .config import (
     default_block,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
+from .kernels.decode import validate_kvcache_config
 from .kernels.fwd_paged import estimate_vmem_bytes
+from .kv_layout import MIN_BLOCK_KV
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 
@@ -139,6 +141,16 @@ PAGED_MAX_BLOCK_KV = 1024
 # by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
 # 4096 but cost 13% at W 1024, so the cap stays at 512.
 PAGED_WINDOW_BLOCK = 512
+DEFAULT_NUM_KV_STAGES = 2
+KVCACHE_KV_COMPUTE_BLOCKS = (1024, 512, 384, 256, 128)
+STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
+# Note (david): a row runs only the kv compute tiles that hold its keys, but a
+# bigger block still issues a copy for every page in it. At Qwen3-4B's 32:8
+# heads of 128 with a 32K-token table row on v6e, 256 rows of 64-1024 tokens
+# took 1.15 ms with 4096-token blocks against 1.08 ms with 1024-token ones
+# (1.82 ms when every tile of the block ran), while a 16K context took 15.53
+# against 15.33 ms.
+KVCACHE_MAX_BLOCK_KV = 1024
 
 
 def get_varlen_head_fold(
@@ -278,6 +290,101 @@ def resolve_tuned_kvcache_config(
         return None
     else:
         return tuned_config
+
+
+def default_kvcache_config(
+    *,
+    capacity: int,
+    page_size: int | None,
+    head_dim: int,
+    num_kv_heads: int,
+) -> KVCacheConfig:
+    """The KV-cache decode kernel's analytic (block_kv, block_kv_compute,
+    num_kv_stages) for a per-row capacity.
+
+    page_size is the paged cache's, None for the contiguous pair, whose
+    capacity block_kv divides; the kernel pads a paged table to whole blocks.
+    """
+    if capacity % MIN_BLOCK_KV:
+        raise ValueError(
+            f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
+        )
+    granule = MIN_BLOCK_KV if page_size is None else page_size
+    target_block_kv = min(
+        capacity,
+        STAGED_KV_ELEMENT_BUDGET // head_dim // next_pow2(2 * num_kv_heads),
+        KVCACHE_MAX_BLOCK_KV,
+    )
+    aligned_target = max(target_block_kv // granule * granule, granule)
+    if page_size is None:
+        # Note (david): capacity is a multiple of granule, so the divisor
+        # search always ends.
+        block_kv = next(
+            block
+            for block in range(aligned_target, 0, -granule)
+            if capacity % block == 0
+        )
+    else:
+        # Note (david): the table is padded to whole blocks below, so a page
+        # count with few factors (37 pages of 256 tokens) keeps the target
+        # block instead of one page per pipeline step.
+        block_kv = aligned_target
+    block_kv_compute = next(
+        candidate
+        for candidate in KVCACHE_KV_COMPUTE_BLOCKS
+        if block_kv % candidate == 0
+    )
+    return (block_kv, block_kv_compute, DEFAULT_NUM_KV_STAGES)
+
+
+def resolve_kvcache_config(
+    *,
+    page_size: int | None,
+    dtype: DTypeLike,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    capacity: int,
+    batch: int,
+    append: bool,
+    sliding_window: int | None,
+    return_lse: bool,
+) -> KVCacheConfig:
+    """The (block_kv, block_kv_compute, num_kv_stages) of one KV-cache decode
+    build: its tuned entry, validated against the build, or else
+    default_kvcache_config.
+
+    The arguments are resolve_tuned_kvcache_config's; num_query_heads counts a
+    folded window's tokens as query heads, as the kernel does.
+    """
+    tuned_config = resolve_tuned_kvcache_config(
+        page_size=page_size,
+        dtype=dtype,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        capacity=capacity,
+        batch=batch,
+        append=append,
+        sliding_window=sliding_window,
+        return_lse=return_lse,
+    )
+    if tuned_config is None:
+        return default_kvcache_config(
+            capacity=capacity,
+            page_size=page_size,
+            head_dim=head_dim,
+            num_kv_heads=num_kv_heads,
+        )
+    else:
+        return validate_kvcache_config(
+            tuned_config,
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            capacity=capacity,
+            kv_itemsize=jnp.dtype(dtype).itemsize,
+        )
 
 
 def resolve_tuned_bwd_config(
