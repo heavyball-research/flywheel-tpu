@@ -120,7 +120,7 @@ TUNED_VARLEN_FWD_HEAD_FOLD: dict[str, dict[tuple[int, int, bool], int]] = {
 # 4096), 1024 beat 512 by 1.25-1.64x and 2048 by up to 1.44x, except at W 4096,
 # where 2048 was 2-7% faster.
 WINDOW_BLOCK = 1024
-# Note (david): a dense window with a left bound runs fwd_pipeline's static
+# Note (david): a dense window with a left bound runs the dense loop's static
 # band copies, which skip and mask per compute tile, so its blocks stay at the
 # full-attention size. On v6e dense 16K causal prefill (16:8 heads of 256,
 # 32:8 of 128, W 128-4096), 2048 blocks with 256-key kv tiles beat 512-key ones
