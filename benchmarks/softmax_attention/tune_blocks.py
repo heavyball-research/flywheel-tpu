@@ -25,8 +25,9 @@ after the second time.
 
 --collect turns a directory of finished searches into the tables the block
 benchmark reads: rpa_tuned_<chip>.json and splash_tuned_<chip>.json next to
-this file, and one section of flywheel_tpu/tuned_configs.json. Which tables and
-which section come from the device the searches recorded, not from the machine
+this file, and one section of
+flywheel_tpu/softmax_attention/tuned_configs.json. Which tables and which
+section come from the device the searches recorded, not from the machine
 --collect runs on, which needs no TPU. It refuses to write an RPA or Splash
 table for a device attention_block.py has no table suffix for, or over a table
 that holds cells the directory has no search for, which would drop them.
@@ -146,7 +147,7 @@ class Flywheel:
         }
 
     def seeds(self):
-        from flywheel_tpu.flash_attn_interface import default_block_sizes
+        from flywheel_tpu.softmax_attention.prefill import default_block_sizes
 
         default = default_block_sizes(self.cell.seq, self.cell.seq)
         return [{
@@ -190,9 +191,9 @@ class Flywheel:
     def build(self, config, qkv):
         import jax
 
-        from flywheel_tpu.flash_attn_interface import fused_q_scale
         from flywheel_tpu.softmax_attention.config import BlockSizes, QKVLayout
         from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
+        from flywheel_tpu.softmax_attention.prefill import fused_q_scale
 
         cell = self.cell
         kernel = make_flash_attn_mha(
@@ -789,7 +790,7 @@ def table_cells(configs):
 
 def collect(directory):
     """Write the tables of the device the searches in directory ran on."""
-    from flywheel_tpu import tuned_block_sizes
+    from flywheel_tpu.softmax_attention import dispatch
     from flywheel_tpu.core.tpu import get_device_name
 
     best = []
@@ -864,12 +865,12 @@ def collect(directory):
         written.append((path, count))
 
     if by_impl["flywheel"]:
-        path = tuned_block_sizes.TUNED_CONFIGS_PATH
+        path = dispatch.TUNED_CONFIGS_PATH
         table = json.loads(path.read_text(encoding="utf-8"))
         section = table.setdefault(section_name, {})
         for record in by_impl["flywheel"]:
             cell = record["cell"]
-            key = tuned_block_sizes.tuned_config_key(
+            key = dispatch.tuned_config_key(
                 "fwd",
                 token_major=False,
                 num_heads=cell["batch"] * cell["heads"],

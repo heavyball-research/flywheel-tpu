@@ -6,8 +6,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu import flash_attn_with_kvcache, tuned_block_sizes
+from flywheel_tpu import flash_attn_with_kvcache
 from flywheel_tpu.core import tuning
+from flywheel_tpu.softmax_attention import dispatch
 from flywheel_tpu.softmax_attention.kernels import decode
 from tests.test_flash_attn import INTERPRET, generate_block_kvcache
 from tests.test_util import merge_kv_heads, randn
@@ -48,24 +49,22 @@ def fixture_run_on(monkeypatch, recwarn):
 def test_untuned_key_warns_once_on_tpu(run_on):
     warnings = run_on("TPU v7")
     for _ in range(2):
-        assert (
-            tuned_block_sizes.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
-        )
-    key = tuned_block_sizes.kvcache_config_key(**UNTUNED_DECODE)
+        assert dispatch.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
+    key = dispatch.kvcache_config_key(**UNTUNED_DECODE)
     assert len(warnings()) == 1
     assert key in warnings()[0] and "TPU v7" in warnings()[0]
 
 
 def test_tuned_key_does_not_warn(run_on):
     warnings = run_on("TPU v7")
-    config = tuned_block_sizes.get_tuned_kvcache_config(**TUNED_DECODE)
+    config = dispatch.get_tuned_kvcache_config(**TUNED_DECODE)
     assert config == (4096, 2048, 2)
     assert not warnings()
 
 
 def test_untuned_dense_key_warns_on_tpu(run_on):
     warnings = run_on("TPU v7")
-    config = tuned_block_sizes.get_tuned_config(
+    config = dispatch.get_tuned_config(
         "fwd",
         token_major=False,
         num_heads=3,
@@ -83,7 +82,7 @@ def test_untuned_dense_key_warns_on_tpu(run_on):
 
 def test_untuned_key_off_tpu_does_not_warn(run_on):
     warnings = run_on("cpu")
-    assert tuned_block_sizes.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
+    assert dispatch.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
     assert not warnings()
 
 

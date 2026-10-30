@@ -11,9 +11,9 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
-from .core.tiling import next_pow2, pick_tile, round_up
-from .core.tpu import NUM_LANES
-from .softmax_attention.config import (
+from ..core.tiling import next_pow2, pick_tile, round_up
+from ..core.tpu import NUM_LANES
+from .config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
@@ -25,14 +25,14 @@ from .softmax_attention.config import (
     TokenMajorInfo,
     default_block,
 )
-from .softmax_attention.kernels.bwd import flash_attn_bwd
-from .softmax_attention.kernels.decode import flash_attn_kvcache_pallas
-from .softmax_attention.kernels.fwd_dense import make_flash_attn_mha
-from .softmax_attention.kernels.fwd_paged import flash_attn_varlen_paged
-from .softmax_attention.kernels.kv_append import append_ragged
-from .softmax_attention.kv_layout import resolve_merged_kv_heads
-from .softmax_attention.rotary import prepare_rotary
-from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
+from .dispatch import get_tuned_config, get_varlen_head_fold
+from .kernels.bwd import flash_attn_bwd
+from .kernels.decode import flash_attn_kvcache_pallas
+from .kernels.fwd_dense import make_flash_attn_mha
+from .kernels.fwd_paged import flash_attn_varlen_paged
+from .kernels.kv_append import append_ragged
+from .kv_layout import resolve_merged_kv_heads
+from .rotary import prepare_rotary
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # decode kernel descriptor-bound.

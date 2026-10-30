@@ -49,7 +49,7 @@ is not inlined, so wrapping a helper in jax.jit (or unwrapping one) shows up
 as a wrapper difference.
 
 Internal entry points (no public wrapper; a commit that moves them updates
-the imports here): flash_attn_interface._flash_attn_func_pcp_causal_offset
+the imports here): softmax_attention.prefill._flash_attn_func_pcp_causal_offset
 (the runtime-offset kernel tpu-inference's PCP attention calls),
 softmax_attention.kernels.kv_cache_write.write_kv_cache_pages, and
 core.tuning.lookup / _warn_untuned_once, which the tuned lookup record wraps.
@@ -87,8 +87,9 @@ from jaxlib.mlir import ir, passmanager
 from jaxlib.mosaic.python import tpu as mosaic_tpu
 
 import flywheel_tpu
-from flywheel_tpu import flash_attn_interface, linear_attention
+from flywheel_tpu import linear_attention
 from flywheel_tpu.core import tuning
+from flywheel_tpu.softmax_attention import prefill
 
 # Note: the page writer has no public wrapper.
 from flywheel_tpu.softmax_attention.kernels.kv_cache_write import write_kv_cache_pages
@@ -484,7 +485,7 @@ def runtime_offset_cases() -> list[Case]:
     tpu-inference calls); internal, so it is not reached from the API."""
     api = "_flash_attn_func_pcp_causal_offset"
     # pylint: disable-next=protected-access
-    entry = flash_attn_interface._flash_attn_func_pcp_causal_offset
+    entry = prefill._flash_attn_func_pcp_causal_offset
     offset = dict(causal_offset=spec((), I32))
     return [
         Case(

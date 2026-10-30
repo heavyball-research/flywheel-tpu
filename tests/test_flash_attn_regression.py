@@ -12,7 +12,7 @@ import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from flywheel_tpu.core.tiling import next_pow2
-from flywheel_tpu.flash_attn_interface import (
+from flywheel_tpu.softmax_attention.prefill import (
     default_block_sizes,
     fused_q_scale,
     pad_seqlen,

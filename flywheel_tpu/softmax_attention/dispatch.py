@@ -28,8 +28,8 @@ import pathlib
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from .core import tuning
-from .core.tpu import get_device_name
+from ..core import tuning
+from ..core.tpu import get_device_name
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 

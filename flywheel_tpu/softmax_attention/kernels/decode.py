@@ -20,13 +20,13 @@ from ...core.tpu import (
     vmem_limit_bytes,
 )
 from ...core.tuning import warn_untuned
-from ...tuned_block_sizes import (
+from ..config import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
+from ..dispatch import (
     TUNED_CONFIGS_PATH,
     KVCacheConfig,
     get_tuned_kvcache_config,
     kvcache_config_key,
 )
-from ..config import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
 from ..kv_layout import (
     MIN_BLOCK_KV,
     bank_safe_word_stride,

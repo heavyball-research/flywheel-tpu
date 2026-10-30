@@ -281,7 +281,7 @@ Return:
 ```
 
 To see the implementation of these functions, check
-[flash_attn_interface.py](flywheel_tpu/flash_attn_interface.py).
+[softmax_attention/prefill.py](flywheel_tpu/softmax_attention/prefill.py).
 
 The linear-attention layers of hybrid models, Gated DeltaNet (GDN, e.g.
 Qwen3-Next) and Kimi Delta Attention (KDA, e.g. Kimi Linear), each run as one

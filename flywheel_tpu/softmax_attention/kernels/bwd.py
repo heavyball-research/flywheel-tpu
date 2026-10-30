@@ -11,7 +11,6 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tiling import pick_tile, round_up
 from ...core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
-from ...tuned_block_sizes import get_tuned_config
 from ..bwd_pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
@@ -38,6 +37,7 @@ from ..config import (
     PAIRED_HEAD_DIM,
     TokenMajorInfo,
 )
+from ..dispatch import get_tuned_config
 from ..dma import advance, drain, hbm_tm_slice
 from ..mask import apply_causal_kv_major
 from ..schedule import (
