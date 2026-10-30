@@ -345,12 +345,8 @@ def flash_attn_varlen_paged(
     The caller runs check_paged_inputs on the operands first, then takes
     block_sizes from dispatch.resolve_paged_block_sizes.
     """
+    variant.check_paged_window()
     window_left, window_right = variant.window
-    if window_right not in (None, 0):
-        raise NotImplementedError(
-            "a paged KV cache takes a window right bound of -1 (unbounded) or 0"
-            f" (causal) only; got window_size={variant.window_size}."
-        )
     if variant.causal_offset or variant.runtime_causal_offset:
         raise ValueError(
             "a paged forward aligns its mask to each sequence's own keys; a"

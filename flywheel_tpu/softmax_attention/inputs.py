@@ -267,25 +267,3 @@ def make_variant(
         has_kv_scales=has_kv_scales,
         return_lse=return_lse,
     )
-
-
-def paged_window(
-    causal: bool, window_size: tuple[int, int]
-) -> tuple[bool, int | None]:
-    """(is_right_bounded, window_left) for the paged varlen kernel.
-
-    Its schedule bounds a row's keys on the right only at the causal diagonal,
-    so the right bound must be 0 or unbounded; causal forces 0, as in
-    flash_attn_func.
-    """
-    if causal or window_size[1] == 0:
-        is_right_bounded = True
-    elif window_size[1] == -1:
-        is_right_bounded = False
-    else:
-        raise NotImplementedError(
-            "a paged KV cache takes a window right bound of -1 (unbounded) or 0"
-            f" (causal) only; got window_size={window_size}."
-        )
-    window_left = None if window_size[0] == -1 else window_size[0]
-    return is_right_bounded, window_left

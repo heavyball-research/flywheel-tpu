@@ -17,7 +17,6 @@ from .inputs import (
     check_sinks,
     descale_scalar,
     make_variant,
-    paged_window,
 )
 from .kernels.decode import flash_attn_kvcache_pallas
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
@@ -126,9 +125,8 @@ def flash_attn_kvcache_varlen(
             num_kv_heads=num_kv_heads,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=pages_per_seq * page_size,
-            return_lse=return_lse,
+            variant=variant,
             rotary=None,
-            has_window=variant.window[0] is not None,
             block_sizes=None,
         )
         outputs = flash_attn_varlen_paged(
@@ -448,10 +446,10 @@ def flash_attn_with_kvcache(
         has_kv_scales=True,
     )
     if is_extend:
-        _, window_left = paged_window(causal, window_size)
+        variant.check_paged_window()
         is_folded = (
             not is_ragged
-            and window_left is None
+            and variant.window[0] is None
             and seqlen_q * (nheads // nheads_k) <= MAX_FOLDED_QUERY_ROWS
         )
     else:

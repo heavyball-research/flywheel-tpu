@@ -186,6 +186,16 @@ class Variant:
         schedule applies the mask instead (the per-seq ones)."""
         return dataclasses.replace(self, causal=False, window_size=(-1, -1))
 
+    def check_paged_window(self) -> None:
+        """Raise unless the mask's right bound is 0 (causal) or unbounded: a
+        paged KV cache's schedule bounds a row's keys on the right only at the
+        causal diagonal."""
+        if self.window[1] not in (None, 0):
+            raise NotImplementedError(
+                "a paged KV cache takes a window right bound of -1 (unbounded)"
+                f" or 0 (causal) only; got window_size={self.window_size}."
+            )
+
     def check_sinks_operand(self, sinks: jax.Array | None) -> None:
         """Raise unless sinks is given exactly when has_sinks."""
         if (sinks is not None) != self.has_sinks:

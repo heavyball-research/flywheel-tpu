@@ -32,7 +32,6 @@ from .inputs import (
     make_variant,
     pad_axis,
     pad_seqlen,
-    paged_window,
     parse_qkv,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
@@ -456,7 +455,6 @@ def paged_varlen_attn(
             "head_dim is only meaningful for token-major inputs; a paged call"
             " takes head-major q."
         )
-    _, window_left = paged_window(causal, window_size)
     if cu_seqlens_k is not None:
         raise ValueError(
             "with block_table, pass cu_seqlens_k=None: seqused_k gives each"
@@ -594,6 +592,7 @@ def paged_varlen_attn(
         return_lse=bool(return_softmax_lse),
         has_kv_scales=True,
     )
+    variant.check_paged_window()
     k_scale = descale_scalar(k_descale, "k_descale")
     v_scale = descale_scalar(v_descale, "v_descale")
     kernel_sinks = check_sinks(sinks, q.shape[0])
@@ -614,9 +613,8 @@ def paged_varlen_attn(
         num_kv_heads=num_kv_heads,
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_k=int(max_seqlen_k),
-        return_lse=bool(return_softmax_lse),
+        variant=variant,
         rotary=rotary,
-        has_window=window_left is not None,
         block_sizes=paged_block_sizes,
     )
     kernel = functools.partial(

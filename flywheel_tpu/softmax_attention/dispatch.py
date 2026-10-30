@@ -931,17 +931,17 @@ def resolve_paged_block_sizes(
     num_kv_heads: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
-    return_lse: bool,
+    variant: Variant,
     rotary: tuple[jax.Array, None] | None,
-    has_window: bool,
     block_sizes: BlockSizes | None,
 ) -> BlockSizes:
     """block_sizes of one flash_attn_varlen_paged build, on operands
     check_paged_inputs accepted (num_kv_heads is what it returned).
 
     max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
-    slow, not wrong. has_window is whether a left window bound is set. A
-    pinned block_sizes is only checked against the VMEM budget.
+    slow, not wrong. variant is the build's: whether it returns lse and sets a
+    left window bound size the tiles. A pinned block_sizes is only checked
+    against the VMEM budget.
     """
     num_q_heads, total_q, head_dim = q.shape
     page_size = kv_cache.shape[1]
@@ -960,10 +960,10 @@ def resolve_paged_block_sizes(
         max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
         page_size=page_size,
         head_dim=head_dim,
-        return_lse=return_lse,
+        return_lse=variant.return_lse,
         rotary_dtype=rotary_dtype,
         gqa_fold=num_q_heads // num_kv_heads,
-        has_window=has_window,
+        has_window=variant.window[0] is not None,
         block_sizes=block_sizes,
         kv_dtype=kv_cache.dtype,
     )
