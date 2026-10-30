@@ -6,7 +6,21 @@ copies, the QK fragment and its masks, the online softmax, the PV with its
 pending-PV hand-off across blocks, and a row's output and lse finish. Each
 takes the build's FwdTraits (and Variant, where it calls a hook) plus a small
 frozen group of the refs it reads, so a loop hands over its scratch rather
-than a helper closing over it.
+than a helper closing over it:
+
+- QRefs: the Q operand, its staging ring and the rotary Q coefficients.
+- KVRefs / PagedKVRefs: the contiguous K and V streams, or the paged merged
+  cache with its word staging ring and unpacked K and V planes. Both give a
+  fragment its V operand through v_tile.
+- RowStateRefs: row max, row sum, o accumulator, block parity, guard flags.
+- PendingPVRefs: the PV a block leaves to the next one.
+- OutRefs: the o and lse operands, their stages and the DMA semaphores.
+
+Two more frozen groups carry values rather than refs: ScoreMask, how a build
+masks its scores, and KVBlock, the kv block a fragment belongs to. The loop
+itself (block descriptors and prefetch, the fragment pipeline copies, the
+overflow replay, row parity and the deferred row finish) stays with each
+kernel's driver.
 """
 
 import dataclasses

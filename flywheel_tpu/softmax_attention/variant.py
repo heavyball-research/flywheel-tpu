@@ -9,14 +9,16 @@ logits, the K and V descales, a runtime causal offset) stay kernel operands,
 which the kernel hands its hooks as VariantOperands. Rotary is not part of a
 Variant: it stages Q and K rather than transforming scores.
 
-fwd_body calls the hooks at fixed points: transform_q on each staged Q tile,
-transform_logits on each QK fragment, mask_logits where the static mask
-applies, fold_sink and lse at a row's end, and output_scale where the output
-is normalized. The decode kernel (kernels/decode.py) calls transform_logits on
-each score fragment and fold_sink at a row's end; its caller scales Q, and it
-keeps its own window mask, output scale and lse, whose op order differs. The
-backward (kernels/bwd.py) reads softmax_scale and the causal mask with its
-causal offset, and check_backward rejects every other feature it lacks.
+The forward building blocks (fwd_blocks.py) call the hooks at fixed points:
+transform_q on each staged Q tile (wait_q_row), transform_logits on each QK
+fragment (qk), mask_logits where the static mask applies (masked_scores),
+fold_sink and lse at a row's end (fold_out_sinks, finish_row_lse), and
+output_scale where the output is normalized (finish_row_out). The decode
+kernel (kernels/decode.py) calls transform_logits on each score fragment and
+fold_sink at a row's end; its caller scales Q, and it keeps its own window
+mask, output scale and lse, whose op order differs. The backward
+(kernels/bwd.py) reads softmax_scale and the causal mask with its causal
+offset, and check_backward rejects every other feature it lacks.
 
 Adding a Variant feature (a new score term such as ALiBi, say) touches:
 1. A static field with a default that means "off", checked in __post_init__
@@ -29,9 +31,9 @@ Adding a Variant feature (a new score term such as ALiBi, say) touches:
    only on fragments the schedule flags as partial (under lax.cond), never on
    full blocks or in the per-seq builds, which take without_mask() and mask
    in their schedule. A position- or head-dependent term therefore needs a
-   hook that fwd_body's _qk hands its fragment's place (q_tok, kv_tok,
-   base_head and g; a per-seq row's diagonal is k = q + its ScheduleRow's
-   bottom_right_offset in packed coordinates).
+   hook that fwd_blocks.qk hands its fragment's place (its KVBlock's q_tok
+   and kv_tok, the row's base_head and g; a per-seq row's diagonal is
+   k = q + its ScheduleRow's bottom_right_offset in packed coordinates).
 3. The decode kernel, whose score rows interleave the heads of a head group,
    calls only transform_logits and fold_sink, and keeps its own mask, output
    scale and lse.
