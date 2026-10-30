@@ -17,6 +17,32 @@ each score fragment and fold_sink at a row's end; its caller scales Q, and it
 keeps its own window mask, output scale and lse, whose op order differs. The
 backward (kernels/bwd.py) reads softmax_scale and the causal mask with its
 causal offset, and check_backward rejects every other feature it lacks.
+
+Adding a Variant feature (a new score term such as ALiBi, say) touches:
+1. A static field with a default that means "off", checked in __post_init__
+   (Variants key caches, so every field is a hashable Python value). A traced
+   value also gets a VariantOperands field and a check_operands entry; each
+   entry kernel passes it as an SMEM operand (see sink_logits, kv_scales).
+2. The hooks. transform_logits sees each QK fragment before any mask, but
+   only its values: no query or key position and no head. mask_logits runs
+   only on fragments the schedule flags as partial (under lax.cond), never on
+   full blocks or in the per-seq builds, which take without_mask() and mask
+   in their schedule. A position- or head-dependent term therefore needs a
+   hook that fwd_body's _qk hands its fragment's place (q_tok, kv_tok,
+   base_head and g; a per-seq row's diagonal is k = q + its ScheduleRow's
+   bottom_right_offset in packed coordinates).
+3. The decode kernel, whose score rows interleave the heads of a head group,
+   calls only transform_logits and fold_sink, and keeps its own mask, output
+   scale and lse.
+4. The backward calls no hook: name the feature in check_backward unless
+   kernels/bwd.py and bwd_pipeline.py learn it.
+5. dispatch: matches_tuned_table keeps a non-default field off the tuned
+   blocks until it is measured and named in TUNED_TABLE_FIELDS. The decode
+   table (dispatch.resolve_kvcache_config) keys on the left window bound and
+   return_lse only, so a decode feature that changes the best tiles needs its
+   own key there.
+6. Entry checks that limit where a feature runs, like check_paged_window and
+   make_flash_attn_mha's runtime_causal_offset check.
 """
 
 import dataclasses
