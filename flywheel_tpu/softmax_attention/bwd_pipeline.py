@@ -59,7 +59,7 @@ def bwd_body(
     head_fold, kv_fold = traits.head_fold, traits.kv_fold
     token_major = traits.token_major
     num_q_tiles, num_kv_tiles = traits.num_q_tiles, traits.num_kv_tiles
-    lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
+    lane_width_qk, lane_width_v = traits.width_qk, traits.width_v
     q_heads_per_row = traits.q_heads_per_row
     kv_heads_per_row = traits.kv_heads_per_row
     is_lane_paired = traits.is_lane_paired
@@ -650,7 +650,7 @@ def bwd_body(
 def bwd_out_shape(traits: BwdTraits) -> list[jax.ShapeDtypeStruct]:
     """(dq, dk, dv) output structs, laid out like q, k and v."""
     token_major, dtype = traits.token_major, traits.dtype
-    num_heads, num_kv_heads = traits.num_heads, traits.num_kv_heads
+    num_heads, num_kv_heads = traits.num_q_heads, traits.num_kv_heads
     q_seq_len, kv_seq_len = traits.q_seq_len, traits.kv_seq_len
     head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
     if token_major is None:

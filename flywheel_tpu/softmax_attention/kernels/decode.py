@@ -1348,7 +1348,7 @@ def flash_attn_kvcache_pallas(
     is_bitcast_load = not interpret and not is_cache_head_major
     traits = DecodeTraits(
         batch=batch,
-        num_query_heads=num_query_heads,
+        num_q_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         query_tokens=query_tokens,

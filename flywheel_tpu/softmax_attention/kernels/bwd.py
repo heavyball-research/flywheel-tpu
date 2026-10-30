@@ -149,7 +149,7 @@ def flash_bwd_folded_kernel(
     num_stages = traits.num_stages
     out_dtype = traits.dtype
     token_major = traits.token_major
-    lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
+    lane_width_qk, lane_width_v = traits.width_qk, traits.width_v
     scale = variant.softmax_scale
     causal = variant.causal
     f32 = jnp.float32
@@ -628,7 +628,7 @@ def flash_attn_bwd(
 
     traits = BwdTraits(
         block_sizes=block_sizes,
-        num_heads=num_heads,
+        num_q_heads=num_heads,
         num_kv_heads=num_kv_heads,
         q_seq_len=q_seq_len,
         kv_seq_len=kv_seq_len,
