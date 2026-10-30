@@ -1,7 +1,6 @@
 """Backward kernels and the flash_attn_bwd entry point."""
 
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -45,6 +44,7 @@ from ..schedule import (
     dense_bwd_params,
     make_dense_bwd_schedule,
 )
+from ..variant import Variant
 
 # Note (david): dq_acc is the only scratch that grows with q_seq_len; capping it
 # at half the VMEM budget leaves the other half to the block-sized stage
@@ -407,9 +407,8 @@ def flash_attn_bwd_q_chunked(
     *,
     chunk_rows: int,
     block_sizes: BlockSizes,
-    causal: bool,
-    causal_offset: int,
-    **knobs: int | float | bool | None,
+    variant: Variant,
+    **knobs: int | bool | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dense backward as one rectangular backward per q-row chunk -> (dq, dk,
     dv).
@@ -420,6 +419,7 @@ def flash_attn_bwd_q_chunked(
     skips for those rows. A full-mask chunk keeps causal_offset, so equal-sized
     chunks share one compiled kernel.
     """
+    causal, causal_offset = variant.causal, variant.causal_offset
     q_seq_len, kv_seq_len = q.shape[-2], k.shape[-2]
     f32 = jnp.float32
     dq_chunks = []
@@ -437,10 +437,10 @@ def flash_attn_bwd_q_chunked(
             kv_stop = min(
                 kv_seq_len, round_up(stop + causal_offset, block_sizes.block_kv)
             )
-            chunk_causal_offset = causal_offset + start
+            chunk_variant = variant.with_causal_offset(causal_offset + start)
         else:
             kv_stop = kv_seq_len
-            chunk_causal_offset = causal_offset
+            chunk_variant = variant
         chunk_dq, chunk_dk, chunk_dv = flash_attn_bwd(
             q[..., start:stop, :],
             k[..., :kv_stop, :],
@@ -448,9 +448,8 @@ def flash_attn_bwd_q_chunked(
             o[..., start:stop, :],
             lse[:, start:stop],
             do[..., start:stop, :],
-            causal=causal,
-            causal_offset=chunk_causal_offset,
             block_sizes=block_sizes,
+            variant=chunk_variant,
             **knobs,
         )
         dq_chunks.append(chunk_dq)
@@ -473,9 +472,7 @@ def flash_attn_bwd(
     *,
     block_sizes: BlockSizes,
     head_fold: int | None,
-    causal: bool = False,
-    causal_offset: int = 0,
-    softmax_scale: float | None = None,
+    variant: Variant,
     interpret: bool = False,
     token_major: bool = False,
     head_dim: int | None = None,
@@ -489,7 +486,9 @@ def flash_attn_bwd(
     lse is (num_heads, q_seq_len) under both layouts: the natural-log logsumexp
     of the scaled logits that the forward saved.
 
-    The causal mask keeps q_idx + causal_offset >= kv_idx.
+    variant is the forward's: its softmax_scale scales the logits, and under
+    causal the mask keeps q_idx + causal_offset >= kv_idx. Any other feature
+    of it raises (Variant.check_backward).
 
     block_sizes (head-dim-minor) and head_fold are the build's, which
     dispatch.resolve_bwd_config picks. head_fold heads share one schedule
@@ -498,6 +497,8 @@ def flash_attn_bwd(
     head_fold=None. A build whose f32 dq accumulator overflows VMEM runs as
     q-row chunks.
     """
+    variant.check_backward()
+    causal, causal_offset = variant.causal, variant.causal_offset
     assert block_sizes.qkv_layout == QKVLayout.HEAD_DIM_MINOR, block_sizes
     if token_major:
         if (
@@ -640,11 +641,7 @@ def flash_attn_bwd(
             " picks; got None."
         )
 
-    if softmax_scale is None:
-        scale = 1.0 / math.sqrt(head_dim_qk)
-    else:
-        scale = softmax_scale
-
+    scale = variant.softmax_scale
     is_rectangular = q_seq_len != kv_seq_len
     num_stages = block_sizes.num_stages
     bq = block_sizes.block_q
@@ -789,9 +786,7 @@ def flash_attn_bwd(
             do,
             chunk_rows=-(-num_q_blocks // num_chunks) * bq,
             block_sizes=block_sizes,
-            causal=causal,
-            causal_offset=causal_offset,
-            softmax_scale=scale,
+            variant=variant,
             head_fold=None if is_gqa else head_fold,
             interpret=interpret,
             token_major=token_major,

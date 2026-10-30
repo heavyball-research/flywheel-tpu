@@ -483,19 +483,19 @@ def resolve_bwd_config(
     k: jax.Array,
     v: jax.Array,
     *,
-    causal: bool,
-    causal_offset: int,
+    variant: Variant,
     token_major: bool,
     head_dim: int | None,
 ) -> tuple[BlockSizes, int | None]:
     """The (block_sizes, head_fold) of one flash_attn_bwd build.
 
-    q, k, v, causal, causal_offset, token_major and head_dim are
-    flash_attn_bwd's. The table is keyed on square, zero-offset MHA shapes, so
-    any other backward skips the lookup; it and a miss take the analytic
-    blocks and fold. head_fold is None under GQA/MQA, whose fold is each kv
-    head's q group.
+    q, k, v, variant, token_major and head_dim are flash_attn_bwd's; the
+    variant's causal flag and causal_offset key the choice. The table is keyed
+    on square, zero-offset MHA shapes, so any other backward skips the lookup;
+    it and a miss take the analytic blocks and fold. head_fold is None under
+    GQA/MQA, whose fold is each kv head's q group.
     """
+    causal, causal_offset = variant.causal, variant.causal_offset
     if token_major:
         num_heads = q.shape[-1] // head_dim
         num_kv_heads = k.shape[-1] // head_dim

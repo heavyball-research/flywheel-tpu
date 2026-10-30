@@ -39,8 +39,7 @@ def attn_with_vjp(
         variant.check_backward()
         block_sizes, head_fold = resolve_bwd_config(
             *residuals[:3],
-            causal=variant.causal,
-            causal_offset=variant.causal_offset,
+            variant=variant,
             token_major=token_major,
             head_dim=head_dim,
         )
@@ -49,9 +48,7 @@ def attn_with_vjp(
             dout,
             block_sizes=block_sizes,
             head_fold=head_fold,
-            causal=variant.causal,
-            causal_offset=variant.causal_offset,
-            softmax_scale=variant.softmax_scale,
+            variant=variant,
             interpret=interpret,
             token_major=token_major,
             head_dim=head_dim,

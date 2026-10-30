@@ -14,7 +14,9 @@ transform_logits on each QK fragment, mask_logits where the static mask
 applies, fold_sink and lse at a row's end, and output_scale where the output
 is normalized. The decode kernel (kernels/decode.py) calls transform_logits on
 each score fragment and fold_sink at a row's end; its caller scales Q, and it
-keeps its own window mask, output scale and lse, whose op order differs.
+keeps its own window mask, output scale and lse, whose op order differs. The
+backward (kernels/bwd.py) reads softmax_scale and the causal mask with its
+causal offset, and check_backward rejects every other feature it lacks.
 """
 
 import dataclasses
@@ -124,6 +126,10 @@ class Variant:
     def with_lse(self, return_lse: bool) -> "Variant":
         """This variant, returning lse or not."""
         return dataclasses.replace(self, return_lse=return_lse)
+
+    def with_causal_offset(self, causal_offset: int) -> "Variant":
+        """This variant with its mask's diagonal shifted by causal_offset."""
+        return dataclasses.replace(self, causal_offset=causal_offset)
 
     def without_mask(self) -> "Variant":
         """This variant with no causal or window mask, for a build whose
@@ -245,13 +251,19 @@ class Variant:
         return v_scale / row_sum
 
     def check_backward(self) -> None:
-        """Raise NotImplementedError for what the backward kernel lacks."""
+        """Raise NotImplementedError for what the backward kernel lacks: it
+        takes softmax_scale, causal and a static causal_offset, and nothing
+        else of a Variant (return_lse only shapes the forward)."""
         if self.window_size != (-1, -1):
             unsupported = "window_size"
         elif self.softcap != 0.0:
             unsupported = "softcap"
         elif self.has_sinks:
             unsupported = "learnable_sink"
+        elif self.runtime_causal_offset:
+            unsupported = "a runtime causal_offset"
+        elif self.has_kv_scales:
+            unsupported = "k_descale / v_descale"
         else:
             return
         raise NotImplementedError(
