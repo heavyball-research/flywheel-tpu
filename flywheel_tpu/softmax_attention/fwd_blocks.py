@@ -1118,14 +1118,7 @@ def pv(
     head_rows = pl.ds(g * group_bq, group_bq)
     v_half = g % traits.heads_per_lane_tile if traits.is_lane_paired else None
 
-    if traits.is_paged:
-        o_curr = lax.dot_general(
-            probs,
-            v_tile,
-            NN_DIM_NUMBERS,
-            preferred_element_type=jnp.float32,
-        )
-    elif traits.is_head_dim_minor:
+    if traits.is_head_dim_minor:
         o_curr = lax.dot_general(
             probs,
             take_half(v_tile, v_half, traits.lane_width_v),

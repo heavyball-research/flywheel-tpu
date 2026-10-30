@@ -121,6 +121,8 @@ def dense_fwd_body(
     """
     assert not (traits.is_paged or traits.is_per_seq), traits
     assert schedule.q_token is None and schedule.num_live_tiles is None
+    # A dense grid has no packed padding rows to fill.
+    assert schedule.packed_q_end is None, schedule.packed_q_end
     bq, bkv = traits.bq, traits.bkv
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     num_stages = traits.num_stages
@@ -593,7 +595,7 @@ def dense_fwd_body(
             state,
             out_refs,
             finish,
-            schedule.packed_q_end,
+            None,
         )
 
     def _row_after(g, si):
@@ -699,7 +701,7 @@ def dense_fwd_body(
                 g,
                 finish,
                 sinks,
-                schedule.packed_q_end,
+                None,
             )
         if sinks is not None:
             fold_out_sinks(traits, variant, state, finish, sinks)
