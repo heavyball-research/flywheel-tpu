@@ -9,22 +9,14 @@ V, and whose q heads are stacked over the rows of every score fragment.
 """
 
 import math
-from functools import cache, partial
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 
-from ...core.tiling import next_pow2, pick_tile, round_up
-from ...core.tpu import (
-    BF16_TILE_ROWS,
-    F32_BYTES,
-    NUM_LANES,
-    NUM_SUBLANES,
-    vmem_limit_bytes,
-)
+from ...core.tiling import next_pow2, round_up
+from ...core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
 from ..config import (
-    FWD_BLOCKS,
-    FWD_KV_COMPUTE_BLOCKS,
     LOG2E,
     MIN_Q_TILES_PER_BLOCK,
     PAGE_SIZE_MULTIPLE,
@@ -54,37 +46,6 @@ SCORE_TEMPORARY_BYTES = 5 * F32_BYTES + 1
 # 10.6 ms) with a 15x longer compile. The kv head's q heads are folded into the
 # fragment rows instead (fwd_body's gqa_fold).
 PAGED_HEAD_FOLD = 1
-# Note (david): a K or V tile pushed to the MXU serves the fragment's
-# gqa_fold * block_q_compute rows, so the q compute tile is the largest that
-# keeps a fragment within this many rows. v6e, chunks over 16K, heads of 256:
-# 32:4 with 1024-token chunks ran 9.14 ms at 1024
-# rows against 10.03 at 2048 (and 10.78 unfolded at 512); 32:32 ran 10.60 at
-# 512 rows against 11.03 at 256, and with 2048-token chunks 10.38 at 1024
-# rows against 10.54 at 512.
-MAX_FRAGMENT_ROWS = 1024
-# Note (david): a 2048 x 2048 q x kv block ran 3.4x slower than 2048 x 1024
-# on v6e (Qwen3-4B's 32:8 heads of 128, a 2040-token chunk over a 16K prefix:
-# 7.72 against 2.19 ms) though it fits VMEM, and 1024 x 2048 ran at par, so
-# the block area is capped at 2048 x 1024. It counts every folded q row: at
-# 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
-# 512 x 512.
-MAX_PAGED_BLOCK_AREA = 2048 * 1024
-# Note (david): a sequence shorter than block_q still fills a whole q block,
-# and a server pads cu_seqlens_q to its request slots, so block_q cannot
-# follow the longest sequence. v6e, 32:8 d128, 16K-128K token batches:
-# 512 x 1024 beat 1024 x 512 on every batch, by 1.35-1.6x on mostly short
-# sequences (3.56 against 5.69 ms).
-PAGED_MAX_BLOCK_Q = 512
-# Note (david): where the block area caps the pair, keeping block_kv and
-# shrinking block_q won: 256 x 1024 beat 512 x 512 by up to 1.5x at 32:4, and
-# 128 x 1024 beat 256 x 512 on six of seven batches at 32:2 (v6e).
-PAGED_KV_PER_Q_BLOCK = 4
-PAGED_MAX_BLOCK_KV = 1024
-# Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
-# dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
-# by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
-# 4096 but cost 13% at W 1024, so the cap stays at 512.
-PAGED_WINDOW_BLOCK = 512
 
 
 def flash_fwd_varlen_paged_kernel(
@@ -252,163 +213,22 @@ def estimate_vmem_bytes(
     return scratch_bytes + temporary_bytes
 
 
-@cache
-def resolve_paged_tiles(
-    *,
-    max_seqlen_q_bucket: int,
-    max_seqlen_k_bucket: int,
-    page_size: int,
-    head_dim: int,
-    return_lse: bool,
-    rotary_dtype: jnp.dtype | None,
-    gqa_fold: int,
-    has_window: bool,
-    kv_dtype: jnp.dtype,
-    block_sizes: BlockSizes | None = None,
-) -> BlockSizes:
-    """block_sizes of one paged build, whose q sizes count tokens per head.
-
-    Among the builds whose TPU staging fits vmem_limit_bytes() and whose
-    (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
-    largest kv block at most a kv target, then the largest q block at most a q
-    target; with none at most a target, the smallest above it. The q target is
-    the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
-    PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
-    tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
-    blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
-    A pinned block_sizes is only checked against the budget.
-    """
-    target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
-    target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
-    if block_sizes is not None:
-        candidate_blocks = [block_sizes]
-    else:
-        block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
-        # Note (david): block_kv is whole pages, so a 384- or 640-token page
-        # takes five or three pages (1920 tokens), where no power-of-two block
-        # ends on a page edge; smaller kv blocks halve the page count.
-        kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
-        max_kv_pages = kv_block_cap // page_size
-        kv_blocks = [
-            page_size * (max_kv_pages >> shift)
-            for shift in range(max_kv_pages.bit_length())
-        ]
-        # Note (david): a fragment reloads its rows' softmax state per kv
-        # compute tile, so no larger q block is bought with a kv block below one
-        # full kv compute tile. At 32:4 heads of 256 (1024-token chunks over
-        # 16K, v6e, gqa fold 8) a 1024 x 256 block took 12.44 ms against 9.14 at
-        # 512 x 512.
-        min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
-        kv_blocks = [
-            block_kv for block_kv in kv_blocks if block_kv >= min_kv_block
-        ]
-        q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
-        # Note (david): FWD_BLOCKS are powers of two, so the smaller of two
-        # powers of two divides the q block; a folded tile stays whole bf16
-        # tiles.
-        head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
-        q_compute_cap = max(
-            BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1)
-        )
-        candidate_blocks = [
-            BlockSizes(
-                block_q=block_q,
-                block_kv=block_kv,
-                block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
-                block_q_compute=min(
-                    q_compute_cap, block_q // MIN_Q_TILES_PER_BLOCK
-                ),
-            )
-            for block_q in FWD_BLOCKS
-            if block_q <= q_block_cap
-            for block_kv in kv_blocks
-            if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
-        ]
-    estimates = {
-        blocks: estimate_vmem_bytes(
-            blocks,
-            head_dim=head_dim,
-            return_lse=return_lse,
-            rotary_dtype=rotary_dtype,
-            gqa_fold=gqa_fold,
-            kv_dtype=kv_dtype,
-        )
-        for blocks in candidate_blocks
-    }
-    fitting = [
-        blocks
-        for blocks, estimate in estimates.items()
-        if estimate <= vmem_limit_bytes()
-    ]
-    if not fitting:
-        blocks, estimate = min(
-            estimates.items(), key=lambda blocks_and_bytes: blocks_and_bytes[1]
-        )
-        raise ValueError(
-            "paged attention does not fit the scoped VMEM budget of"
-            f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
-            f"{blocks.block_q}, block_kv={blocks.block_kv}) needs ~{estimate}"
-            f" bytes at {head_dim=}."
-        )
-
-    def _nearest_below(size, target):
-        return (size <= target, size if size <= target else -size)
-
-    return max(
-        fitting,
-        key=lambda blocks: (
-            _nearest_below(blocks.block_kv, target_kv),
-            _nearest_below(blocks.block_q, target_q),
-        ),
-    )
-
-
-def flash_attn_varlen_paged(
+def check_paged_inputs(
     q: jax.Array,
     kv_cache: jax.Array,
     cu_seqlens_q: jax.Array,
     seqused_k: jax.Array,
     block_table: jax.Array,
-    sinks: jax.Array | None = None,
+    sinks: jax.Array | None,
     *,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
-    causal: bool,
-    q_scale: float,
-    return_lse: bool,
-    interpret: bool,
-    block_sizes: BlockSizes | None = None,
-    rotary: tuple[jax.Array, None] | None = None,
-    rotary_interleaved: bool = False,
-    window_left: int | None = None,
-    softcap: float = 0.0,
-    nheads_k: int | None = None,
-    k_scale: float | jax.Array = 1.0,
-    v_scale: float | jax.Array = 1.0,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Packed head-major attention over a paged KV cache, read-only.
+    nheads_k: int | None,
+    block_sizes: BlockSizes | None,
+) -> int:
+    """Check flash_attn_varlen_paged's operands, and a pinned block_sizes,
+    before dispatch picks the build's tiles; returns the pool's kv head count.
 
-    q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
-    entry is 0. kv_cache is the merged (num_pages, page_size,
-    merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
-    interleave the kv heads' K and V rows (kv_layout's merged order); nheads_k
-    defaults to half its head axis, and an fp8 pool, which pads an odd head
-    count, needs it. An fp8 pool is widened to bf16 once per staged block;
-    k_scale multiplies every score and v_scale the output, both scalars that
-    may be traced. seqused_k is each sequence's kv length with its new tokens,
-    which the cache must already hold; a block_table entry past those tokens'
-    pages is only read through a clamp into the pool, and the rows it names are
-    discarded.
-    Causal rows align to the end of their sequence's keys; window_left (None
-    unbounded) also hides the keys more than window_left positions before that
-    diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
-    scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
-    softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
-    max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
-    slow, not wrong. rotary is prepare_rotary's (q coefficients, None) pair.
-    sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
-    denominator, sink logits on the scale of the softcapped scores (gpt-oss
-    attention sinks).
+    The arguments are flash_attn_varlen_paged's; block_sizes is the caller's
+    pinned one, None when dispatch picks it.
     """
     num_q_heads, total_q, head_dim = q.shape
     if q.dtype != jnp.bfloat16:
@@ -470,8 +290,6 @@ def flash_attn_varlen_paged(
             f"block_table must be a (batch={batch}, max_pages_per_seq >= 1)"
             f" integer array; got {block_table.shape} {block_table.dtype}."
         )
-    pages_per_seq = block_table.shape[1]
-    capacity = pages_per_seq * page_size
 
     if block_sizes is not None and block_sizes.block_kv % page_size:
         raise ValueError(
@@ -488,28 +306,67 @@ def flash_attn_varlen_paged(
             f" compute tiles; got block_q={block_sizes.block_q},"
             f" block_q_compute={block_sizes.block_q_compute}."
         )
-    if rotary is None:
-        rotary_dtype = None
-    else:
-        rotary_dtype = jnp.dtype(rotary[0].dtype)
-    gqa_fold = num_q_heads // num_kv_heads
-    # Note (david): the bounds key the tile cache, so power-of-two buckets keep
-    # a wobbling longest sequence on one build. The caps hold because no q
-    # block passes the 128-padded buffer and no sequence outgrows its table row.
-    block_sizes = resolve_paged_tiles(
-        max_seqlen_q_bucket=min(
-            next_pow2(max_seqlen_q), round_up(total_q, NUM_LANES)
-        ),
-        max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
-        page_size=page_size,
-        head_dim=head_dim,
-        return_lse=return_lse,
-        rotary_dtype=rotary_dtype,
-        gqa_fold=gqa_fold,
-        has_window=window_left is not None,
-        block_sizes=block_sizes,
-        kv_dtype=kv_cache.dtype,
+    return num_kv_heads
+
+
+def flash_attn_varlen_paged(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    cu_seqlens_q: jax.Array,
+    seqused_k: jax.Array,
+    block_table: jax.Array,
+    sinks: jax.Array | None = None,
+    *,
+    block_sizes: BlockSizes,
+    causal: bool,
+    q_scale: float,
+    return_lse: bool,
+    interpret: bool,
+    rotary: tuple[jax.Array, None] | None = None,
+    rotary_interleaved: bool = False,
+    window_left: int | None = None,
+    softcap: float = 0.0,
+    nheads_k: int | None = None,
+    k_scale: float | jax.Array = 1.0,
+    v_scale: float | jax.Array = 1.0,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Packed head-major attention over a paged KV cache, read-only.
+
+    q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
+    entry is 0. kv_cache is the merged (num_pages, page_size,
+    merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
+    interleave the kv heads' K and V rows (kv_layout's merged order); nheads_k
+    defaults to half its head axis, and an fp8 pool, which pads an odd head
+    count, needs it. An fp8 pool is widened to bf16 once per staged block;
+    k_scale multiplies every score and v_scale the output, both scalars that
+    may be traced. seqused_k is each sequence's kv length with its new tokens,
+    which the cache must already hold; a block_table entry past those tokens'
+    pages is only read through a clamp into the pool, and the rows it names are
+    discarded.
+    Causal rows align to the end of their sequence's keys; window_left (None
+    unbounded) also hides the keys more than window_left positions before that
+    diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
+    scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
+    softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
+    rotary is prepare_rotary's (q coefficients, None) pair.
+    sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
+    denominator, sink logits on the scale of the softcapped scores (gpt-oss
+    attention sinks).
+
+    The caller runs check_paged_inputs on the operands first, then takes
+    block_sizes from dispatch.resolve_paged_block_sizes.
+    """
+    num_q_heads, total_q, _ = q.shape
+    _, page_size, cache_heads, _ = kv_cache.shape
+    num_kv_heads = resolve_merged_kv_heads(
+        cache_heads, kv_cache.dtype, nheads_k
     )
+    cu_seqlens_q = jnp.asarray(cu_seqlens_q)
+    seqused_k = jnp.asarray(seqused_k)
+    block_table = jnp.asarray(block_table)
+    pages_per_seq = block_table.shape[1]
+    capacity = pages_per_seq * page_size
+    gqa_fold = num_q_heads // num_kv_heads
     bq = block_sizes.block_q
     paged = PagedKVInfo(
         num_kv_heads=num_kv_heads,

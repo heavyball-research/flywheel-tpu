@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 
 from .config import PAGE_SIZE_MULTIPLE
-from .dispatch import resolve_tuned_kvcache_config
+from .dispatch import resolve_paged_block_sizes, resolve_tuned_kvcache_config
 from .inputs import (
     check_common_kwargs,
     check_sinks,
@@ -20,7 +20,7 @@ from .inputs import (
     paged_window,
 )
 from .kernels.decode import flash_attn_kvcache_pallas
-from .kernels.fwd_paged import flash_attn_varlen_paged
+from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .kernels.kv_append import append_ragged
 from .kv_layout import resolve_merged_kv_heads
 
@@ -59,9 +59,10 @@ def flash_attn_kvcache_varlen(
     q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
     merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
     head_dim) cache and block_table its flat (batch * pages_per_seq,) page
-    table. max_seqlen_q, causal, window_left, softcap, q_scale, nheads_k,
-    k_scale, v_scale and sinks are flash_attn_varlen_paged's. Returns (out,
-    kv_cache) plus lse (nheads, total_q) float32 when return_lse.
+    table. max_seqlen_q is dispatch.resolve_paged_block_sizes's; causal,
+    window_left, softcap, q_scale, nheads_k, k_scale, v_scale and sinks are
+    flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse (nheads,
+    total_q) float32 when return_lse.
     """
     batch = cu_seqlens_q.shape[0] - 1
     num_query_heads = q.shape[1]
@@ -108,15 +109,38 @@ def flash_attn_kvcache_varlen(
         total_lengths = cache_seqlens + (
             jnp.diff(cu_seqlens_q) if has_new else 0
         )
-        outputs = flash_attn_varlen_paged(
-            q.transpose(1, 0, 2),
+        head_major_q = q.transpose(1, 0, 2)
+        row_block_table = block_table.reshape(batch, pages_per_seq)
+        num_kv_heads = check_paged_inputs(
+            head_major_q,
             updated_kv_cache,
             kept_cu_seqlens_q,
             total_lengths,
-            block_table.reshape(batch, pages_per_seq),
+            row_block_table,
             sinks,
+            nheads_k=nheads_k,
+            block_sizes=None,
+        )
+        block_sizes = resolve_paged_block_sizes(
+            head_major_q,
+            updated_kv_cache,
+            row_block_table,
+            num_kv_heads=num_kv_heads,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=pages_per_seq * page_size,
+            return_lse=return_lse,
+            rotary=None,
+            has_window=window_left is not None,
+            block_sizes=None,
+        )
+        outputs = flash_attn_varlen_paged(
+            head_major_q,
+            updated_kv_cache,
+            kept_cu_seqlens_q,
+            total_lengths,
+            row_block_table,
+            sinks,
+            block_sizes=block_sizes,
             causal=causal,
             q_scale=q_scale,
             return_lse=return_lse,

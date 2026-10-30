@@ -15,7 +15,11 @@ from ..core.tiling import next_pow2, round_up
 from ..core.tpu import NUM_LANES
 from .autograd import attn_with_vjp, forward_only_attn
 from .config import BlockSizes
-from .dispatch import default_block_sizes, get_kernel
+from .dispatch import (
+    default_block_sizes,
+    get_kernel,
+    resolve_paged_block_sizes,
+)
 from .inputs import (
     HEAD_MAJOR_PACKED_AXIS,
     HEAD_MAJOR_SEQ_AXIS,
@@ -32,7 +36,7 @@ from .inputs import (
     parse_qkv,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
-from .kernels.fwd_paged import flash_attn_varlen_paged
+from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .rotary import prepare_rotary
 
 
@@ -581,20 +585,43 @@ def paged_varlen_attn(
     softmax_scale = (
         1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
     )
-    kernel = functools.partial(
-        flash_attn_varlen_paged,
+    k_scale = descale_scalar(k_descale, "k_descale")
+    v_scale = descale_scalar(v_descale, "v_descale")
+    kernel_sinks = check_sinks(sinks, q.shape[0])
+    num_kv_heads = check_paged_inputs(
+        q,
+        k,
+        cu_seqlens_q,
+        seqused_k,
+        block_table,
+        kernel_sinks,
+        nheads_k=nheads_k,
+        block_sizes=paged_block_sizes,
+    )
+    block_sizes = resolve_paged_block_sizes(
+        q,
+        k,
+        block_table,
+        num_kv_heads=num_kv_heads,
         max_seqlen_q=int(max_seqlen_q),
         max_seqlen_k=int(max_seqlen_k),
+        return_lse=bool(return_softmax_lse),
+        rotary=rotary,
+        has_window=window_left is not None,
+        block_sizes=paged_block_sizes,
+    )
+    kernel = functools.partial(
+        flash_attn_varlen_paged,
+        block_sizes=block_sizes,
         causal=is_right_bounded,
         window_left=window_left,
         softcap=float(softcap),
         q_scale=float(fused_q_scale(softmax_scale, softcap)),
         return_lse=bool(return_softmax_lse),
         interpret=bool(interpret),
-        block_sizes=paged_block_sizes,
         nheads_k=nheads_k,
-        k_scale=descale_scalar(k_descale, "k_descale"),
-        v_scale=descale_scalar(v_descale, "v_descale"),
+        k_scale=k_scale,
+        v_scale=v_scale,
     )
     # Note (david): K and V share the one merged cache operand k.
     return forward_only_attn(
@@ -605,7 +632,7 @@ def paged_varlen_attn(
         q,
         k,
         None,
-        (cu_seqlens_q, seqused_k, block_table, check_sinks(sinks, q.shape[0])),
+        (cu_seqlens_q, seqused_k, block_table, kernel_sinks),
         rotary,
         rotary_interleaved,
     )

@@ -15,7 +15,8 @@
 """Kernel choice for softmax attention: block sizes and tuned configs.
 
 get_kernel builds the dense and packed forward kernels from a tuned config or
-the analytic default_block_sizes; resolve_tuned_bwd_config and
+the analytic default_block_sizes; resolve_paged_block_sizes picks the paged
+forward kernel's tiles; resolve_tuned_bwd_config and
 resolve_tuned_kvcache_config find the configs the backward and the KV-cache
 decode kernels take. This is the only module that reads tuned_configs.json,
 the family's kernel configs measured per TPU generation and exact problem
@@ -38,8 +39,13 @@ import jax.numpy as jnp
 from jax.typing import DTypeLike
 
 from ..core import tuning
-from ..core.tiling import pick_tile
-from ..core.tpu import NUM_LANES, get_device_name
+from ..core.tiling import next_pow2, pick_tile, round_up
+from ..core.tpu import (
+    BF16_TILE_ROWS,
+    NUM_LANES,
+    get_device_name,
+    vmem_limit_bytes,
+)
 from .config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
@@ -53,6 +59,7 @@ from .config import (
     default_block,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
+from .kernels.fwd_paged import estimate_vmem_bytes
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 
@@ -101,6 +108,37 @@ WINDOW_BLOCK = 1024
 # W 512). A d256 window wider than a block pair runs the 64-fragment mask-free
 # copy, which ran 9.63 ms at 256-key tiles (W 4096) against 1.98 at 512.
 BAND_KV_COMPUTE_BLOCKS = (256, 128)
+# Note (david): a K or V tile pushed to the MXU serves the fragment's
+# gqa_fold * block_q_compute rows, so the q compute tile is the largest that
+# keeps a fragment within this many rows. v6e, chunks over 16K, heads of 256:
+# 32:4 with 1024-token chunks ran 9.14 ms at 1024
+# rows against 10.03 at 2048 (and 10.78 unfolded at 512); 32:32 ran 10.60 at
+# 512 rows against 11.03 at 256, and with 2048-token chunks 10.38 at 1024
+# rows against 10.54 at 512.
+MAX_FRAGMENT_ROWS = 1024
+# Note (david): a 2048 x 2048 q x kv block ran 3.4x slower than 2048 x 1024
+# on v6e (Qwen3-4B's 32:8 heads of 128, a 2040-token chunk over a 16K prefix:
+# 7.72 against 2.19 ms) though it fits VMEM, and 1024 x 2048 ran at par, so
+# the block area is capped at 2048 x 1024. It counts every folded q row: at
+# 32:4 a 512 x 1024 block of 8 folded heads ran 32.3 against 9.14 ms at
+# 512 x 512.
+MAX_PAGED_BLOCK_AREA = 2048 * 1024
+# Note (david): a sequence shorter than block_q still fills a whole q block,
+# and a server pads cu_seqlens_q to its request slots, so block_q cannot
+# follow the longest sequence. v6e, 32:8 d128, 16K-128K token batches:
+# 512 x 1024 beat 1024 x 512 on every batch, by 1.35-1.6x on mostly short
+# sequences (3.56 against 5.69 ms).
+PAGED_MAX_BLOCK_Q = 512
+# Note (david): where the block area caps the pair, keeping block_kv and
+# shrinking block_q won: 256 x 1024 beat 512 x 512 by up to 1.5x at 32:4, and
+# 128 x 1024 beat 256 x 512 on six of seven batches at 32:2 (v6e).
+PAGED_KV_PER_Q_BLOCK = 4
+PAGED_MAX_BLOCK_KV = 1024
+# Note (david): a sliding window caps both blocks, as WINDOW_BLOCK does on the
+# dense entries. On v6e chunked prefill (d256, W 1024 and 4096), 512 beat 256
+# by 1.4-2.7x and uncapped blocks by up to 1.55x. 1024 saved 26% at 32:32 W
+# 4096 but cost 13% at W 1024, so the cap stays at 512.
+PAGED_WINDOW_BLOCK = 512
 
 
 def get_varlen_head_fold(
@@ -531,4 +569,161 @@ def get_kernel(
         token_major=token_major_info,
         q_scale=q_scale,
         heads_outer_batch=heads_outer_batch,
+    )
+
+
+@functools.cache
+def resolve_paged_tiles(
+    *,
+    max_seqlen_q_bucket: int,
+    max_seqlen_k_bucket: int,
+    page_size: int,
+    head_dim: int,
+    return_lse: bool,
+    rotary_dtype: jnp.dtype | None,
+    gqa_fold: int,
+    has_window: bool,
+    kv_dtype: jnp.dtype,
+    block_sizes: BlockSizes | None = None,
+) -> BlockSizes:
+    """block_sizes of one paged build, whose q sizes count tokens per head.
+
+    Among the builds whose TPU staging fits vmem_limit_bytes() and whose
+    (gqa_fold * q) x kv block area is at most MAX_PAGED_BLOCK_AREA, picks the
+    largest kv block at most a kv target, then the largest q block at most a q
+    target; with none at most a target, the smallest above it. The q target is
+    the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
+    PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
+    tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
+    blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
+    A pinned block_sizes is only checked against the budget.
+    """
+    target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
+    target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
+    if block_sizes is not None:
+        candidate_blocks = [block_sizes]
+    else:
+        block_cap = PAGED_WINDOW_BLOCK if has_window else FWD_BLOCKS[0]
+        # Note (david): block_kv is whole pages, so a 384- or 640-token page
+        # takes five or three pages (1920 tokens), where no power-of-two block
+        # ends on a page edge; smaller kv blocks halve the page count.
+        kv_block_cap = max(min(max_seqlen_k_bucket, block_cap), page_size)
+        max_kv_pages = kv_block_cap // page_size
+        kv_blocks = [
+            page_size * (max_kv_pages >> shift)
+            for shift in range(max_kv_pages.bit_length())
+        ]
+        # Note (david): a fragment reloads its rows' softmax state per kv
+        # compute tile, so no larger q block is bought with a kv block below one
+        # full kv compute tile. At 32:4 heads of 256 (1024-token chunks over
+        # 16K, v6e, gqa fold 8) a 1024 x 256 block took 12.44 ms against 9.14 at
+        # 512 x 512.
+        min_kv_block = min(FWD_KV_COMPUTE_BLOCKS[0], kv_blocks[0])
+        kv_blocks = [
+            block_kv for block_kv in kv_blocks if block_kv >= min_kv_block
+        ]
+        q_block_cap = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), block_cap)
+        # Note (david): FWD_BLOCKS are powers of two, so the smaller of two
+        # powers of two divides the q block; a folded tile stays whole bf16
+        # tiles.
+        head_tile_rows = MAX_FRAGMENT_ROWS // gqa_fold
+        q_compute_cap = max(
+            BF16_TILE_ROWS, 1 << (head_tile_rows.bit_length() - 1)
+        )
+        candidate_blocks = [
+            BlockSizes(
+                block_q=block_q,
+                block_kv=block_kv,
+                block_kv_compute=pick_tile(FWD_KV_COMPUTE_BLOCKS, block_kv),
+                block_q_compute=min(
+                    q_compute_cap, block_q // MIN_Q_TILES_PER_BLOCK
+                ),
+            )
+            for block_q in FWD_BLOCKS
+            if block_q <= q_block_cap
+            for block_kv in kv_blocks
+            if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
+        ]
+    estimates = {
+        blocks: estimate_vmem_bytes(
+            blocks,
+            head_dim=head_dim,
+            return_lse=return_lse,
+            rotary_dtype=rotary_dtype,
+            gqa_fold=gqa_fold,
+            kv_dtype=kv_dtype,
+        )
+        for blocks in candidate_blocks
+    }
+    fitting = [
+        blocks
+        for blocks, estimate in estimates.items()
+        if estimate <= vmem_limit_bytes()
+    ]
+    if not fitting:
+        blocks, estimate = min(
+            estimates.items(), key=lambda blocks_and_bytes: blocks_and_bytes[1]
+        )
+        raise ValueError(
+            "paged attention does not fit the scoped VMEM budget of"
+            f" {vmem_limit_bytes()} bytes: its smallest build (block_q="
+            f"{blocks.block_q}, block_kv={blocks.block_kv}) needs ~{estimate}"
+            f" bytes at {head_dim=}."
+        )
+
+    def _nearest_below(size, target):
+        return (size <= target, size if size <= target else -size)
+
+    return max(
+        fitting,
+        key=lambda blocks: (
+            _nearest_below(blocks.block_kv, target_kv),
+            _nearest_below(blocks.block_q, target_q),
+        ),
+    )
+
+
+def resolve_paged_block_sizes(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    block_table: jax.Array,
+    *,
+    num_kv_heads: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    return_lse: bool,
+    rotary: tuple[jax.Array, None] | None,
+    has_window: bool,
+    block_sizes: BlockSizes | None,
+) -> BlockSizes:
+    """block_sizes of one flash_attn_varlen_paged build, on operands
+    check_paged_inputs accepted (num_kv_heads is what it returned).
+
+    max_seqlen_q and max_seqlen_k only pick the tiles, so an underestimate is
+    slow, not wrong. has_window is whether a left window bound is set. A
+    pinned block_sizes is only checked against the VMEM budget.
+    """
+    num_q_heads, total_q, head_dim = q.shape
+    page_size = kv_cache.shape[1]
+    capacity = jnp.shape(block_table)[1] * page_size
+    if rotary is None:
+        rotary_dtype = None
+    else:
+        rotary_dtype = jnp.dtype(rotary[0].dtype)
+    # Note (david): the bounds key the tile cache, so power-of-two buckets keep
+    # a wobbling longest sequence on one build. The caps hold because no q
+    # block passes the 128-padded buffer and no sequence outgrows its table row.
+    return resolve_paged_tiles(
+        max_seqlen_q_bucket=min(
+            next_pow2(max_seqlen_q), round_up(total_q, NUM_LANES)
+        ),
+        max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
+        page_size=page_size,
+        head_dim=head_dim,
+        return_lse=return_lse,
+        rotary_dtype=rotary_dtype,
+        gqa_fold=num_q_heads // num_kv_heads,
+        has_window=has_window,
+        block_sizes=block_sizes,
+        kv_dtype=kv_cache.dtype,
     )
