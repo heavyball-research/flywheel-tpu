@@ -18,12 +18,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..kv_layout import (
-    INTERLEAVE_STEP_ELEMENTS,
-    check_merged_kv_dtype,
-    interleave_kv_rows,
-    merged_cache_heads,
-)
+from ..kv_layout import INTERLEAVE_STEP_ELEMENTS, interleave_kv_rows
 
 # Note (david): the scoped VMEM the staging is sized against; the compiler
 # gets KV_WRITE_VMEM_HEADROOM_BYTES more for the interleave temporaries.
@@ -138,45 +133,19 @@ def kv_cache_write_kernel(
         copy.wait()
 
 
-@functools.partial(
-    jax.jit, static_argnames=("interpret",), donate_argnames=("kv_cache",)
-)
-def write_kv_cache_pages(
+def kv_cache_write_pallas(
     k: jax.Array,
     v: jax.Array,
     kv_cache: jax.Array,
     slices: jax.Array,
     num_slices: jax.Array,
     *,
-    interpret: bool = False,
+    interpret: bool,
 ) -> jax.Array:
-    """Copy new K/V rows into the merged interleaved cache; returns the cache,
-    updated in place (it is donated).
-
-    k and v are (T, H, D) and kv_cache is (P, S, merged_cache_heads(H), D), all
-    of one dtype: bf16, or fp8 already quantized by the caller. slices is
-    i32[3, n] and num_slices i32[1]: column j < num_slices[0] of slices is
-    (cache_row_start, new_row_start, length) in rows of the flat (P * S) cache
-    view and of k / v, each piece inside one page; later columns are ignored.
-    """
+    """write_kv_cache_pages' write as one pallas_call, on operands it has
+    checked; returns the updated cache."""
     _, num_kv_heads, head_dim = k.shape
-    num_pages, page_size, cache_heads, cache_head_dim = kv_cache.shape
-    check_merged_kv_dtype(kv_cache.dtype)
-    if k.dtype != kv_cache.dtype or v.dtype != kv_cache.dtype:
-        raise NotImplementedError(
-            f"k, v and the cache must share one dtype; got {k.dtype},"
-            f" {v.dtype}, {kv_cache.dtype}."
-        )
-    if v.shape != k.shape or (cache_heads, cache_head_dim) != (
-        merged_cache_heads(num_kv_heads, kv_cache.dtype),
-        head_dim,
-    ):
-        raise ValueError(
-            "k and v must be (T, H, D) of a (P, S, merged_cache_heads(H), D)"
-            f" cache; got {k.shape=}, {v.shape=}, {kv_cache.shape=}."
-        )
-    if head_dim % 128:
-        raise ValueError(f"head_dim must be a multiple of 128; got {head_dim}.")
+    num_pages, page_size, cache_heads, _ = kv_cache.shape
     # Note (david): an odd fp8 head count is staged with the cache's zero pad
     # head, so the interleave writes whole u32 words.
     staged_kv_heads = cache_heads // 2
