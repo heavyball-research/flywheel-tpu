@@ -15,7 +15,7 @@ from ..config import (
     QKVLayout,
     TokenMajorInfo,
 )
-from ..fwd_pipeline import forward_common, fwd_body
+from ..fwd_pipeline import forward_common, fwd_body, qkv_fwd_traits
 from ..schedule import (
     DenseFwdParams,
     VarlenSchedule,
@@ -24,11 +24,13 @@ from ..schedule import (
     make_runtime_offset_dense_fwd_schedule,
 )
 from ..softmax import overflow_guard_threshold
+from ..traits import FwdTraits
 from .fwd_varlen import flash_attn_forward_varlen
 
 
 def flash_fwd_kernel(
     *refs: jax.Array,
+    traits: FwdTraits,
     has_sinks: bool,
     dense_params: DenseFwdParams,
     **body,
@@ -39,6 +41,7 @@ def flash_fwd_kernel(
         sinks_ref = None
         q_hbm, k_hbm, v_hbm, *refs = refs
     fwd_body(
+        traits,
         make_dense_fwd_schedule(dense_params),
         q_hbm,
         k_hbm,
@@ -85,6 +88,14 @@ def flash_attn_forward(
     sinks: jax.Array | None = None,
     *,
     dense_params: DenseFwdParams,
+    block_sizes: BlockSizes,
+    num_kv_heads: int,
+    head_fold: int,
+    transposed_pv: bool,
+    token_major: TokenMajorInfo | None,
+    guard_threshold: float,
+    rotary: tuple[jax.Array, jax.Array | None] | None = None,
+    rotary_interleaved: bool = False,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     if sinks is not None:
@@ -92,9 +103,22 @@ def flash_attn_forward(
             sinks,
             q.shape[0],
             dense_params.heads_outer_batch,
-            body.get("token_major"),
+            token_major,
         )
     smem_operands = [] if sinks is None else [sinks.astype(jnp.float32) * LOG2E]
+    traits = qkv_fwd_traits(
+        q,
+        v,
+        rotary,
+        rotary_interleaved,
+        block_sizes=block_sizes,
+        num_kv_heads=num_kv_heads,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+        token_major=token_major,
+        is_per_seq=False,
+        guard_threshold=guard_threshold,
+    )
     return forward_common(
         partial(
             flash_fwd_kernel,
@@ -105,7 +129,9 @@ def flash_attn_forward(
         q,
         k,
         v,
+        traits,
         kernel_name="flash_attn_mha_static_t1_guarded_fwd",
+        rotary=rotary,
         **body,
     )
 
@@ -116,6 +142,7 @@ def flash_fwd_runtime_offset_kernel(
     k_hbm: jax.Array,
     v_hbm: jax.Array,
     *refs: jax.Array,
+    traits: FwdTraits,
     dense_params: DenseFwdParams,
     **body,
 ) -> None:
@@ -123,6 +150,7 @@ def flash_fwd_runtime_offset_kernel(
     body = dict(body)
     body["causal_offset"] = runtime_offset
     fwd_body(
+        traits,
         make_runtime_offset_dense_fwd_schedule(dense_params, runtime_offset),
         q_hbm,
         k_hbm,
@@ -139,16 +167,39 @@ def flash_attn_forward_runtime_offset(
     runtime_offset: jax.Array,
     *,
     dense_params: DenseFwdParams,
+    block_sizes: BlockSizes,
+    num_kv_heads: int,
+    head_fold: int,
+    transposed_pv: bool,
+    token_major: TokenMajorInfo | None,
+    guard_threshold: float,
+    rotary: tuple[jax.Array, jax.Array | None] | None = None,
+    rotary_interleaved: bool = False,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     offset = jnp.asarray(runtime_offset, jnp.int32).reshape(1)
+    traits = qkv_fwd_traits(
+        q,
+        v,
+        rotary,
+        rotary_interleaved,
+        block_sizes=block_sizes,
+        num_kv_heads=num_kv_heads,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+        token_major=token_major,
+        is_per_seq=False,
+        guard_threshold=guard_threshold,
+    )
     return forward_common(
         partial(flash_fwd_runtime_offset_kernel, dense_params=dense_params),
         [offset],
         q,
         k,
         v,
+        traits,
         kernel_name="flash_attn_mha_runtime_offset_fwd",
+        rotary=rotary,
         **body,
     )
 

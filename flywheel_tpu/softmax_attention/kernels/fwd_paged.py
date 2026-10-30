@@ -29,6 +29,7 @@ from ..fwd_pipeline import (
     NUM_O_SLOTS,
     forward_common,
     fwd_body,
+    rotary_fields,
 )
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
@@ -37,6 +38,7 @@ from ..schedule import (
     paged_schedule_table,
 )
 from ..softmax import overflow_guard_threshold
+from ..traits import PagedFwdTraits
 
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.
@@ -54,16 +56,13 @@ def flash_fwd_varlen_paged_kernel(
     block_table_ref: jax.Array,
     kv_scales_ref: jax.Array,
     *refs: jax.Array,
+    traits: PagedFwdTraits,
     has_sinks: bool,
-    paged: PagedKVInfo,
     layout: ScheduleTableLayout,
     causal: bool,
     window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
-    bq: int,
-    bkv: int,
-    bkv_compute: int,
     q_scale: float,
     **body,
 ) -> None:
@@ -78,26 +77,23 @@ def flash_fwd_varlen_paged_kernel(
         layout=layout,
         num_head_groups=num_head_groups,
         q_heads_per_kv_head=q_heads_per_kv_head,
-        bq=bq,
-        bkv=bkv,
-        bkv_compute=bkv_compute,
-        page_size=paged.page_size,
-        pages_per_seq=paged.pages_per_seq,
+        bq=traits.bq,
+        bkv=traits.bkv,
+        bkv_compute=traits.bkv_compute,
+        page_size=traits.paged.page_size,
+        pages_per_seq=traits.paged.pages_per_seq,
         causal=causal,
         left=window_left,
     )
     # Note (david): K and V share the one merged cache operand. The K and V
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
     fwd_body(
+        traits,
         schedule,
         q_hbm,
         kv_hbm,
         kv_hbm,
         refs,
-        bq=bq,
-        bkv=bkv,
-        bkv_compute=bkv_compute,
-        paged=paged,
         q_scale=q_scale * kv_scales_ref[0],
         v_scale=kv_scales_ref[1],
         sinks_ref=sinks_ref,
@@ -357,7 +353,7 @@ def flash_attn_varlen_paged(
     The caller runs check_paged_inputs on the operands first, then takes
     block_sizes from dispatch.resolve_paged_block_sizes.
     """
-    num_q_heads, total_q, _ = q.shape
+    num_q_heads, total_q, head_dim = q.shape
     _, page_size, cache_heads, _ = kv_cache.shape
     num_kv_heads = resolve_merged_kv_heads(
         cache_heads, kv_cache.dtype, nheads_k
@@ -401,6 +397,21 @@ def flash_attn_varlen_paged(
         causal=causal,
         left=window_left,
     )
+    traits = PagedFwdTraits(
+        block_sizes=block_sizes,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_v=head_dim,
+        head_fold=PAGED_HEAD_FOLD,
+        transposed_pv=False,
+        token_major=None,
+        is_per_seq=True,
+        guard_threshold=overflow_guard_threshold(capacity),
+        **rotary_fields(padded_rotary, rotary_interleaved),
+        paged=paged,
+        gqa_fold=gqa_fold,
+    )
     smem_operands = [
         table,
         block_table.astype(jnp.int32).reshape(-1),
@@ -426,20 +437,11 @@ def flash_attn_varlen_paged(
         padded_q,
         kv_cache,
         None,
-        block_sizes=block_sizes,
-        num_kv_heads=num_kv_heads,
-        head_fold=PAGED_HEAD_FOLD,
-        transposed_pv=False,
+        traits,
         return_lse=return_lse,
         kernel_name="flash_attn_varlen_paged_fwd",
         interpret=interpret,
-        token_major=None,
-        is_per_seq=True,
         rotary=padded_rotary,
-        rotary_interleaved=rotary_interleaved,
-        paged=paged,
-        gqa_fold=gqa_fold,
-        guard_threshold=overflow_guard_threshold(capacity),
         window=(None, None),
         causal_offset=0,
         # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /

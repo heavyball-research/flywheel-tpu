@@ -18,7 +18,6 @@ from .config import (
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     BlockSizes,
-    PagedKVInfo,
     QKVLayout,
     TokenMajorInfo,
     from_head_minor,
@@ -34,7 +33,7 @@ from .kv_layout import (
     staged_words,
 )
 from .mask import apply_packed_bounds_mask
-from .rotary import ROTARY_DIM_MULTIPLE, rotate_tile
+from .rotary import rotate_tile
 from .schedule import FwdSchedule, window_fragment_plans
 from .softmax import (
     MASKED_ROW_BOUND,
@@ -42,6 +41,7 @@ from .softmax import (
     UNANCHORED_ROW_MAX,
     fold_sink,
 )
+from .traits import FwdTraits
 
 SEM_Q = 0
 SEM_K = 1
@@ -83,47 +83,29 @@ class RowFinish(NamedTuple):
 
 
 def fwd_body(
+    traits: FwdTraits,
     schedule: FwdSchedule,
     q_hbm: jax.Array,
     k_hbm: jax.Array,
     v_hbm: jax.Array,
     refs: Sequence[jax.Array],
     *,
-    bq: int,
-    bkv: int,
-    bkv_compute: int,
-    bq_compute: int,
-    num_stages: int,
-    head_dim_v: int,
-    qkv_layout: QKVLayout,
-    guard_threshold: float,
-    head_fold: int,
-    transposed_pv: bool,
     window: tuple[int | None, int | None],
     causal_offset: int,
     softcap: float,
     return_lse: bool,
-    token_major: TokenMajorInfo | None,
     q_scale: float | jax.Array,
-    rotary_dim: int = 0,
-    rotary_interleaved: bool = False,
-    rotary_batch: int = 1,
-    rotary_q_heads: int = 1,
-    rotary_k_heads: int = 1,
-    rotary_groups: int = 1,
-    rotary_k: bool = True,
-    paged: PagedKVInfo | None = None,
-    gqa_fold: int = 1,
     v_scale: float | jax.Array = 1.0,
     sinks_ref: jax.Array | None = None,
 ) -> None:
     """Run the fragment pipeline over every block the schedule yields.
 
-    refs are forward_common's rotary operands, outputs and scratch, in its
-    allocation order. The logits run in log2 units: Q reaches the QK matmul
-    pre-multiplied by log2(e). paged (per-seq only) reads K and V from the one
-    merged interleaved cache operand (k_hbm is v_hbm). A per-seq schedule writes
-    the packed padding rows past schedule.packed_q_end as out = 0, lse = -inf.
+    traits is the build's static configuration, and refs are forward_common's
+    rotary operands, outputs and scratch, in its allocation order. The logits
+    run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). A
+    PagedFwdTraits build (per-seq only) reads K and V from the one merged
+    interleaved cache operand (k_hbm is v_hbm). A per-seq schedule writes the
+    packed padding rows past schedule.packed_q_end as out = 0, lse = -inf.
 
     gqa_fold > 1 (paged only) stages gqa_fold consecutive q heads of one kv head
     per group and stacks them over the rows of every score fragment: fragment
@@ -137,8 +119,41 @@ def fwd_body(
     f // heads_outer_batch heads-outer), each added to its head's softmax
     denominator.
     """
-    is_per_seq = schedule.q_token is not None
-    is_paged = paged is not None
+    is_per_seq = traits.is_per_seq
+    assert (schedule.q_token is not None) == is_per_seq, is_per_seq
+    is_paged = traits.is_paged
+    paged = traits.paged
+    bq, bkv = traits.bq, traits.bkv
+    bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
+    num_stages = traits.num_stages
+    qkv_layout = traits.qkv_layout
+    is_head_dim_minor = traits.is_head_dim_minor
+    o_layout = traits.o_layout
+    transposed_pv = traits.transposed_pv
+    token_major = traits.token_major
+    guard_threshold = traits.guard_threshold
+    guard_detect_bound = traits.guard_detect_bound
+    head_dim_v_repeats = traits.head_dim_v_repeats
+    bkv_repeats = traits.bkv_repeats
+    num_k_compute_tiles = traits.num_k_compute_tiles
+    num_q_compute_tiles = traits.num_q_compute_tiles
+    num_compute_tiles = traits.num_compute_tiles
+    head_fold, gqa_fold = traits.head_fold, traits.gqa_fold
+    group_heads, group_bq = traits.group_heads, traits.group_bq
+    frag_rows = traits.frag_rows
+    token_tile_shape = traits.token_tile_shape
+    defers_row_finish = traits.defers_row_finish
+    width_qk, width_v = traits.width_qk, traits.width_v
+    q_heads_per_row = traits.q_heads_per_row
+    kv_heads_per_row = traits.kv_heads_per_row
+    lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
+    is_lane_paired = traits.is_lane_paired
+    heads_per_lane_tile = traits.heads_per_lane_tile
+    rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
+    rotary_interleaved = traits.rotary_interleaved
+    rotary_batch, rotary_groups = traits.rotary_batch, traits.rotary_groups
+    rotary_q_heads = traits.rotary_q_heads
+    rotary_k_heads = traits.rotary_k_heads
 
     remaining_refs = list(refs)
     if rotary_dim:
@@ -185,31 +200,11 @@ def fwd_body(
     if return_lse and is_per_seq:
         lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
-    is_head_dim_minor = qkv_layout == QKVLayout.HEAD_DIM_MINOR
-    head_dim_v_repeats = pl.cdiv(head_dim_v, NUM_LANES)
-    guard_detect_bound = math.exp2(guard_threshold)
     has_static_mask = window != (None, None)
-    o_layout = (
-        QKVLayout.SEQ_MINOR if transposed_pv else QKVLayout.HEAD_DIM_MINOR
-    )
     num_head_groups = schedule.num_head_groups
     num_rows = schedule.num_rows
     q_heads_per_kv_head = schedule.q_heads_per_kv_head
     heads_outer_batch = schedule.heads_outer_batch
-    bkv_repeats = bkv_compute // NUM_LANES
-    num_k_compute_tiles = bkv // bkv_compute
-    num_q_compute_tiles = bq // bq_compute
-    num_compute_tiles = num_k_compute_tiles * num_q_compute_tiles
-    # Note (david): a group stages group_heads q heads. head_fold runs one
-    # fragment pipeline per head, while gqa_fold stacks its heads over the rows
-    # of one fragment, so each K and V tile the MXU holds serves frag_rows rows.
-    # The row state of pipeline head g is its group_bq rows, ordered (q tile,
-    # folded head, token).
-    assert gqa_fold == 1 or (is_paged and head_fold == 1), (gqa_fold, head_fold)
-    group_heads = head_fold * gqa_fold
-    group_bq = gqa_fold * bq
-    frag_rows = gqa_fold * bq_compute
-    token_tile_shape = (bq_compute, bkv_compute)
     # Note (david): a partial block of a dense window (causal included) masks
     # every fragment of the generic copy, about as many VPU ops as the softmax.
     # Under bq % bkv == 0 and a static offset its fragment flags are static per
@@ -241,34 +236,10 @@ def fwd_body(
     # indexes the tile at runtime; only a sublane token axis allows that.
     skips_past_frontier = schedule.num_live_tiles is not None
     assert skips_past_frontier == is_per_seq, (skips_past_frontier, is_per_seq)
-    assert not skips_past_frontier or (
-        is_head_dim_minor and not transposed_pv
-    ), (qkv_layout, transposed_pv)
     # Note (david): only a left window can mask a row's whole first fragment
     # while later keys stay visible; anchoring on that masked score would push
     # the row's first visible key past the guard into a replay.
     defers_row_start = window[0] is not None or schedule.has_q_span
-    # Note (david): a per-seq row is often one or two blocks, so its row-end
-    # work is paid every block or two: on v6e (32:8 d128, 512 x 512, one-block
-    # rows) each row cost 0.97 us on top of its 1.89 us block, 0.50 of it the
-    # unoverlapped last PV. Dense rows are long and keep the row-end drain.
-    defers_row_finish = is_per_seq
-
-    if token_major is None:
-        width_qk = width_v = q_heads_per_row = kv_heads_per_row = None
-    else:
-        width_qk, width_v = token_major.head_dim_qk, token_major.head_dim_v
-        q_heads_per_row = token_major.num_q_heads
-        kv_heads_per_row = token_major.num_kv_heads
-    is_lane_fold = token_major is not None and head_fold > 1
-    lane_width_qk = width_qk if is_lane_fold else None
-    lane_width_v = width_v if is_lane_fold else None
-    # Note (david): a sub-tile lane width (d64) breaks two Mosaic rules: a
-    # slot-sliced scratch ref only takes lane windows at whole-tile offset and
-    # size, and the head's half of the loaded tile must then be a static value
-    # slice. So scratch is sliced per 128-lane pair and g must be a Python int.
-    is_lane_paired = is_lane_fold and lane_width_qk % NUM_LANES != 0
-    heads_per_lane_tile = NUM_LANES // lane_width_qk if is_lane_paired else 1
 
     def _fold_lane(ref, g, block, width, layout=qkv_layout):
         if is_lane_paired:
@@ -460,7 +431,6 @@ def fwd_body(
     # read its (K, V) rows; those of one page are the u32 word window of the
     # interleaved cache's head axis that holds them, one DMA: a bf16 head's
     # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
-    assert not is_paged or head_fold == 1, head_fold
     if is_paged:
         word_rows = kv_word_rows(kv_pair_buf.dtype)
         heads_per_word = kv_heads_per_word(kv_pair_buf.dtype)
@@ -2246,73 +2216,128 @@ def fwd_body(
         lax.fori_loop(0, num_fills, _fill_rows, None)
 
 
+def qkv_fwd_traits(
+    q: jax.Array,
+    v: jax.Array,
+    rotary: tuple[jax.Array, jax.Array | None] | None,
+    rotary_interleaved: bool,
+    *,
+    block_sizes: BlockSizes,
+    num_kv_heads: int,
+    head_fold: int,
+    transposed_pv: bool,
+    token_major: TokenMajorInfo | None,
+    is_per_seq: bool,
+    guard_threshold: float,
+) -> FwdTraits:
+    """The FwdTraits of a dense or varlen build: its statics, plus the flat q
+    heads and head widths of head-major or token-major q and v and the layout
+    of the rotary pair (rotary_fields)."""
+    if token_major is None:
+        num_q_heads, _, head_dim_qk = q.shape
+        head_dim_v = v.shape[-1]
+    else:
+        num_q_heads = (token_major.batch or 1) * token_major.num_q_heads
+        head_dim_qk, head_dim_v = (
+            token_major.head_dim_qk,
+            token_major.head_dim_v,
+        )
+    return FwdTraits(
+        block_sizes=block_sizes,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+        token_major=token_major,
+        is_per_seq=is_per_seq,
+        guard_threshold=guard_threshold,
+        **rotary_fields(rotary, rotary_interleaved),
+    )
+
+
+def rotary_fields(
+    rotary: tuple[jax.Array, jax.Array | None] | None,
+    rotary_interleaved: bool,
+) -> dict[str, int | bool]:
+    """The FwdTraits rotary fields of prepare_rotary's packed (batch, tokens,
+    head_dim) Q and K coefficient pair (K None when K arrives rotated); none
+    without rotary."""
+    if rotary is None:
+        return {}
+    if len(rotary) != 2:
+        raise ValueError("rotary must contain Q and K coefficient arrays.")
+    rotary_q_coeff, rotary_k_coeff = rotary
+    rotary_k = rotary_k_coeff is not None
+    if (
+        rotary_q_coeff.ndim != 3
+        or rotary_q_coeff.shape[0] == 0
+        or (
+            rotary_k
+            and (
+                rotary_k_coeff.ndim != 3
+                or rotary_q_coeff.shape[0] != rotary_k_coeff.shape[0]
+                or rotary_q_coeff.shape[2] != rotary_k_coeff.shape[2]
+            )
+        )
+    ):
+        raise ValueError(
+            "rotary coefficients must be (batch, tokens, head_dim)."
+        )
+    if rotary_q_coeff.shape[2] <= 0 or (
+        rotary_k and rotary_k_coeff.dtype != rotary_q_coeff.dtype
+    ):
+        raise ValueError("Invalid rotary dimension or coefficient dtype.")
+    return {
+        "rotary_dim": rotary_q_coeff.shape[2],
+        "rotary_batch": rotary_q_coeff.shape[0],
+        "rotary_interleaved": rotary_interleaved,
+        "rotary_k": rotary_k,
+    }
+
+
 def forward_common(
     kernel: Callable[..., None],
     smem_operands: list[jax.Array],
     q: jax.Array,
     k: jax.Array,
     v: jax.Array | None,
+    traits: FwdTraits,
     *,
-    block_sizes: BlockSizes,
-    num_kv_heads: int,
-    head_fold: int,
-    transposed_pv: bool,
     return_lse: bool,
     kernel_name: str,
     interpret: bool,
-    token_major: TokenMajorInfo | None,
-    is_per_seq: bool = False,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
-    rotary_interleaved: bool = False,
-    paged: PagedKVInfo | None = None,
-    gqa_fold: int = 1,
     **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Validate q/k/v, allocate scratch and run a fwd_body kernel.
+    """Validate q/k/v against traits, allocate scratch and run a fwd_body
+    kernel.
 
-    kernel is the mode kernel with its schedule already bound; every fwd_body
-    static that follows from block_sizes or the q/k/v shapes is bound here.
-    rotary is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair
-    (K None when K arrives rotated). Returns o shaped like q (head_dim_v wide),
-    or (o, lse) with a (num_q_heads, q_seq_len) float32 natural-log lse.
+    kernel is the mode kernel with its schedule already bound; traits,
+    return_lse and body, fwd_body's per-call keywords, are bound here. rotary
+    is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair (K None
+    when K arrives rotated), whose layout traits' rotary fields hold. Returns o
+    shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads, q_seq_len)
+    float32 natural-log lse.
 
-    paged (per-seq, head-major q only) makes k the merged interleaved cache
-    paged describes and v None; the kernel then takes (q, k, *rotary). Only a
-    paged build takes gqa_fold > 1, the q heads per kv head that fwd_body
-    stacks over the rows of one score fragment.
+    A PagedFwdTraits build (per-seq, head-major q only) makes k the merged
+    interleaved cache traits.paged describes and v None; the kernel then takes
+    (q, k, *rotary).
     """
-    bq, bkv = block_sizes.block_q, block_sizes.block_kv
-    bkv_compute = block_sizes.block_kv_compute
-    bq_compute = block_sizes.block_q_compute
-    num_stages = block_sizes.num_stages
-    qkv_layout = block_sizes.qkv_layout
-
-    if bq % bq_compute:
-        raise ValueError(f"{bq=} must be a multiple of {bq_compute=}.")
-    if bq_compute % NUM_SUBLANES:
-        raise ValueError(f"{bq_compute=} must be a multiple of {NUM_SUBLANES}.")
-    if is_per_seq and bq % BF16_TILE_ROWS:
-        # Note (david): the per-seq head blend steps the output stage in whole
-        # 16-row tiles.
-        raise ValueError(
-            f"per-seq {bq=} must be a multiple of {BF16_TILE_ROWS}."
-        )
-    if gqa_fold > 1 and (
-        paged is None or head_fold != 1 or transposed_pv or gqa_fold > NUM_LANES
-    ):
-        # Note (david): a folded group's lse rides one 128-lane row per token.
-        raise ValueError(
-            f"{gqa_fold=} needs a paged build with head_fold == 1, no"
-            f" transposed pv and at most {NUM_LANES} folded heads; got"
-            f" {head_fold=}, {transposed_pv=}."
-        )
-    if gqa_fold > 1 and bq_compute % BF16_TILE_ROWS:
-        # Note (david): a folded q tile collapses (gqa_fold, bq_compute) into
-        # fragment rows, which moves no data only on whole bf16 tiles.
-        raise ValueError(
-            f"a gqa fold needs {bq_compute=} to be a multiple of"
-            f" {BF16_TILE_ROWS}."
-        )
+    bq, bkv = traits.bq, traits.bkv
+    bkv_compute = traits.bkv_compute
+    bq_compute = traits.bq_compute
+    num_stages = traits.num_stages
+    qkv_layout = traits.qkv_layout
+    num_q_heads, num_kv_heads = traits.num_q_heads, traits.num_kv_heads
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
+    head_fold, gqa_fold = traits.head_fold, traits.gqa_fold
+    transposed_pv = traits.transposed_pv
+    token_major, paged = traits.token_major, traits.paged
+    is_per_seq = traits.is_per_seq
+    rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
+    assert (rotary is None) == (rotary_dim == 0), rotary_dim
 
     if paged is None and k.shape[:-1] != v.shape[:-1]:
         raise ValueError(
@@ -2321,18 +2346,7 @@ def forward_common(
         )
 
     if paged is not None:
-        if qkv_layout != QKVLayout.HEAD_DIM_MINOR:
-            raise ValueError(
-                "a paged KV cache needs a HEAD_DIM_MINOR layout; got"
-                f" {qkv_layout=}."
-            )
-        num_q_heads, q_seq_len, head_dim_qk = q.shape
-        head_dim_v = head_dim_qk
-        if gqa_fold > 1 and num_q_heads != num_kv_heads * gqa_fold:
-            raise ValueError(
-                "a gqa fold stacks all of a kv head's q heads; got"
-                f" {num_q_heads=}, {num_kv_heads=}, {gqa_fold=}."
-            )
+        q_seq_len = q.shape[1]
         # Note (david): seqused_k bounds every sequence's kv blocks, so the kv
         # axis only needs its block count; the padded capacity stands in for its
         # length.
@@ -2341,10 +2355,6 @@ def forward_common(
         batch = token_major.batch
         q_heads_per_row = token_major.num_q_heads
         kv_heads_per_row = token_major.num_kv_heads
-        head_dim_qk, head_dim_v = (
-            token_major.head_dim_qk,
-            token_major.head_dim_v,
-        )
         expected_rank = 2 if batch is None else 3
         if (
             q.ndim != expected_rank
@@ -2374,20 +2384,10 @@ def forward_common(
                 f"v's fused width {v.shape[-1]} != num_kv_heads"
                 f" {kv_heads_per_row} * head_dim_v {head_dim_v}."
             )
-        if head_dim_v % NUM_LANES and (head_fold * head_dim_v) % NUM_LANES:
-            # Note (david): a sub-tile head_dim (d64) relies on an even
-            # head_fold so every DMA group spans whole 128-lane tiles.
-            raise ValueError(
-                "token-major requires head_dim_v % 128 == 0, or a head_fold"
-                " that pads the DMA group to a 128-lane multiple; got"
-                f" {head_dim_v=}, {head_fold=}."
-            )
         q_seq_len = q.shape[-2]
         kv_seq_len = k.shape[-2]
-        num_q_heads = (batch or 1) * q_heads_per_row
     else:
-        num_q_heads, q_seq_len, head_dim_qk = q.shape
-        head_dim_v = v.shape[-1]
+        q_seq_len = q.shape[1]
 
         if k.ndim != 3:
             raise ValueError(
@@ -2406,120 +2406,40 @@ def forward_common(
 
         kv_seq_len = k.shape[1]
 
-    if head_fold > 1 and head_dim_v != head_dim_qk:
-        # Note (david): v_buf, o_stage and the f32 o_scratch all scale with
-        # head_dim_v, which no tuned fold was measured against; a fold sized for
-        # head_dim_qk can miss the scoped VMEM budget by tens of MB.
-        raise ValueError(
-            "head_fold > 1 requires head_dim_v == head_dim_qk; got"
-            f" {head_dim_v} vs {head_dim_qk}."
-        )
-    if bkv % bkv_compute:
-        raise ValueError(f"{bkv=} must be a multiple of {bkv_compute=}.")
-    if bkv_compute % NUM_LANES:
-        raise ValueError(f"{bkv_compute=} must be a multiple of {NUM_LANES}.")
-
     # Note (david): a per-seq schedule clamps its windows to the axis end and
     # checks that each block fits, so only the dense grid needs the
     # divisibility.
     if not is_per_seq and (q_seq_len % bq or kv_seq_len % bkv):
         raise ValueError(f"{bq=} and {bkv=} must divide the sequence lengths.")
     if rotary is None:
-        rotary_dim, rotary_batch, rotary_groups = 0, 1, 1
-        rotary_q_heads, rotary_k_heads = num_q_heads, num_kv_heads
-        rotary_k, rotary_dtype = True, q.dtype
+        rotary_dtype = q.dtype
         rotary_operands = []
     else:
-        if type(rotary_interleaved) is not bool:
-            raise ValueError("rotary_interleaved must be a static bool.")
-        if len(rotary) != 2:
-            raise ValueError("rotary must contain Q and K coefficient arrays.")
         rotary_q_coeff, rotary_k_coeff = rotary
-        rotary_k = rotary_k_coeff is not None
-        if (
-            rotary_q_coeff.ndim != 3
-            or rotary_q_coeff.shape[0] == 0
-            or rotary_q_coeff.shape[1] != q_seq_len
-            or (
-                rotary_k
-                and (
-                    rotary_k_coeff.ndim != 3
-                    or rotary_q_coeff.shape[0] != rotary_k_coeff.shape[0]
-                    or rotary_k_coeff.shape[1] != kv_seq_len
-                    or rotary_q_coeff.shape[2] != rotary_k_coeff.shape[2]
-                )
-            )
+        if rotary_q_coeff.shape[1] != q_seq_len or (
+            rotary_k and rotary_k_coeff.shape[1] != kv_seq_len
         ):
             raise ValueError(
                 "rotary coefficients must be (batch, tokens, head_dim)."
             )
-        rotary_dim = rotary_q_coeff.shape[2]
-        rotary_batch = rotary_q_coeff.shape[0]
         # Note (david): float32 coefficients keep the in-kernel f32 rotation
         # identical to an f32 RoPE computed outside the kernel.
         rotary_dtype = rotary_q_coeff.dtype
-        # Note (david): rotate_tile rotates every dim of the head, so only full
-        # rotary is supported.
-        if (
-            rotary_dim <= 0
-            or rotary_dim % ROTARY_DIM_MULTIPLE
-            or rotary_dim != head_dim_qk
-            or rotary_dtype not in (q.dtype, jnp.dtype(jnp.float32))
-            or (rotary_k and rotary_k_coeff.dtype != rotary_dtype)
-        ):
+        if rotary_dtype not in (q.dtype, jnp.dtype(jnp.float32)):
             raise ValueError("Invalid rotary dimension or coefficient dtype.")
-        if num_q_heads % rotary_batch or num_kv_heads % rotary_batch:
-            raise ValueError(
-                "rotary batch must divide the flattened head counts."
-            )
-        if token_major is not None and rotary_batch not in (
-            1,
-            token_major.batch,
-        ):
-            raise ValueError(
-                "rotary batch must match token-major batch or be shared."
-            )
-        rotary_q_heads = num_q_heads // rotary_batch
-        rotary_k_heads = num_kv_heads // rotary_batch
-        # Note (david): a dense head-major fold may span batch rows, and only
-        # then does each folded head need its own coefficient plane.
-        if rotary_q_heads % head_fold or rotary_k_heads % head_fold:
-            rotary_groups = head_fold
-        else:
-            rotary_groups = 1
         rotary_operands = [coeff for coeff in rotary if coeff is not None]
     num_rotary_streams = (1 + int(rotary_k)) if rotary_dim else 0
 
     fwd_kernel = partial(
         kernel,
-        bq=bq,
-        bkv=bkv,
-        bkv_compute=bkv_compute,
-        bq_compute=bq_compute,
-        num_stages=num_stages,
-        head_dim_v=head_dim_v,
-        qkv_layout=qkv_layout,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
+        traits=traits,
         return_lse=return_lse,
-        token_major=token_major,
-        rotary_dim=rotary_dim,
-        rotary_interleaved=rotary_interleaved,
-        rotary_batch=rotary_batch,
-        rotary_q_heads=rotary_q_heads,
-        rotary_k_heads=rotary_k_heads,
-        rotary_groups=rotary_groups,
-        rotary_k=rotary_k,
-        paged=paged,
-        gqa_fold=gqa_fold,
         **body,
     )
 
-    group_heads = head_fold * gqa_fold
+    group_heads = traits.group_heads
     folded_bq = group_heads * bq
-    o_layout = (
-        QKVLayout.SEQ_MINOR if transposed_pv else QKVLayout.HEAD_DIM_MINOR
-    )
+    o_layout = traits.o_layout
     vmem = pltpu.VMEM
 
     def _staged_shape(rows, head_dim, layout, stages=num_stages):
@@ -2577,7 +2497,7 @@ def forward_common(
             vmem(
                 (
                     stages,
-                    rotary_groups,
+                    traits.rotary_groups,
                     *from_head_minor((block, rotary_dim), qkv_layout),
                 ),
                 rotary_dtype,
@@ -2598,12 +2518,7 @@ def forward_common(
     # Note (david): a lane-paired fold's pending V tile is its pair's 128 lanes,
     # as fwd_body loads it.
     pending_probs = vmem((gqa_fold * bq_compute, bkv_compute), jnp.float32)
-    is_lane_paired = (
-        token_major is not None
-        and head_fold > 1
-        and head_dim_qk % NUM_LANES != 0
-    )
-    v_tile_width = NUM_LANES if is_lane_paired else head_dim_v
+    v_tile_width = NUM_LANES if traits.is_lane_paired else head_dim_v
     pending_v = vmem(
         from_head_minor((bkv_compute, v_tile_width), qkv_layout),
         q.dtype if paged is not None else v.dtype,
