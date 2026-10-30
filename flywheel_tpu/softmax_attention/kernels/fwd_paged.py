@@ -68,7 +68,7 @@ from ..fwd_blocks import (
     wait_paged_kv_block,
     wait_q_row,
 )
-from ..fwd_call import rotary_fields
+from ..fwd_call import check_rotary_operands, rotary_fields
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
     FwdSchedule,
@@ -1129,22 +1129,14 @@ def paged_pallas_call(
     num_q_heads, q_seq_len, _ = q.shape
     assert q.dtype == jnp.bfloat16, q.dtype
     assert (rotary is None) == (traits.rotary_dim == 0), traits.rotary_dim
-    if rotary is None:
-        rotary_dtype = None
-        rotary_operands = []
-    else:
-        rotary_q_coeff, rotary_k_coeff = rotary
-        assert rotary_k_coeff is None, rotary_k_coeff.shape
-        if rotary_q_coeff.shape[1] != q_seq_len:
-            raise ValueError(
-                "rotary coefficients must be (batch, tokens, head_dim)."
-            )
-        # Note (david): float32 coefficients keep the in-kernel f32 rotation
-        # identical to an f32 RoPE computed outside the kernel.
-        rotary_dtype = rotary_q_coeff.dtype
-        if rotary_dtype not in (q.dtype, jnp.dtype(jnp.float32)):
-            raise ValueError("Invalid rotary dimension or coefficient dtype.")
-        rotary_operands = [rotary_q_coeff]
+    if rotary is not None:
+        _, rotary_k_coeff = rotary
+        assert rotary_k_coeff is None and not traits.rotary_k, traits
+    # A paged build rotates Q only, so the check never reads the kv length and
+    # q_seq_len stands in for it.
+    rotary_dtype, rotary_operands = check_rotary_operands(
+        rotary, traits, q.dtype, q_seq_len, q_seq_len
+    )
     scratch_shapes = paged_scratch_shapes(
         traits.block_sizes,
         head_dim=traits.head_dim_qk,
