@@ -6,3 +6,6 @@
 
 # softmax_attention: move pallas/ into the family package (git mv + imports)
 d0c2b0b6d30fd5e2b0b124642109b4d990f288f6
+
+# softmax_attention: move flash_attn_interface.py and tuned_block_sizes.py into the family package (git mv + imports)
+44c5c63566a85a3b058cef3804a574efe2736eda
