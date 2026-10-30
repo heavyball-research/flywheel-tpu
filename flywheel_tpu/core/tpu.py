@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 NUM_LANES = 128
 NUM_SUBLANES = 8
+MXU_LANES = 256
 # Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
 # of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
 # load or store must start on that tile. Dynamic row accesses into bf16 stages

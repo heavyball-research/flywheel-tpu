@@ -21,17 +21,19 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
+
 # Note (david): Mosaic requires every DMA offset and size along a tiled
 # dimension to be provably a multiple of the sublane tile height, and the token
 # axis of the native [batch, dim] layout is that tiled dimension.
-SUBLANE_ALIGN = 8
+SUBLANE_ALIGN = NUM_SUBLANES
 
 # Note (david): Mosaic tiles a bf16 VMEM scratch ref whose row count is a
 # multiple of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic
 # vector load or store must start on that tile. The bf16 output stage is
 # therefore read and written in whole 16-row tiles, which is legal under either
 # tiling; the HBM DMAs stay on SUBLANE_ALIGN.
-STAGE_TILE_ROWS = 16
+STAGE_TILE_ROWS = BF16_TILE_ROWS
 
 NUM_BUFFERS = 2
 
