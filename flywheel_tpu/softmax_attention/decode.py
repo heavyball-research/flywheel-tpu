@@ -16,13 +16,13 @@ from .inputs import (
     check_common_kwargs,
     check_sinks,
     descale_scalar,
-    fused_q_scale,
     paged_window,
 )
 from .kernels.decode import flash_attn_kvcache_pallas
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .kernels.kv_append import append_ragged
 from .kv_layout import resolve_merged_kv_heads
+from .variant import fused_q_scale
 
 # Note (david): the paged varlen kernel pads every request to a 128-token q
 # block, so a short window folded into the decode kernel's query heads reads

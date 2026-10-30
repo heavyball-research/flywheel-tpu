@@ -7,6 +7,7 @@ import jax
 
 from .dispatch import resolve_bwd_config
 from .kernels.bwd import flash_attn_bwd
+from .variant import Variant
 
 
 def attn_with_vjp(
@@ -15,11 +16,8 @@ def attn_with_vjp(
     v: jax.Array,
     *,
     build_kernel: Callable[..., functools.partial],
-    softmax_scale: float,
-    causal: bool,
-    causal_offset: int,
+    variant: Variant,
     interpret: bool,
-    bwd_unsupported: str,
     token_major: bool,
     head_dim: int | None,
 ) -> jax.Array:
@@ -29,24 +27,20 @@ def attn_with_vjp(
     # compute and DMA.
     @jax.custom_vjp
     def _attn(q, k, v):
-        return build_kernel(return_lse=False)(q, k, v)
+        return build_kernel(variant=variant.with_lse(False))(q, k, v)
 
     def _attn_fwd(q, k, v):
-        out, lse = build_kernel(return_lse=True)(q, k, v)
+        out, lse = build_kernel(variant=variant.with_lse(True))(q, k, v)
         return out, (q, k, v, out, lse)
 
     def _attn_bwd(residuals, dout):
         # Note (david): raise only when a gradient is requested, so forward-only
         # configurations still run their forward.
-        if bwd_unsupported:
-            raise NotImplementedError(
-                f"The TPU backward kernel does not support {bwd_unsupported};"
-                " that configuration is forward-only."
-            )
+        variant.check_backward()
         block_sizes, head_fold = resolve_bwd_config(
             *residuals[:3],
-            causal=causal,
-            causal_offset=causal_offset,
+            causal=variant.causal,
+            causal_offset=variant.causal_offset,
             token_major=token_major,
             head_dim=head_dim,
         )
@@ -55,9 +49,9 @@ def attn_with_vjp(
             dout,
             block_sizes=block_sizes,
             head_fold=head_fold,
-            causal=causal,
-            causal_offset=causal_offset,
-            softmax_scale=softmax_scale,
+            causal=variant.causal,
+            causal_offset=variant.causal_offset,
+            softmax_scale=variant.softmax_scale,
             interpret=interpret,
             token_major=token_major,
             head_dim=head_dim,

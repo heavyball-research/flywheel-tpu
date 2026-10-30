@@ -64,6 +64,7 @@ from .kernels.fwd_dense import make_flash_attn_mha
 from .kernels.decode import validate_kvcache_config
 from .kernels.fwd_paged import estimate_vmem_bytes
 from .kv_layout import MIN_BLOCK_KV
+from .variant import Variant
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 
@@ -669,36 +670,31 @@ def get_kernel(
     num_kv_heads: int,
     seqlen_q: int,
     seqlen_kv: int,
-    causal: bool,
-    window_size: tuple[int, int],
+    variant: Variant,
     interpret: bool,
-    softcap: float,
     head_dim: int,
     head_dim_v: int,
-    causal_offset: int,
     varlen_max_seqlen_kv: int | None = None,
     varlen_max_seqlen_q: int | None = None,
     token_major: bool = False,
     kernel_batch: int | None = None,
-    q_scale: float = 1.0,
     blocks_override: tuple[int, int, int, int] | None = None,
-    return_lse: bool = False,
     heads_outer_batch: int | None = None,
 ) -> functools.partial:
     # Note (david): seqlen_q and seqlen_kv are padded lengths while
     # causal_offset comes from the original ones. Different original pairs can
     # pad to the same multiples of 128, so a rectangular mask is detected by
     # causal_offset too.
-    is_rectangular = seqlen_q != seqlen_kv or causal_offset != 0
+    is_rectangular = seqlen_q != seqlen_kv or variant.causal_offset != 0
     is_varlen = varlen_max_seqlen_kv is not None
-    has_window = window_size != (-1, -1)
+    has_window = variant.window_size != (-1, -1)
     # Note (david): a tuned config fixes the blocks and the head fold together,
     # so a hit replaces the analytic block sizes wholesale. Windows, softcap and
     # rectangular masks were never measured and never consult it.
     if (
         blocks_override is None
         and not has_window
-        and softcap == 0.0
+        and variant.softcap == 0.0
         and not is_rectangular
     ):
         tuned_config = get_tuned_config(
@@ -709,9 +705,9 @@ def get_kernel(
             seq_len=seqlen_q,
             head_dim=head_dim,
             head_dim_v=head_dim_v,
-            causal=causal,
+            causal=variant.causal,
             max_seqlen=varlen_max_seqlen_kv,
-            return_lse=return_lse,
+            return_lse=variant.return_lse,
             num_kv_heads=num_kv_heads,
             heads_outer_batch=heads_outer_batch,
         )
@@ -745,7 +741,7 @@ def get_kernel(
                 seqlen_kv,
                 varlen_max_seqlen_kv,
                 varlen_max_seqlen_q,
-                window_size=window_size,
+                window_size=variant.window_size,
                 head_dim=head_dim,
             )
         else:
@@ -777,7 +773,7 @@ def get_kernel(
             head_fold = 1
         else:
             head_fold = get_varlen_head_fold(
-                (head_dim, block_sizes.block_q, causal),
+                (head_dim, block_sizes.block_q, variant.causal),
                 num_heads,
                 head_dim,
                 head_dim_v,
@@ -788,19 +784,6 @@ def get_kernel(
         kernel_head_fold = 2
     else:
         kernel_head_fold = head_fold
-    if has_window:
-        window_left = None if window_size[0] == -1 else window_size[0]
-        # Note (david): window semantics: causal forces the right bound to 0,
-        # and -1 means unbounded.
-        if causal:
-            window_right = 0
-        elif window_size[1] == -1:
-            window_right = None
-        else:
-            window_right = window_size[1]
-        window = (window_left, window_right)
-    else:
-        window = None
     if token_major:
         token_major_info = TokenMajorInfo(
             batch=kernel_batch,
@@ -815,19 +798,14 @@ def get_kernel(
         num_heads,
         seqlen_q,
         seqlen_kv,
-        causal=causal,
-        causal_offset=causal_offset,
-        window=window,
+        variant=variant,
         block_sizes=block_sizes,
         num_kv_heads=num_kv_heads,
         interpret=interpret,
-        softcap=softcap,
-        return_lse=return_lse,
         head_fold=kernel_head_fold,
         transposed_pv=transposed_pv,
         varlen_max_seqlen_kv=varlen_max_seqlen_kv,
         token_major=token_major_info,
-        q_scale=q_scale,
         heads_outer_batch=heads_outer_batch,
     )
 

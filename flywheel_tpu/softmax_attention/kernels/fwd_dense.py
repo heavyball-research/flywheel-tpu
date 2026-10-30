@@ -25,6 +25,7 @@ from ..schedule import (
 )
 from ..softmax import overflow_guard_threshold
 from ..traits import FwdTraits
+from ..variant import Variant
 from .fwd_varlen import flash_attn_forward_varlen
 
 
@@ -209,49 +210,38 @@ def make_flash_attn_mha(
     seqlen_q: int,
     seqlen_kv: int,
     *,
-    causal: bool,
-    causal_offset: int = 0,
-    window: tuple[int | None, int | None] | None = None,
+    variant: Variant,
     block_sizes: BlockSizes,
     num_kv_heads: int | None = None,
     interpret: bool = False,
     head_fold: int = 1,
     transposed_pv: bool = False,
-    softcap: float = 0.0,
-    return_lse: bool = False,
     varlen_max_seqlen_kv: int | None = None,
     token_major: TokenMajorInfo | None = None,
-    q_scale: float = 1.0,
     heads_outer_batch: int | None = None,
-    runtime_causal_offset: bool = False,
 ) -> Callable[..., jax.Array | tuple[jax.Array, jax.Array]]:
     """Build the MHA forward kernel for one static attention configuration.
 
     The returned callable takes (q, k, v), or (q, k, v, cu_seqlens_q,
     cu_seqlens_k) when varlen_max_seqlen_kv is set, or (q, k, v, causal_offset)
-    under runtime_causal_offset, plus optional rotary and rotary_interleaved
-    kwargs, and returns o, or (o, lse) under return_lse. Except under
-    runtime_causal_offset, an optional sinks argument after those, (nheads,)
-    float sink logits, one per sequence head (flat q head f reads f % nheads,
-    or f // heads_outer_batch heads-outer), joins each head's softmax
-    denominator. Batch-outer only checks that the sinks' length divides the
-    flat q heads, so the caller must pass exactly nheads logits.
+    under variant.runtime_causal_offset, plus optional rotary and
+    rotary_interleaved kwargs, and returns o, or (o, lse) under
+    variant.return_lse. Except under runtime_causal_offset, an optional sinks
+    argument after those, (nheads,) float sink logits, one per sequence head
+    (flat q head f reads f % nheads, or f // heads_outer_batch heads-outer),
+    joins each head's softmax denominator. Batch-outer only checks that the
+    sinks' length divides the flat q heads, so the caller must pass exactly
+    nheads logits.
 
     num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;
       num_kv_heads=None is MHA and MQA is num_kv_heads=1.
-    causal / causal_offset / window: causal alone is window=(None, 0) shifted by
-      causal_offset; an explicit window fully determines (left, right). Under
-      varlen both are bottom-right per sequence and causal_offset must be 0.
+    variant: the scale, softcap, mask and outputs. Under varlen its mask is
+      bottom-right per sequence and its causal_offset must be 0;
+      runtime_causal_offset is dense causal only, without a window.
     block_sizes: block_q must hold at least two block_q_compute tiles.
     head_fold: consecutive heads folded into one physical block; 1 disables it.
     transposed_pv: compute PV as o^T [head_dim, q_block], which requires
       block_sizes.qkv_layout == SEQ_MINOR; the output is swapped back.
-    softcap: Gemma-2 tanh softcap; Q must then carry softmax_scale / softcap
-      instead of softmax_scale * log2(e).
-    q_scale: scale applied in-kernel to each staged Q tile. The softmax runs in
-      exp2, so Q must reach the QK matmul multiplied by log2(e).
-    return_lse: also return the natural-log logsumexp, (num_q_heads, seqlen_q)
-      float32.
     varlen_max_seqlen_kv: switches to the cu_seqlens-driven block schedule;
       only its presence is read.
     token_major: (batch, seq, heads * head_dim) or (total, heads * head_dim)
@@ -259,12 +249,11 @@ def make_flash_attn_mha(
     heads_outer_batch: B for a heads-outer dense fold of B sequences, where q
       fold index n * B + b reads kv fold index (n // q_heads_per_kv_head) * B +
       b; None keeps the batch-outer fold.
-    runtime_causal_offset: dense causal only; the causal offset becomes a
-      device-side int32 scalar argument of the returned callable, and the static
-      causal_offset must stay 0.
     """
-    if runtime_causal_offset and (
-        not causal or window is not None or varlen_max_seqlen_kv is not None
+    if variant.runtime_causal_offset and (
+        not variant.causal
+        or variant.window_size != (-1, -1)
+        or varlen_max_seqlen_kv is not None
     ):
         raise ValueError(
             "runtime_causal_offset requires dense causal attention without an"
@@ -272,15 +261,11 @@ def make_flash_attn_mha(
         )
     if type(transposed_pv) is not bool:
         raise TypeError("transposed_pv must be a bool.")
-    if type(return_lse) is not bool:
-        raise TypeError("return_lse must be a bool.")
-    if return_lse and transposed_pv:
+    if variant.return_lse and transposed_pv:
         raise NotImplementedError(
             "return_lse is only wired for transposed_pv=False; got"
             f" {transposed_pv=}."
         )
-    if softcap < 0.0:
-        raise ValueError(f"softcap must be non-negative; got {softcap}.")
     if (
         token_major is not None
         and block_sizes.qkv_layout != QKVLayout.HEAD_DIM_MINOR
@@ -426,18 +411,13 @@ def make_flash_attn_mha(
     # bottom-right diagonal, which no single static offset expresses once q and
     # kv pack independently, so the per-seq schedule carries them and the kernel
     # is built without a static mask.
-    if is_varlen and causal_offset != 0:
+    if is_varlen and variant.causal_offset != 0:
         raise ValueError(
             "a packed forward derives its bottom-right offset per sequence from"
-            f" cu_seqlens; a kernel-wide causal_offset={causal_offset} would be"
-            " applied on top of it. Pass causal_offset=0."
+            f" cu_seqlens; a kernel-wide causal_offset={variant.causal_offset}"
+            " would be applied on top of it. Pass causal_offset=0."
         )
-    if window is not None:
-        left, right = window
-    elif causal:
-        left, right = None, 0
-    else:
-        left, right = None, None
+    left, right = variant.window
 
     if is_varlen:
         forward = flash_attn_forward_varlen
@@ -454,7 +434,7 @@ def make_flash_attn_mha(
     else:
         forward = (
             flash_attn_forward_runtime_offset
-            if runtime_causal_offset
+            if variant.runtime_causal_offset
             else flash_attn_forward
         )
         schedule_kwargs = {
@@ -468,15 +448,11 @@ def make_flash_attn_mha(
                 bkv=block_sizes.block_kv,
                 left=left,
                 right=right,
-                offset=causal_offset,
+                offset=variant.causal_offset,
                 heads_outer_batch=heads_outer_batch,
             )
         }
         static_window = (left, right)
-    # Note (david): Q carries softmax_scale / softcap rather than log2(e), so
-    # the log2(e) the exp2 softmax needs is folded into the tanh output scale;
-    # 0.0 stays 0.0, so the kernel never traces the tanh.
-    log2_softcap = softcap * LOG2E
     return partial(
         forward,
         **schedule_kwargs,
@@ -487,9 +463,9 @@ def make_flash_attn_mha(
         head_fold=head_fold,
         transposed_pv=transposed_pv,
         window=static_window,
-        causal_offset=causal_offset,
-        softcap=log2_softcap,
-        return_lse=return_lse,
+        causal_offset=variant.causal_offset,
+        softcap=variant.log2_softcap,
+        return_lse=variant.return_lse,
         token_major=token_major,
-        q_scale=float(q_scale),
+        q_scale=variant.q_scale,
     )

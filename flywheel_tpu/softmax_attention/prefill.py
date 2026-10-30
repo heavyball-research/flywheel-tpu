@@ -29,7 +29,7 @@ from .inputs import (
     check_common_kwargs,
     check_sinks,
     descale_scalar,
-    fused_q_scale,
+    make_variant,
     pad_axis,
     pad_seqlen,
     paged_window,
@@ -38,6 +38,7 @@ from .inputs import (
 from .kernels.fwd_dense import make_flash_attn_mha
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .rotary import prepare_rotary
+from .variant import fused_q_scale
 
 
 def flash_attn_func(
@@ -190,6 +191,15 @@ def flash_attn_func(
     # Note (david): bottom-right alignment anchors the causal diagonal on the
     # original lengths, not the padded ones.
     causal_offset = seqlen_k - seqlen_q
+    variant = make_variant(
+        softmax_scale,
+        softcap=float(softcap),
+        causal=bool(causal),
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        return_lse=bool(return_softmax_lse),
+        causal_offset=causal_offset,
+    )
     # Note (david): token-major kernels are built from per-row heads plus the
     # batch, while head-major folds the batch into the head axis.
     if token_major:
@@ -205,16 +215,11 @@ def flash_attn_func(
         num_kv_heads=kernel_num_kv_heads,
         seqlen_q=padded_seqlen_q,
         seqlen_kv=padded_seqlen_k,
-        causal=bool(causal),
-        window_size=window_size,
         interpret=bool(interpret),
-        softcap=float(softcap),
         head_dim=head_dim_qk,
         head_dim_v=head_dim_v,
-        causal_offset=causal_offset,
         token_major=bool(token_major),
         kernel_batch=token_major_batch,
-        q_scale=float(fused_q_scale(softmax_scale, softcap)),
     )
     # Note (david): token-major kernels address heads as lane-axis column
     # windows of the fused refs, and either head-major layout is the kernel's
@@ -234,7 +239,7 @@ def flash_attn_func(
         # is one sequence at positions 0..seqlen-1.
         reason = "heads_outer_fold" if rotary_coeffs is None else "Fused RoPE"
         kernel_output = forward_only_attn(
-            build_kernel(return_lse=False, heads_outer_batch=batch),
+            build_kernel(variant=variant, heads_outer_batch=batch),
             reason,
             kernel_q,
             kernel_k,
@@ -246,7 +251,7 @@ def flash_attn_func(
     elif rotary_coeffs is not None or sinks is not None:
         reason = "learnable_sink" if rotary_coeffs is None else "Fused RoPE"
         kernel_output = forward_only_attn(
-            build_kernel(return_lse=bool(return_softmax_lse)),
+            build_kernel(variant=variant),
             reason,
             kernel_q,
             kernel_k,
@@ -258,26 +263,17 @@ def flash_attn_func(
     elif return_softmax_lse:
         # Note (david): lse has no gradient of its own, so this path stays the
         # bare kernel call.
-        kernel_output = build_kernel(return_lse=True)(
+        kernel_output = build_kernel(variant=variant)(
             kernel_q, kernel_k, kernel_v
         )
     else:
-        if window_size != (-1, -1):
-            bwd_unsupported = "window_size"
-        elif softcap != 0.0:
-            bwd_unsupported = "softcap"
-        else:
-            bwd_unsupported = ""
         kernel_output = attn_with_vjp(
             kernel_q,
             kernel_k,
             kernel_v,
             build_kernel=build_kernel,
-            softmax_scale=softmax_scale,
-            causal=bool(causal),
-            causal_offset=causal_offset,
+            variant=variant,
             interpret=bool(interpret),
-            bwd_unsupported=bwd_unsupported,
             token_major=token_major,
             head_dim=head_dim_qk if token_major else None,
         )
@@ -387,15 +383,19 @@ def _flash_attn_func_pcp_causal_offset(
         num_heads,
         padded_q_len,
         padded_kv_len,
-        causal=True,
-        causal_offset=0,
+        variant=make_variant(
+            softmax_scale,
+            softcap=0.0,
+            causal=True,
+            window_size=(-1, -1),
+            learnable_sink=None,
+            return_lse=return_softmax_lse,
+            runtime_causal_offset=True,
+        ),
         block_sizes=default_block_sizes(padded_q_len, padded_kv_len),
         num_kv_heads=num_kv_heads,
         interpret=interpret,
-        return_lse=return_softmax_lse,
-        q_scale=float(fused_q_scale(softmax_scale, 0.0)),
         heads_outer_batch=1 if heads_outer_fold else None,
-        runtime_causal_offset=True,
     )
     kernel_output = kernel(
         *(operand.reshape(-1, *operand.shape[2:]) for operand in (q, k, v)),
@@ -875,23 +875,27 @@ def flash_attn_varlen_func(
         # Note (david): causal_offset stays 0 because packed causal and window
         # masking is per-sequence bottom-right, derived from the cu_seqlens pair
         # in the kernel.
+        variant = make_variant(
+            softmax_scale,
+            softcap=float(softcap),
+            causal=bool(causal),
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            return_lse=bool(return_softmax_lse),
+            causal_offset=0,
+        )
         build_kernel = functools.partial(
             get_kernel,
             num_heads=nheads,
             num_kv_heads=nheads_k,
             seqlen_q=padded_total_q,
             seqlen_kv=padded_total_k,
-            causal=bool(causal),
-            window_size=window_size,
             interpret=bool(interpret),
-            softcap=float(softcap),
             head_dim=head_dim_qk,
             head_dim_v=head_dim_v,
-            causal_offset=0,
             varlen_max_seqlen_kv=max_seqlen_k_bucket,
             varlen_max_seqlen_q=max_seqlen_q_bucket,
             token_major=bool(token_major),
-            q_scale=float(fused_q_scale(softmax_scale, softcap)),
             blocks_override=blocks_override,
         )
         sinks = check_sinks(learnable_sink, nheads)
@@ -900,7 +904,7 @@ def flash_attn_varlen_func(
         # included, is forward-only and jax.grad names it instead of failing in
         # the tracer.
         kernel_output = forward_only_attn(
-            build_kernel(return_lse=bool(return_softmax_lse)),
+            build_kernel(variant=variant),
             "flash_attn_varlen_func",
             q,
             k,

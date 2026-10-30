@@ -192,15 +192,17 @@ class Flywheel:
         import jax
 
         from flywheel_tpu.softmax_attention.config import BlockSizes, QKVLayout
-        from flywheel_tpu.softmax_attention.inputs import fused_q_scale
         from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
+        from flywheel_tpu.softmax_attention.variant import Variant
 
         cell = self.cell
         kernel = make_flash_attn_mha(
             cell.batch * cell.heads,
             cell.seq,
             cell.seq,
-            causal=True,
+            variant=Variant(
+                softmax_scale=1.0 / math.sqrt(cell.head_dim), causal=True
+            ),
             block_sizes=BlockSizes(
                 block_q=config["q_block"],
                 block_kv=config["kv_block"],
@@ -212,7 +214,6 @@ class Flywheel:
             num_kv_heads=cell.batch * cell.heads_k,
             head_fold=config["head_fold"],
             transposed_pv=config["transposed_pv"],
-            q_scale=float(fused_q_scale(1.0 / math.sqrt(cell.head_dim), 0.0)),
         )
         call = jax.jit(kernel)
         return (lambda state: (call(*qkv), state)), (lambda: None)

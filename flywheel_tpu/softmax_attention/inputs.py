@@ -1,12 +1,13 @@
 """User arguments -> kernel inputs: shape and keyword checks, padding and
-the fused Q scale."""
+the Variant."""
 
 import jax
 import jax.numpy as jnp
 
 from ..core.tiling import round_up
 from ..core.tpu import NUM_LANES
-from .config import LOG2E, PAIRED_HEAD_DIM
+from .config import PAIRED_HEAD_DIM
+from .variant import Variant
 
 # Note (david): seq is axis 1 of the token-major dense layout (batch, seq,
 # heads * head_dim) and axis 2 of both head-major ones, (batch, heads, seq,
@@ -41,16 +42,6 @@ def pad_axis(operand: jax.Array, axis: int, num_pad: int) -> jax.Array:
             operand,
             [(0, num_pad if dim == axis else 0) for dim in range(operand.ndim)],
         )
-
-
-def fused_q_scale(softmax_scale: float, softcap: float) -> float:
-    # Note (david): the kernel softmax runs in log2 units, so log2(e) rides in
-    # the fused Q scale. With softcap, Q takes softmax_scale / softcap instead
-    # and the kernel applies log2(e) after its tanh.
-    if softcap == 0.0:
-        return softmax_scale * LOG2E
-    else:
-        return softmax_scale / softcap
 
 
 def descale_scalar(
@@ -244,6 +235,34 @@ def check_common_kwargs(
             "return_attn_probs is not supported on TPU (v0)."
         )
     return window_size
+
+
+def make_variant(
+    softmax_scale: float,
+    *,
+    softcap: float,
+    causal: bool,
+    window_size: tuple[int, int],
+    learnable_sink: jax.Array | None,
+    return_lse: bool,
+    causal_offset: int = 0,
+    runtime_causal_offset: bool = False,
+    has_kv_scales: bool = False,
+) -> Variant:
+    """The Variant of one call from its user kwargs: softmax_scale resolved,
+    window_size as check_common_kwargs returns it, and learnable_sink, which
+    stays a kernel operand, only marking that the build takes sinks."""
+    return Variant(
+        softmax_scale=softmax_scale,
+        softcap=softcap,
+        causal=causal,
+        window_size=window_size,
+        causal_offset=causal_offset,
+        runtime_causal_offset=runtime_causal_offset,
+        has_sinks=learnable_sink is not None,
+        has_kv_scales=has_kv_scales,
+        return_lse=return_lse,
+    )
 
 
 def paged_window(

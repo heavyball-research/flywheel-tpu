@@ -13,8 +13,9 @@ import pytest
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
-from flywheel_tpu.softmax_attention.inputs import fused_q_scale, pad_seqlen
+from flywheel_tpu.softmax_attention.inputs import pad_seqlen
 from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
+from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -588,12 +589,13 @@ def test_kernel_rejects_misshaped_sinks(entry):
     # SMEM past its end.
     batch, nheads, seqlen = 2, 4, 128
     blocks = default_block_sizes(seqlen, seqlen, head_dim=128)
+    variant = Variant(softmax_scale=1.0, causal=True, has_sinks=True)
     if entry == "dense":
         kernel = make_flash_attn_mha(
             batch * nheads,
             seqlen,
             seqlen,
-            causal=True,
+            variant=variant,
             block_sizes=blocks,
             interpret=INTERPRET,
         )
@@ -604,7 +606,7 @@ def test_kernel_rejects_misshaped_sinks(entry):
             nheads,
             seqlen,
             seqlen,
-            causal=True,
+            variant=variant,
             block_sizes=blocks,
             interpret=INTERPRET,
             varlen_max_seqlen_kv=seqlen,
