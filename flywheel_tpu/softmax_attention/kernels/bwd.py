@@ -385,11 +385,14 @@ def flash_attn_bwd_q_chunked(
     *,
     chunk_rows: int,
     block_sizes: BlockSizes,
+    head_fold: int | None,
     variant: Variant,
-    **knobs: int | bool | None,
+    interpret: bool,
+    token_major: bool,
+    head_dim: int | None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Dense backward as one rectangular backward per q-row chunk -> (dq, dk,
-    dv).
+    dv); the arguments past chunk_rows are each chunk's flash_attn_bwd's.
 
     dq rows are disjoint, so the chunks concatenate; dk/dv sum in f32, so each
     chunk's own out_dtype rounding is the only one added. A causal chunk drops
@@ -427,8 +430,11 @@ def flash_attn_bwd_q_chunked(
             lse[:, start:stop],
             do[..., start:stop, :],
             block_sizes=block_sizes,
+            head_fold=head_fold,
             variant=chunk_variant,
-            **knobs,
+            interpret=interpret,
+            token_major=token_major,
+            head_dim=head_dim,
         )
         dq_chunks.append(chunk_dq)
         dk = dk.at[..., :kv_stop, :].add(chunk_dk.astype(f32))
