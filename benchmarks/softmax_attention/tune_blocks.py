@@ -192,7 +192,7 @@ class Flywheel:
         import jax
 
         from flywheel_tpu.softmax_attention.config import BlockSizes, QKVLayout
-        from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
+        from flywheel_tpu.softmax_attention.dispatch import make_flash_attn_mha
         from flywheel_tpu.softmax_attention.variant import Variant
 
         cell = self.cell

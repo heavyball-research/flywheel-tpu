@@ -12,9 +12,11 @@ import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 from flywheel_tpu.softmax_attention.config import next_pow2
-from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
+from flywheel_tpu.softmax_attention.dispatch import (
+    default_block_sizes,
+    make_flash_attn_mha,
+)
 from flywheel_tpu.softmax_attention.inputs import pad_seqlen
-from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import attention_ref, randn
 

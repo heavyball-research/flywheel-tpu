@@ -18,6 +18,7 @@ from .config import BlockSizes, next_pow2
 from .dispatch import (
     default_block_sizes,
     get_kernel,
+    make_flash_attn_mha,
     resolve_paged_block_sizes,
 )
 from .inputs import (
@@ -34,7 +35,6 @@ from .inputs import (
     pad_seqlen,
     parse_qkv,
 )
-from .kernels.fwd_dense import make_flash_attn_mha
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .rotary import prepare_rotary
 
