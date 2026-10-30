@@ -23,13 +23,8 @@ from ..config import (
     PagedKVInfo,
     next_pow2,
 )
-from ..fwd_pipeline import (
-    NUM_KV_STAGES,
-    NUM_O_SLOTS,
-    forward_common,
-    fwd_body,
-    rotary_fields,
-)
+from ..fwd_blocks import NUM_KV_STAGES, NUM_O_SLOTS
+from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
     ScheduleTableLayout,

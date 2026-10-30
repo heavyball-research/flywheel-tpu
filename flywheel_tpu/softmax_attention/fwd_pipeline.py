@@ -2,7 +2,6 @@
 
 from collections.abc import Callable, Sequence
 from functools import partial, reduce
-from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +20,31 @@ from .config import (
     hbm_bf16_tile_rows,
     vmem_limit_bytes,
 )
-from .dma import advance, drain, fold_row, hbm_window
+from .dma import advance, drain, hbm_window
+from .fwd_blocks import (
+    NUM_KV_STAGES,
+    NUM_O_SLOTS,
+    NUM_PENDING_FIELDS,
+    NUM_SEMS,
+    PENDING_READ_PARITY,
+    PENDING_ROW_START,
+    PENDING_WRITE_PARITY,
+    SEM_K,
+    SEM_LSE,
+    SEM_OUT,
+    SEM_ROTARY_K,
+    SEM_V,
+    TRASH_PARITY,
+    QRefs,
+    RowFinish,
+    fold_lane,
+    rotary_copies,
+    rotate_staged,
+    set_half,
+    start_q_row,
+    take_half,
+    wait_q_row,
+)
 from .kv_layout import (
     kv_heads_per_word,
     kv_word_halves,
@@ -30,7 +53,6 @@ from .kv_layout import (
     staged_words,
 )
 from .mask import apply_packed_bounds_mask
-from .rotary import rotate_tile
 from .schedule import FwdSchedule, window_fragment_plans
 from .softmax import (
     MASKED_ROW_BOUND,
@@ -39,44 +61,6 @@ from .softmax import (
 )
 from .traits import FwdTraits
 from .variant import Variant, VariantOperands
-
-SEM_Q = 0
-SEM_K = 1
-SEM_V = 2
-SEM_OUT = 3
-SEM_LSE = 4
-NUM_SEMS = 5
-SEM_ROTARY_Q = NUM_SEMS
-SEM_ROTARY_K = NUM_SEMS + 1
-PENDING_WRITE_PARITY = 0
-PENDING_READ_PARITY = 1
-PENDING_ROW_START = 2
-NUM_PENDING_FIELDS = 3
-# Note (david): an empty pending PV reads and writes this trash o slot, so the
-# next block issues the pending PV without a branch.
-TRASH_PARITY = 2
-NUM_O_SLOTS = 3
-# Note (david): the kv stream prefetches two blocks ahead, so its ring holds
-# the running block, the next one and the one in flight.
-NUM_KV_STAGES = 3
-
-
-class RowFinish(NamedTuple):
-    """A q block row's output finish, deferred until its last PV has run.
-
-    prev_out_tok is the previous output block's q_tok, out_count the row's
-    output copy index and parity that of its final row state. is_live 0 marks
-    no row.
-    """
-
-    is_live: jax.Array
-    si: jax.Array
-    q_tok: jax.Array
-    base_head: jax.Array
-    num_blend_rows: jax.Array
-    prev_out_tok: jax.Array
-    out_count: jax.Array
-    parity: jax.Array
 
 
 def fwd_body(
@@ -143,9 +127,6 @@ def fwd_body(
     is_lane_paired = traits.is_lane_paired
     heads_per_lane_tile = traits.heads_per_lane_tile
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
-    rotary_interleaved = traits.rotary_interleaved
-    rotary_batch, rotary_groups = traits.rotary_batch, traits.rotary_groups
-    rotary_q_heads = traits.rotary_q_heads
     rotary_k_heads = traits.rotary_k_heads
     variant.check_operands(operands)
     return_lse = variant.return_lse
@@ -195,6 +176,13 @@ def fwd_body(
         pending_smem,
         sems,
     ) = pipeline_refs
+    q_refs = QRefs(
+        hbm=q_hbm,
+        buf=q_buf,
+        rotary_hbm=rotary_q_hbm,
+        rotary_buf=rotary_q_buf,
+        sems=sems,
+    )
     if return_lse and is_per_seq:
         lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
@@ -238,139 +226,6 @@ def fwd_body(
     # while later keys stay visible; anchoring on that masked score would push
     # the row's first visible key past the guard into a replay.
     defers_row_start = window[0] is not None or schedule.has_q_span
-
-    def _fold_lane(ref, g, block, width, layout=qkv_layout):
-        if is_lane_paired:
-            tile_start = (g // heads_per_lane_tile) * NUM_LANES
-            return (
-                ref.at[:, pl.ds(tile_start, NUM_LANES)],
-                g % heads_per_lane_tile,
-            )
-        else:
-            return fold_row(ref, g, block, head_fold, layout, width), None
-
-    def _take_half(value, half, width):
-        if half is None:
-            return value
-        else:
-            return value[..., half * width : (half + 1) * width]
-
-    def _set_half(value, half, width, new_half):
-        # Note (david): jnp .at[].set lowers to scatter, which Pallas TPU lacks,
-        # so replace the half with a static split + concatenate.
-        halves = [
-            value[..., i * width : (i + 1) * width]
-            for i in range(value.shape[-1] // width)
-        ]
-        halves[half] = new_half
-        return jnp.concatenate(halves, axis=-1)
-
-    def _q_copy(head, tok, slot):
-        return pltpu.make_async_copy(
-            hbm_window(
-                q_hbm,
-                head,
-                tok,
-                bq,
-                width=width_qk,
-                heads_per_row=q_heads_per_row,
-                layout=qkv_layout,
-                token_major=token_major,
-                fold=group_heads,
-            ),
-            q_buf.at[slot],
-            sems.at[SEM_Q, slot],
-        )
-
-    def _rotary_copies(
-        coeff_hbm, coeff_buf, head, tok, block, slot, heads_per_batch, sem_plane
-    ):
-        for g in range(rotary_groups):
-            batch_idx = (
-                0 if rotary_batch == 1 else (head + g) // heads_per_batch
-            )
-            rows = pl.ds(tok, block)
-            coeff_window = (
-                coeff_hbm.at[batch_idx, rows, :]
-                if is_head_dim_minor
-                else coeff_hbm.at[batch_idx, :, rows]
-            )
-            yield pltpu.make_async_copy(
-                coeff_window, coeff_buf.at[slot, g], sems.at[sem_plane, slot]
-            )
-
-    def _rotate_staged(buf, coeff_buf, slot, block):
-        for g in range(head_fold):
-            head_ref, half = _fold_lane(buf.at[slot], g, block, lane_width_qk)
-            coeff_group = 0 if rotary_groups == 1 else g
-            staged = head_ref[...]
-            head_value = _take_half(staged, half, lane_width_qk)
-            rotated = rotate_tile(
-                head_value,
-                coeff_buf[slot, coeff_group],
-                interleaved=rotary_interleaved,
-                head_dim_minor=is_head_dim_minor,
-            )
-            head_ref[...] = (
-                rotated
-                if half is None
-                else _set_half(staged, half, lane_width_qk, rotated)
-            )
-
-    def _rotate_gqa_folded_q(slot):
-        # Note (david): the gqa-folded heads share the paged build's one Q
-        # coefficient plane, and a rolled loop keeps one copy of the rotation.
-        def _rotate_head(h, carry):
-            head_ref = q_buf.at[slot, h]
-            head_ref[...] = rotate_tile(
-                head_ref[...],
-                rotary_q_buf[slot, 0],
-                interleaved=rotary_interleaved,
-                head_dim_minor=is_head_dim_minor,
-            )
-            return carry
-
-        lax.fori_loop(0, gqa_fold, _rotate_head, None)
-
-    def _start_q_row(head, tok, slot):
-        _q_copy(head, tok, slot).start()
-        if rotary_dim:
-            for dma in _rotary_copies(
-                rotary_q_hbm,
-                rotary_q_buf,
-                head,
-                tok,
-                bq,
-                slot,
-                rotary_q_heads,
-                SEM_ROTARY_Q,
-            ):
-                dma.start()
-
-    def _wait_q_row(slot):
-        _q_copy(0, 0, slot).wait()
-        if rotary_dim:
-            for dma in _rotary_copies(
-                rotary_q_hbm,
-                rotary_q_buf,
-                0,
-                0,
-                bq,
-                slot,
-                rotary_q_heads,
-                SEM_ROTARY_Q,
-            ):
-                dma.wait()
-            if gqa_fold > 1:
-                _rotate_gqa_folded_q(slot)
-            else:
-                _rotate_staged(q_buf, rotary_q_buf, slot, bq)
-        # Note (david): each staged Q tile is waited on exactly once per
-        # row, so scaling it here replaces an HBM pre-scaled Q copy with the
-        # same f32 multiply and cast, leaving the logits unchanged.
-        if variant.scales_q(operands):
-            q_ref = q_buf.at[slot]
-            q_ref[...] = variant.transform_q(q_ref[...], operands)
 
     def _kv_copies(kv_head, tok, slot):
         return [
@@ -541,7 +396,9 @@ def fwd_body(
             for dma in _kv_copies(kv_head, kv_tok, slot):
                 dma.start()
             if rotary_dim and rotary_k:
-                for dma in _rotary_copies(
+                for dma in rotary_copies(
+                    traits,
+                    sems,
                     rotary_k_hbm,
                     rotary_k_buf,
                     kv_head,
@@ -571,7 +428,9 @@ def fwd_body(
             for dma in _kv_copies(0, 0, slot):
                 dma.wait()
             if rotary_dim and rotary_k:
-                for dma in _rotary_copies(
+                for dma in rotary_copies(
+                    traits,
+                    sems,
                     rotary_k_hbm,
                     rotary_k_buf,
                     0,
@@ -595,7 +454,9 @@ def fwd_body(
         if is_paged:
             return _paged_fragment(kv_compute_index, 1)
         else:
-            v_ref, _ = _fold_lane(v_buf.at[kv_slot], g, bkv, lane_width_v)
+            v_ref, _ = fold_lane(
+                traits, v_buf.at[kv_slot], g, bkv, lane_width_v, qkv_layout
+            )
             slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
             return v_ref[slice_k, :] if is_head_dim_minor else v_ref[:, slice_k]
 
@@ -625,7 +486,7 @@ def fwd_body(
         elif is_head_dim_minor:
             o_curr = lax.dot_general(
                 probs,
-                _take_half(v_tile, v_half, lane_width_v),
+                take_half(v_tile, v_half, lane_width_v),
                 NN_DIM_NUMBERS,
                 preferred_element_type=jnp.float32,
             )
@@ -779,23 +640,28 @@ def fwd_body(
                         frag_rows, q_buf.shape[-1]
                     )
                 else:
-                    q_ref, _ = _fold_lane(
-                        q_buf.at[q_slot], g, bq, lane_width_qk
+                    q_ref, _ = fold_lane(
+                        traits,
+                        q_buf.at[q_slot],
+                        g,
+                        bq,
+                        lane_width_qk,
+                        qkv_layout,
                     )
                     q = q_ref[slice_q, :]
                 k = _paged_fragment(kv_compute_index, 0)
                 dim_numbers = NT_DIM_NUMBERS
             else:
-                q_ref, q_half = _fold_lane(
-                    q_buf.at[q_slot], g, bq, lane_width_qk
+                q_ref, q_half = fold_lane(
+                    traits, q_buf.at[q_slot], g, bq, lane_width_qk, qkv_layout
                 )
-                k_ref, k_half = _fold_lane(
-                    k_buf.at[kv_slot], g, bkv, lane_width_qk
+                k_ref, k_half = fold_lane(
+                    traits, k_buf.at[kv_slot], g, bkv, lane_width_qk, qkv_layout
                 )
                 slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
                 if is_head_dim_minor:
-                    q = _take_half(q_ref[slice_q, :], q_half, lane_width_qk)
-                    k = _take_half(k_ref[slice_k, :], k_half, lane_width_qk)
+                    q = take_half(q_ref[slice_q, :], q_half, lane_width_qk)
+                    k = take_half(k_ref[slice_k, :], k_half, lane_width_qk)
                     dim_numbers = NT_DIM_NUMBERS
                 else:
                     q = q_ref[:, slice_q].T
@@ -1423,7 +1289,7 @@ def fwd_body(
                             kv_planes.dtype
                         )
             elif rotary_dim and rotary_k:
-                _rotate_staged(k_buf, rotary_k_buf, kv_slot, bkv)
+                rotate_staged(traits, k_buf, rotary_k_buf, kv_slot, bkv)
             # Note (david): a path that loads every block starts the block two
             # ahead inside the copy, where the page DMAs' scalar work rides the
             # copy's idle scalar slots.
@@ -1702,7 +1568,7 @@ def fwd_body(
             row_sum_ref = row_sum_scratch.at[finish.parity, head_rows]
             # Note (david): o_stage keeps an explicit fold axis (leading on
             # head-major, lanes on token-major) while o_scratch stays flat-row
-            # addressed, so only o_stage goes through _fold_lane. A gqa fold
+            # addressed, so only o_stage goes through fold_lane. A gqa fold
             # writes all of its heads at once.
             o_ref = (
                 o_scratch.at[finish.parity, :, head_rows]
@@ -1712,8 +1578,13 @@ def fwd_body(
             if gqa_fold > 1:
                 o_stage_g, o_half = o_stage.at[out_slot], None
             else:
-                o_stage_g, o_half = _fold_lane(
-                    o_stage.at[out_slot], g, bq, lane_width_v, layout=o_layout
+                o_stage_g, o_half = fold_lane(
+                    traits,
+                    o_stage.at[out_slot],
+                    g,
+                    bq,
+                    lane_width_v,
+                    o_layout,
                 )
 
             def _finalize_fragment(q_compute_index, carry):
@@ -1745,7 +1616,7 @@ def fwd_body(
                     # Note (david): the stage tile holds both heads of the pair,
                     # and the head loop is sequential, so the other half is
                     # either untouched or already this step's final value.
-                    o_stage_g[tile_index] = _set_half(
+                    o_stage_g[tile_index] = set_half(
                         o_stage_g[tile_index],
                         o_half,
                         lane_width_v,
@@ -1972,9 +1843,11 @@ def fwd_body(
         q_loaded, q_inflight, q_slot = advance(
             g * num_rows + si,
             next_g * num_rows + next_si,
-            lambda slot: _start_q_row(base_head, q_tok, slot),
-            lambda slot: _start_q_row(next_head, next_q_tok, slot),
-            _wait_q_row,
+            lambda slot: start_q_row(traits, q_refs, base_head, q_tok, slot),
+            lambda slot: start_q_row(
+                traits, q_refs, next_head, next_q_tok, slot
+            ),
+            partial(wait_q_row, traits, variant, operands, q_refs),
             q_loaded,
             q_inflight,
             q_slot,
