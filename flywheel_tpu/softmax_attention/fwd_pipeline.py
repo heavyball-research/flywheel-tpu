@@ -2317,7 +2317,7 @@ def forward_common(
     kernel is the mode kernel with its schedule already bound; traits,
     return_lse and body, fwd_body's per-call keywords, are bound here. rotary
     is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair (K None
-    when K arrives rotated), whose layout traits' rotary fields hold. Returns o
+    when K arrives rotated) that traits' rotary fields describe. Returns o
     shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads, q_seq_len)
     float32 natural-log lse.
 
