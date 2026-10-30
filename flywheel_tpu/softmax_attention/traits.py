@@ -22,9 +22,16 @@ from .config import (
     QKVLayout,
     TokenMajorInfo,
 )
-from .kv_layout import kv_heads_per_word, kv_word_rows, merged_cache_heads
+from .kv_layout import (
+    MIN_BLOCK_KV,
+    kv_heads_per_word,
+    kv_word_rows,
+    merged_cache_heads,
+)
 from .rotary import ROTARY_DIM_MULTIPLE
 from .softmax import overflow_guard_threshold
+
+DECODE_HEAD_DIMS = (64, 128, 256)
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -382,6 +389,36 @@ class DecodeTraits:
     capacity: int
     page_size: int | None
     pages_per_seq: int | None
+
+    def __post_init__(self) -> None:
+        num_kv_heads = self.num_kv_heads
+        if not self.is_merged_cache:
+            if self.cache_dtype != jnp.bfloat16:
+                raise NotImplementedError(
+                    "the K/V cache pair is bfloat16 only; got"
+                    f" {self.cache_dtype}."
+                )
+            if num_kv_heads != 1 and num_kv_heads % 2:
+                # Note (david): the packed load bitcasts two bf16 heads into one
+                # u32 lane. The plain strided read an odd axis would need leaves
+                # a singleton minor-but-one buffer dim that Mosaic pads to a
+                # full 8-sublane tile, measured 5-10x slower at batch >= 32 and
+                # behind the RPA v3 baseline.
+                raise ValueError(
+                    "token-major cache needs an even head axis (the packed load"
+                    " carries two bf16 heads per u32 lane); got"
+                    f" {num_kv_heads=}."
+                )
+        if self.head_dim not in DECODE_HEAD_DIMS:
+            raise ValueError(
+                f"head_dim must be one of {DECODE_HEAD_DIMS}; got"
+                f" {self.head_dim}."
+            )
+        if self.capacity % MIN_BLOCK_KV:
+            raise ValueError(
+                f"capacity must be a multiple of {MIN_BLOCK_KV}; got"
+                f" {self.capacity}."
+            )
 
     @property
     def block_kv(self) -> int:

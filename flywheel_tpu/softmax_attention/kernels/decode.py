@@ -34,7 +34,6 @@ from ..kv_layout import (
 from ..traits import DecodeTraits
 from ..variant import Variant
 
-SUPPORTED_HEAD_DIMS = (64, 128, 256)
 NUM_IO_STAGES = 2
 SEM_K = 0
 SEM_V = 1
@@ -1290,23 +1289,8 @@ def flash_attn_kvcache_pallas(
         num_kv_heads = resolve_merged_kv_heads(
             cache_shape[2], k_cache.dtype, nheads_k
         )
-    elif k_cache.dtype != jnp.bfloat16:
-        raise NotImplementedError(
-            f"the K/V cache pair is bfloat16 only; got {k_cache.dtype}."
-        )
     else:
         row_tokens, num_kv_heads = cache_shape[1], cache_shape[2]
-        if num_kv_heads != 1 and num_kv_heads % 2:
-            # Note (david): the packed load bitcasts two bf16 heads into one u32
-            # lane. The plain strided read an odd axis would need leaves a
-            # singleton minor-but-one buffer dim that Mosaic pads to a full
-            # 8-sublane tile, measured 5-10x slower at batch >= 32 and behind
-            # the RPA v3 baseline.
-            raise ValueError(
-                "token-major cache needs an even head axis (the packed load"
-                " carries two bf16 heads per u32 lane); got"
-                f" num_kv_heads={num_kv_heads}."
-            )
     # Note (david): with a singleton head axis a token-major
     # (rows, capacity, 1, head_dim) cache is the same bytes as head-major
     # (rows, 1, capacity, head_dim), whose tile is a dense (block_kv, head_dim)
@@ -1328,10 +1312,6 @@ def flash_attn_kvcache_pallas(
         page_size = row_tokens
         pages_per_seq = block_table.shape[0] // batch
         capacity = pages_per_seq * page_size
-    if head_dim not in SUPPORTED_HEAD_DIMS:
-        raise ValueError(
-            f"head_dim must be one of {SUPPORTED_HEAD_DIMS}; got {head_dim}."
-        )
     if is_window:
         assert window_heads % num_kv_heads == 0
         assert not has_new and left is None, "a window is already in the cache"
@@ -1354,10 +1334,6 @@ def flash_attn_kvcache_pallas(
                 sinks.reshape(num_kv_heads, 1, group),
                 (num_kv_heads, query_tokens, group),
             ).reshape(num_query_heads)
-    if capacity % MIN_BLOCK_KV:
-        raise ValueError(
-            f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
-        )
     block_kv, _, num_kv_stages = kv_config
     if page_size is not None:
         # Note (david): the padded entries lie past every row's length and each
