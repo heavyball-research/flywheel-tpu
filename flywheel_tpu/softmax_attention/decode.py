@@ -541,7 +541,6 @@ def flash_attn_with_kvcache(
             v_new,
             row_cache_seqlens,
             cache_batch_idx,
-            cache_head_major=False,
             has_new=kernel_has_new,
             left=window_left,
             return_lse=bool(return_softmax_lse),

@@ -1274,7 +1274,6 @@ def flash_attn_kvcache_pallas(
     cache_seqlens: jax.Array,
     cache_batch_idx: jax.Array,
     *,
-    cache_head_major: bool,
     has_new: bool,
     left: int | None,
     return_lse: bool,
@@ -1297,8 +1296,7 @@ def flash_attn_kvcache_pallas(
     num_query_heads, head_dim) q is a window already in the cache, folded into
     the query heads so each row's cache is read once; out and lse keep q's
     layout, and causal bounds window token t at cache_seqlens - window + 1 + t.
-    k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim), or head-major
-    (rows, num_kv_heads, capacity, head_dim) with cache_head_major. With
+    k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim). With
     block_table, the flat (batch * pages_per_seq,) int32 page table, the caches
     are (num_pages, page_size, ...) pools and the per-row capacity is
     pages_per_seq * page_size.
@@ -1332,8 +1330,8 @@ def flash_attn_kvcache_pallas(
     ) == merged_cache, (
         "merged_cache takes one cache operand and v_cache=None, a pair both."
     )
-    assert not merged_cache or (
-        not cache_head_major and k_cache.shape[2] % 2 == 0
+    assert (
+        not merged_cache or k_cache.shape[2] % 2 == 0
     ), "merged_cache takes one token-major cache with an even head axis."
     cache_operands = (k_cache,) if merged_cache else (k_cache, v_cache)
     cache_shape = k_cache.shape
@@ -1363,8 +1361,6 @@ def flash_attn_kvcache_pallas(
         raise NotImplementedError(
             f"the K/V cache pair is bfloat16 only; got {k_cache.dtype}."
         )
-    elif cache_head_major:
-        num_kv_heads, row_tokens = cache_shape[1], cache_shape[2]
     else:
         row_tokens, num_kv_heads = cache_shape[1], cache_shape[2]
         if num_kv_heads != 1 and num_kv_heads % 2:
@@ -1382,10 +1378,8 @@ def flash_attn_kvcache_pallas(
     # (rows, capacity, 1, head_dim) cache is the same bytes as head-major
     # (rows, 1, capacity, head_dim), whose tile is a dense (block_kv, head_dim)
     # window with no head pair to pack and no 8-sublane pad.
-    is_token_major_mqa = (
-        not cache_head_major and not merged_cache and num_kv_heads == 1
-    )
-    is_cache_head_major = cache_head_major or is_token_major_mqa
+    is_token_major_mqa = not merged_cache and num_kv_heads == 1
+    is_cache_head_major = is_token_major_mqa
     if is_token_major_mqa:
         kernel_caches = tuple(
             cache.reshape(cache.shape[0], 1, row_tokens, head_dim)
