@@ -246,6 +246,11 @@ class Variant:
                 k_ids <= q_ids + right, left_masked, DEFAULT_MASK_VALUE
             )
 
+    def sink_logits(self, sinks: jax.Array) -> jax.Array:
+        """The sink logits as sinks_ref holds them: float32, in the log2 units
+        of the kernel's scores."""
+        return sinks.astype(jnp.float32) * LOG2E
+
     def fold_sink(
         self, row_max: jax.Array, row_sum: jax.Array, sink: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:

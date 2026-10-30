@@ -8,7 +8,6 @@ import jax.numpy as jnp
 
 from ...core.tpu import NUM_LANES
 from ..config import (
-    LOG2E,
     MIN_Q_TILES_PER_BLOCK,
     PAIRED_HEAD_DIM,
     BlockSizes,
@@ -107,7 +106,7 @@ def flash_attn_forward(
             dense_params.heads_outer_batch,
             token_major,
         )
-    smem_operands = [] if sinks is None else [sinks.astype(jnp.float32) * LOG2E]
+    smem_operands = [] if sinks is None else [variant.sink_logits(sinks)]
     traits = qkv_fwd_traits(
         q,
         v,

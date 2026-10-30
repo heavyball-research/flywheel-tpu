@@ -8,9 +8,8 @@ causal or window edges around each sequence's own bottom-right diagonal.
 from functools import partial
 
 import jax
-import jax.numpy as jnp
 
-from ..config import LOG2E, BlockSizes, QKVLayout, TokenMajorInfo
+from ..config import BlockSizes, QKVLayout, TokenMajorInfo
 from ..fwd_pipeline import forward_common, fwd_body, qkv_fwd_traits
 from ..schedule import (
     ScheduleTableLayout,
@@ -127,7 +126,7 @@ def flash_attn_forward_varlen(
                 f"sinks must be ({num_seq_heads},), one per q head; got"
                 f" {sinks.shape}."
             )
-        smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
+        smem_operands.append(variant.sink_logits(sinks))
 
     kernel = partial(
         flash_fwd_varlen_kernel,

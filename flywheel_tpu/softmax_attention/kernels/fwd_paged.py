@@ -17,7 +17,6 @@ import jax.numpy as jnp
 from ...core.tiling import round_up
 from ...core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
 from ..config import (
-    LOG2E,
     MIN_Q_TILES_PER_BLOCK,
     PAGE_SIZE_MULTIPLE,
     BlockSizes,
@@ -433,7 +432,7 @@ def flash_attn_varlen_paged(
         ]),
     ]
     if sinks is not None:
-        smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
+        smem_operands.append(variant.sink_logits(sinks))
     kernel = partial(
         flash_fwd_varlen_paged_kernel,
         layout=layout,

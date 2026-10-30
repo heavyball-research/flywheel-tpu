@@ -13,7 +13,6 @@ from jax.experimental.pallas import tpu as pltpu
 from ...core.tiling import round_up
 from ...core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES, NUM_LANES
 from ..config import (
-    LOG2E,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     STAGES,
@@ -1487,9 +1486,7 @@ def flash_attn_kvcache_pallas(
     else:
         sink_shape = (num_query_heads, NUM_LANES)
         sink_inputs = (
-            jnp.broadcast_to(
-                (sinks.astype(jnp.float32) * LOG2E)[:, None], sink_shape
-            ),
+            jnp.broadcast_to(variant.sink_logits(sinks)[:, None], sink_shape),
         )
         sink_specs = (pl.BlockSpec(sink_shape, lambda *_: (0, 0)),)
     call = pl.pallas_call(
