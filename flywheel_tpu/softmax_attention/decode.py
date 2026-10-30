@@ -16,13 +16,14 @@ from .inputs import (
     check_common_kwargs,
     check_sinks,
     descale_scalar,
+    make_variant,
     paged_window,
 )
 from .kernels.decode import flash_attn_kvcache_pallas
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .kernels.kv_append import append_ragged
 from .kv_layout import resolve_merged_kv_heads
-from .variant import fused_q_scale
+from .variant import Variant, fused_q_scale
 
 # Note (david): the paged varlen kernel pads every request to a 128-token q
 # block, so a short window folded into the decode kernel's query heads reads
@@ -42,11 +43,7 @@ def flash_attn_kvcache_varlen(
     num_active: int | jax.Array | None,
     *,
     max_seqlen_q: int,
-    q_scale: float,
-    causal: bool,
-    window_left: int | None,
-    softcap: float,
-    return_lse: bool,
+    variant: Variant,
     interpret: bool,
     nheads_k: int,
     k_scale: jax.Array,
@@ -59,11 +56,12 @@ def flash_attn_kvcache_varlen(
     q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
     merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
     head_dim) cache and block_table its flat (batch * pages_per_seq,) page
-    table. max_seqlen_q is dispatch.resolve_paged_block_sizes's; causal,
-    window_left, softcap, q_scale, nheads_k, k_scale, v_scale and sinks are
-    flash_attn_varlen_paged's. Returns (out, kv_cache) plus lse (nheads,
-    total_q) float32 when return_lse.
+    table. max_seqlen_q is dispatch.resolve_paged_block_sizes's; variant,
+    nheads_k, k_scale, v_scale and sinks are flash_attn_varlen_paged's.
+    Returns (out, kv_cache) plus lse (nheads, total_q) float32 when
+    variant.return_lse.
     """
+    return_lse = variant.return_lse
     batch = cu_seqlens_q.shape[0] - 1
     num_query_heads = q.shape[1]
     page_size = kv_cache.shape[1]
@@ -130,7 +128,7 @@ def flash_attn_kvcache_varlen(
             max_seqlen_k=pages_per_seq * page_size,
             return_lse=return_lse,
             rotary=None,
-            has_window=window_left is not None,
+            has_window=variant.window[0] is not None,
             block_sizes=None,
         )
         outputs = flash_attn_varlen_paged(
@@ -141,12 +139,8 @@ def flash_attn_kvcache_varlen(
             row_block_table,
             sinks,
             block_sizes=block_sizes,
-            causal=causal,
-            q_scale=q_scale,
-            return_lse=return_lse,
+            variant=variant,
             interpret=interpret,
-            window_left=window_left,
-            softcap=softcap,
             nheads_k=nheads_k,
             k_scale=k_scale,
             v_scale=v_scale,
@@ -479,11 +473,15 @@ def flash_attn_with_kvcache(
             flat_block_table,
             num_active,
             max_seqlen_q=packed_max_seqlen_q,
-            q_scale=float(fused_q_scale(softmax_scale, softcap)),
-            causal=is_right_bounded,  # pylint: disable=possibly-used-before-assignment
-            window_left=window_left,
-            softcap=float(softcap),
-            return_lse=bool(return_softmax_lse),
+            variant=make_variant(
+                softmax_scale,
+                softcap=float(softcap),
+                causal=bool(causal),
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                return_lse=bool(return_softmax_lse),
+                has_kv_scales=True,
+            ),
             interpret=bool(interpret),
             nheads_k=nheads_k,
             k_scale=k_descale,
@@ -574,7 +572,7 @@ def flash_attn_with_kvcache(
             num_active=num_active_array,
             merged_cache=is_paged,
             softcap=float(softcap),
-            causal=is_folded and is_right_bounded,
+            causal=is_folded and is_right_bounded,  # pylint: disable=possibly-used-before-assignment
             nheads_k=nheads_k if is_paged else None,
             v_scale=v_descale,
             sinks=sinks,

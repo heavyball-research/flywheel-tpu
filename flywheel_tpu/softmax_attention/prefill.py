@@ -38,7 +38,6 @@ from .inputs import (
 from .kernels.fwd_dense import make_flash_attn_mha
 from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
 from .rotary import prepare_rotary
-from .variant import fused_q_scale
 
 
 def flash_attn_func(
@@ -456,7 +455,7 @@ def paged_varlen_attn(
             "head_dim is only meaningful for token-major inputs; a paged call"
             " takes head-major q."
         )
-    is_right_bounded, window_left = paged_window(causal, window_size)
+    _, window_left = paged_window(causal, window_size)
     if cu_seqlens_k is not None:
         raise ValueError(
             "with block_table, pass cu_seqlens_k=None: seqused_k gives each"
@@ -585,6 +584,15 @@ def paged_varlen_attn(
     softmax_scale = (
         1.0 / math.sqrt(head_dim_qk) if softmax_scale is None else softmax_scale
     )
+    variant = make_variant(
+        softmax_scale,
+        softcap=float(softcap),
+        causal=bool(causal),
+        window_size=window_size,
+        learnable_sink=sinks,
+        return_lse=bool(return_softmax_lse),
+        has_kv_scales=True,
+    )
     k_scale = descale_scalar(k_descale, "k_descale")
     v_scale = descale_scalar(v_descale, "v_descale")
     kernel_sinks = check_sinks(sinks, q.shape[0])
@@ -613,11 +621,7 @@ def paged_varlen_attn(
     kernel = functools.partial(
         flash_attn_varlen_paged,
         block_sizes=block_sizes,
-        causal=is_right_bounded,
-        window_left=window_left,
-        softcap=float(softcap),
-        q_scale=float(fused_q_scale(softmax_scale, softcap)),
-        return_lse=bool(return_softmax_lse),
+        variant=variant,
         interpret=bool(interpret),
         nheads_k=nheads_k,
         k_scale=k_scale,

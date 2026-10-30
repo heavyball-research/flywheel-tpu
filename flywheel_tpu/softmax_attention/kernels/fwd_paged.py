@@ -39,6 +39,7 @@ from ..schedule import (
 )
 from ..softmax import overflow_guard_threshold
 from ..traits import PagedFwdTraits
+from ..variant import Variant
 
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.
@@ -315,14 +316,10 @@ def flash_attn_varlen_paged(
     sinks: jax.Array | None = None,
     *,
     block_sizes: BlockSizes,
-    causal: bool,
-    q_scale: float,
-    return_lse: bool,
+    variant: Variant,
     interpret: bool,
     rotary: tuple[jax.Array, None] | None = None,
     rotary_interleaved: bool = False,
-    window_left: int | None = None,
-    softcap: float = 0.0,
     nheads_k: int | None = None,
     k_scale: float | jax.Array = 1.0,
     v_scale: float | jax.Array = 1.0,
@@ -336,23 +333,38 @@ def flash_attn_varlen_paged(
     defaults to half its head axis, and an fp8 pool, which pads an odd head
     count, needs it. An fp8 pool is widened to bf16 once per staged block;
     k_scale multiplies every score and v_scale the output, both scalars that
-    may be traced. seqused_k is each sequence's kv length with its new tokens,
-    which the cache must already hold; a block_table entry past those tokens'
-    pages is only read through a clamp into the pool, and the rows it names are
-    discarded.
-    Causal rows align to the end of their sequence's keys; window_left (None
-    unbounded) also hides the keys more than window_left positions before that
-    diagonal. softcap > 0 applies Gemma-2's tanh(s / softcap) * softcap to the
-    scaled scores. q_scale is softmax_scale * log2(e), or softmax_scale /
-    softcap with a softcap. Rows past cu_seqlens_q[-1] are out = 0, lse = -inf.
-    rotary is prepare_rotary's (q coefficients, None) pair.
-    sinks (None or (nheads,) float) adds exp(sinks[h]) to head h's softmax
-    denominator, sink logits on the scale of the softcapped scores (gpt-oss
-    attention sinks).
+    may be traced (variant.has_kv_scales). seqused_k is each sequence's kv
+    length with its new tokens, which the cache must already hold; a
+    block_table entry past those tokens' pages is only read through a clamp
+    into the pool, and the rows it names are discarded.
+    variant's mask aligns to the end of each sequence's keys, with a right
+    bound of 0 (causal) or none, and no causal_offset; a left bound also hides
+    the keys more than that many positions before that diagonal. Rows past
+    cu_seqlens_q[-1] are out = 0, lse = -inf. rotary is prepare_rotary's (q
+    coefficients, None) pair. sinks (None or (nheads,) float) adds
+    exp(sinks[h]) to head h's softmax denominator, sink logits on the scale of
+    the softcapped scores (gpt-oss attention sinks).
 
     The caller runs check_paged_inputs on the operands first, then takes
     block_sizes from dispatch.resolve_paged_block_sizes.
     """
+    window_left, window_right = variant.window
+    if window_right not in (None, 0):
+        raise NotImplementedError(
+            "a paged KV cache takes a window right bound of -1 (unbounded) or 0"
+            f" (causal) only; got window_size={variant.window_size}."
+        )
+    if variant.causal_offset or variant.runtime_causal_offset:
+        raise ValueError(
+            "a paged forward aligns its mask to each sequence's own keys; a"
+            " kernel-wide causal_offset would be applied on top of it."
+        )
+    if not variant.has_kv_scales:
+        raise ValueError(
+            "the paged kernel always reads K and V descales; build its Variant"
+            " with has_kv_scales=True."
+        )
+    causal = window_right == 0
     num_q_heads, total_q, head_dim = q.shape
     _, page_size, cache_heads, _ = kv_cache.shape
     num_kv_heads = resolve_merged_kv_heads(
@@ -438,7 +450,7 @@ def flash_attn_varlen_paged(
         kv_cache,
         None,
         traits,
-        return_lse=return_lse,
+        return_lse=variant.return_lse,
         kernel_name="flash_attn_varlen_paged_fwd",
         interpret=interpret,
         rotary=padded_rotary,
@@ -446,10 +458,10 @@ def flash_attn_varlen_paged(
         causal_offset=0,
         # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
         # softcap, so log2(e) rides in the tanh output scale.
-        softcap=softcap * LOG2E,
-        q_scale=q_scale,
+        softcap=variant.log2_softcap,
+        q_scale=variant.q_scale,
     )
-    if return_lse:
+    if variant.return_lse:
         out, lse = outputs
         return out[:, :total_q], lse[:, :total_q]
     else:
