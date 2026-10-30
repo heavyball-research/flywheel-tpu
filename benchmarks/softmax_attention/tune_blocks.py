@@ -147,7 +147,7 @@ class Flywheel:
         }
 
     def seeds(self):
-        from flywheel_tpu.softmax_attention.prefill import default_block_sizes
+        from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
 
         default = default_block_sizes(self.cell.seq, self.cell.seq)
         return [{
@@ -192,8 +192,8 @@ class Flywheel:
         import jax
 
         from flywheel_tpu.softmax_attention.config import BlockSizes, QKVLayout
+        from flywheel_tpu.softmax_attention.inputs import fused_q_scale
         from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
-        from flywheel_tpu.softmax_attention.prefill import fused_q_scale
 
         cell = self.cell
         kernel = make_flash_attn_mha(
