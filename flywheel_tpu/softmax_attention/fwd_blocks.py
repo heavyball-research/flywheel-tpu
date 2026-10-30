@@ -18,12 +18,13 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tpu import NUM_LANES, NUM_SUBLANES
+from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
 from .config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     QKVLayout,
+    hbm_bf16_tile_rows,
 )
 from .dma import fold_row, hbm_window
 from .kv_layout import (
@@ -35,7 +36,7 @@ from .kv_layout import (
 )
 from .mask import apply_packed_bounds_mask
 from .rotary import rotate_tile
-from .schedule import FwdSchedule, WindowFragment
+from .schedule import FwdSchedule, ScheduleRow, WindowFragment
 from .softmax import (
     MASKED_ROW_BOUND,
     UNANCHORED_ROW_BOUND,
@@ -1247,3 +1248,541 @@ def carry_out_pv(
         kv_compute_index, is_tile_zero, new_parity, old_parity
     )
     fields[PENDING_ROW_START] = jnp.asarray(is_row_start, jnp.int32)
+
+
+def stage_bounds(
+    traits: FwdTraits,
+    schedule: FwdSchedule,
+    bounds_buf: jax.Array,
+    ctx: ScheduleRow,
+    kv: jax.Array,
+    kv_tok: jax.Array,
+) -> None:
+    """Per-seq: write the bounds rows of kv block kv, whose first token is
+    kv_tok, into bounds_buf, one slot per kv compute tile."""
+    bkv, bkv_compute = traits.bkv, traits.bkv_compute
+    # Note (david): synthesize the bounds rows once for the whole (1,
+    # bkv) kv window; evaluated per fragment they spilled vector
+    # registers the MXU then waited on (+13.4% on a 2048/256 prefill).
+    k_ids = kv_tok + lax.broadcasted_iota(jnp.int32, (1, bkv), 1)
+    q_lower, q_span = schedule.q_bounds(ctx, kv, k_ids)
+    for tile in range(traits.num_k_compute_tiles):
+        tile_lanes = slice(tile * bkv_compute, (tile + 1) * bkv_compute)
+        bounds_buf[tile, 0:1, :] = q_lower[:, tile_lanes]
+        if schedule.has_q_span:
+            bounds_buf[tile, 1:2, :] = q_span[:, tile_lanes]
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class OutRefs:
+    """The output streams: the o operand and its staging ring, the lse
+    operand and its stage when the variant returns lse (else None), and the
+    kernel's DMA semaphores."""
+
+    o_hbm: jax.Array
+    o_stage: jax.Array
+    lse_hbm: jax.Array | None
+    lse_stage: jax.Array | None
+    sems: jax.Array
+
+
+def o_copy(
+    traits: FwdTraits,
+    out_refs: OutRefs,
+    head: jax.Array | int,
+    tok: jax.Array | int,
+    slot: jax.Array | int,
+):
+    """The DMA of output staging slot slot to the o block at (head, tok)."""
+    return pltpu.make_async_copy(
+        out_refs.o_stage.at[slot],
+        hbm_window(
+            out_refs.o_hbm,
+            head,
+            tok,
+            traits.bq,
+            width=traits.width_v,
+            heads_per_row=traits.q_heads_per_row,
+            layout=traits.o_layout,
+            token_major=traits.token_major,
+            fold=traits.group_heads,
+        ),
+        out_refs.sems.at[SEM_OUT, slot],
+    )
+
+
+def blend_stage_rows(
+    traits: FwdTraits, stage_ref: jax.Array, finish: RowFinish
+) -> None:
+    """Per-seq: copy the rows of the row's stage slot that the previous
+    output block owns from that block's slot."""
+    num_stages = traits.num_stages
+    # Note (david): a per-seq window sits on the hbm_bf16_tile_rows() grid
+    # and may reach below blend_start into rows the previous output block
+    # computed correctly. That stage is still resident (num_stages >= 2 and
+    # only its outbound DMA reads it), so the rows are copied over from it.
+    # The bf16 stage is accessed in whole 16-row tiles, but the two windows
+    # can be only 8-aligned apart, so each own tile reads the two source
+    # tiles it straddles and picks their 8-row halves in f32, where 8 rows
+    # are one whole (8, 128) tile.
+    out_slot = lax.rem(finish.out_count, num_stages)
+    num_blend_rows = finish.num_blend_rows
+
+    # Note (david): rows below a head group's first block belong to no
+    # sequence, and the previous output block is the last group's, so the
+    # first block never blends.
+    @pl.when(jnp.logical_and(num_blend_rows > 0, finish.si > 0))
+    def _blend_head_rows():
+        prev_slot = lax.rem(finish.out_count + num_stages - 1, num_stages)
+        src_row_offset = finish.q_tok - finish.prev_out_tok
+        src_offset_in_tile = src_row_offset & (BF16_TILE_ROWS - 1)
+        half_rows = BF16_TILE_ROWS // 2
+
+        def _tile_index(slot, row_start):
+            return (
+                (slot,)
+                + (slice(None),) * (len(stage_ref.shape) - 3)
+                + (
+                    pl.ds(
+                        pl.multiple_of(row_start, BF16_TILE_ROWS),
+                        BF16_TILE_ROWS,
+                    ),
+                    slice(None),
+                )
+            )
+
+        def _blend_tile(tile, carry):
+            own_index = _tile_index(out_slot, tile * BF16_TILE_ROWS)
+            own_rows = stage_ref[own_index].astype(jnp.float32)
+            src_lower_start = (
+                src_row_offset - src_offset_in_tile + tile * BF16_TILE_ROWS
+            )
+            # Note (david): the upper source tile is used only when
+            # src_offset_in_tile is 8 and this tile's upper half blends, and
+            # then it lies inside the source stage; the clamp keeps the
+            # unused read in bounds otherwise.
+            src_upper_start = jnp.minimum(
+                src_lower_start + BF16_TILE_ROWS,
+                stage_ref.shape[-2] - BF16_TILE_ROWS,
+            )
+            src_lower = stage_ref[
+                _tile_index(prev_slot, src_lower_start)
+            ].astype(jnp.float32)
+            src_upper = stage_ref[
+                _tile_index(prev_slot, src_upper_start)
+            ].astype(jnp.float32)
+            half_ids = lax.broadcasted_iota(
+                jnp.int32,
+                src_lower[..., :half_rows, :].shape,
+                src_lower.ndim - 2,
+            )
+            is_src_on_tile = half_ids + src_offset_in_tile < half_rows
+            prev_rows = jnp.concatenate(
+                [
+                    jnp.where(
+                        is_src_on_tile,
+                        src_lower[..., :half_rows, :],
+                        src_lower[..., half_rows:, :],
+                    ),
+                    jnp.where(
+                        is_src_on_tile,
+                        src_lower[..., half_rows:, :],
+                        src_upper[..., :half_rows, :],
+                    ),
+                ],
+                axis=-2,
+            )
+            row_ids = tile * BF16_TILE_ROWS + lax.broadcasted_iota(
+                jnp.int32, own_rows.shape, own_rows.ndim - 2
+            )
+            stage_ref[own_index] = jnp.where(
+                row_ids < num_blend_rows, prev_rows, own_rows
+            ).astype(stage_ref.dtype)
+            return carry
+
+        lax.fori_loop(
+            0,
+            (num_blend_rows + BF16_TILE_ROWS - 1) // BF16_TILE_ROWS,
+            _blend_tile,
+            None,
+        )
+
+
+def fill_packed_padding(
+    traits: FwdTraits,
+    packed_q_end: jax.Array,
+    stage_ref: jax.Array,
+    finish: RowFinish,
+    fill_value: float,
+) -> None:
+    """Per-seq: write fill_value into the rows of the row's stage slot at or
+    past packed_q_end, cu_seqlens_q[-1]."""
+    num_stages = traits.num_stages
+
+    # Note (david): rows at or past cu_seqlens_q[-1] belong to no sequence
+    # and read out = 0 (lse = -inf). A window reaching them fills them in
+    # its stage, which covers the partial tile at the packed end; the fill
+    # after the loop covers the whole tiles past it.
+    @pl.when(finish.q_tok + traits.bq > packed_q_end)
+    def _fill_rows():
+        stage_slot = stage_ref.at[lax.rem(finish.out_count, num_stages)]
+        staged = stage_slot[...]
+        rows = finish.q_tok + lax.broadcasted_iota(
+            jnp.int32, staged.shape, staged.ndim - 2
+        )
+        stage_slot[...] = jnp.where(
+            rows < packed_q_end,
+            staged,
+            jnp.asarray(fill_value, staged.dtype),
+        )
+
+
+def finish_row_out(
+    traits: FwdTraits,
+    variant: Variant,
+    operands: VariantOperands,
+    state: RowStateRefs,
+    out_refs: OutRefs,
+    finish: RowFinish,
+    packed_q_end: jax.Array | None,
+) -> None:
+    """Normalize the row's output into its output stage slot and start its
+    write; its last PV has run, and its final o and row_sum sit at
+    finish.parity. packed_q_end is a per-seq build's cu_seqlens_q[-1], None
+    on a dense one."""
+    num_stages = traits.num_stages
+    group_bq, frag_rows = traits.group_bq, traits.frag_rows
+    bq_compute, gqa_fold = traits.bq_compute, traits.gqa_fold
+    transposed_pv = traits.transposed_pv
+    lane_width_v = traits.lane_width_v
+    o_scratch, o_stage = state.o, out_refs.o_stage
+    out_slot = lax.rem(finish.out_count, num_stages)
+
+    # Note (david): o_stage is one output ring shared by the whole fold
+    # group, so wait out the slot's previous DMA before any head writes into
+    # it.
+    @pl.when(finish.out_count >= num_stages)
+    def _wait_prev_out():
+        o_copy(traits, out_refs, 0, 0, out_slot).wait()
+
+    def _finalize_head(g):
+        head_rows = pl.ds(g * group_bq, group_bq)
+        row_sum_ref = state.row_sum.at[finish.parity, head_rows]
+        # Note (david): o_stage keeps an explicit fold axis (leading on
+        # head-major, lanes on token-major) while o_scratch stays flat-row
+        # addressed, so only o_stage goes through fold_lane. A gqa fold
+        # writes all of its heads at once.
+        o_ref = (
+            o_scratch.at[finish.parity, :, head_rows]
+            if transposed_pv
+            else o_scratch.at[finish.parity, head_rows]
+        )
+        if gqa_fold > 1:
+            o_stage_g, o_half = o_stage.at[out_slot], None
+        else:
+            o_stage_g, o_half = fold_lane(
+                traits,
+                o_stage.at[out_slot],
+                g,
+                traits.bq,
+                lane_width_v,
+                traits.o_layout,
+            )
+
+        def _finalize_fragment(q_compute_index, carry):
+            slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
+            row_sum = row_sum_ref[slice_q, :]
+            if transposed_pv:
+                tile_index = (slice(None), slice_q)
+                inverse_row_sum = variant.output_scale(
+                    row_sum[:, 0:1], operands
+                ).T
+            else:
+                tile_index = (slice_q, slice(None))
+                inverse_row_sum = jnp.tile(
+                    variant.output_scale(row_sum, operands),
+                    (1, traits.head_dim_v_repeats),
+                )[..., : o_scratch.shape[-1]]
+            o_normalized = (o_ref[tile_index] * inverse_row_sum).astype(
+                o_stage.dtype
+            )
+            if gqa_fold > 1:
+                o_stage_g[
+                    :, pl.ds(q_compute_index * bq_compute, bq_compute), :
+                ] = o_normalized.reshape(
+                    gqa_fold, bq_compute, o_normalized.shape[-1]
+                )
+            elif o_half is None:
+                o_stage_g[tile_index] = o_normalized
+            else:
+                # Note (david): the stage tile holds both heads of the pair,
+                # and the head loop is sequential, so the other half is
+                # either untouched or already this step's final value.
+                o_stage_g[tile_index] = set_half(
+                    o_stage_g[tile_index],
+                    o_half,
+                    lane_width_v,
+                    o_normalized,
+                )
+            return carry
+
+        lax.fori_loop(
+            0,
+            traits.num_q_compute_tiles,
+            _finalize_fragment,
+            None,
+            unroll=True,
+        )
+
+    for g in range(traits.head_fold):
+        _finalize_head(g)
+
+    if traits.is_per_seq:
+        blend_stage_rows(traits, o_stage, finish)
+        fill_packed_padding(traits, packed_q_end, o_stage, finish, 0.0)
+    # Note (david): the output copy starts only after the boundary blend has
+    # repaired the rows shared with the previous block.
+    o_copy(traits, out_refs, finish.base_head, finish.q_tok, out_slot).start()
+
+
+def head_sinks(
+    traits: FwdTraits,
+    sinks_ref: jax.Array,
+    heads_outer_batch: int | None,
+    base_head: jax.Array,
+) -> list[jax.Array]:
+    """The sink of each pipeline head of the group at base_head."""
+    gqa_fold = traits.gqa_fold
+
+    # Note (deepolar): the sinks hold one logit per sequence head: flat q
+    # head f reads sinks[f % nheads], or sinks[f // B] heads-outer. Pipeline
+    # head g is flat q head base_head + g * gqa_fold, and the rows of a q
+    # tile run (folded head, token), so the tile below, built once per head,
+    # gives each folded head's rows its own sink.
+    def sink_of(flat_head):
+        if heads_outer_batch is None:
+            return sinks_ref[lax.rem(flat_head, sinks_ref.shape[0])]
+        return sinks_ref[flat_head // heads_outer_batch]
+
+    def head_sink(g):
+        first_head = base_head + g * gqa_fold
+        if gqa_fold == 1:
+            return sink_of(first_head)
+        return jnp.concatenate([
+            jnp.full(
+                (traits.bq_compute, NUM_LANES),
+                sink_of(first_head + h),
+                jnp.float32,
+            )
+            for h in range(gqa_fold)
+        ])
+
+    return [head_sink(g) for g in range(traits.head_fold)]
+
+
+def fold_out_sinks(
+    traits: FwdTraits,
+    variant: Variant,
+    state: RowStateRefs,
+    finish: RowFinish,
+    sinks: list[jax.Array],
+) -> None:
+    """Fold the sinks into the row's final row_sum at finish.parity, which
+    finish_row_out divides by; finish_row_lse reads it sink-free first."""
+    group_bq, frag_rows = traits.group_bq, traits.frag_rows
+    # Note (david): the row state stays sink-free while the row runs, as FA4
+    # folds into its register row state only at the end. A deferred output
+    # finish runs after the next row's first block has re-anchored
+    # row_max_scratch, so the fold that needs this row's row_max runs at its
+    # row end. The slot takes 1 / out_scale: an overflowed sink term gives
+    # inf, the output's limit 0, and so does a row with no key.
+    for g in range(traits.head_fold):
+        head_rows = pl.ds(g * group_bq, group_bq)
+        row_sum_ref = state.row_sum.at[finish.parity, head_rows]
+        for q_compute_index in range(traits.num_q_compute_tiles):
+            tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
+            _, _, out_scale = variant.fold_sink(
+                state.row_max.at[head_rows][tile_rows, :],
+                row_sum_ref[tile_rows, :],
+                sinks[g],
+            )
+            row_sum_ref[tile_rows, :] = 1.0 / out_scale
+
+
+def finish_row_lse(
+    traits: FwdTraits,
+    variant: Variant,
+    state: RowStateRefs,
+    out_refs: OutRefs,
+    group: jax.Array,
+    finish: RowFinish,
+    sinks: list[jax.Array] | None,
+    packed_q_end: jax.Array | None,
+) -> None:
+    """Stage and write the lse of head group group's row; its last softmax
+    has run, and its final row_sum sits at finish.parity. sinks is
+    head_sinks's list, or None; packed_q_end as in finish_row_out."""
+    bq, bq_compute = traits.bq, traits.bq_compute
+    head_fold, gqa_fold = traits.head_fold, traits.gqa_fold
+    group_bq, frag_rows = traits.group_bq, traits.frag_rows
+    is_per_seq = traits.is_per_seq
+    row_max_scratch = state.row_max
+    lse_hbm, lse_stage = out_refs.lse_hbm, out_refs.lse_stage
+    out_slot = lax.rem(finish.out_count, traits.num_stages)
+    for g in range(head_fold):
+        head_rows = pl.ds(g * group_bq, group_bq)
+        row_sum_ref = state.row_sum.at[finish.parity, head_rows]
+        sink = None if sinks is None else sinks[g]
+        if gqa_fold > 1:
+            # Note (david): every lane of a row state holds the row's value,
+            # and the rows of a q tile run (folded head, token), so each
+            # head's token rows reach its own lse lane through one lane
+            # select per head.
+            lane_ids = lax.broadcasted_iota(
+                jnp.int32, (bq_compute, NUM_LANES), 1
+            )
+            for q_compute_index in range(traits.num_q_compute_tiles):
+                tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
+                row_max = row_max_scratch[tile_rows, :]
+                row_sum = row_sum_ref[tile_rows, :]
+                tile_lse = variant.lse(row_max, row_sum, sink).reshape(
+                    gqa_fold, bq_compute, NUM_LANES
+                )
+                head_lanes = tile_lse[0]
+                for h in range(1, gqa_fold):
+                    head_lanes = jnp.where(
+                        lane_ids == h, tile_lse[h], head_lanes
+                    )
+                lse_stage[
+                    out_slot,
+                    pl.ds(q_compute_index * bq_compute, bq_compute),
+                    :,
+                ] = head_lanes
+        else:
+            row_max = row_max_scratch.at[head_rows][:, 0:1]
+            row_sum = row_sum_ref[:, 0:1]
+            lse_row = variant.lse(row_max, row_sum, sink)
+            if is_per_seq:
+                lse_stage[out_slot, :, g] = lse_row[:, 0]
+            else:
+                lse_stage[g, :] = lse_row[:, 0]
+
+    if is_per_seq:
+        blend_stage_rows(traits, lse_stage, finish)
+        fill_packed_padding(traits, packed_q_end, lse_stage, finish, -jnp.inf)
+        # Note (david): the head group is a leading untiled axis and its
+        # 128-lane minor axis is copied whole, avoiding the rejected dynamic
+        # minor-axis slice at the head offset.
+        lse_copies = [(
+            lse_stage.at[out_slot],
+            lse_hbm.at[group, pl.ds(finish.q_tok, bq), :],
+        )]
+    elif head_fold % NUM_SUBLANES == 0:
+        # Note (david): HBM's leading f32 tile is 8 rows, so an 8-aligned
+        # fold is one group-wide copy; a smaller fold copies row by row,
+        # since later groups start at h = 2 or 4 and would break tile
+        # alignment.
+        lse_copies = [(
+            lse_stage,
+            lse_hbm.at[
+                pl.ds(finish.base_head, head_fold), pl.ds(finish.q_tok, bq)
+            ],
+        )]
+    else:
+        lse_copies = [
+            (
+                lse_stage.at[pl.ds(local_head, 1), :],
+                lse_hbm.at[
+                    pl.ds(finish.base_head + local_head, 1),
+                    pl.ds(finish.q_tok, bq),
+                ],
+            )
+            for local_head in range(head_fold)
+        ]
+    for lse_src, lse_dst in lse_copies:
+        lse_copy = pltpu.make_async_copy(
+            lse_src, lse_dst, out_refs.sems.at[SEM_LSE, 0]
+        )
+        lse_copy.start()
+        lse_copy.wait()
+
+
+def fill_packed_tail(
+    traits: FwdTraits,
+    variant: Variant,
+    out_refs: OutRefs,
+    packed_q_end: jax.Array,
+    num_head_groups: int,
+) -> None:
+    """Per-seq: once every output DMA has landed, write out = 0 (lse = -inf)
+    into the packed padding rows past packed_q_end's HBM tile, for every
+    head group."""
+    bq = traits.bq
+    token_major, group_heads = traits.token_major, traits.group_heads
+    o_hbm, o_stage = out_refs.o_hbm, out_refs.o_stage
+    lse_hbm, lse_stage = out_refs.lse_hbm, out_refs.lse_stage
+    return_lse = variant.return_lse
+    # Note (david): packed padding rows own no q block, so once every output
+    # DMA has landed they are written from a cleared stage. The last block
+    # already zeroed its window's padding rows, so the fill starts at the
+    # next HBM tile; with no block at all, cu_seqlens_q is all 0 and so is
+    # that tile.
+    padded_total_q = o_hbm.shape[-2]
+    tile_rows = hbm_bf16_tile_rows()
+    fill_start = (packed_q_end + tile_rows - 1) // tile_rows * tile_rows
+    num_fills = pl.cdiv(jnp.maximum(padded_total_q - fill_start, 0), bq)
+
+    @pl.when(num_fills > 0)
+    def _clear_fill_stage():
+        o_stage[0] = jnp.zeros(o_stage.shape[1:], o_stage.dtype)
+        if return_lse:
+            lse_stage[0] = jnp.full(lse_stage.shape[1:], -jnp.inf, jnp.float32)
+
+    def _fill_rows(fill_index, carry):
+        row_start = pl.multiple_of(fill_start + fill_index * bq, tile_rows)
+        num_fill_rows = pl.multiple_of(
+            jnp.minimum(padded_total_q - row_start, bq), tile_rows
+        )
+        fill_rows = pl.ds(0, num_fill_rows)
+        # Note (david): only a head-major fold stages a leading fold axis; a
+        # token-major fold rides the lanes.
+        if token_major is None and group_heads > 1:
+            o_fill = o_stage.at[0, :, fill_rows, :]
+        else:
+            o_fill = o_stage.at[0, fill_rows, :]
+        for group in range(num_head_groups):
+            o_fill_copy = (
+                o_fill,
+                hbm_window(
+                    o_hbm,
+                    group * group_heads,
+                    row_start,
+                    num_fill_rows,
+                    width=traits.width_v,
+                    heads_per_row=traits.q_heads_per_row,
+                    layout=traits.o_layout,
+                    token_major=token_major,
+                    fold=group_heads,
+                ),
+                SEM_OUT,
+            )
+            if return_lse:
+                fill_copies = [
+                    o_fill_copy,
+                    (
+                        lse_stage.at[0, fill_rows, :],
+                        lse_hbm.at[group, pl.ds(row_start, num_fill_rows), :],
+                        SEM_LSE,
+                    ),
+                ]
+            else:
+                fill_copies = [o_fill_copy]
+            for fill_src, fill_dst, sem_index in fill_copies:
+                fill_copy = pltpu.make_async_copy(
+                    fill_src, fill_dst, out_refs.sems.at[sem_index, 0]
+                )
+                fill_copy.start()
+                fill_copy.wait()
+        return carry
+
+    lax.fori_loop(0, num_fills, _fill_rows, None)
