@@ -28,7 +28,6 @@ from .fwd_blocks import (
     KVBlock,
     KVRefs,
     OutRefs,
-    PagedKVRefs,
     PendingPVRefs,
     QRefs,
     RowFinish,
@@ -50,12 +49,9 @@ from .fwd_blocks import (
     qk,
     rotate_staged,
     start_kv_block,
-    start_paged_kv_block,
     stage_bounds,
     start_q_row,
-    unpack_paged_block,
     wait_kv_block,
-    wait_paged_kv_block,
     wait_q_row,
 )
 from .kv_layout import kv_word_rows
@@ -81,25 +77,18 @@ def fwd_body(
     and operands the variant's traced values, and refs are forward_common's
     rotary operands, outputs and scratch, in its allocation order. The logits
     run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). A
-    PagedFwdTraits build (per-seq only) reads K and V from the one merged
-    interleaved cache operand (k_hbm is v_hbm). A per-seq schedule writes the
-    packed padding rows past schedule.packed_q_end as out = 0, lse = -inf, and
-    applies the mask itself, so its variant has none.
-
-    gqa_fold > 1 (paged only) stages gqa_fold consecutive q heads of one kv head
-    per group and stacks them over the rows of every score fragment: fragment
-    row r holds head r // bq_compute at token r % bq_compute of the q tile, so
-    bq and bq_compute count tokens per head. A paged fp8 cache is widened to
-    bf16 K and V planes, and V's descale multiplies the output.
+    per-seq schedule writes the packed padding rows past schedule.packed_q_end
+    as out = 0, lse = -inf, and applies the mask itself, so its variant has
+    none. A paged build runs kernels/fwd_paged.py's own loop instead.
 
     operands.sinks_ref is None or an SMEM (nheads,) float32 of per-head sink
     logits in log2 units, one per sequence head (flat q head f reads
     f % nheads, or f // heads_outer_batch heads-outer), each added to its
     head's softmax denominator.
     """
+    assert not traits.is_paged, traits
     is_per_seq = traits.is_per_seq
     assert (schedule.q_token is not None) == is_per_seq, is_per_seq
-    is_paged = traits.is_paged
     bq, bkv = traits.bq, traits.bkv
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     num_stages = traits.num_stages
@@ -126,15 +115,7 @@ def fwd_body(
     o_hbm = remaining_refs.pop(0)
     lse_hbm = remaining_refs.pop(0) if return_lse else None
     q_buf = remaining_refs.pop(0)
-    if is_paged:
-        # Note (david): a paged block stages its kv head's K and V rows as a
-        # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into dense
-        # K and V planes, so every q tile of the block reads plain tiles.
-        kv_pair_buf, kv_planes = remaining_refs.pop(0), remaining_refs.pop(0)
-        k_buf = v_buf = None
-    else:
-        k_buf, v_buf = remaining_refs.pop(0), remaining_refs.pop(0)
-        kv_pair_buf = kv_planes = None
+    k_buf, v_buf = remaining_refs.pop(0), remaining_refs.pop(0)
     bounds_buf = remaining_refs.pop(0) if is_per_seq else None
     if rotary_dim:
         rotary_q_buf = remaining_refs.pop(0)
@@ -183,20 +164,15 @@ def fwd_body(
         rotary_buf=rotary_q_buf,
         sems=sems,
     )
-    if is_paged:
-        kv_refs = PagedKVRefs(
-            cache_hbm=k_hbm, pair_buf=kv_pair_buf, planes=kv_planes, sems=sems
-        )
-    else:
-        kv_refs = KVRefs(
-            k_hbm=k_hbm,
-            v_hbm=v_hbm,
-            k_buf=k_buf,
-            v_buf=v_buf,
-            rotary_hbm=rotary_k_hbm,
-            rotary_buf=rotary_k_buf,
-            sems=sems,
-        )
+    kv_refs = KVRefs(
+        k_hbm=k_hbm,
+        v_hbm=v_hbm,
+        k_buf=k_buf,
+        v_buf=v_buf,
+        rotary_hbm=rotary_k_hbm,
+        rotary_buf=rotary_k_buf,
+        sems=sems,
+    )
     if return_lse and is_per_seq:
         lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
@@ -267,15 +243,7 @@ def fwd_body(
             kv_head = (
                 head // heads_outer_batch // q_heads_per_kv_head
             ) * heads_outer_batch + head % heads_outer_batch
-        if is_paged:
-            desc = (
-                ctx.page_base,
-                kv_head,
-                ctx.kv_load_end,
-                ctx.kv_used_end,
-                kv,
-            )
-        elif is_per_seq:
+        if is_per_seq:
             desc = (kv_head, schedule.kv_token(kv, ctx))
         else:
             desc = (kv_head, kv * bkv)
@@ -295,7 +263,7 @@ def fwd_body(
     # (v6e, 32:4 d256, 1024 tokens: 63.4 against 60.6 us). Paged blocks start
     # their DMAs inside the copy and a rotary K is rotated in place, so both
     # load every block.
-    reuses_blocks = not is_paged and not (rotary_dim and rotary_k)
+    reuses_blocks = not (rotary_dim and rotary_k)
 
     def _is_fresh(desc, prev_desc):
         if reuses_blocks:
@@ -308,28 +276,12 @@ def fwd_body(
             return jnp.bool_(True)
 
     def _start_block_data(desc, slot):
-        if is_paged:
-            page_base, kv_head, kv_load_end, _, kv = desc
-            start_paged_kv_block(
-                traits,
-                schedule,
-                kv_refs,
-                page_base,
-                kv_head,
-                kv_load_end,
-                kv,
-                slot,
-            )
-        else:
-            kv_head, kv_tok = desc
-            start_kv_block(traits, kv_refs, kv_head, kv_tok, slot)
+        kv_head, kv_tok = desc
+        start_kv_block(traits, kv_refs, kv_head, kv_tok, slot)
 
     def _wait_block_data(desc, slot):
-        if is_paged:
-            _, _, kv_load_end, _, kv = desc
-            wait_paged_kv_block(traits, kv_refs, kv_load_end, kv, slot)
-        else:
-            wait_kv_block(traits, kv_refs, slot)
+        del desc
+        wait_kv_block(traits, kv_refs, slot)
 
     pending_g, pending_k, _ = pending_fragment(traits)
 
@@ -746,20 +698,7 @@ def fwd_body(
             # Note (david): the unpack (or K rotation) leads the copy in program
             # order, where the scheduler overlaps it with the pending PV, which
             # reads only scratch.
-            if is_paged:
-                _, staged_kv_head, kv_load_end, kv_used_end, staged_kv = (
-                    block_desc
-                )
-                unpack_paged_block(
-                    traits,
-                    kv_refs,
-                    kv_slot,
-                    staged_kv_head,
-                    kv_load_end,
-                    kv_used_end,
-                    staged_kv,
-                )
-            elif rotary_dim and rotary_k:
+            if rotary_dim and rotary_k:
                 rotate_staged(
                     traits, kv_refs.k_buf, kv_refs.rotary_buf, kv_slot, bkv
                 )
