@@ -224,15 +224,22 @@ def get_tuned_config(
     """Return the measured config tuple (CONFIG_FIELDS order), or None.
 
     head_dim_v is checked, not keyed: every entry was measured at
-    head_dim_v == head_dim.
+    head_dim_v == head_dim. An entry that is not one value per CONFIG_FIELDS
+    field raises.
     """
     if head_dim_v != key_fields["head_dim"]:
         return None
-    else:
-        config = tuning.lookup(
-            TUNED_CONFIGS_PATH, tuned_config_key(direction, **key_fields)
+    key = tuned_config_key(direction, **key_fields)
+    config = tuning.lookup(TUNED_CONFIGS_PATH, key)
+    if config is None:
+        return None
+    elif len(config) != len(CONFIG_FIELDS):
+        raise ValueError(
+            f"{TUNED_CONFIGS_PATH.name} entry {key} holds {len(config)}"
+            f" values; a dense fwd / bwd entry holds {CONFIG_FIELDS}."
         )
-        return None if config is None else tuple(config)
+    else:
+        return tuple(config)
 
 
 def kvcache_config_key(
@@ -557,16 +564,8 @@ def get_kernel(
     else:
         tuned_config = None
     if tuned_config is not None:
-        (
-            block_q,
-            block_kv,
-            block_q_compute,
-            block_kv_compute,
-            num_stages,
-            head_fold,
-            qkv_layout_name,
-            tuned_transposed_pv,
-        ) = tuned_config
+        tuned = dict(zip(CONFIG_FIELDS, tuned_config))
+        head_fold = tuned["head_fold"]
         # Note (david): the per-sequence varlen schedule DMAs at arbitrary token
         # offsets, which needs the token axis second-minor, so it overrides a
         # tuned SEQ_MINOR layout and transposed_pv.
@@ -574,14 +573,14 @@ def get_kernel(
             qkv_layout = QKVLayout.HEAD_DIM_MINOR
             transposed_pv = False
         else:
-            qkv_layout = QKVLayout[qkv_layout_name.upper()]
-            transposed_pv = tuned_transposed_pv
+            qkv_layout = QKVLayout[tuned["qkv_layout"].upper()]
+            transposed_pv = tuned["transposed_pv"]
         block_sizes = BlockSizes(
-            block_q=block_q,
-            block_kv=block_kv,
-            block_kv_compute=block_kv_compute,
-            block_q_compute=block_q_compute,
-            num_stages=num_stages,
+            block_q=tuned["q_block"],
+            block_kv=tuned["kv_block"],
+            block_kv_compute=tuned["kv_cblock"],
+            block_q_compute=tuned["q_cblock"],
+            num_stages=tuned["stages"],
             qkv_layout=qkv_layout,
         )
     else:
