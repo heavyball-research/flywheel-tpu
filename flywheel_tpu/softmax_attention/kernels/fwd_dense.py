@@ -631,7 +631,6 @@ def dense_fwd_body(
             q_inflight,
             q_slot,
             kv_carry,
-            prev_out_tok,
             num_out_copies,
         ) = carry
         row_parity = 0
@@ -683,7 +682,7 @@ def dense_fwd_body(
             q_tok=q_tok,
             base_head=base_head,
             num_blend_rows=jnp.int32(0),
-            prev_out_tok=prev_out_tok,
+            prev_out_tok=jnp.int32(0),
             out_count=num_out_copies,
             parity=lax.rem(row_parity + hi - lo, 2),
         )
@@ -717,7 +716,6 @@ def dense_fwd_body(
             q_inflight,
             q_slot,
             kv_carry,
-            prev_out_tok,
             num_out_copies + 1,
         )
 
@@ -746,9 +744,8 @@ def dense_fwd_body(
             second_desc,
         ),
         zero,
-        zero,
     )
-    *_, kv_carry, _, num_out_copies = lax.fori_loop(
+    *_, kv_carry, num_out_copies = lax.fori_loop(
         0,
         num_head_groups,
         lambda g, group_carry: lax.fori_loop(
