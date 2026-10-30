@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache, tuned_block_sizes
+from flywheel_tpu.core import tuning
 from flywheel_tpu.pallas import flash_fwd_kvcache
 from tests.test_flash_attn import INTERPRET, generate_block_kvcache
 from tests.test_util import merge_kv_heads, randn
@@ -32,10 +33,8 @@ def fixture_run_on(monkeypatch, recwarn):
     callable listing the fallback warnings raised since."""
 
     def pretend(device_name):
-        monkeypatch.setattr(
-            tuned_block_sizes, "get_device_name", lambda: device_name
-        )
-        tuned_block_sizes._warn_untuned_once.cache_clear()  # pylint: disable=protected-access
+        monkeypatch.setattr(tuning, "get_device_name", lambda: device_name)
+        tuning._warn_untuned_once.cache_clear()  # pylint: disable=protected-access
         recwarn.clear()
         return lambda: [
             str(warning.message)

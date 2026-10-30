@@ -11,20 +11,23 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..core.tiling import round_up
+from ..core.tpu import (
+    BF16_TILE_ROWS,
+    NUM_LANES,
+    NUM_SUBLANES,
+    hbm_bf16_tile_rows,
+    vmem_limit_bytes,
+)
 from .block_sizes import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
-    NUM_LANES,
-    NUM_SUBLANES,
     BlockSizes,
     PagedKVInfo,
     QKVLayout,
     TokenMajorInfo,
     from_head_minor,
-    hbm_bf16_tile_rows,
-    round_up,
-    vmem_limit_bytes,
 )
 from .copy_utils import (
     advance,
@@ -60,12 +63,6 @@ NUM_O_SLOTS = 3
 # Note (david): the kv stream prefetches two blocks ahead, so its ring holds
 # the running block, the next one and the one in flight.
 NUM_KV_STAGES = 3
-# Note (david): Mosaic tiles a bf16 VMEM scratch whose row count is a multiple
-# of 16 as (16, 128) (v7x does; v6e may keep (8, 128)), and a dynamic vector
-# load or store must start on that tile. Dynamic row accesses into bf16 stages
-# therefore step in whole 16-row tiles, which is legal under either tiling;
-# HBM DMAs stay on the hbm_bf16_tile_rows() grid.
-BF16_TILE_ROWS = 2 * NUM_SUBLANES
 
 # Note (david): the guard keeps score <= e^T, row_sum <= kv_seq_len * e^T and
 # |o| <= row_sum * max|v| under the f32 max (e^88.7), assuming |v| <= 2^12 and

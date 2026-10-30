@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .block_sizes import NUM_SUBLANES, hbm_bf16_tile_rows
+from ..core.tpu import NUM_SUBLANES, hbm_bf16_tile_rows
 
 PER_SEQ_ROW_FIELDS = (
     "q_tok",

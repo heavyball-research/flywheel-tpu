@@ -8,7 +8,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import NUM_LANES, QKVLayout, TokenMajorInfo, round_up
+from ..core.tiling import round_up
+from ..core.tpu import NUM_LANES
+from .block_sizes import QKVLayout, TokenMajorInfo
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16

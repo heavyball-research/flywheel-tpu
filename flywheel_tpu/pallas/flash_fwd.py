@@ -6,9 +6,9 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
+from ..core.tpu import NUM_LANES
 from .block_sizes import (
     LOG2E,
-    NUM_LANES,
     PAIRED_HEAD_DIM,
     BlockSizes,
     QKVLayout,

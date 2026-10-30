@@ -182,7 +182,7 @@ def vllm_page_size(max_model_len: int, max_num_seqs: int) -> int:
     """
     # Note (david): flywheel_tpu imports jax; kept local so a bench that
     # skips its cell never loads it.
-    from flywheel_tpu.pallas.block_sizes import next_pow2
+    from flywheel_tpu.core.tiling import next_pow2
 
     if max_model_len > 8192:
         page_size = 16

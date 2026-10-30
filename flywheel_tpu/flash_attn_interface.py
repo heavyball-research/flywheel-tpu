@@ -11,20 +11,18 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+from .core.tiling import next_pow2, pick_tile, round_up
+from .core.tpu import NUM_LANES
 from .pallas.block_sizes import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
     LOG2E,
-    NUM_LANES,
     PAIRED_HEAD_DIM,
     BlockSizes,
     QKVLayout,
     TokenMajorInfo,
     default_block,
-    next_pow2,
-    pick_tile,
-    round_up,
 )
 from .pallas.copy_utils import resolve_merged_kv_heads
 from .pallas.flash_bwd import flash_attn_bwd

@@ -9,6 +9,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..core.tiling import pick_tile, round_up
+from ..core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
 from ..tuned_block_sizes import get_tuned_config
 from .block_sizes import (
     DEFAULT_MASK_VALUE,
@@ -16,13 +18,8 @@ from .block_sizes import (
     MIN_NUM_STAGES,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
-    NUM_LANES,
-    NUM_SUBLANES,
     PAIRED_HEAD_DIM,
     TokenMajorInfo,
-    pick_tile,
-    round_up,
-    vmem_limit_bytes,
 )
 from .bwd_pipeline import (
     DQ_DIM_NUMBERS,

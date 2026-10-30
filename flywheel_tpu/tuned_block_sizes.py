@@ -23,15 +23,13 @@ block_kv_compute, num_kv_stages); every other key holds a dense fwd / bwd
 CONFIG_FIELDS tuple.
 """
 
-import functools
-import json
 import pathlib
-import re
-import warnings
 
-import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
+
+from .core import tuning
+from .core.tpu import get_device_name
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 
@@ -66,34 +64,6 @@ TUNED_VARLEN_FWD_HEAD_FOLD: dict[str, dict[tuple[int, int, bool], int]] = {
         (128, 1024, False): 4,
     },
 }
-
-
-def get_device_variant_name(device_kind: str | None = None) -> str:
-    """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p).
-
-    device_kind defaults to the chip JAX runs on.
-    """
-    if device_kind is None:
-        device_kind = jax.devices()[0].device_kind
-    kind_match = re.fullmatch(r"TPU\s*v?(\d+)(?:(e|p)|\s+(lite))?", device_kind)
-    if device_kind == "TPU7x":
-        return "TPU v7"
-    elif kind_match is None:
-        return device_kind
-    elif kind_match.group(2):
-        return f"TPU v{kind_match.group(1)}{kind_match.group(2)}"
-    elif kind_match.group(3):
-        return f"TPU v{kind_match.group(1)}e"
-    else:
-        return f"TPU v{kind_match.group(1)}"
-
-
-def get_device_name(device_kind: str | None = None) -> str:
-    """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX
-    does)."""
-    return re.sub(
-        r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind)
-    )
 
 
 def get_varlen_head_fold(
@@ -161,38 +131,6 @@ def tuned_config_key(
     return base_key + kv_heads_suffix + heads_outer_suffix
 
 
-@functools.cache
-def load_tuned_configs() -> dict[str, dict[str, list[int | str | bool]]]:
-    return json.loads(TUNED_CONFIGS_PATH.read_text(encoding="utf-8"))
-
-
-@functools.cache
-def _warn_untuned_once(device_name: str, key: str, reason: str) -> None:
-    detail = f" ({reason})" if reason else ""
-    warnings.warn(
-        f"flywheel_tpu: no usable tuned config for {key} on {device_name} in"
-        f" {TUNED_CONFIGS_PATH.name}{detail}; falling back to the default"
-        " config."
-    )
-
-
-def warn_untuned(key: str, reason: str = "") -> None:
-    """Warn, once per device, key and reason, that a kernel build on a TPU
-    falls back to its default config. Off TPU there are no tables to miss."""
-    device_name = get_device_name()
-    if device_name.startswith("TPU"):
-        _warn_untuned_once(device_name, key, reason)
-
-
-def lookup_tuned_config(key: str) -> list[int | str | bool] | None:
-    """The current device's tuned_configs.json entry for key, warning when
-    there is none."""
-    config = load_tuned_configs().get(get_device_name(), {}).get(key)
-    if config is None:
-        warn_untuned(key)
-    return config
-
-
 def get_tuned_config(
     direction: str, *, head_dim_v: int, **key_fields: int | bool | None
 ) -> TunedConfig | None:
@@ -204,7 +142,9 @@ def get_tuned_config(
     if head_dim_v != key_fields["head_dim"]:
         return None
     else:
-        config = lookup_tuned_config(tuned_config_key(direction, **key_fields))
+        config = tuning.lookup(
+            TUNED_CONFIGS_PATH, tuned_config_key(direction, **key_fields)
+        )
         return None if config is None else tuple(config)
 
 
@@ -232,5 +172,5 @@ def kvcache_config_key(
 def get_tuned_kvcache_config(
     **key_fields: DTypeLike | int | bool | None,
 ) -> KVCacheConfig | None:
-    config = lookup_tuned_config(kvcache_config_key(**key_fields))
+    config = tuning.lookup(TUNED_CONFIGS_PATH, kvcache_config_key(**key_fields))
     return None if config is None else tuple(config)

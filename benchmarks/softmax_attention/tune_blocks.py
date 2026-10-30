@@ -790,6 +790,7 @@ def table_cells(configs):
 def collect(directory):
     """Write the tables of the device the searches in directory ran on."""
     from flywheel_tpu import tuned_block_sizes
+    from flywheel_tpu.core.tpu import get_device_name
 
     best = []
     for path in sorted(directory.glob("*.jsonl")):
@@ -806,7 +807,7 @@ def collect(directory):
     if len(devices) != 1:
         raise ValueError(f"expected searches from one device, got {devices}.")
     device = devices.pop()
-    section_name = tuned_block_sizes.get_device_name(device)
+    section_name = get_device_name(device)
 
     def head_tables(records):
         configs = {}

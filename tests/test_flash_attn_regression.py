@@ -11,12 +11,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.core.tiling import next_pow2
 from flywheel_tpu.flash_attn_interface import (
     default_block_sizes,
     fused_q_scale,
     pad_seqlen,
 )
-from flywheel_tpu.pallas.block_sizes import next_pow2
 from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
 from tests.test_util import attention_ref, randn
 

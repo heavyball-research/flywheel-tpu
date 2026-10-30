@@ -10,25 +10,23 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..core.tiling import next_pow2, round_up
+from ..core.tpu import (
+    BF16_BYTES,
+    BF16_TILE_ROWS,
+    F32_BYTES,
+    NUM_LANES,
+    NUM_SUBLANES,
+    vmem_limit_bytes,
+)
+from ..core.tuning import warn_untuned
 from ..tuned_block_sizes import (
+    TUNED_CONFIGS_PATH,
     KVCacheConfig,
     get_tuned_kvcache_config,
     kvcache_config_key,
-    warn_untuned,
 )
-from .block_sizes import (
-    BF16_BYTES,
-    F32_BYTES,
-    LOG2E,
-    NN_DIM_NUMBERS,
-    NT_DIM_NUMBERS,
-    NUM_LANES,
-    NUM_SUBLANES,
-    STAGES,
-    next_pow2,
-    round_up,
-    vmem_limit_bytes,
-)
+from .block_sizes import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
 from .copy_utils import (
     MIN_BLOCK_KV,
     bank_safe_word_stride,
@@ -41,7 +39,7 @@ from .copy_utils import (
     resolve_merged_kv_heads,
     staged_words,
 )
-from .fwd_pipeline import BF16_TILE_ROWS, fold_sink, overflow_guard_threshold
+from .fwd_pipeline import fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2
@@ -1451,6 +1449,7 @@ def flash_attn_kvcache_pallas(
         and tuned_config[0] % page_size
     ):
         warn_untuned(
+            TUNED_CONFIGS_PATH,
             kvcache_config_key(**tuned_key_fields),
             f"the entry's block_kv {tuned_config[0]} is not a multiple of the"
             f" page size {page_size}, and a paged block must be whole pages",
