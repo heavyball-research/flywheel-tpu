@@ -11,7 +11,6 @@ from jax.experimental.pallas import tpu as pltpu
 from ..core.tpu import NUM_LANES
 from .config import (
     DEFAULT_MASK_VALUE,
-    LOG2E,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     QKVLayout,
@@ -65,7 +64,7 @@ def bwd_body(
     kv_heads_per_row = traits.kv_heads_per_row
     is_lane_paired = traits.is_lane_paired
     heads_per_lane_tile = traits.heads_per_lane_tile
-    scale = float(variant.softmax_scale)
+    scale = variant.softmax_scale
     causal, causal_offset = variant.causal, variant.causal_offset
     # Note (david): the exact unpack pins this ref list against call_bwd's
     # operand and scratch order; a mismatch fails here instead of shifting every
@@ -98,7 +97,7 @@ def bwd_body(
     f32 = jnp.float32
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
-    score_scale = scale * LOG2E
+    score_scale = variant.q_scale
     # Note (david): fully masked q rows (causal_offset < 0) carry lse == -inf,
     # so exp2(qk - lse) overflows to inf and 0 * inf = NaN would reach dk/dv.
     should_guard_lse = causal and causal_offset < 0

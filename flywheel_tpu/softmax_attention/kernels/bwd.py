@@ -150,12 +150,12 @@ def flash_bwd_folded_kernel(
     out_dtype = traits.dtype
     token_major = traits.token_major
     lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
-    scale = float(variant.softmax_scale)
+    scale = variant.softmax_scale
     causal = variant.causal
     f32 = jnp.float32
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
-    score_scale = scale * LOG2E
+    score_scale = variant.q_scale
 
     def _group_window(hbm, lane_width, group):
         if token_major is None:
