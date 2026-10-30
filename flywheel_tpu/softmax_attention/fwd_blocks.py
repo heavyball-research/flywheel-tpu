@@ -738,22 +738,63 @@ class ScoreMask:
     defers_row_start: bool
 
 
+class Fragment(NamedTuple):
+    """One score fragment of the block running: pipeline head g's q compute
+    tile q_tile against kv compute tile kv_tile. Each is a Python int where
+    the copy knows it, else an int32 scalar; a pipeline carries it."""
+
+    g: jax.Array | int
+    kv_tile: jax.Array | int
+    q_tile: jax.Array | int
+
+
+class FragmentPV(NamedTuple):
+    """What a fragment's online softmax leaves its PV: the probs, the
+    row-start flags and the recovery rescale (None on the ordinary pass). A
+    pipeline carries it from a fragment's softmax to its PV."""
+
+    probs: jax.Array
+    is_row_start: jax.Array
+    rescale: jax.Array | None
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class SoftmaxPass:
+    """How online_softmax treats a copy's fragments.
+
+    needs_mask applies the variant's window mask, and apply_bounds (static)
+    the per-seq bounds rows. guard_recovery runs the overflow replay, which
+    rebases the anchor and returns the fragment's rescale. last_kv_tile is the
+    block's last kv compute tile that runs, where the ordinary pass checks the
+    guard; None leaves the check to the caller. is_tile_zero is a static bool
+    when the caller knows whether the fragment's kv tile is 0, else None.
+    window_fragment is the fragment's static plan entry on a window block
+    copy, None on the generic copies.
+    """
+
+    needs_mask: jax.Array | bool
+    guard_recovery: bool
+    apply_bounds: bool
+    last_kv_tile: int | jax.Array | None
+    is_tile_zero: bool | None = None
+    window_fragment: WindowFragment | None = None
+
+
 def qk(
     traits: FwdTraits,
     variant: Variant,
-    q_buf: jax.Array,
+    q_refs: QRefs,
     kv_refs: KVRefs | PagedKVRefs,
     block: KVBlock,
-    g: jax.Array | int,
-    kv_compute_index: jax.Array | int,
-    q_compute_index: jax.Array | int,
+    frag: Fragment,
 ) -> jax.Array:
-    """The (frag_rows, bkv_compute) log2-unit logits of pipeline head g's q
-    compute tile q_compute_index against kv compute tile kv_compute_index of
-    the staged block."""
+    """The (frag_rows, bkv_compute) log2-unit logits of fragment frag of the
+    staged block."""
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     lane_width_qk = traits.lane_width_qk
     frag_rows = traits.frag_rows
+    q_buf = q_refs.buf
+    g, kv_compute_index, q_compute_index = frag
     q_slot, kv_slot = block.q_slot, block.kv_slot
     slice_q = pl.ds(q_compute_index * bq_compute, bq_compute)
     if traits.is_paged:
@@ -813,17 +854,19 @@ def masked_scores(
     variant: Variant,
     mask: ScoreMask,
     block: KVBlock,
-    kv_compute_index: jax.Array | int,
-    q_compute_index: jax.Array | int,
+    frag: Fragment,
     logits: jax.Array,
-    needs_mask: jax.Array | bool,
-    apply_bounds: bool,
+    softmax_pass: SoftmaxPass,
 ) -> jax.Array:
-    """A fragment's logits with the variant's window mask applied where
-    needs_mask holds, and the per-seq bounds rows where apply_bounds."""
+    """Fragment frag's logits with the variant's window mask applied where
+    softmax_pass.needs_mask holds, and the per-seq bounds rows where
+    softmax_pass.apply_bounds."""
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     token_tile_shape = traits.token_tile_shape
     gqa_fold = traits.gqa_fold
+    kv_compute_index, q_compute_index = frag.kv_tile, frag.q_tile
+    needs_mask = softmax_pass.needs_mask
+    apply_bounds = softmax_pass.apply_bounds
     # Note (david): per-seq bounds live in unshifted q coordinates,
     # while the static window lives in coordinates shifted by
     # causal_offset.
@@ -922,30 +965,22 @@ def online_softmax(
     state: RowStateRefs,
     mask: ScoreMask,
     block: KVBlock,
-    g: jax.Array | int,
-    kv_compute_index: jax.Array | int,
-    q_compute_index: jax.Array | int,
+    frag: Fragment,
     logits: jax.Array,
-    needs_mask: jax.Array | bool,
-    *,
-    guard_recovery: bool,
-    apply_bounds: bool,
-    last_kv_tile: int | jax.Array | None,
-    window_fragment: WindowFragment | None = None,
-    is_tile_zero: bool | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array | None]:
-    """Mask a fragment's logits and fold them into pipeline head g's row
-    state; returns (probs, is_row_start, rescale) for the fragment's PV.
+    softmax_pass: SoftmaxPass,
+) -> FragmentPV:
+    """Mask fragment frag's logits and fold them into its pipeline head's row
+    state; returns what the fragment's PV needs.
 
-    guard_recovery runs the overflow replay, which rebases the anchor and
-    returns the fragment's rescale (None on the ordinary pass).
-    window_fragment is the fragment's static plan entry on a window block
-    copy, None on the generic copies. is_tile_zero is a static bool when the
-    caller knows whether kv_compute_index is 0, else None. last_kv_tile is
-    the block's last kv compute tile that runs, where the ordinary pass
-    checks the guard; None leaves the check to the caller.
+    softmax_pass says which masks apply, whether this is the overflow replay
+    (which also returns the fragment's rescale) and where the guard is
+    checked.
     """
     group_bq, frag_rows = traits.group_bq, traits.frag_rows
+    g, kv_compute_index, q_compute_index = frag
+    guard_recovery = softmax_pass.guard_recovery
+    window_fragment = softmax_pass.window_fragment
+    is_tile_zero = softmax_pass.is_tile_zero
     is_first = block.is_first
     defers_row_start = mask.defers_row_start
     head_rows = pl.ds(g * group_bq, group_bq)
@@ -955,15 +990,7 @@ def online_softmax(
 
     slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
     scores = masked_scores(
-        traits,
-        variant,
-        mask,
-        block,
-        kv_compute_index,
-        q_compute_index,
-        logits,
-        needs_mask,
-        apply_bounds,
+        traits, variant, mask, block, frag, logits, softmax_pass
     )
 
     read_parity = tile_parity(
@@ -1051,11 +1078,15 @@ def online_softmax(
         flag_overflow_risk(
             traits, state, g, row_sum_new, window_fragment.checks_guard
         )
-    elif last_kv_tile is not None:
+    elif softmax_pass.last_kv_tile is not None:
         flag_overflow_risk(
-            traits, state, g, row_sum_new, kv_compute_index == last_kv_tile
+            traits,
+            state,
+            g,
+            row_sum_new,
+            kv_compute_index == softmax_pass.last_kv_tile,
         )
-    return probs, is_row_start, rescale
+    return FragmentPV(probs, is_row_start, rescale)
 
 
 def pv(
@@ -1151,27 +1182,23 @@ def fragment_pv(
     state: RowStateRefs,
     kv_refs: KVRefs | PagedKVRefs,
     block: KVBlock,
-    g: jax.Array | int,
-    kv_compute_index: jax.Array | int,
-    q_compute_index: jax.Array | int,
-    probs: jax.Array,
-    is_row_start: jax.Array,
-    rescale: jax.Array | None,
+    frag: Fragment,
+    frag_pv: FragmentPV,
     is_tile_zero: bool | None = None,
 ) -> None:
-    """The PV of one of block's fragments, from the online_softmax that
-    returned probs, is_row_start and rescale; is_tile_zero as in
-    online_softmax."""
+    """The PV of block's fragment frag, from what its online_softmax returned;
+    is_tile_zero as in SoftmaxPass."""
+    g, kv_compute_index, q_compute_index = frag
     new_parity, old_parity = state.block_parities()
     pv(
         traits,
         state,
         g,
         q_compute_index,
-        probs,
+        frag_pv.probs,
         kv_refs.v_tile(traits, g, kv_compute_index, block.kv_slot),
-        is_row_start,
-        rescale,
+        frag_pv.is_row_start,
+        frag_pv.rescale,
         write_parity=new_parity,
         read_parity=tile_parity(
             kv_compute_index, is_tile_zero, new_parity, old_parity
@@ -1201,13 +1228,12 @@ class PendingPVRefs:
 # every copy carries its last PV out and a row's output finish runs after
 # the next row's first block, so rows alternate parity to keep the finished
 # row's state intact until then.
-def pending_fragment(traits: FwdTraits) -> tuple[int, int, int]:
-    """The (pipeline head, kv compute tile, q compute tile) of a block's last
-    fragment, whose PV a copy leaves pending."""
-    return (
-        traits.head_fold - 1,
-        traits.num_k_compute_tiles - 1,
-        traits.num_q_compute_tiles - 1,
+def pending_fragment(traits: FwdTraits) -> Fragment:
+    """A block's last fragment, whose PV a copy leaves pending."""
+    return Fragment(
+        g=traits.head_fold - 1,
+        kv_tile=traits.num_k_compute_tiles - 1,
+        q_tile=traits.num_q_compute_tiles - 1,
     )
 
 
@@ -1243,18 +1269,21 @@ def carry_out_pv(
     pending: PendingPVRefs,
     kv_refs: KVRefs | PagedKVRefs,
     block: KVBlock,
-    probs: jax.Array,
-    is_row_start: jax.Array,
-    kv_compute_index: jax.Array | int,
+    frag: Fragment,
+    frag_pv: FragmentPV,
     is_tile_zero: bool | None,
 ) -> None:
-    """Leave the PV of block's last fragment (pending_fragment's head and q
-    tile, kv tile kv_compute_index) to the next block; is_tile_zero as in
-    online_softmax."""
-    pending_g, _, _ = pending_fragment(traits)
+    """Leave the PV of block's last fragment frag to the next block: frag has
+    pending_fragment's head and q tile, and its kv tile is the block's last
+    that ran. is_tile_zero as in SoftmaxPass."""
+    pending_g, _, pending_q = pending_fragment(traits)
+    assert (frag.g, frag.q_tile) == (pending_g, pending_q), frag
+    # Only the ordinary pass carries its last PV out, so it has no rescale.
+    assert frag_pv.rescale is None, frag_pv.rescale
+    kv_compute_index = frag.kv_tile
     fields = pending.fields
     new_parity, old_parity = state.block_parities()
-    pending.probs[...] = probs
+    pending.probs[...] = frag_pv.probs
     pending.v[...] = kv_refs.v_tile(
         traits, pending_g, kv_compute_index, block.kv_slot
     )
@@ -1262,7 +1291,7 @@ def carry_out_pv(
     fields[PENDING_READ_PARITY] = tile_parity(
         kv_compute_index, is_tile_zero, new_parity, old_parity
     )
-    fields[PENDING_ROW_START] = jnp.asarray(is_row_start, jnp.int32)
+    fields[PENDING_ROW_START] = jnp.asarray(frag_pv.is_row_start, jnp.int32)
 
 
 def stage_bounds(

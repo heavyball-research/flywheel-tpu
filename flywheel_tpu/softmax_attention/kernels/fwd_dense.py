@@ -26,6 +26,7 @@ from ..fwd_blocks import (
     NUM_SEMS,
     PENDING_WRITE_PARITY,
     TRASH_PARITY,
+    Fragment,
     KVBlock,
     KVRefs,
     OutRefs,
@@ -34,6 +35,7 @@ from ..fwd_blocks import (
     RowFinish,
     RowStateRefs,
     ScoreMask,
+    SoftmaxPass,
     cancel_pending_pv,
     carry_out_pv,
     finish_row_lse,
@@ -298,7 +300,7 @@ def dense_fwd_body(
         del desc
         wait_kv_block(traits, kv_refs, slot)
 
-    pending_g, pending_k, _ = pending_fragment(traits)
+    pending_frag = pending_fragment(traits)
 
     def _block_step(si, kv, lo, hi, ctx, row, ahead, carry):
         """One kv block of row si. ahead holds the descriptors of the next row's
@@ -357,66 +359,16 @@ def dense_fwd_body(
             is_first=is_first,
         )
 
-        def _qk(g, kv_compute_index, q_compute_index):
-            return qk(
-                traits,
-                variant,
-                q_buf,
-                kv_refs,
-                block,
-                g,
-                kv_compute_index,
-                q_compute_index,
-            )
+        def _qk(frag):
+            return qk(traits, variant, q_refs, kv_refs, block, frag)
 
-        def _online_softmax(
-            g,
-            kv_compute_index,
-            q_compute_index,
-            logits,
-            needs_mask,
-            *,
-            last_kv_tile=num_k_compute_tiles - 1,
-            **flags,
-        ):
-            """online_softmax of one of this block's fragments, which no
-            bounds row touches, flags its keyword flags."""
+        def _online_softmax(frag, logits, softmax_pass):
             return online_softmax(
-                traits,
-                variant,
-                state,
-                mask,
-                block,
-                g,
-                kv_compute_index,
-                q_compute_index,
-                logits,
-                needs_mask,
-                apply_bounds=False,
-                last_kv_tile=last_kv_tile,
-                **flags,
+                traits, variant, state, mask, block, frag, logits, softmax_pass
             )
 
-        def _block_pv(*fragment):
-            fragment_pv(traits, state, kv_refs, block, *fragment)
-
-        def _carry_out_pv(
-            probs,
-            is_row_start,
-            kv_compute_index=pending_k,
-            is_tile_zero=num_k_compute_tiles == 1,
-        ):
-            carry_out_pv(
-                traits,
-                state,
-                pending,
-                kv_refs,
-                block,
-                probs,
-                is_row_start,
-                kv_compute_index,
-                is_tile_zero,
-            )
+        def _block_pv(frag, frag_pv):
+            fragment_pv(traits, state, kv_refs, block, frag, frag_pv)
 
         def _run_schedule(
             is_causal,
@@ -447,28 +399,24 @@ def dense_fwd_body(
                 pending_pv = None
                 for g in heads:
                     for fragment in window_fragments:
-                        logits = _qk(g, fragment.kv_tile, fragment.q_tile)
-                        probs, is_row_start, rescale = _online_softmax(
-                            g,
-                            fragment.kv_tile,
-                            fragment.q_tile,
+                        frag = Fragment(g, fragment.kv_tile, fragment.q_tile)
+                        logits = _qk(frag)
+                        frag_pv = _online_softmax(
+                            frag,
                             logits,
-                            fragment.needs_mask,
-                            guard_recovery=guard_recovery,
-                            window_fragment=fragment,
+                            SoftmaxPass(
+                                needs_mask=fragment.needs_mask,
+                                guard_recovery=guard_recovery,
+                                apply_bounds=False,
+                                last_kv_tile=num_k_compute_tiles - 1,
+                                window_fragment=fragment,
+                            ),
                         )
                         if pending_pv is None:
                             _after_first_softmax()
                         else:
                             _block_pv(*pending_pv)
-                        pending_pv = (
-                            g,
-                            fragment.kv_tile,
-                            fragment.q_tile,
-                            probs,
-                            is_row_start,
-                            rescale,
-                        )
+                        pending_pv = (frag, frag_pv)
                 _block_pv(*pending_pv)
             else:
                 if static_g is None:
@@ -477,7 +425,7 @@ def dense_fwd_body(
                     def _fragment_coords(frag_idx):
                         g = frag_idx // num_compute_tiles
                         tile_idx = frag_idx % num_compute_tiles
-                        return (
+                        return Fragment(
                             g,
                             tile_idx // num_q_compute_tiles,
                             tile_idx % num_q_compute_tiles,
@@ -487,7 +435,7 @@ def dense_fwd_body(
                     num_fragments = num_compute_tiles
 
                     def _fragment_coords(frag_idx):
-                        return (
+                        return Fragment(
                             static_g,
                             frag_idx // num_q_compute_tiles,
                             frag_idx % num_q_compute_tiles,
@@ -496,98 +444,59 @@ def dense_fwd_body(
                 # Note (david): a pinned g replaces the loop-carried copy as a
                 # Python int, because sub-tile (d64) lane windows need static
                 # offsets; a static g costs nothing on the other builds.
-                def _resolve_g(g):
-                    return static_g if static_g is not None else g
+                def _resolve_g(frag):
+                    if static_g is None:
+                        return frag
+                    return frag._replace(g=static_g)
 
-                first_g, first_k, first_q = (
-                    jnp.int32(coord) for coord in _fragment_coords(0)
+                softmax_pass = SoftmaxPass(
+                    needs_mask=is_causal,
+                    guard_recovery=guard_recovery,
+                    apply_bounds=False,
+                    last_kv_tile=num_k_compute_tiles - 1,
                 )
-                logits = _qk(_resolve_g(first_g), first_k, first_q)
-                probs_first, is_row_start_first, rescale_first = (
-                    _online_softmax(
-                        _resolve_g(first_g),
-                        first_k,
-                        first_q,
-                        logits,
-                        needs_mask=is_causal,
-                        guard_recovery=guard_recovery,
-                    )
+                first = Fragment(
+                    *(jnp.int32(coord) for coord in _fragment_coords(0))
+                )
+                logits = _qk(_resolve_g(first))
+                first_pv = _online_softmax(
+                    _resolve_g(first), logits, softmax_pass
                 )
                 _after_first_softmax()
 
                 def _pipeline_step(frag_idx, carry):
-                    (
-                        probs_prev,
-                        is_row_start_prev,
-                        rescale_prev,
-                        prev_g,
-                        prev_k,
-                        prev_q,
-                    ) = carry
-                    current_g, current_k, current_q = _fragment_coords(frag_idx)
-                    logits = _qk(_resolve_g(current_g), current_k, current_q)
-                    probs_curr, is_row_start_curr, rescale_curr = (
-                        _online_softmax(
-                            _resolve_g(current_g),
-                            current_k,
-                            current_q,
-                            logits,
-                            is_causal,
-                            guard_recovery=guard_recovery,
-                        )
+                    prev_pv, prev = carry
+                    current = _fragment_coords(frag_idx)
+                    logits = _qk(_resolve_g(current))
+                    current_pv = _online_softmax(
+                        _resolve_g(current), logits, softmax_pass
                     )
-                    _block_pv(
-                        _resolve_g(prev_g),
-                        prev_k,
-                        prev_q,
-                        probs_prev,
-                        is_row_start_prev,
-                        rescale_prev,
-                    )
-                    return (
-                        probs_curr,
-                        is_row_start_curr,
-                        rescale_curr,
-                        current_g,
-                        current_k,
-                        current_q,
-                    )
+                    _block_pv(_resolve_g(prev), prev_pv)
+                    return current_pv, current
 
-                (
-                    probs_last,
-                    is_row_start_last,
-                    rescale_last,
-                    last_g,
-                    last_k,
-                    last_q,
-                ) = lax.fori_loop(
+                last_pv, last = lax.fori_loop(
                     1,
                     num_fragments,
                     _pipeline_step,
-                    (
-                        probs_first,
-                        is_row_start_first,
-                        rescale_first,
-                        first_g,
-                        first_k,
-                        first_q,
-                    ),
+                    (first_pv, first),
                     unroll=True,
                 )
                 if carries_out:
                     # Note (david): this copy runs every fragment, so its last
                     # fragment is the static pending one.
                     assert not guard_recovery
-                    _carry_out_pv(probs_last, is_row_start_last)
-                else:
-                    _block_pv(
-                        _resolve_g(last_g),
-                        last_k,
-                        last_q,
-                        probs_last,
-                        is_row_start_last,
-                        rescale_last,
+                    carry_out_pv(
+                        traits,
+                        state,
+                        pending,
+                        kv_refs,
+                        block,
+                        pending_frag,
+                        last_pv,
+                        num_k_compute_tiles == 1,
                     )
+                else:
+                    _block_pv(_resolve_g(last), last_pv)
 
         def _run_group(is_causal, window_fragments=None, carries_out=False):
             # Note (david): the unpack (or K rotation) leads the copy in program
@@ -637,7 +546,7 @@ def dense_fwd_body(
                         static_g=g,
                         window_fragments=window_fragments,
                     )
-                    if g == pending_g:
+                    if g == pending_frag.g:
                         cancel_pending_pv(pending)
 
         # Note (david): a mask-free copy of the fragment pipeline and masked
