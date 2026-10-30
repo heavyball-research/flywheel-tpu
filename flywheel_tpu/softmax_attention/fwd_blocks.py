@@ -13,12 +13,16 @@ reads, so a loop hands over its scratch rather than a helper closing over it:
 - KVRefs / PagedKVRefs: the contiguous K and V streams, or the paged merged
   cache with its word staging ring and unpacked K and V planes. Both give a
   fragment its V operand through v_tile.
+- RotaryStream: a Q or K coefficient stream, as QRefs and KVRefs build it.
 - RowStateRefs: row max, row sum, o accumulator, block parity, guard flags.
 - PendingPVRefs: the PV a block leaves to the next one.
 - OutRefs: the o and lse operands, their stages and the DMA semaphores.
 
-Two more frozen groups carry values rather than refs: ScoreMask, how a build
-masks its scores, and KVBlock, the kv block a fragment belongs to. The loop
+More frozen groups carry values rather than refs: ScoreMask, how a build
+masks its scores, KVBlock, the kv block a fragment belongs to, and
+SoftmaxPass, how online_softmax treats a copy's fragments. A fragment
+travels through a pipeline as a Fragment (its coordinates) and a FragmentPV
+(what its PV needs), both NamedTuples a loop can carry. The loop
 itself (block descriptors and prefetch, the fragment pipeline copies, the
 overflow replay, row parity and the deferred row finish) stays with each
 kernel's driver.
@@ -148,6 +152,20 @@ def set_half(
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
+class RotaryStream:
+    """A rotary coefficient stream: the coefficient operand, its staging
+    ring, the rows a block stages, the heads that share one coefficient
+    batch, and the kernel's DMA semaphores with the plane its DMAs signal."""
+
+    hbm: jax.Array
+    buf: jax.Array
+    block: int
+    heads_per_batch: int
+    sems: jax.Array
+    sem_plane: int
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
 class QRefs:
     """The Q stream: the HBM operand, its staging ring, and under rotary the
     Q coefficient operand and its staging ring (else None), plus the kernel's
@@ -158,6 +176,17 @@ class QRefs:
     rotary_hbm: jax.Array | None
     rotary_buf: jax.Array | None
     sems: jax.Array
+
+    def rotary_stream(self, traits: FwdTraits) -> RotaryStream:
+        """The Q coefficient stream, one bq-row block per q block."""
+        return RotaryStream(
+            hbm=self.rotary_hbm,
+            buf=self.rotary_buf,
+            block=traits.bq,
+            heads_per_batch=traits.rotary_q_heads,
+            sems=self.sems,
+            sem_plane=SEM_ROTARY_Q,
+        )
 
 
 def q_copy(
@@ -187,30 +216,29 @@ def q_copy(
 
 def rotary_copies(
     traits: FwdTraits,
-    sems: jax.Array,
-    coeff_hbm: jax.Array,
-    coeff_buf: jax.Array,
+    stream: RotaryStream,
     head: jax.Array | int,
     tok: jax.Array | int,
-    block: int,
     slot: jax.Array | int,
-    heads_per_batch: int,
-    sem_plane: int,
 ):
-    """The DMAs of the rotary coefficient rows [tok, tok + block) of every
-    coefficient group of the group at head into staging slot slot."""
+    """The DMAs of stream's coefficient rows [tok, tok + stream.block) of
+    every coefficient group of the group at head into staging slot slot."""
     for g in range(traits.rotary_groups):
         batch_idx = (
-            0 if traits.rotary_batch == 1 else (head + g) // heads_per_batch
+            0
+            if traits.rotary_batch == 1
+            else (head + g) // stream.heads_per_batch
         )
-        rows = pl.ds(tok, block)
+        rows = pl.ds(tok, stream.block)
         coeff_window = (
-            coeff_hbm.at[batch_idx, rows, :]
+            stream.hbm.at[batch_idx, rows, :]
             if traits.is_head_dim_minor
-            else coeff_hbm.at[batch_idx, :, rows]
+            else stream.hbm.at[batch_idx, :, rows]
         )
         yield pltpu.make_async_copy(
-            coeff_window, coeff_buf.at[slot, g], sems.at[sem_plane, slot]
+            coeff_window,
+            stream.buf.at[slot, g],
+            stream.sems.at[stream.sem_plane, slot],
         )
 
 
@@ -274,16 +302,7 @@ def start_q_row(
     q_copy(traits, q_refs, head, tok, slot).start()
     if traits.rotary_dim:
         for dma in rotary_copies(
-            traits,
-            q_refs.sems,
-            q_refs.rotary_hbm,
-            q_refs.rotary_buf,
-            head,
-            tok,
-            traits.bq,
-            slot,
-            traits.rotary_q_heads,
-            SEM_ROTARY_Q,
+            traits, q_refs.rotary_stream(traits), head, tok, slot
         ):
             dma.start()
 
@@ -300,16 +319,7 @@ def wait_q_row(
     q_copy(traits, q_refs, 0, 0, slot).wait()
     if traits.rotary_dim:
         for dma in rotary_copies(
-            traits,
-            q_refs.sems,
-            q_refs.rotary_hbm,
-            q_refs.rotary_buf,
-            0,
-            0,
-            traits.bq,
-            slot,
-            traits.rotary_q_heads,
-            SEM_ROTARY_Q,
+            traits, q_refs.rotary_stream(traits), 0, 0, slot
         ):
             dma.wait()
         if traits.gqa_fold > 1:
@@ -339,6 +349,17 @@ class KVRefs:
     rotary_hbm: jax.Array | None
     rotary_buf: jax.Array | None
     sems: jax.Array
+
+    def rotary_stream(self, traits: FwdTraits) -> RotaryStream:
+        """The K coefficient stream, one bkv-row block per kv block."""
+        return RotaryStream(
+            hbm=self.rotary_hbm,
+            buf=self.rotary_buf,
+            block=traits.bkv,
+            heads_per_batch=traits.rotary_k_heads,
+            sems=self.sems,
+            sem_plane=SEM_ROTARY_K,
+        )
 
     def v_tile(
         self,
@@ -420,16 +441,7 @@ def start_kv_block(
         dma.start()
     if traits.rotary_dim and traits.rotary_k:
         for dma in rotary_copies(
-            traits,
-            kv_refs.sems,
-            kv_refs.rotary_hbm,
-            kv_refs.rotary_buf,
-            kv_head,
-            kv_tok,
-            traits.bkv,
-            slot,
-            traits.rotary_k_heads,
-            SEM_ROTARY_K,
+            traits, kv_refs.rotary_stream(traits), kv_head, kv_tok, slot
         ):
             dma.start()
 
@@ -442,16 +454,7 @@ def wait_kv_block(
         dma.wait()
     if traits.rotary_dim and traits.rotary_k:
         for dma in rotary_copies(
-            traits,
-            kv_refs.sems,
-            kv_refs.rotary_hbm,
-            kv_refs.rotary_buf,
-            0,
-            0,
-            traits.bkv,
-            slot,
-            traits.rotary_k_heads,
-            SEM_ROTARY_K,
+            traits, kv_refs.rotary_stream(traits), 0, 0, slot
         ):
             dma.wait()
 
