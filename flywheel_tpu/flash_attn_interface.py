@@ -29,10 +29,7 @@ from .softmax_attention.kernels.bwd import flash_attn_bwd
 from .softmax_attention.kernels.decode import flash_attn_kvcache_pallas
 from .softmax_attention.kernels.fwd_dense import make_flash_attn_mha
 from .softmax_attention.kernels.fwd_paged import flash_attn_varlen_paged
-from .softmax_attention.kernels.kv_append import (
-    append_ragged,
-    flash_attn_kvcache_varlen,
-)
+from .softmax_attention.kernels.kv_append import append_ragged
 from .softmax_attention.kv_layout import resolve_merged_kv_heads
 from .softmax_attention.rotary import prepare_rotary
 from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
@@ -1506,6 +1503,109 @@ def flash_attn_varlen_func(
             return out, kernel_lse[:, :total_q]
         else:
             return out
+
+
+def flash_attn_kvcache_varlen(
+    q: jax.Array,
+    kv_cache: jax.Array,
+    k: jax.Array | None,
+    v: jax.Array | None,
+    cu_seqlens_q: jax.Array,
+    cache_seqlens: jax.Array,
+    block_table: jax.Array,
+    num_active: int | jax.Array | None,
+    *,
+    max_seqlen_q: int,
+    q_scale: float,
+    causal: bool,
+    window_left: int | None,
+    softcap: float,
+    return_lse: bool,
+    interpret: bool,
+    nheads_k: int,
+    k_scale: jax.Array,
+    v_scale: jax.Array,
+    sinks: jax.Array | None = None,
+) -> tuple[jax.Array, ...]:
+    """Append packed new tokens once, then attend with the paged varlen kernel,
+    which reads the updated pages only.
+
+    q is (total_q, nheads, head_dim) packed by cu_seqlens_q; kv_cache is the
+    merged interleaved (num_pages, page_size, merged_cache_heads(nheads_k),
+    head_dim) cache and block_table its flat (batch * pages_per_seq,) page
+    table. max_seqlen_q, causal, window_left, softcap, q_scale, nheads_k,
+    k_scale, v_scale and sinks are flash_attn_varlen_paged's. Returns (out,
+    kv_cache) plus lse (nheads, total_q) float32 when return_lse.
+    """
+    batch = cu_seqlens_q.shape[0] - 1
+    num_query_heads = q.shape[1]
+    page_size = kv_cache.shape[1]
+    pages_per_seq = block_table.size // batch
+    if pages_per_seq == 0:
+        raise ValueError(
+            "block_table must reserve at least one page per sequence."
+        )
+    if q.shape[0] == 0 and return_lse:
+        return (q, kv_cache, jnp.empty((num_query_heads, 0), jnp.float32))
+    elif q.shape[0] == 0:
+        return (q, kv_cache)
+    else:
+        num_active_array = jnp.asarray(
+            batch if num_active is None else num_active, jnp.int32
+        ).reshape(1)
+        has_new = k is not None
+        if has_new:
+            updated_kv_cache = append_ragged(
+                kv_cache,
+                k,
+                v,
+                cu_seqlens_q,
+                cache_seqlens,
+                block_table,
+                num_active_array,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                interpret=interpret,
+            )
+        else:
+            updated_kv_cache = kv_cache
+        # Note (david): pinning every boundary past num_active to
+        # cu_seqlens_q[num_active] empties the inactive requests, so they own no
+        # q block and the kernel never reads their lengths or table rows; their
+        # rows become packed padding (out = 0, lse = -inf).
+        num_active_scalar = num_active_array[0]
+        kept_cu_seqlens_q = jnp.where(
+            jnp.arange(batch + 1, dtype=jnp.int32) <= num_active_scalar,
+            cu_seqlens_q,
+            cu_seqlens_q[num_active_scalar],
+        )
+        total_lengths = cache_seqlens + (
+            jnp.diff(cu_seqlens_q) if has_new else 0
+        )
+        outputs = flash_attn_varlen_paged(
+            q.transpose(1, 0, 2),
+            updated_kv_cache,
+            kept_cu_seqlens_q,
+            total_lengths,
+            block_table.reshape(batch, pages_per_seq),
+            sinks,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=pages_per_seq * page_size,
+            causal=causal,
+            q_scale=q_scale,
+            return_lse=return_lse,
+            interpret=interpret,
+            window_left=window_left,
+            softcap=softcap,
+            nheads_k=nheads_k,
+            k_scale=k_scale,
+            v_scale=v_scale,
+        )
+        if return_lse:
+            out, lse = outputs
+            return (out.transpose(1, 0, 2), updated_kv_cache, lse)
+        else:
+            return (outputs.transpose(1, 0, 2), updated_kv_cache)
 
 
 @functools.partial(
