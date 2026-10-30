@@ -9,7 +9,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tiling import round_up
 from ..core.tpu import NUM_LANES
 from .config import (
     QKVLayout,
@@ -54,7 +53,6 @@ from .fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from .kv_layout import kv_word_rows
 from .schedule import FwdSchedule, window_fragment_plans
 from .traits import FwdTraits
 from .variant import Variant, VariantOperands
@@ -1128,7 +1126,7 @@ def forward_common(
     smem_operands: list[jax.Array],
     q: jax.Array,
     k: jax.Array,
-    v: jax.Array | None,
+    v: jax.Array,
     traits: FwdTraits,
     variant: Variant,
     *,
@@ -1145,12 +1143,10 @@ def forward_common(
     rotary is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair
     (K None when K arrives rotated) that traits' rotary fields describe.
     Returns o shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads,
-    q_seq_len) float32 natural-log lse.
-
-    A PagedFwdTraits build (per-seq, head-major q only) makes k the merged
-    interleaved cache traits.paged describes and v None; the kernel then takes
-    (q, k, *rotary).
+    q_seq_len) float32 natural-log lse. A paged build allocates its own
+    scratch (kernels/fwd_paged.py).
     """
+    assert not traits.is_paged, traits
     bq, bkv = traits.bq, traits.bkv
     bkv_compute = traits.bkv_compute
     bq_compute = traits.bq_compute
@@ -1158,27 +1154,21 @@ def forward_common(
     qkv_layout = traits.qkv_layout
     num_q_heads, num_kv_heads = traits.num_q_heads, traits.num_kv_heads
     head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
-    head_fold, gqa_fold = traits.head_fold, traits.gqa_fold
+    head_fold = traits.head_fold
     transposed_pv = traits.transposed_pv
-    token_major, paged = traits.token_major, traits.paged
+    token_major = traits.token_major
     is_per_seq = traits.is_per_seq
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     return_lse = variant.return_lse
     assert (rotary is None) == (rotary_dim == 0), rotary_dim
 
-    if paged is None and k.shape[:-1] != v.shape[:-1]:
+    if k.shape[:-1] != v.shape[:-1]:
         raise ValueError(
             f"'key' {k.shape} and 'value' {v.shape} must have the same leading"
             " dimensions."
         )
 
-    if paged is not None:
-        q_seq_len = q.shape[1]
-        # Note (david): seqused_k bounds every sequence's kv blocks, so the kv
-        # axis only needs its block count; the padded capacity stands in for its
-        # length.
-        kv_seq_len = round_up(paged.pages_per_seq * paged.page_size, bkv)
-    elif token_major is not None:
+    if token_major is not None:
         batch = token_major.batch
         q_heads_per_row = token_major.num_q_heads
         kv_heads_per_row = token_major.num_kv_heads
@@ -1298,27 +1288,13 @@ def forward_common(
             )
 
     q_buf = vmem(_staged_shape(bq, head_dim_qk, qkv_layout), q.dtype)
-    if paged is None:
-        k_buf = vmem(
-            _staged_shape(bkv, head_dim_qk, qkv_layout, NUM_KV_STAGES), k.dtype
-        )
-        v_buf = vmem(
-            _staged_shape(bkv, head_dim_v, qkv_layout, NUM_KV_STAGES), v.dtype
-        )
-        scratch_shapes = [q_buf, k_buf, v_buf]
-    else:
-        # Note (david): a paged block stages the u32 word rows holding one kv
-        # head's K and V, then unpacks them into one bf16 K and one bf16 V
-        # plane; a word's (kv_word_rows, head_dim) rows pad to nothing, so the
-        # staging costs what two dense planes of the cache dtype would.
-        scratch_shapes = [
-            q_buf,
-            vmem(
-                (NUM_KV_STAGES, bkv, 1, kv_word_rows(k.dtype), head_dim_qk),
-                k.dtype,
-            ),
-            vmem((2, bkv, head_dim_qk), q.dtype),
-        ]
+    k_buf = vmem(
+        _staged_shape(bkv, head_dim_qk, qkv_layout, NUM_KV_STAGES), k.dtype
+    )
+    v_buf = vmem(
+        _staged_shape(bkv, head_dim_v, qkv_layout, NUM_KV_STAGES), v.dtype
+    )
+    scratch_shapes = [q_buf, k_buf, v_buf]
     if is_per_seq:
         # Note (david): the per-seq kernel synthesizes its bounds rows (the q
         # lower bound, plus the span under a left window) once per block
@@ -1353,11 +1329,10 @@ def forward_common(
     )
     # Note (david): a lane-paired fold's pending V tile is its pair's 128 lanes,
     # as fwd_body loads it.
-    pending_probs = vmem((gqa_fold * bq_compute, bkv_compute), jnp.float32)
+    pending_probs = vmem((bq_compute, bkv_compute), jnp.float32)
     v_tile_width = NUM_LANES if traits.is_lane_paired else head_dim_v
     pending_v = vmem(
-        from_head_minor((bkv_compute, v_tile_width), qkv_layout),
-        q.dtype if paged is not None else v.dtype,
+        from_head_minor((bkv_compute, v_tile_width), qkv_layout), v.dtype
     )
     guard_smem = pltpu.SMEM((head_fold,), jnp.int32)
     parity_smem = pltpu.SMEM((1,), jnp.int32)
@@ -1388,21 +1363,7 @@ def forward_common(
         )
     else:
         q_in, k_in, v_in, *rotary_in = (q, k, v, *rotary_operands)
-    if paged is not None:
-        # Note (david): the pool is pinned to HBM because memory space
-        # assignment otherwise moves a pool that fits its VMEM budget there and
-        # back around every call, the whole pool however few pages the call
-        # reads (v6e, 16 MB e5m2 pool: 0.369 against 0.339 ms a chunk). The spec
-        # stays pl.ANY: a layout copy XLA inserts before the call escapes the
-        # constraint and can land in VMEM, where DMAs compiled for an HBM
-        # operand halt the chip.
-        kernel_inputs = [
-            q_in,
-            pltpu.with_memory_space_constraint(k_in, pltpu.HBM),
-            *rotary_in,
-        ]
-    else:
-        kernel_inputs = [q_in, k_in, v_in, *rotary_in]
+    kernel_inputs = [q_in, k_in, v_in, *rotary_in]
     smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
     in_specs = [smem_spec] * len(smem_operands) + [any_spec] * len(

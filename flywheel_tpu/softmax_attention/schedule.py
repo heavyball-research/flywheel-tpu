@@ -90,7 +90,8 @@ ScheduleContext = ScheduleRow | None
 
 @dataclasses.dataclass(frozen=True)
 class FwdSchedule:
-    """Nested-loop bounds and per-block arithmetic for fwd_body.
+    """Nested-loop bounds and per-block arithmetic for a forward main loop
+    (fwd_pipeline.fwd_body, kernels/fwd_paged.paged_fwd_body).
 
     Loop order: head group g (static bound), q block row si (static bound,
     qi = first_row + si), kv block in [lo, hi] (runtime bounds).
@@ -104,7 +105,7 @@ class FwdSchedule:
         window starts; q_bounds(ctx, kv, k_abs) is (lower, span), the absolute q
         lower-bound row plus, when has_q_span, the row of span widths: a q row
         attends a column iff lower <= q, and q - lower < span under has_q_span.
-        blend_start(ctx) is the first row the block owns, and fwd_body blends
+        blend_start(ctx) is the first row the block owns, and the loop blends
         rows [q_token, blend_start) of the output stage from the previous block
         before the packed write.
       has_q_span: per-seq only; q_bounds returns a span row (a left window
@@ -114,7 +115,7 @@ class FwdSchedule:
         is a heads-outer fold of B sequences (q fold index n * B + b reads kv
         fold index (n // q_heads_per_kv_head) * B + b).
       packed_q_end: per-seq only; cu_seqlens_q[-1], where the packed padding
-        rows fwd_body zero-fills begin.
+        rows the loop zero-fills begin.
       num_live_tiles: per-seq only; (kv, ctx) -> the block's kv compute tiles
         below the q block's kv frontier, at least 1.
       kv_page: paged only; (page_base, kv, page) -> the physical page holding
@@ -451,7 +452,7 @@ def per_seq_schedule_rows(
     unbounded, and causal is (None, 0). Rows past num_rows are never read.
 
     The aligned base drags rows of earlier sequences into the first block and
-    the last block runs past q_end: fwd_body blends rows [q_tok, q_start) from
+    the last block runs past q_end: the loop blends rows [q_tok, q_start) from
     the previous block's stage, and tail rows are overwritten by the next block
     or, past cu_q[-1], written as out = 0, lse = -inf.
     """
@@ -800,6 +801,9 @@ def make_paged_fwd_schedule(
         layout=layout,
         num_head_groups=num_head_groups,
         q_heads_per_kv_head=q_heads_per_kv_head,
+        # Note (david): seqused_k bounds every sequence's kv blocks, so the kv
+        # axis only needs its block count; the padded capacity stands in for its
+        # length.
         padded_total_k=-(-(pages_per_seq * page_size) // bkv) * bkv,
         bq=bq,
         bkv=bkv,
@@ -809,8 +813,9 @@ def make_paged_fwd_schedule(
     )
 
     def _kv_page(page_base, kv, page):
-        # Note (david): fwd_body issues every page DMA of a block, even past the
-        # sequence's last page, so the lookup must stay inside the row.
+        # Note (david): start_paged_kv_block issues every page DMA of a block,
+        # even past the sequence's last page, so the lookup must stay inside the
+        # row.
         table_index = jnp.minimum(
             kv * pages_per_block + page, pages_per_seq - 1
         )

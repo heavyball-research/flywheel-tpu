@@ -1,12 +1,12 @@
 """Building blocks of the forward fragment pipeline.
 
-A forward main loop (fwd_pipeline.fwd_body) runs these at fixed points: the
-Q and rotary staging copies and their in-place rotation, the K and V staging
-copies, the QK fragment and its masks, the online softmax, the PV with its
-pending-PV hand-off across blocks, and a row's output and lse finish. Each
-takes the build's FwdTraits (and Variant, where it calls a hook) plus a small
-frozen group of the refs it reads, so a loop hands over its scratch rather
-than a helper closing over it:
+A forward main loop (fwd_pipeline.fwd_body, or kernels/fwd_paged.py's
+paged_fwd_body) runs these at fixed points: the Q and rotary staging copies
+and their in-place rotation, the K and V staging copies, the QK fragment and
+its masks, the online softmax, the PV with its pending-PV hand-off across
+blocks, and a row's output and lse finish. Each takes the build's FwdTraits
+(and Variant, where it calls a hook) plus a small frozen group of the refs it
+reads, so a loop hands over its scratch rather than a helper closing over it:
 
 - QRefs: the Q operand, its staging ring and the rotary Q coefficients.
 - KVRefs / PagedKVRefs: the contiguous K and V streams, or the paged merged

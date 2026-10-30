@@ -2,11 +2,11 @@
 
 A traits object holds what one build fixes at trace time: its tile sizes and
 layout, head counts and widths, head folds and rotary layout, plus the
-constants derived from them as properties. forward_common sizes its scratch
-from it and fwd_body reads it; schedules, refs and traced scalars stay
-arguments. DecodeTraits does the same for the KV-cache decode kernel
-(kernels/decode.py), and BwdTraits for the backward kernels (kernels/bwd.py,
-bwd_pipeline.py).
+constants derived from them as properties. forward_common (or a paged build's
+paged_pallas_call) sizes its scratch from it and the forward main loops read
+it; schedules, refs and traced scalars stay arguments. DecodeTraits does the
+same for the KV-cache decode kernel (kernels/decode.py), and BwdTraits for the
+backward kernels (kernels/bwd.py, bwd_pipeline.py).
 """
 
 import dataclasses
