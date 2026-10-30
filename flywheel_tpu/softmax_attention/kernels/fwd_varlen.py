@@ -49,7 +49,7 @@ from ..fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
+from ..fwd_pipeline import forward_common, rotary_fields
 from ..schedule import (
     FwdSchedule,
     ScheduleTableLayout,
@@ -88,9 +88,9 @@ def flash_fwd_varlen_kernel(
         left=left,
         right=right,
     )
-    # The schedule masks each sequence around its own diagonal, so fwd_body
+    # The schedule masks each sequence around its own diagonal, so the loop
     # runs without the Variant's static mask.
-    fwd_body(
+    varlen_fwd_body(
         traits,
         variant.without_mask(),
         schedule,
