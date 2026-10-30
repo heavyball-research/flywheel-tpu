@@ -21,6 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...core.tiling import round_up
 from ...core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
 
 # Note (david): Mosaic requires every DMA offset and size along a tiled
@@ -160,7 +161,7 @@ class GDNConfig:
         # the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
         # early and rounded up to whole tiles.
         widened_rows = self.chunk_size + SUBLANE_ALIGN - 1
-        return pl.cdiv(widened_rows, SUBLANE_ALIGN) * SUBLANE_ALIGN
+        return round_up(widened_rows, SUBLANE_ALIGN)
 
     @property
     def out_window_rows(self) -> int:
@@ -171,10 +172,7 @@ class GDNConfig:
         # whole stage tiles keeps the 16-row tile holding the last used row,
         # and the DMA window, inside the stage.
         tile_rows = self.seq_tile_size * self.chunk_size
-        return (
-            pl.cdiv(tile_rows + SUBLANE_ALIGN, STAGE_TILE_ROWS)
-            * STAGE_TILE_ROWS
-        )
+        return round_up(tile_rows + SUBLANE_ALIGN, STAGE_TILE_ROWS)
 
     @property
     def v_dim_size(self) -> int:
@@ -187,7 +185,7 @@ class GDNConfig:
     @property
     def aligned_num_v_heads(self) -> int:
         num_lanes = pltpu.get_tpu_info().num_lanes
-        return pl.cdiv(self.num_v_heads, num_lanes) * num_lanes
+        return round_up(self.num_v_heads, num_lanes)
 
     @property
     def record_k_offset(self) -> int:

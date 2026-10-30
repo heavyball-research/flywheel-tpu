@@ -24,6 +24,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ...core.tiling import round_up
 from ...core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
 from . import (
     compute_conv1d,
@@ -1533,9 +1534,9 @@ def launch_fused_conv1d_kda(
     num_lanes = tpu_info.num_lanes
     mixed_tile_size = min(
         mixed_tile_size,
-        pl.cdiv(batch_size, compute_chunk_size) * compute_chunk_size,
+        round_up(batch_size, compute_chunk_size),
     )
-    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    aligned_num_v_heads = round_up(n_v, num_lanes)
 
     if replay_window:
         # Note (david): a replay tile reads a checkpoint's hi plane, and its
