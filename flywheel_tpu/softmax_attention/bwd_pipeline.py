@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..core.tpu import NUM_LANES, vmem_limit_bytes
-from .block_sizes import (
+from .config import (
     DEFAULT_MASK_VALUE,
     LOG2E,
     NN_DIM_NUMBERS,
@@ -19,9 +19,9 @@ from .block_sizes import (
     TokenMajorInfo,
     default_block,
 )
-from .copy_utils import advance, drain, fold_row, hbm_head_slice, hbm_window
-from .loop_schedule import BwdSchedule
+from .kv_layout import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .mask import apply_causal_kv_major
+from .schedule import BwdSchedule
 
 # Note (david): contracting axis 0 of both ds and k gives dq = ds^T @ k without
 # materializing the transpose.

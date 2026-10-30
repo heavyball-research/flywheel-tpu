@@ -6,23 +6,23 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from ..core.tpu import NUM_LANES
-from .block_sizes import (
+from ...core.tpu import NUM_LANES
+from ..config import (
     LOG2E,
     PAIRED_HEAD_DIM,
     BlockSizes,
     QKVLayout,
     TokenMajorInfo,
 )
-from .flash_fwd_varlen import flash_attn_forward_varlen
-from .fwd_pipeline import forward_common, fwd_body, overflow_guard_threshold
-from .loop_schedule import (
+from ..fwd_pipeline import forward_common, fwd_body, overflow_guard_threshold
+from ..schedule import (
     DenseFwdParams,
     VarlenSchedule,
     dense_fwd_params,
     make_dense_fwd_schedule,
     make_runtime_offset_dense_fwd_schedule,
 )
+from .fwd_varlen import flash_attn_forward_varlen
 
 # Note (david): the static-anchor softmax runs a distance-1 fragment pipeline,
 # which must not revisit a q slice while its rescale is still pending.

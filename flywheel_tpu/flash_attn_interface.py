@@ -13,7 +13,7 @@ import jax.numpy as jnp
 
 from .core.tiling import next_pow2, pick_tile, round_up
 from .core.tpu import NUM_LANES
-from .pallas.block_sizes import (
+from .softmax_attention.config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
@@ -24,16 +24,16 @@ from .pallas.block_sizes import (
     TokenMajorInfo,
     default_block,
 )
-from .pallas.copy_utils import resolve_merged_kv_heads
-from .pallas.flash_bwd import flash_attn_bwd
-from .pallas.flash_fwd import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
-from .pallas.flash_fwd_kvcache import flash_attn_kvcache_pallas
-from .pallas.flash_fwd_kvcache_varlen import (
+from .softmax_attention.kernels.bwd import flash_attn_bwd
+from .softmax_attention.kernels.decode import flash_attn_kvcache_pallas
+from .softmax_attention.kernels.fwd_dense import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
+from .softmax_attention.kernels.fwd_paged import flash_attn_varlen_paged
+from .softmax_attention.kernels.kv_append import (
     append_ragged,
     flash_attn_kvcache_varlen,
 )
-from .pallas.flash_fwd_varlen_paged import flash_attn_varlen_paged
-from .pallas.rotary import prepare_rotary
+from .softmax_attention.kv_layout import resolve_merged_kv_heads
+from .softmax_attention.rotary import prepare_rotary
 from .tuned_block_sizes import get_tuned_config, get_varlen_head_fold
 
 # Note (david): each page is its own DMA, so smaller pages would leave the

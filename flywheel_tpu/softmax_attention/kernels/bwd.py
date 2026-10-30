@@ -9,19 +9,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tiling import pick_tile, round_up
-from ..core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
-from ..tuned_block_sizes import get_tuned_config
-from .block_sizes import (
-    DEFAULT_MASK_VALUE,
-    LOG2E,
-    MIN_NUM_STAGES,
-    NN_DIM_NUMBERS,
-    NT_DIM_NUMBERS,
-    PAIRED_HEAD_DIM,
-    TokenMajorInfo,
-)
-from .bwd_pipeline import (
+from ...core.tiling import pick_tile, round_up
+from ...core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
+from ...tuned_block_sizes import get_tuned_config
+from ..bwd_pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
     SEM_DI,
@@ -38,13 +29,22 @@ from .bwd_pipeline import (
     call_bwd,
     default_bwd_block,
 )
-from .copy_utils import advance, drain, hbm_tm_slice
-from .loop_schedule import (
+from ..config import (
+    DEFAULT_MASK_VALUE,
+    LOG2E,
+    MIN_NUM_STAGES,
+    NN_DIM_NUMBERS,
+    NT_DIM_NUMBERS,
+    PAIRED_HEAD_DIM,
+    TokenMajorInfo,
+)
+from ..kv_layout import advance, drain, hbm_tm_slice
+from ..mask import apply_causal_kv_major
+from ..schedule import (
     DenseBwdParams,
     dense_bwd_params,
     make_dense_bwd_schedule,
 )
-from .mask import apply_causal_kv_major
 
 # Note (david): dq_acc is the only scratch that grows with q_seq_len; capping it
 # at half the VMEM budget leaves the other half to the block-sized stage

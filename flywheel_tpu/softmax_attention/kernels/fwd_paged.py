@@ -14,35 +14,35 @@ from functools import cache, partial
 import jax
 import jax.numpy as jnp
 
-from ..core.tiling import next_pow2, pick_tile, round_up
-from ..core.tpu import (
+from ...core.tiling import next_pow2, pick_tile, round_up
+from ...core.tpu import (
     BF16_TILE_ROWS,
     F32_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
     vmem_limit_bytes,
 )
-from .block_sizes import (
+from ..config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     LOG2E,
     BlockSizes,
     PagedKVInfo,
 )
-from .copy_utils import kv_word_rows, resolve_merged_kv_heads
-from .flash_fwd import MIN_Q_TILES_PER_BLOCK
-from .fwd_pipeline import (
+from ..fwd_pipeline import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
     forward_common,
     fwd_body,
     overflow_guard_threshold,
 )
-from .loop_schedule import (
+from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
+from ..schedule import (
     ScheduleTableLayout,
     make_paged_fwd_schedule,
     paged_schedule_table,
 )
+from .fwd_dense import MIN_Q_TILES_PER_BLOCK
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # kv stream descriptor-bound.

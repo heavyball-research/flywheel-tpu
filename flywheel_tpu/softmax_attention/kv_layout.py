@@ -10,7 +10,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ..core.tiling import round_up
 from ..core.tpu import NUM_LANES
-from .block_sizes import QKVLayout, TokenMajorInfo
+from .config import QKVLayout, TokenMajorInfo
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16

@@ -7,8 +7,8 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu.pallas.copy_utils import merged_cache_heads
-from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
+from flywheel_tpu.softmax_attention.kernels.kv_cache_write import write_kv_cache_pages
+from flywheel_tpu.softmax_attention.kv_layout import merged_cache_heads
 from tests.test_util import merge_kv_heads, randn
 
 INTERPRET = jax.default_backend() != "tpu"

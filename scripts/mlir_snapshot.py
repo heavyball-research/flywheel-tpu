@@ -51,7 +51,7 @@ as a wrapper difference.
 Internal entry points (no public wrapper; a commit that moves them updates
 the imports here): flash_attn_interface._flash_attn_func_pcp_causal_offset
 (the runtime-offset kernel tpu-inference's PCP attention calls),
-pallas.kv_cache_write.write_kv_cache_pages, and
+softmax_attention.kernels.kv_cache_write.write_kv_cache_pages, and
 core.tuning.lookup / _warn_untuned_once, which the tuned lookup record wraps.
 
 Out of reach by construction: interpret=True (plain XLA, no
@@ -91,7 +91,7 @@ from flywheel_tpu import flash_attn_interface, linear_attention
 from flywheel_tpu.core import tuning
 
 # Note: the page writer has no public wrapper.
-from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
+from flywheel_tpu.softmax_attention.kernels.kv_cache_write import write_kv_cache_pages
 
 FORMAT_VERSION = 2
 INDEX_FILE = "index.json"

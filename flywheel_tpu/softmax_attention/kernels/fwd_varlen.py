@@ -10,15 +10,15 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from .block_sizes import LOG2E, BlockSizes, QKVLayout, TokenMajorInfo
-from .fwd_pipeline import forward_common, fwd_body
-from .loop_schedule import (
+from ..config import LOG2E, BlockSizes, QKVLayout, TokenMajorInfo
+from ..fwd_pipeline import forward_common, fwd_body
+from ..schedule import (
     ScheduleTableLayout,
     VarlenSchedule,
     make_per_seq_fwd_schedule,
     varlen_schedule_table,
 )
-from .seqlen_info import check_cu_seqlens_pair
+from ..seqlen import check_cu_seqlens_pair
 
 
 def flash_fwd_varlen_kernel(

@@ -17,7 +17,7 @@ from flywheel_tpu.flash_attn_interface import (
     fused_q_scale,
     pad_seqlen,
 )
-from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
+from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
 from tests.test_util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"

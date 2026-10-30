@@ -67,7 +67,7 @@ PAGE_SIZE = 128
 # write_kv_cache_pages is tpu-inference's prefill cache writer and is not
 # re-exported at the package root; a refactor that moves it must update this
 # module path in the same commit.
-KV_WRITE_MODULE = "flywheel_tpu.pallas.kv_cache_write"
+KV_WRITE_MODULE = "flywheel_tpu.softmax_attention.kernels.kv_cache_write"
 
 # Llama-3-8B-like GQA attention: 32 query heads, 8 KV heads of 128.
 HEADS = 32

@@ -19,7 +19,7 @@ from ..core.tpu import (
     hbm_bf16_tile_rows,
     vmem_limit_bytes,
 )
-from .block_sizes import (
+from .config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
@@ -29,7 +29,7 @@ from .block_sizes import (
     TokenMajorInfo,
     from_head_minor,
 )
-from .copy_utils import (
+from .kv_layout import (
     advance,
     drain,
     fold_row,
@@ -40,9 +40,9 @@ from .copy_utils import (
     load_staged_words,
     staged_words,
 )
-from .loop_schedule import FwdSchedule, window_fragment_plans
 from .mask import apply_packed_bounds_mask
 from .rotary import ROTARY_DIM_MULTIPLE, rotate_tile
+from .schedule import FwdSchedule, window_fragment_plans
 
 SEM_Q = 0
 SEM_K = 1

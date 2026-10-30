@@ -10,8 +10,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tiling import next_pow2, round_up
-from ..core.tpu import (
+from ...core.tiling import next_pow2, round_up
+from ...core.tpu import (
     BF16_BYTES,
     BF16_TILE_ROWS,
     F32_BYTES,
@@ -19,15 +19,16 @@ from ..core.tpu import (
     NUM_SUBLANES,
     vmem_limit_bytes,
 )
-from ..core.tuning import warn_untuned
-from ..tuned_block_sizes import (
+from ...core.tuning import warn_untuned
+from ...tuned_block_sizes import (
     TUNED_CONFIGS_PATH,
     KVCacheConfig,
     get_tuned_kvcache_config,
     kvcache_config_key,
 )
-from .block_sizes import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
-from .copy_utils import (
+from ..config import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
+from ..fwd_pipeline import fold_sink, overflow_guard_threshold
+from ..kv_layout import (
     MIN_BLOCK_KV,
     bank_safe_word_stride,
     kv_heads_per_word,
@@ -39,7 +40,6 @@ from .copy_utils import (
     resolve_merged_kv_heads,
     staged_words,
 )
-from .fwd_pipeline import fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2

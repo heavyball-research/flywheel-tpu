@@ -284,7 +284,7 @@ def build_flywheel(cell, inputs, args):
     import jax
 
     from flywheel_tpu import flash_attn_with_kvcache
-    from flywheel_tpu.pallas.copy_utils import merged_cache_heads
+    from flywheel_tpu.softmax_attention.kv_layout import merged_cache_heads
 
     calls, block_table, starts = inputs
     # Note (david): the merged cache interleaves each kv head's K row and V

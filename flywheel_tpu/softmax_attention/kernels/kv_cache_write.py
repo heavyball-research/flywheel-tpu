@@ -18,7 +18,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .copy_utils import (
+from ..kv_layout import (
     check_merged_kv_dtype,
     interleave_kv_rows,
     merged_cache_heads,
