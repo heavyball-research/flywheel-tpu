@@ -396,16 +396,10 @@ class VarlenSchedule(NamedTuple):
     Attributes:
       padded_total_q: padded packed q rows, which a block need not divide.
       padded_total_k: padded packed kv rows, which a block need not divide.
-      q_heads_per_kv_head: maps a q head to its kv head.
-      left/right: the window around each sequence's own bottom-right diagonal;
-        None is unbounded, and causal is (None, 0).
     """
 
     padded_total_q: int
     padded_total_k: int
-    q_heads_per_kv_head: int
-    left: int | None
-    right: int | None
 
 
 def align_to_sublane_tile(token: jax.Array) -> jax.Array:
@@ -601,9 +595,13 @@ def varlen_schedule_table(
     bq: int,
     bkv: int,
     bkv_compute: int,
+    left: int | None,
+    right: int | None,
 ) -> tuple[jax.Array, ScheduleTableLayout]:
     """(table, layout) of the packed K/V varlen kernel's schedule, whose kv
-    axis packs sequence r at [cu_k[r], cu_k[r + 1])."""
+    axis packs sequence r at [cu_k[r], cu_k[r + 1]). left / right is the
+    window around each sequence's own bottom-right diagonal (Variant.window):
+    None is unbounded, and causal is (None, 0)."""
     cu_k = jnp.asarray(cu_seqlens_k, jnp.int32)
     rows = per_seq_schedule_rows(
         cu_seqlens_q,
@@ -614,8 +612,8 @@ def varlen_schedule_table(
         bq=bq,
         bkv=bkv,
         bkv_compute=bkv_compute,
-        left=varlen_sched.left,
-        right=varlen_sched.right,
+        left=left,
+        right=right,
     )
     layout = ScheduleTableLayout(
         fields=PER_SEQ_ROW_FIELDS, num_rows=rows.seq_idx.shape[0]

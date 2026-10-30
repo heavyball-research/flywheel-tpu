@@ -59,36 +59,35 @@ def flash_fwd_varlen_paged_kernel(
     traits: PagedFwdTraits,
     variant: Variant,
     layout: ScheduleTableLayout,
-    causal: bool,
-    window_left: int | None,
-    num_head_groups: int,
-    q_heads_per_kv_head: int,
 ) -> None:
     if variant.has_sinks:
         sinks_ref, q_hbm, kv_hbm, *refs = refs
     else:
         sinks_ref = None
         q_hbm, kv_hbm, *refs = refs
+    window_left, window_right = variant.window
     schedule = make_paged_fwd_schedule(
         table_ref,
         block_table_ref,
         layout=layout,
-        num_head_groups=num_head_groups,
-        q_heads_per_kv_head=q_heads_per_kv_head,
+        num_head_groups=traits.num_head_groups,
+        q_heads_per_kv_head=traits.q_heads_per_kv_head,
         bq=traits.bq,
         bkv=traits.bkv,
         bkv_compute=traits.bkv_compute,
         page_size=traits.paged.page_size,
         pages_per_seq=traits.paged.pages_per_seq,
-        causal=causal,
+        causal=window_right == 0,
         left=window_left,
     )
     # Note (david): K and V share the one merged cache operand. The K and V
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
     q_scale, v_scale = variant.kv_scales(kv_scales_ref)
+    # The schedule masks each sequence around its own diagonal, so fwd_body
+    # runs without the Variant's static mask.
     fwd_body(
         traits,
-        variant,
+        variant.without_mask(),
         schedule,
         q_hbm,
         kv_hbm,
@@ -433,14 +432,7 @@ def flash_attn_varlen_paged(
     ]
     if sinks is not None:
         smem_operands.append(variant.sink_logits(sinks))
-    kernel = partial(
-        flash_fwd_varlen_paged_kernel,
-        layout=layout,
-        causal=causal,
-        window_left=window_left,
-        num_head_groups=num_kv_heads,
-        q_heads_per_kv_head=gqa_fold,
-    )
+    kernel = partial(flash_fwd_varlen_paged_kernel, layout=layout)
     outputs = forward_common(
         kernel,
         smem_operands,
@@ -450,7 +442,7 @@ def flash_attn_varlen_paged(
         traits,
         # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
         # softcap, so log2(e) rides in the tanh output scale.
-        variant.without_mask(),
+        variant,
         kernel_name="flash_attn_varlen_paged_fwd",
         interpret=interpret,
         rotary=padded_rotary,

@@ -426,14 +426,10 @@ def make_flash_attn_mha(
         return partial(
             flash_attn_forward_varlen,
             varlen_sched=VarlenSchedule(
-                padded_total_q=seqlen_q,
-                padded_total_k=seqlen_kv,
-                q_heads_per_kv_head=q_heads_per_kv_head,
-                left=left,
-                right=right,
+                padded_total_q=seqlen_q, padded_total_k=seqlen_kv
             ),
             traits=traits,
-            variant=variant.without_mask(),
+            variant=variant,
             interpret=interpret,
         )
     else:

@@ -84,6 +84,10 @@ class QKVTraits:
         return self.num_q_heads // self.group_heads
 
     @property
+    def q_heads_per_kv_head(self) -> int:
+        return self.num_q_heads // self.num_kv_heads
+
+    @property
     def width_qk(self) -> int | None:
         if self.token_major is None:
             return None

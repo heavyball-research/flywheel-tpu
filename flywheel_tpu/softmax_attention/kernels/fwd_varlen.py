@@ -35,21 +35,24 @@ def flash_fwd_varlen_kernel(
     else:
         sinks_ref = None
         q_hbm, k_hbm, v_hbm, *refs = refs
+    left, right = variant.window
     schedule = make_per_seq_fwd_schedule(
         table_ref,
         layout=layout,
         num_head_groups=traits.num_head_groups,
-        q_heads_per_kv_head=varlen_sched.q_heads_per_kv_head,
+        q_heads_per_kv_head=traits.q_heads_per_kv_head,
         padded_total_k=varlen_sched.padded_total_k,
         bq=traits.bq,
         bkv=traits.bkv,
         bkv_compute=traits.bkv_compute,
-        left=varlen_sched.left,
-        right=varlen_sched.right,
+        left=left,
+        right=right,
     )
+    # The schedule masks each sequence around its own diagonal, so fwd_body
+    # runs without the Variant's static mask.
     fwd_body(
         traits,
-        variant,
+        variant.without_mask(),
         schedule,
         q_hbm,
         k_hbm,
@@ -83,6 +86,7 @@ def flash_attn_forward_varlen(
     # back out = 0, lse = -inf, so they cost no attention; kv tokens past
     # cu_seqlens_k[-1] are masked wherever a block loads them. Resolving the
     # schedule once per call spares every q block a search of the cu_seqlens.
+    left, right = variant.window
     table, layout = varlen_schedule_table(
         cu_seqlens_q,
         cu_seqlens_k,
@@ -90,6 +94,8 @@ def flash_attn_forward_varlen(
         bq=traits.bq,
         bkv=traits.bkv,
         bkv_compute=traits.bkv_compute,
+        left=left,
+        right=right,
     )
     smem_operands = [table]
     variant.check_sinks_operand(sinks)
