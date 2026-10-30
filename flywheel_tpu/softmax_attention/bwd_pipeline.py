@@ -21,6 +21,7 @@ from .config import (
 from .dma import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .mask import apply_causal_kv_major
 from .schedule import BwdSchedule
+from .variant import Variant
 
 # Note (david): contracting axis 0 of both ds and k gives dq = ds^T @ k without
 # materializing the transpose.
@@ -42,14 +43,12 @@ def bwd_body(
     schedule: BwdSchedule,
     refs: tuple[jax.Array, ...],
     *,
+    variant: Variant,
     bq: int,
     bkv: int,
     bq_compute: int,
     bkv_compute: int,
     num_stages: int,
-    scale: float,
-    causal: bool,
-    causal_offset: int,
     out_dtype: jnp.dtype,
     head_fold: int,
     kv_fold: int,
@@ -59,8 +58,11 @@ def bwd_body(
 
     refs are q, k, v, do, lse, di, dq, dk, dv, then call_bwd's scratch in order.
     dk/dv accumulate per kv block and dq over the whole group; each streams out
-    as soon as it is complete.
+    as soon as it is complete. variant gives the softmax scale and the causal
+    mask with its causal offset.
     """
+    scale = float(variant.softmax_scale)
+    causal, causal_offset = variant.causal, variant.causal_offset
     # Note (david): the exact unpack pins this ref list against call_bwd's
     # operand and scratch order; a mismatch fails here instead of shifting every
     # later ref.

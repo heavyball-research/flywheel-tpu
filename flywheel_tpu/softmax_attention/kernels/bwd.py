@@ -136,8 +136,7 @@ def flash_bwd_folded_kernel(
     head_fold: int,
     seq_len: int,
     num_stages: int,
-    scale: float,
-    causal: bool,
+    variant: Variant,
     out_dtype: jnp.dtype,
     token_major: TokenMajorInfo | None,
 ) -> None:
@@ -145,8 +144,11 @@ def flash_bwd_folded_kernel(
 
     Batching heads amortizes the per-step DMA and loop overhead that dominates
     many-head short-sequence builds. With one kv block dq needs no reduction and
-    is written straight out.
+    is written straight out. variant gives the softmax scale and the causal
+    flag; the single block's diagonal has no offset.
     """
+    scale = float(variant.softmax_scale)
+    causal = variant.causal
     f32 = jnp.float32
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
@@ -326,8 +328,7 @@ def flash_attn_bwd_folded(
     head_dim_qk: int,
     head_dim_v: int,
     head_fold: int,
-    scale: float,
-    causal: bool,
+    variant: Variant,
     interpret: bool,
     num_stages: int,
     token_major: TokenMajorInfo | None,
@@ -366,8 +367,7 @@ def flash_attn_bwd_folded(
         num_head_groups=num_heads // head_fold,
         head_fold=head_fold,
         seq_len=q_seq_len,
-        scale=scale,
-        causal=causal,
+        variant=variant,
         out_dtype=q.dtype,
         num_stages=num_stages,
         token_major=token_major,
@@ -641,7 +641,6 @@ def flash_attn_bwd(
             " picks; got None."
         )
 
-    scale = variant.softmax_scale
     is_rectangular = q_seq_len != kv_seq_len
     num_stages = block_sizes.num_stages
     bq = block_sizes.block_q
@@ -841,8 +840,7 @@ def flash_attn_bwd(
             head_dim_qk=head_dim_qk,
             head_dim_v=head_dim_v,
             head_fold=head_fold,
-            scale=float(scale),
-            causal=causal,
+            variant=variant,
             interpret=interpret,
             num_stages=num_stages,
             token_major=token_major_info,
@@ -883,9 +881,7 @@ def flash_attn_bwd(
             bq_compute=bq_compute,
             bkv_compute=bkv_compute,
             num_stages=num_stages,
-            scale=float(scale),
-            causal=causal,
-            causal_offset=causal_offset,
+            variant=variant,
             out_dtype=q.dtype,
             head_fold=head_fold,
             kv_fold=kv_fold,
