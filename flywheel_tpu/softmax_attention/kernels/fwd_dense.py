@@ -9,12 +9,13 @@ import jax.numpy as jnp
 from ...core.tpu import NUM_LANES
 from ..config import (
     LOG2E,
+    MIN_Q_TILES_PER_BLOCK,
     PAIRED_HEAD_DIM,
     BlockSizes,
     QKVLayout,
     TokenMajorInfo,
 )
-from ..fwd_pipeline import forward_common, fwd_body, overflow_guard_threshold
+from ..fwd_pipeline import forward_common, fwd_body
 from ..schedule import (
     DenseFwdParams,
     VarlenSchedule,
@@ -22,11 +23,8 @@ from ..schedule import (
     make_dense_fwd_schedule,
     make_runtime_offset_dense_fwd_schedule,
 )
+from ..softmax import overflow_guard_threshold
 from .fwd_varlen import flash_attn_forward_varlen
-
-# Note (david): the static-anchor softmax runs a distance-1 fragment pipeline,
-# which must not revisit a q slice while its rescale is still pending.
-MIN_Q_TILES_PER_BLOCK = 2
 
 
 def flash_fwd_kernel(

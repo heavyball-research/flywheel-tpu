@@ -27,7 +27,6 @@ from ...tuned_block_sizes import (
     kvcache_config_key,
 )
 from ..config import LOG2E, NN_DIM_NUMBERS, NT_DIM_NUMBERS, STAGES
-from ..fwd_pipeline import fold_sink, overflow_guard_threshold
 from ..kv_layout import (
     MIN_BLOCK_KV,
     bank_safe_word_stride,
@@ -40,6 +39,7 @@ from ..kv_layout import (
     resolve_merged_kv_heads,
     staged_words,
 )
+from ..softmax import fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2

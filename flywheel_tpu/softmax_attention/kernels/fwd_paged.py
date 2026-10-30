@@ -26,6 +26,7 @@ from ..config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     LOG2E,
+    MIN_Q_TILES_PER_BLOCK,
     BlockSizes,
     PagedKVInfo,
 )
@@ -34,7 +35,6 @@ from ..fwd_pipeline import (
     NUM_O_SLOTS,
     forward_common,
     fwd_body,
-    overflow_guard_threshold,
 )
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
@@ -42,7 +42,7 @@ from ..schedule import (
     make_paged_fwd_schedule,
     paged_schedule_table,
 )
-from .fwd_dense import MIN_Q_TILES_PER_BLOCK
+from ..softmax import overflow_guard_threshold
 
 # Note (david): each page is its own DMA, so smaller pages would leave the
 # kv stream descriptor-bound.

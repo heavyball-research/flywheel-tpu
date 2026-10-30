@@ -29,6 +29,9 @@ DEFAULT_BLOCK_Q_COMPUTE = 256
 FWD_BLOCKS = (2048, 1024, 512, 256, 128)
 FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
 FWD_Q_COMPUTE_BLOCKS = (256, 128)
+# Note (david): the static-anchor softmax runs a distance-1 fragment pipeline,
+# which must not revisit a q slice while its rescale is still pending.
+MIN_Q_TILES_PER_BLOCK = 2
 
 # Note (david): exp(x) == exp2(x * log2(e)). Folding log2(e) into the score
 # scale and the loaded lse lets the softmax use exp2, dropping the per-element

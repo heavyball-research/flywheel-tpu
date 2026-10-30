@@ -18,6 +18,7 @@ from .softmax_attention.config import (
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
     LOG2E,
+    MIN_Q_TILES_PER_BLOCK,
     PAIRED_HEAD_DIM,
     BlockSizes,
     QKVLayout,
@@ -26,7 +27,7 @@ from .softmax_attention.config import (
 )
 from .softmax_attention.kernels.bwd import flash_attn_bwd
 from .softmax_attention.kernels.decode import flash_attn_kvcache_pallas
-from .softmax_attention.kernels.fwd_dense import MIN_Q_TILES_PER_BLOCK, make_flash_attn_mha
+from .softmax_attention.kernels.fwd_dense import make_flash_attn_mha
 from .softmax_attention.kernels.fwd_paged import flash_attn_varlen_paged
 from .softmax_attention.kernels.kv_append import (
     append_ragged,
