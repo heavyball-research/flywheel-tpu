@@ -39,6 +39,7 @@ from ..kv_layout import (
     staged_words,
 )
 from ..softmax import fold_sink, overflow_guard_threshold
+from ..variant import Variant
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 NUM_IO_STAGES = 2
@@ -1258,15 +1259,12 @@ def flash_attn_kvcache_pallas(
     cache_batch_idx: jax.Array,
     *,
     has_new: bool,
-    left: int | None,
-    return_lse: bool,
+    variant: Variant,
     interpret: bool,
     kv_config: KVCacheConfig,
     block_table: jax.Array | None = None,
     num_active: int | jax.Array | None = None,
     merged_cache: bool = False,
-    softcap: float = 0.0,
-    causal: bool = False,
     nheads_k: int | None = None,
     v_scale: float | jax.Array = 1.0,
     sinks: jax.Array | None = None,
@@ -1274,11 +1272,15 @@ def flash_attn_kvcache_pallas(
     """One-token cache append and decode attention for every row in one call.
 
     q: (batch, num_query_heads, head_dim), already scaled into log2 units, or
-    by softmax_scale / softcap when softcap > 0, which applies Gemma-2's
-    tanh(s / softcap) * softcap to the scaled scores. A (batch, window,
-    num_query_heads, head_dim) q is a window already in the cache, folded into
-    the query heads so each row's cache is read once; out and lse keep q's
-    layout, and causal bounds window token t at cache_seqlens - window + 1 + t.
+    by softmax_scale / softcap when variant.softcap > 0, which applies
+    Gemma-2's tanh(s / softcap) * softcap to the scaled scores. A (batch,
+    window, num_query_heads, head_dim) q is a window already in the cache,
+    folded into the query heads so each row's cache is read once; out and lse
+    keep q's layout, and a right window bound of 0 (causal) bounds window
+    token t at cache_seqlens - window + 1 + t. A single-token row attends its
+    cache through its own token: variant's left bound hides the keys more than
+    that many positions before the token, and its right bound has nothing to
+    cut.
     k_cache/v_cache: (rows, capacity, num_kv_heads, head_dim). With
     block_table, the flat (batch * pages_per_seq,) int32 page table, the caches
     are (num_pages, page_size, ...) pools and the per-row capacity is
@@ -1302,11 +1304,27 @@ def flash_attn_kvcache_pallas(
     rows unspecified. None means every row is active.
 
     sinks: None or (num_query_heads,) float sink logits, on the scale of the
-    softcapped scores; exp(sinks[h]) joins head h's softmax denominator.
+    softcapped scores, given exactly when variant.has_sinks; exp(sinks[h])
+    joins head h's softmax denominator. variant also gives the softcap and
+    return_lse; the kernel always reads v_scale (variant.has_kv_scales) and
+    takes no causal_offset.
 
     kv_config: the (block_kv, block_kv_compute, num_kv_stages) that
     dispatch.resolve_kvcache_config picked for this build.
     """
+    left, right = variant.window
+    if variant.causal_offset or variant.runtime_causal_offset:
+        raise ValueError(
+            "the decode kernel aligns its mask to each row's cache end; a"
+            " kernel-wide causal_offset would be applied on top of it."
+        )
+    if not variant.has_kv_scales:
+        raise ValueError(
+            "the decode kernel always reads a V descale; build its Variant"
+            " with has_kv_scales=True."
+        )
+    variant.check_sinks_operand(sinks)
+    return_lse = variant.return_lse
     assert (
         v_cache is None
     ) == merged_cache, (
@@ -1384,6 +1402,7 @@ def flash_attn_kvcache_pallas(
     if is_window:
         assert window_heads % num_kv_heads == 0
         assert not has_new and left is None, "a window is already in the cache"
+        assert right in (None, 0), variant.window_size
         # Note (david): putting window token t of query head h * group + j at
         # folded head (h * query_tokens + t) * group + j lets KV head h's rows
         # share one read of its keys.
@@ -1553,13 +1572,13 @@ def flash_attn_kvcache_pallas(
         has_new=has_new,
         left=left,
         query_tokens=query_tokens,
-        causal=causal,
-        log2_softcap=softcap * LOG2E,
+        causal=right == 0,
+        log2_softcap=variant.log2_softcap,
         guard_threshold=guard_threshold,
         page_size=page_size,
         pages_per_seq=pages_per_seq,
         is_merged_cache=merged_cache,
-        has_sinks=sinks is not None,
+        has_sinks=variant.has_sinks,
     )
     # Note (deepolar): the sinks follow the caches, so the alias indices above
     # stay put; they arrive in log2 units, broadcast over the row-state lanes.

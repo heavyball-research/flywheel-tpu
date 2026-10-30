@@ -438,8 +438,17 @@ def flash_attn_with_kvcache(
         1.0 / math.sqrt(head_dim) if softmax_scale is None else softmax_scale
     )
     sinks = check_sinks(learnable_sink, nheads)
+    variant = make_variant(
+        softmax_scale,
+        softcap=float(softcap),
+        causal=bool(causal),
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        return_lse=bool(return_softmax_lse),
+        has_kv_scales=True,
+    )
     if is_extend:
-        is_right_bounded, window_left = paged_window(causal, window_size)
+        _, window_left = paged_window(causal, window_size)
         is_folded = (
             not is_ragged
             and window_left is None
@@ -473,15 +482,7 @@ def flash_attn_with_kvcache(
             flat_block_table,
             num_active,
             max_seqlen_q=packed_max_seqlen_q,
-            variant=make_variant(
-                softmax_scale,
-                softcap=float(softcap),
-                causal=bool(causal),
-                window_size=window_size,
-                learnable_sink=learnable_sink,
-                return_lse=bool(return_softmax_lse),
-                has_kv_scales=True,
-            ),
+            variant=variant,
             interpret=bool(interpret),
             nheads_k=nheads_k,
             k_scale=k_descale,
@@ -496,7 +497,7 @@ def flash_attn_with_kvcache(
         # one per-tensor factor on every score, so it rides in the same scale.
         q_scaled = (
             q.astype(jnp.float32)
-            * fused_q_scale(softmax_scale * k_descale, softcap)
+            * fused_q_scale(variant.softmax_scale * k_descale, variant.softcap)
         ).astype(q.dtype)
         new_token_shape = (batch, nheads_k, head_dim)
         num_active_array = jnp.asarray(
@@ -532,7 +533,6 @@ def flash_attn_with_kvcache(
             # Note (david): without has_new the kernel never touches these, but
             # it still needs correctly shaped operands to build its BlockSpecs.
             k_new = v_new = jnp.zeros(new_token_shape, k_cache.dtype)
-        window_left = None if window_size[0] == -1 else window_size[0]
         if is_paged:
             page_size = k_cache.shape[1]
             capacity = flat_block_table.shape[0] // batch * page_size
@@ -552,8 +552,7 @@ def flash_attn_with_kvcache(
             capacity=capacity,
             batch=batch,
             append=kernel_has_new,
-            sliding_window=window_left,
-            return_lse=bool(return_softmax_lse),
+            variant=variant,
         )
         kernel_outputs = flash_attn_kvcache_pallas(
             kernel_q,
@@ -564,15 +563,12 @@ def flash_attn_with_kvcache(
             row_cache_seqlens,
             cache_batch_idx,
             has_new=kernel_has_new,
-            left=window_left,
-            return_lse=bool(return_softmax_lse),
+            variant=variant,
             interpret=bool(interpret),
             kv_config=kv_config,
             block_table=flat_block_table,
             num_active=num_active_array,
             merged_cache=is_paged,
-            softcap=float(softcap),
-            causal=is_folded and is_right_bounded,  # pylint: disable=possibly-used-before-assignment
             nheads_k=nheads_k if is_paged else None,
             v_scale=v_descale,
             sinks=sinks,

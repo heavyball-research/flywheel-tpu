@@ -437,15 +437,16 @@ def resolve_kvcache_config(
     capacity: int,
     batch: int,
     append: bool,
-    sliding_window: int | None,
-    return_lse: bool,
+    variant: Variant,
 ) -> KVCacheConfig:
     """The (block_kv, block_kv_compute, num_kv_stages) of one KV-cache decode
     build: its tuned entry, validated against the build, or else
     default_kvcache_config.
 
-    The arguments are resolve_tuned_kvcache_config's; num_query_heads counts a
-    folded window's tokens as query heads, as the kernel does.
+    The arguments are resolve_tuned_kvcache_config's, with the key's
+    sliding_window (the left window bound) and return_lse read from variant;
+    num_query_heads counts a folded window's tokens as query heads, as the
+    kernel does.
     """
     tuned_config = resolve_tuned_kvcache_config(
         page_size=page_size,
@@ -456,8 +457,8 @@ def resolve_kvcache_config(
         capacity=capacity,
         batch=batch,
         append=append,
-        sliding_window=sliding_window,
-        return_lse=return_lse,
+        sliding_window=variant.window[0],
+        return_lse=variant.return_lse,
     )
     if tuned_config is None:
         return default_kvcache_config(
