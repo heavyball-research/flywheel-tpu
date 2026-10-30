@@ -368,7 +368,9 @@ def fwd_body(
         # Note (david): each staged Q tile is waited on exactly once per
         # row, so scaling it here replaces an HBM pre-scaled Q copy with the
         # same f32 multiply and cast, leaving the logits unchanged.
-        variant.transform_q(q_buf.at[slot], operands)
+        if variant.scales_q(operands):
+            q_ref = q_buf.at[slot]
+            q_ref[...] = variant.transform_q(q_ref[...], operands)
 
     def _kv_copies(kv_head, tok, slot):
         return [

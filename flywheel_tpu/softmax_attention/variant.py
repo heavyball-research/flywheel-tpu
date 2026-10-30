@@ -22,7 +22,8 @@ Adding a Variant feature (a new score term such as ALiBi, say) touches:
 1. A static field with a default that means "off", checked in __post_init__
    (Variants key caches, so every field is a hashable Python value). A traced
    value also gets a VariantOperands field and a check_operands entry; each
-   entry kernel passes it as an SMEM operand (see sink_logits, kv_scales).
+   entry kernel passes it as an SMEM operand (see sink_logits and
+   descaled_q_scale).
 2. The hooks. transform_logits sees each QK fragment before any mask, but
    only its values: no query or key position and no head. mask_logits runs
    only on fragments the schedule flags as partial (under lax.cond), never on
@@ -76,7 +77,7 @@ class VariantOperands(NamedTuple):
 
     causal_offset: runtime_causal_offset's int32 scalar, read from SMEM.
     q_scale / v_scale: has_kv_scales' f32 scalars, the Q scale times K's
-      descale and V's descale (Variant.kv_scales).
+      descale (Variant.descaled_q_scale) and V's descale.
     sinks_ref: has_sinks' SMEM (nheads,) float32 sink logits in log2 units.
     """
 
@@ -241,12 +242,10 @@ class Variant:
         assert (operands.v_scale is not None) == self.has_kv_scales, operands
         assert (operands.sinks_ref is not None) == self.has_sinks, operands
 
-    def kv_scales(
-        self, kv_scales_ref: jax.Array
-    ) -> tuple[jax.Array, jax.Array]:
-        """The (q_scale, v_scale) operands of a has_kv_scales build, read from
-        the SMEM (2,) K and V descales: K's joins the Q scale."""
-        return self.q_scale * kv_scales_ref[0], kv_scales_ref[1]
+    def descaled_q_scale(self, k_descale: jax.Array) -> jax.Array:
+        """The q_scale operand of a has_kv_scales build: K's descale joins the
+        Q scale, since it multiplies every score."""
+        return self.q_scale * k_descale
 
     def mask_offset(self, operands: VariantOperands) -> int | jax.Array:
         """The causal offset the mask shifts query positions by: the static
@@ -256,17 +255,23 @@ class Variant:
         else:
             return self.causal_offset
 
-    def transform_q(self, q_ref: jax.Array, operands: VariantOperands) -> None:
-        """Scale a staged Q tile in place by the Q scale (K's descale
-        included); a static 1.0 leaves it untouched."""
+    def _operand_q_scale(self, operands: VariantOperands) -> float | jax.Array:
         if operands.q_scale is None:
-            q_scale = self.q_scale
+            return self.q_scale
         else:
-            q_scale = operands.q_scale
-        if isinstance(q_scale, jax.Array) or q_scale != 1.0:
-            q_ref[...] = (q_ref[...].astype(jnp.float32) * q_scale).astype(
-                q_ref.dtype
-            )
+            return operands.q_scale
+
+    def scales_q(self, operands: VariantOperands) -> bool:
+        """Whether transform_q changes a Q tile: a static 1.0 leaves it
+        untouched."""
+        q_scale = self._operand_q_scale(operands)
+        return isinstance(q_scale, jax.Array) or q_scale != 1.0
+
+    def transform_q(self, q: jax.Array, operands: VariantOperands) -> jax.Array:
+        """A staged Q tile scaled by the Q scale (K's descale included), in
+        f32 and cast back to q's dtype."""
+        q_scale = self._operand_q_scale(operands)
+        return (q.astype(jnp.float32) * q_scale).astype(q.dtype)
 
     def transform_logits(self, logits: jax.Array) -> jax.Array:
         """The softcap on a QK fragment's log2-unit logits."""

@@ -82,7 +82,8 @@ def flash_fwd_varlen_paged_kernel(
     )
     # Note (david): K and V share the one merged cache operand. The K and V
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
-    q_scale, v_scale = variant.kv_scales(kv_scales_ref)
+    q_scale = variant.descaled_q_scale(kv_scales_ref[0])
+    v_scale = kv_scales_ref[1]
     # The schedule masks each sequence around its own diagonal, so fwd_body
     # runs without the Variant's static mask.
     fwd_body(
