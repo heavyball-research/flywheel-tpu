@@ -1,6 +1,5 @@
 """Forward fragment pipeline shared by the batch and varlen flash kernels."""
 
-import math
 from collections.abc import Callable, Sequence
 from functools import partial, reduce
 from typing import NamedTuple
@@ -39,9 +38,9 @@ from .softmax import (
     MASKED_ROW_BOUND,
     UNANCHORED_ROW_BOUND,
     UNANCHORED_ROW_MAX,
-    fold_sink,
 )
 from .traits import FwdTraits
+from .variant import Variant, VariantOperands
 
 SEM_Q = 0
 SEM_K = 1
@@ -84,40 +83,36 @@ class RowFinish(NamedTuple):
 
 def fwd_body(
     traits: FwdTraits,
+    variant: Variant,
     schedule: FwdSchedule,
     q_hbm: jax.Array,
     k_hbm: jax.Array,
     v_hbm: jax.Array,
     refs: Sequence[jax.Array],
     *,
-    window: tuple[int | None, int | None],
-    causal_offset: int,
-    softcap: float,
-    return_lse: bool,
-    q_scale: float | jax.Array,
-    v_scale: float | jax.Array = 1.0,
-    sinks_ref: jax.Array | None = None,
+    operands: VariantOperands,
 ) -> None:
     """Run the fragment pipeline over every block the schedule yields.
 
-    traits is the build's static configuration, and refs are forward_common's
+    traits is the build's static configuration, variant its elementwise math
+    and operands the variant's traced values, and refs are forward_common's
     rotary operands, outputs and scratch, in its allocation order. The logits
     run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). A
     PagedFwdTraits build (per-seq only) reads K and V from the one merged
     interleaved cache operand (k_hbm is v_hbm). A per-seq schedule writes the
-    packed padding rows past schedule.packed_q_end as out = 0, lse = -inf.
+    packed padding rows past schedule.packed_q_end as out = 0, lse = -inf, and
+    applies the mask itself, so its variant has none.
 
     gqa_fold > 1 (paged only) stages gqa_fold consecutive q heads of one kv head
     per group and stacks them over the rows of every score fragment: fragment
     row r holds head r // bq_compute at token r % bq_compute of the q tile, so
     bq and bq_compute count tokens per head. A paged fp8 cache is widened to
-    bf16 K and V planes, and v_scale multiplies the output. q_scale and v_scale
-    are static floats, or (paged) f32 scalars the kernel read from SMEM.
+    bf16 K and V planes, and V's descale multiplies the output.
 
-    sinks_ref is None or an SMEM (nheads,) float32 of per-head sink logits in
-    log2 units, one per sequence head (flat q head f reads f % nheads, or
-    f // heads_outer_batch heads-outer), each added to its head's softmax
-    denominator.
+    operands.sinks_ref is None or an SMEM (nheads,) float32 of per-head sink
+    logits in log2 units, one per sequence head (flat q head f reads
+    f % nheads, or f // heads_outer_batch heads-outer), each added to its
+    head's softmax denominator.
     """
     is_per_seq = traits.is_per_seq
     assert (schedule.q_token is not None) == is_per_seq, is_per_seq
@@ -154,6 +149,11 @@ def fwd_body(
     rotary_batch, rotary_groups = traits.rotary_batch, traits.rotary_groups
     rotary_q_heads = traits.rotary_q_heads
     rotary_k_heads = traits.rotary_k_heads
+    variant.check_operands(operands)
+    return_lse = variant.return_lse
+    window = variant.window
+    causal_offset = variant.mask_offset(operands)
+    sinks_ref = operands.sinks_ref
 
     remaining_refs = list(refs)
     if rotary_dim:
@@ -367,14 +367,10 @@ def fwd_body(
                 _rotate_gqa_folded_q(slot)
             else:
                 _rotate_staged(q_buf, rotary_q_buf, slot, bq)
-        if isinstance(q_scale, jax.Array) or q_scale != 1.0:
-            # Note (david): each staged Q tile is waited on exactly once per
-            # row, so scaling it here replaces an HBM pre-scaled Q copy with the
-            # same f32 multiply and cast, leaving the logits unchanged.
-            q_ref = q_buf.at[slot]
-            q_ref[...] = (q_ref[...].astype(jnp.float32) * q_scale).astype(
-                q_buf.dtype
-            )
+        # Note (david): each staged Q tile is waited on exactly once per
+        # row, so scaling it here replaces an HBM pre-scaled Q copy with the
+        # same f32 multiply and cast, leaving the logits unchanged.
+        variant.transform_q(q_buf.at[slot], operands)
 
     def _kv_copies(kv_head, tok, slot):
         return [
@@ -809,11 +805,8 @@ def fwd_body(
                 q, k, dim_numbers, preferred_element_type=jnp.float32
             )
             assert raw_logits.shape == (frag_rows, bkv_compute)
-            if softcap:
-                # Note (david): the softcap is applied before masking.
-                return jnp.tanh(raw_logits) * softcap
-            else:
-                return raw_logits
+            # Note (david): the softcap is applied before masking.
+            return variant.transform_logits(raw_logits)
 
         def _masked_scores(
             kv_compute_index, q_compute_index, logits, needs_mask, apply_bounds
@@ -826,25 +819,9 @@ def fwd_body(
             k_abs = kv_tok + kv_compute_index * bkv_compute
 
             def _apply_window_mask(scores):
-                left, right = window
-                q_ids = q_abs + lax.broadcasted_iota(
-                    jnp.int32, token_tile_shape, 0
+                return variant.mask_logits(
+                    scores, q_abs, k_abs, token_tile_shape
                 )
-                k_ids = k_abs + lax.broadcasted_iota(
-                    jnp.int32, token_tile_shape, 1
-                )
-                if left is None:
-                    left_masked = scores
-                else:
-                    left_masked = jnp.where(
-                        q_ids - left <= k_ids, scores, DEFAULT_MASK_VALUE
-                    )
-                if right is None:
-                    return left_masked
-                else:
-                    return jnp.where(
-                        k_ids <= q_ids + right, left_masked, DEFAULT_MASK_VALUE
-                    )
 
             # Note (david): a mask depends on the row's token alone, so a gqa
             # fold masks the (gqa_fold, bq_compute, bkv_compute) view of the
@@ -1742,15 +1719,16 @@ def fwd_body(
             def _finalize_fragment(q_compute_index, carry):
                 slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
                 row_sum = row_sum_ref[slice_q, :]
-                # Note (david): a quantized cache's V descale is one per-tensor
-                # factor, folded into the softmax normalization.
                 if transposed_pv:
                     tile_index = (slice(None), slice_q)
-                    inverse_row_sum = (v_scale / row_sum[:, 0:1]).T
+                    inverse_row_sum = variant.output_scale(
+                        row_sum[:, 0:1], operands
+                    ).T
                 else:
                     tile_index = (slice_q, slice(None))
                     inverse_row_sum = jnp.tile(
-                        v_scale / row_sum, (1, head_dim_v_repeats)
+                        variant.output_scale(row_sum, operands),
+                        (1, head_dim_v_repeats),
                     )[..., : o_scratch.shape[-1]]
                 o_normalized = (o_ref[tile_index] * inverse_row_sum).astype(
                     o_stage.dtype
@@ -1835,7 +1813,7 @@ def fwd_body(
             row_sum_ref = row_sum_scratch.at[finish.parity, head_rows]
             for q_compute_index in range(num_q_compute_tiles):
                 tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
-                _, _, out_scale = fold_sink(
+                _, _, out_scale = variant.fold_sink(
                     row_max_scratch.at[head_rows][tile_rows, :],
                     row_sum_ref[tile_rows, :],
                     sinks[g],
@@ -1850,9 +1828,7 @@ def fwd_body(
         for g in range(head_fold):
             head_rows = pl.ds(g * group_bq, group_bq)
             row_sum_ref = row_sum_scratch.at[finish.parity, head_rows]
-            # Note (david): the static anchor keeps sum_j exp2(logit_j) ==
-            # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
-            # units; scale by ln(2) for the natural-log lse that is returned.
+            sink = None if sinks is None else sinks[g]
             if gqa_fold > 1:
                 # Note (david): every lane of a row state holds the row's value,
                 # and the rows of a q tile run (folded head, token), so each
@@ -1865,13 +1841,9 @@ def fwd_body(
                     tile_rows = pl.ds(q_compute_index * frag_rows, frag_rows)
                     row_max = row_max_scratch[tile_rows, :]
                     row_sum = row_sum_ref[tile_rows, :]
-                    if sinks is not None:
-                        row_max, row_sum, _ = fold_sink(
-                            row_max, row_sum, sinks[g]
-                        )
-                    tile_lse = (
-                        (row_max + jnp.log2(row_sum)) * math.log(2.0)
-                    ).reshape(gqa_fold, bq_compute, NUM_LANES)
+                    tile_lse = variant.lse(row_max, row_sum, sink).reshape(
+                        gqa_fold, bq_compute, NUM_LANES
+                    )
                     head_lanes = tile_lse[0]
                     for h in range(1, gqa_fold):
                         head_lanes = jnp.where(
@@ -1885,9 +1857,7 @@ def fwd_body(
             else:
                 row_max = row_max_scratch.at[head_rows][:, 0:1]
                 row_sum = row_sum_ref[:, 0:1]
-                if sinks is not None:
-                    row_max, row_sum, _ = fold_sink(row_max, row_sum, sinks[g])
-                lse_row = (row_max + jnp.log2(row_sum)) * math.log(2.0)
+                lse_row = variant.lse(row_max, row_sum, sink)
                 if is_per_seq:
                     lse_stage[out_slot, :, g] = lse_row[:, 0]
                 else:
@@ -2040,7 +2010,7 @@ def fwd_body(
             out_count=num_out_copies,
             parity=lax.rem(row_parity + hi - lo, 2),
         )
-        sinks = None if sinks_ref is None else _head_sinks(base_head)
+        sinks = _head_sinks(base_head) if variant.has_sinks else None
         if return_lse:
             _finish_row_lse(g, finish, sinks)
         if sinks is not None:
@@ -2304,22 +2274,22 @@ def forward_common(
     k: jax.Array,
     v: jax.Array | None,
     traits: FwdTraits,
+    variant: Variant,
     *,
-    return_lse: bool,
     kernel_name: str,
     interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
-    **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Validate q/k/v against traits, allocate scratch and run a fwd_body
     kernel.
 
-    kernel is the mode kernel with its schedule already bound; traits,
-    return_lse and body, fwd_body's per-call keywords, are bound here. rotary
-    is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair (K None
-    when K arrives rotated) that traits' rotary fields describe. Returns o
-    shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads, q_seq_len)
-    float32 natural-log lse.
+    kernel is the mode kernel with its schedule already bound; traits and
+    variant are bound here. smem_operands lead the kernel's inputs, among them
+    the variant's traced values, which the kernel reads into VariantOperands.
+    rotary is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair
+    (K None when K arrives rotated) that traits' rotary fields describe.
+    Returns o shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads,
+    q_seq_len) float32 natural-log lse.
 
     A PagedFwdTraits build (per-seq, head-major q only) makes k the merged
     interleaved cache traits.paged describes and v None; the kernel then takes
@@ -2337,6 +2307,7 @@ def forward_common(
     token_major, paged = traits.token_major, traits.paged
     is_per_seq = traits.is_per_seq
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
+    return_lse = variant.return_lse
     assert (rotary is None) == (rotary_dim == 0), rotary_dim
 
     if paged is None and k.shape[:-1] != v.shape[:-1]:
@@ -2430,12 +2401,7 @@ def forward_common(
         rotary_operands = [coeff for coeff in rotary if coeff is not None]
     num_rotary_streams = (1 + int(rotary_k)) if rotary_dim else 0
 
-    fwd_kernel = partial(
-        kernel,
-        traits=traits,
-        return_lse=return_lse,
-        **body,
-    )
+    fwd_kernel = partial(kernel, traits=traits, variant=variant)
 
     group_heads = traits.group_heads
     folded_bq = group_heads * bq

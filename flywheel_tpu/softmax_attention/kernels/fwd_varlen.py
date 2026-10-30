@@ -20,19 +20,19 @@ from ..schedule import (
 )
 from ..seqlen import check_cu_seqlens_pair
 from ..traits import FwdTraits
+from ..variant import Variant, VariantOperands
 
 
 def flash_fwd_varlen_kernel(
     table_ref: jax.Array,
     *refs: jax.Array,
     traits: FwdTraits,
-    has_sinks: bool,
+    variant: Variant,
     varlen_sched: VarlenSchedule,
     layout: ScheduleTableLayout,
     num_head_groups: int,
-    **body,
 ) -> None:
-    if has_sinks:
+    if variant.has_sinks:
         sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
     else:
         sinks_ref = None
@@ -51,13 +51,13 @@ def flash_fwd_varlen_kernel(
     )
     fwd_body(
         traits,
+        variant,
         schedule,
         q_hbm,
         k_hbm,
         v_hbm,
         refs,
-        sinks_ref=sinks_ref,
-        **body,
+        operands=VariantOperands(sinks_ref=sinks_ref),
     )
 
 
@@ -76,9 +76,10 @@ def flash_attn_forward_varlen(
     transposed_pv: bool,
     token_major: TokenMajorInfo | None,
     guard_threshold: float,
+    variant: Variant,
+    interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = False,
-    **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     check_cu_seqlens_pair(cu_seqlens_k, cu_seqlens_q)
     # Note (david): per-seq blocks address HBM at arbitrary token offsets, which
@@ -114,6 +115,7 @@ def flash_attn_forward_varlen(
         bkv_compute=block_sizes.block_kv_compute,
     )
     smem_operands = [table]
+    variant.check_sinks_operand(sinks)
     if sinks is not None:
         # Note (deepolar): packed rows carry no batch, so the flat q head is the
         # sequence head itself.
@@ -129,7 +131,6 @@ def flash_attn_forward_varlen(
 
     kernel = partial(
         flash_fwd_varlen_kernel,
-        has_sinks=sinks is not None,
         varlen_sched=varlen_sched,
         layout=layout,
         num_head_groups=traits.num_q_heads // head_fold,
@@ -141,7 +142,8 @@ def flash_attn_forward_varlen(
         k,
         v,
         traits,
+        variant,
         kernel_name="flash_attn_mha_static_t1_guarded_fwd_varlen_per_seq",
+        interpret=interpret,
         rotary=rotary,
-        **body,
     )

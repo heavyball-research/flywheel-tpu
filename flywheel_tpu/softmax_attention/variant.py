@@ -5,14 +5,26 @@ their layout (traits.py): the softmax and Q scales, the softcap, the causal or
 window mask with its causal offset, learnable sinks, the K and V descales and
 whether lse is returned. Every field is static, so a Variant can key a
 functools cache or be a jit static; the traced values a build may carry (sink
-logits, the K and V descales, a runtime causal offset) stay kernel operands.
-Rotary is not part of a Variant: it stages Q and K rather than transforming
-scores.
+logits, the K and V descales, a runtime causal offset) stay kernel operands,
+which the kernel hands its hooks as VariantOperands. Rotary is not part of a
+Variant: it stages Q and K rather than transforming scores.
+
+fwd_body calls the hooks at fixed points: transform_q on each staged Q tile,
+transform_logits on each QK fragment, mask_logits where the static mask
+applies, fold_sink and lse at a row's end, and output_scale where the output
+is normalized.
 """
 
 import dataclasses
+import math
+from typing import NamedTuple
 
-from .config import LOG2E
+import jax
+import jax.numpy as jnp
+from jax import lax
+
+from .config import DEFAULT_MASK_VALUE, LOG2E
+from .softmax import fold_sink
 
 
 def fused_q_scale(softmax_scale: float, softcap: float) -> float:
@@ -23,6 +35,22 @@ def fused_q_scale(softmax_scale: float, softcap: float) -> float:
         return softmax_scale * LOG2E
     else:
         return softmax_scale / softcap
+
+
+class VariantOperands(NamedTuple):
+    """The traced values a Variant's hooks take in one kernel run, each set
+    exactly when its Variant flag is.
+
+    causal_offset: runtime_causal_offset's int32 scalar, read from SMEM.
+    q_scale / v_scale: has_kv_scales' f32 scalars, the Q scale times K's
+      descale and V's descale (Variant.kv_scales).
+    sinks_ref: has_sinks' SMEM (nheads,) float32 sink logits in log2 units.
+    """
+
+    causal_offset: jax.Array | None = None
+    q_scale: jax.Array | None = None
+    v_scale: jax.Array | None = None
+    sinks_ref: jax.Array | None = None
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -94,6 +122,125 @@ class Variant:
     def with_lse(self, return_lse: bool) -> "Variant":
         """This variant, returning lse or not."""
         return dataclasses.replace(self, return_lse=return_lse)
+
+    def without_mask(self) -> "Variant":
+        """This variant with no causal or window mask, for a build whose
+        schedule applies the mask instead (the per-seq ones)."""
+        return dataclasses.replace(self, causal=False, window_size=(-1, -1))
+
+    def check_sinks_operand(self, sinks: jax.Array | None) -> None:
+        """Raise unless sinks is given exactly when has_sinks."""
+        if (sinks is not None) != self.has_sinks:
+            raise ValueError(
+                "sinks must be passed exactly when the Variant has_sinks; got"
+                f" has_sinks={self.has_sinks} and"
+                f" sinks={None if sinks is None else sinks.shape}."
+            )
+
+    def check_operands(self, operands: VariantOperands) -> None:
+        """Assert that operands holds exactly the traced values the flags
+        name."""
+        assert (
+            operands.causal_offset is not None
+        ) == self.runtime_causal_offset, operands
+        assert (operands.q_scale is not None) == self.has_kv_scales, operands
+        assert (operands.v_scale is not None) == self.has_kv_scales, operands
+        assert (operands.sinks_ref is not None) == self.has_sinks, operands
+
+    def kv_scales(
+        self, kv_scales_ref: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        """The (q_scale, v_scale) operands of a has_kv_scales build, read from
+        the SMEM (2,) K and V descales: K's joins the Q scale."""
+        return self.q_scale * kv_scales_ref[0], kv_scales_ref[1]
+
+    def mask_offset(self, operands: VariantOperands) -> int | jax.Array:
+        """The causal offset the mask shifts query positions by: the static
+        causal_offset, or the runtime scalar."""
+        if self.runtime_causal_offset:
+            return operands.causal_offset
+        else:
+            return self.causal_offset
+
+    def transform_q(self, q_ref: jax.Array, operands: VariantOperands) -> None:
+        """Scale a staged Q tile in place by the Q scale (K's descale
+        included); a static 1.0 leaves it untouched."""
+        if operands.q_scale is None:
+            q_scale = self.q_scale
+        else:
+            q_scale = operands.q_scale
+        if isinstance(q_scale, jax.Array) or q_scale != 1.0:
+            q_ref[...] = (q_ref[...].astype(jnp.float32) * q_scale).astype(
+                q_ref.dtype
+            )
+
+    def transform_logits(self, logits: jax.Array) -> jax.Array:
+        """The softcap on a QK fragment's log2-unit logits."""
+        if self.log2_softcap:
+            return jnp.tanh(logits) * self.log2_softcap
+        else:
+            return logits
+
+    def mask_logits(
+        self,
+        scores: jax.Array,
+        q_first: int | jax.Array,
+        k_first: int | jax.Array,
+        tile_shape: tuple[int, int],
+    ) -> jax.Array:
+        """scores with the causal / window mask applied to a token tile whose
+        rows are queries from q_first, already shifted by the causal offset,
+        and whose columns are keys from k_first."""
+        left, right = self.window
+        q_ids = q_first + lax.broadcasted_iota(jnp.int32, tile_shape, 0)
+        k_ids = k_first + lax.broadcasted_iota(jnp.int32, tile_shape, 1)
+        if left is None:
+            left_masked = scores
+        else:
+            left_masked = jnp.where(
+                q_ids - left <= k_ids, scores, DEFAULT_MASK_VALUE
+            )
+        if right is None:
+            return left_masked
+        else:
+            return jnp.where(
+                k_ids <= q_ids + right, left_masked, DEFAULT_MASK_VALUE
+            )
+
+    def fold_sink(
+        self, row_max: jax.Array, row_sum: jax.Array, sink: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """softmax.fold_sink: a finished row's (anchor, row_sum, out_scale)
+        with its sink logit joined."""
+        return fold_sink(row_max, row_sum, sink)
+
+    def lse(
+        self,
+        row_max: jax.Array,
+        row_sum: jax.Array,
+        sink: jax.Array | None = None,
+    ) -> jax.Array:
+        """The natural-log lse of a finished row's static-anchor state, its
+        sink folded in first when given."""
+        if sink is not None:
+            row_max, row_sum, _ = self.fold_sink(row_max, row_sum, sink)
+        # Note (david): the static anchor keeps sum_j exp2(logit_j) ==
+        # exp2(row_max) * row_sum, so lse is row_max + log2(row_sum) in log2
+        # units; scale by ln(2) for the natural-log lse that is returned.
+        return (row_max + jnp.log2(row_sum)) * math.log(2.0)
+
+    def output_scale(
+        self, row_sum: jax.Array, operands: VariantOperands
+    ) -> jax.Array:
+        """The factor that normalizes the output accumulator's rows: 1 /
+        row_sum, times V's descale under has_kv_scales."""
+        # Note (david): a quantized cache's V descale is one per-tensor factor,
+        # folded into the softmax normalization.
+        if operands.v_scale is None:
+            v_scale = 1.0
+        else:
+            v_scale = operands.v_scale
+        return v_scale / row_sum
 
     def check_backward(self) -> None:
         """Raise NotImplementedError for what the backward kernel lacks."""

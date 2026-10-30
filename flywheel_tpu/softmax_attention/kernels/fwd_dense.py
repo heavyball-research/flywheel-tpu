@@ -25,31 +25,30 @@ from ..schedule import (
 )
 from ..softmax import overflow_guard_threshold
 from ..traits import FwdTraits
-from ..variant import Variant
+from ..variant import Variant, VariantOperands
 from .fwd_varlen import flash_attn_forward_varlen
 
 
 def flash_fwd_kernel(
     *refs: jax.Array,
     traits: FwdTraits,
-    has_sinks: bool,
+    variant: Variant,
     dense_params: DenseFwdParams,
-    **body,
 ) -> None:
-    if has_sinks:
+    if variant.has_sinks:
         sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
     else:
         sinks_ref = None
         q_hbm, k_hbm, v_hbm, *refs = refs
     fwd_body(
         traits,
+        variant,
         make_dense_fwd_schedule(dense_params),
         q_hbm,
         k_hbm,
         v_hbm,
         refs,
-        sinks_ref=sinks_ref,
-        **body,
+        operands=VariantOperands(sinks_ref=sinks_ref),
     )
 
 
@@ -95,10 +94,12 @@ def flash_attn_forward(
     transposed_pv: bool,
     token_major: TokenMajorInfo | None,
     guard_threshold: float,
+    variant: Variant,
+    interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = False,
-    **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    variant.check_sinks_operand(sinks)
     if sinks is not None:
         check_dense_sinks(
             sinks,
@@ -121,19 +122,16 @@ def flash_attn_forward(
         guard_threshold=guard_threshold,
     )
     return forward_common(
-        partial(
-            flash_fwd_kernel,
-            has_sinks=sinks is not None,
-            dense_params=dense_params,
-        ),
+        partial(flash_fwd_kernel, dense_params=dense_params),
         smem_operands,
         q,
         k,
         v,
         traits,
+        variant,
         kernel_name="flash_attn_mha_static_t1_guarded_fwd",
+        interpret=interpret,
         rotary=rotary,
-        **body,
     )
 
 
@@ -144,20 +142,19 @@ def flash_fwd_runtime_offset_kernel(
     v_hbm: jax.Array,
     *refs: jax.Array,
     traits: FwdTraits,
+    variant: Variant,
     dense_params: DenseFwdParams,
-    **body,
 ) -> None:
     runtime_offset = offset_ref[0]
-    body = dict(body)
-    body["causal_offset"] = runtime_offset
     fwd_body(
         traits,
+        variant,
         make_runtime_offset_dense_fwd_schedule(dense_params, runtime_offset),
         q_hbm,
         k_hbm,
         v_hbm,
         refs,
-        **body,
+        operands=VariantOperands(causal_offset=runtime_offset),
     )
 
 
@@ -174,10 +171,12 @@ def flash_attn_forward_runtime_offset(
     transposed_pv: bool,
     token_major: TokenMajorInfo | None,
     guard_threshold: float,
+    variant: Variant,
+    interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = False,
-    **body,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
+    variant.check_sinks_operand(None)
     offset = jnp.asarray(runtime_offset, jnp.int32).reshape(1)
     traits = qkv_fwd_traits(
         q,
@@ -199,9 +198,10 @@ def flash_attn_forward_runtime_offset(
         k,
         v,
         traits,
+        variant,
         kernel_name="flash_attn_mha_runtime_offset_fwd",
+        interpret=interpret,
         rotary=rotary,
-        **body,
     )
 
 
@@ -430,7 +430,7 @@ def make_flash_attn_mha(
                 right=right,
             )
         }
-        static_window = (None, None)
+        kernel_variant = variant.without_mask()
     else:
         forward = (
             flash_attn_forward_runtime_offset
@@ -452,7 +452,7 @@ def make_flash_attn_mha(
                 heads_outer_batch=heads_outer_batch,
             )
         }
-        static_window = (left, right)
+        kernel_variant = variant
     return partial(
         forward,
         **schedule_kwargs,
@@ -462,10 +462,6 @@ def make_flash_attn_mha(
         guard_threshold=guard_threshold,
         head_fold=head_fold,
         transposed_pv=transposed_pv,
-        window=static_window,
-        causal_offset=variant.causal_offset,
-        softcap=variant.log2_softcap,
-        return_lse=variant.return_lse,
         token_major=token_major,
-        q_scale=variant.q_scale,
+        variant=kernel_variant,
     )

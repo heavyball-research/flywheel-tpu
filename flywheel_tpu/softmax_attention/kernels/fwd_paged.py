@@ -39,7 +39,7 @@ from ..schedule import (
 )
 from ..softmax import overflow_guard_threshold
 from ..traits import PagedFwdTraits
-from ..variant import Variant
+from ..variant import Variant, VariantOperands
 
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.
@@ -58,16 +58,14 @@ def flash_fwd_varlen_paged_kernel(
     kv_scales_ref: jax.Array,
     *refs: jax.Array,
     traits: PagedFwdTraits,
-    has_sinks: bool,
+    variant: Variant,
     layout: ScheduleTableLayout,
     causal: bool,
     window_left: int | None,
     num_head_groups: int,
     q_heads_per_kv_head: int,
-    q_scale: float,
-    **body,
 ) -> None:
-    if has_sinks:
+    if variant.has_sinks:
         sinks_ref, q_hbm, kv_hbm, *refs = refs
     else:
         sinks_ref = None
@@ -88,17 +86,18 @@ def flash_fwd_varlen_paged_kernel(
     )
     # Note (david): K and V share the one merged cache operand. The K and V
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
+    q_scale, v_scale = variant.kv_scales(kv_scales_ref)
     fwd_body(
         traits,
+        variant,
         schedule,
         q_hbm,
         kv_hbm,
         kv_hbm,
         refs,
-        q_scale=q_scale * kv_scales_ref[0],
-        v_scale=kv_scales_ref[1],
-        sinks_ref=sinks_ref,
-        **body,
+        operands=VariantOperands(
+            q_scale=q_scale, v_scale=v_scale, sinks_ref=sinks_ref
+        ),
     )
 
 
@@ -364,6 +363,7 @@ def flash_attn_varlen_paged(
             "the paged kernel always reads K and V descales; build its Variant"
             " with has_kv_scales=True."
         )
+    variant.check_sinks_operand(sinks)
     causal = window_right == 0
     num_q_heads, total_q, head_dim = q.shape
     _, page_size, cache_heads, _ = kv_cache.shape
@@ -436,7 +436,6 @@ def flash_attn_varlen_paged(
         smem_operands.append(sinks.astype(jnp.float32) * LOG2E)
     kernel = partial(
         flash_fwd_varlen_paged_kernel,
-        has_sinks=sinks is not None,
         layout=layout,
         causal=causal,
         window_left=window_left,
@@ -450,16 +449,12 @@ def flash_attn_varlen_paged(
         kv_cache,
         None,
         traits,
-        return_lse=variant.return_lse,
+        # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
+        # softcap, so log2(e) rides in the tanh output scale.
+        variant.without_mask(),
         kernel_name="flash_attn_varlen_paged_fwd",
         interpret=interpret,
         rotary=padded_rotary,
-        window=(None, None),
-        causal_offset=0,
-        # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
-        # softcap, so log2(e) rides in the tanh output scale.
-        softcap=variant.log2_softcap,
-        q_scale=variant.q_scale,
     )
     if variant.return_lse:
         out, lse = outputs
