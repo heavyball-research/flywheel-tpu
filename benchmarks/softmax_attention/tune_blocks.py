@@ -211,6 +211,7 @@ class Flywheel:
                 num_stages=config["stages"],
                 qkv_layout=QKVLayout[config["qkv_layout"].upper()],
             ),
+            head_dim=cell.head_dim,
             num_kv_heads=cell.batch * cell.heads_k,
             head_fold=config["head_fold"],
             transposed_pv=config["transposed_pv"],

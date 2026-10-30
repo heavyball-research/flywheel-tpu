@@ -392,6 +392,7 @@ def _flash_attn_func_pcp_causal_offset(
             runtime_causal_offset=True,
         ),
         block_sizes=default_block_sizes(padded_q_len, padded_kv_len),
+        head_dim=head_dim,
         num_kv_heads=num_kv_heads,
         interpret=interpret,
         heads_outer_batch=1 if heads_outer_fold else None,

@@ -16,9 +16,7 @@ from .config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
-    BlockSizes,
     QKVLayout,
-    TokenMajorInfo,
     from_head_minor,
     hbm_bf16_tile_rows,
     vmem_limit_bytes,
@@ -2186,47 +2184,6 @@ def fwd_body(
         lax.fori_loop(0, num_fills, _fill_rows, None)
 
 
-def qkv_fwd_traits(
-    q: jax.Array,
-    v: jax.Array,
-    rotary: tuple[jax.Array, jax.Array | None] | None,
-    rotary_interleaved: bool,
-    *,
-    block_sizes: BlockSizes,
-    num_kv_heads: int,
-    head_fold: int,
-    transposed_pv: bool,
-    token_major: TokenMajorInfo | None,
-    is_per_seq: bool,
-    guard_threshold: float,
-) -> FwdTraits:
-    """The FwdTraits of a dense or varlen build: its statics, plus the flat q
-    heads and head widths of head-major or token-major q and v and the layout
-    of the rotary pair (rotary_fields)."""
-    if token_major is None:
-        num_q_heads, _, head_dim_qk = q.shape
-        head_dim_v = v.shape[-1]
-    else:
-        num_q_heads = (token_major.batch or 1) * token_major.num_q_heads
-        head_dim_qk, head_dim_v = (
-            token_major.head_dim_qk,
-            token_major.head_dim_v,
-        )
-    return FwdTraits(
-        block_sizes=block_sizes,
-        num_q_heads=num_q_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim_qk=head_dim_qk,
-        head_dim_v=head_dim_v,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
-        token_major=token_major,
-        is_per_seq=is_per_seq,
-        guard_threshold=guard_threshold,
-        **rotary_fields(rotary, rotary_interleaved),
-    )
-
-
 def rotary_fields(
     rotary: tuple[jax.Array, jax.Array | None] | None,
     rotary_interleaved: bool,
@@ -2360,6 +2317,20 @@ def forward_common(
     else:
         q_seq_len = q.shape[1]
 
+        if (
+            q.ndim != 3
+            or q.shape[0] != num_q_heads
+            or q.shape[2] != head_dim_qk
+        ):
+            raise ValueError(
+                f"'query' {q.shape} must be (num_q_heads={num_q_heads}, seq,"
+                f" head_dim={head_dim_qk})."
+            )
+        if v.ndim != 3 or v.shape[2] != head_dim_v:
+            raise ValueError(
+                f"'value' {v.shape} must be (num_kv_heads, seq,"
+                f" head_dim_v={head_dim_v})."
+            )
         if k.ndim != 3:
             raise ValueError(
                 f"Expected 3-dim 'key' tensor. Instead got a {k.ndim}-dim one."

@@ -631,6 +631,7 @@ def test_kernel_rejects_misshaped_sinks(entry):
             seqlen,
             variant=variant,
             block_sizes=blocks,
+            head_dim=128,
             interpret=INTERPRET,
         )
         q = jnp.zeros((batch * nheads, seqlen, 128), jnp.bfloat16)
@@ -642,6 +643,7 @@ def test_kernel_rejects_misshaped_sinks(entry):
             seqlen,
             variant=variant,
             block_sizes=blocks,
+            head_dim=128,
             interpret=INTERPRET,
             varlen_max_seqlen_kv=seqlen,
         )

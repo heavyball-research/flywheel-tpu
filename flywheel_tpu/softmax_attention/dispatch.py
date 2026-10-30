@@ -800,6 +800,8 @@ def get_kernel(
         seqlen_kv,
         variant=variant,
         block_sizes=block_sizes,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
         num_kv_heads=num_kv_heads,
         interpret=interpret,
         head_fold=kernel_head_fold,

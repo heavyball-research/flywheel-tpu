@@ -5,12 +5,12 @@ row each, and synthesizes its masks in-kernel: the sequence bounds plus the
 causal or window edges around each sequence's own bottom-right diagonal.
 """
 
+import dataclasses
 from functools import partial
 
 import jax
 
-from ..config import BlockSizes, QKVLayout, TokenMajorInfo
-from ..fwd_pipeline import forward_common, fwd_body, qkv_fwd_traits
+from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
 from ..schedule import (
     ScheduleTableLayout,
     VarlenSchedule,
@@ -29,7 +29,6 @@ def flash_fwd_varlen_kernel(
     variant: Variant,
     varlen_sched: VarlenSchedule,
     layout: ScheduleTableLayout,
-    num_head_groups: int,
 ) -> None:
     if variant.has_sinks:
         sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
@@ -39,7 +38,7 @@ def flash_fwd_varlen_kernel(
     schedule = make_per_seq_fwd_schedule(
         table_ref,
         layout=layout,
-        num_head_groups=num_head_groups,
+        num_head_groups=traits.num_head_groups,
         q_heads_per_kv_head=varlen_sched.q_heads_per_kv_head,
         padded_total_k=varlen_sched.padded_total_k,
         bq=traits.bq,
@@ -69,37 +68,16 @@ def flash_attn_forward_varlen(
     sinks: jax.Array | None = None,
     *,
     varlen_sched: VarlenSchedule,
-    block_sizes: BlockSizes,
-    num_kv_heads: int,
-    head_fold: int,
-    transposed_pv: bool,
-    token_major: TokenMajorInfo | None,
-    guard_threshold: float,
+    traits: FwdTraits,
     variant: Variant,
     interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
     rotary_interleaved: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     check_cu_seqlens_pair(cu_seqlens_k, cu_seqlens_q)
-    # Note (david): per-seq blocks address HBM at arbitrary token offsets, which
-    # only a second-minor (sublane) token axis supports.
-    if transposed_pv or block_sizes.qkv_layout != QKVLayout.HEAD_DIM_MINOR:
-        raise ValueError(
-            "the per-seq varlen schedule requires a HEAD_DIM_MINOR qkv_layout"
-            " and transposed_pv=False (token axis must stay second-minor)."
-        )
-    traits = qkv_fwd_traits(
-        q,
-        v,
-        rotary,
-        rotary_interleaved,
-        block_sizes=block_sizes,
-        num_kv_heads=num_kv_heads,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
-        token_major=token_major,
-        is_per_seq=True,
-        guard_threshold=guard_threshold,
+    assert traits.is_per_seq, traits
+    traits = dataclasses.replace(
+        traits, **rotary_fields(rotary, rotary_interleaved)
     )
     # Note (david): padding rows past cu_seqlens_q[-1] own no q block and come
     # back out = 0, lse = -inf, so they cost no attention; kv tokens past
@@ -109,9 +87,9 @@ def flash_attn_forward_varlen(
         cu_seqlens_q,
         cu_seqlens_k,
         varlen_sched=varlen_sched,
-        bq=block_sizes.block_q,
-        bkv=block_sizes.block_kv,
-        bkv_compute=block_sizes.block_kv_compute,
+        bq=traits.bq,
+        bkv=traits.bkv,
+        bkv_compute=traits.bkv_compute,
     )
     smem_operands = [table]
     variant.check_sinks_operand(sinks)
@@ -119,7 +97,9 @@ def flash_attn_forward_varlen(
         # Note (deepolar): packed rows carry no batch, so the flat q head is the
         # sequence head itself.
         num_seq_heads = (
-            q.shape[0] if token_major is None else token_major.num_q_heads
+            q.shape[0]
+            if traits.token_major is None
+            else traits.token_major.num_q_heads
         )
         if sinks.shape != (num_seq_heads,):
             raise ValueError(
@@ -129,10 +109,7 @@ def flash_attn_forward_varlen(
         smem_operands.append(variant.sink_logits(sinks))
 
     kernel = partial(
-        flash_fwd_varlen_kernel,
-        varlen_sched=varlen_sched,
-        layout=layout,
-        num_head_groups=traits.num_q_heads // head_fold,
+        flash_fwd_varlen_kernel, varlen_sched=varlen_sched, layout=layout
     )
     return forward_common(
         kernel,

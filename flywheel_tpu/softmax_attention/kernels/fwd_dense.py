@@ -1,5 +1,6 @@
 """Dense (batch) forward kernel and the forward kernel builder."""
 
+import dataclasses
 from collections.abc import Callable
 from functools import partial
 
@@ -14,7 +15,7 @@ from ..config import (
     QKVLayout,
     TokenMajorInfo,
 )
-from ..fwd_pipeline import forward_common, fwd_body, qkv_fwd_traits
+from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
 from ..schedule import (
     DenseFwdParams,
     VarlenSchedule,
@@ -87,12 +88,7 @@ def flash_attn_forward(
     sinks: jax.Array | None = None,
     *,
     dense_params: DenseFwdParams,
-    block_sizes: BlockSizes,
-    num_kv_heads: int,
-    head_fold: int,
-    transposed_pv: bool,
-    token_major: TokenMajorInfo | None,
-    guard_threshold: float,
+    traits: FwdTraits,
     variant: Variant,
     interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
@@ -104,29 +100,18 @@ def flash_attn_forward(
             sinks,
             q.shape[0],
             dense_params.heads_outer_batch,
-            token_major,
+            traits.token_major,
         )
     smem_operands = [] if sinks is None else [variant.sink_logits(sinks)]
-    traits = qkv_fwd_traits(
-        q,
-        v,
-        rotary,
-        rotary_interleaved,
-        block_sizes=block_sizes,
-        num_kv_heads=num_kv_heads,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
-        token_major=token_major,
-        is_per_seq=False,
-        guard_threshold=guard_threshold,
-    )
     return forward_common(
         partial(flash_fwd_kernel, dense_params=dense_params),
         smem_operands,
         q,
         k,
         v,
-        traits,
+        dataclasses.replace(
+            traits, **rotary_fields(rotary, rotary_interleaved)
+        ),
         variant,
         kernel_name="flash_attn_mha_static_t1_guarded_fwd",
         interpret=interpret,
@@ -164,12 +149,7 @@ def flash_attn_forward_runtime_offset(
     runtime_offset: jax.Array,
     *,
     dense_params: DenseFwdParams,
-    block_sizes: BlockSizes,
-    num_kv_heads: int,
-    head_fold: int,
-    transposed_pv: bool,
-    token_major: TokenMajorInfo | None,
-    guard_threshold: float,
+    traits: FwdTraits,
     variant: Variant,
     interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
@@ -177,26 +157,15 @@ def flash_attn_forward_runtime_offset(
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     variant.check_sinks_operand(None)
     offset = jnp.asarray(runtime_offset, jnp.int32).reshape(1)
-    traits = qkv_fwd_traits(
-        q,
-        v,
-        rotary,
-        rotary_interleaved,
-        block_sizes=block_sizes,
-        num_kv_heads=num_kv_heads,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
-        token_major=token_major,
-        is_per_seq=False,
-        guard_threshold=guard_threshold,
-    )
     return forward_common(
         partial(flash_fwd_runtime_offset_kernel, dense_params=dense_params),
         [offset],
         q,
         k,
         v,
-        traits,
+        dataclasses.replace(
+            traits, **rotary_fields(rotary, rotary_interleaved)
+        ),
         variant,
         kernel_name="flash_attn_mha_runtime_offset_fwd",
         interpret=interpret,
@@ -211,6 +180,8 @@ def make_flash_attn_mha(
     *,
     variant: Variant,
     block_sizes: BlockSizes,
+    head_dim: int,
+    head_dim_v: int | None = None,
     num_kv_heads: int | None = None,
     interpret: bool = False,
     head_fold: int = 1,
@@ -234,6 +205,8 @@ def make_flash_attn_mha(
 
     num_heads / num_kv_heads: per-row counts under token_major, flat otherwise;
       num_kv_heads=None is MHA and MQA is num_kv_heads=1.
+    head_dim / head_dim_v: the q/k and v head widths; head_dim_v=None is
+      head_dim. Under token_major they must be its widths.
     variant: the scale, softcap, mask and outputs. Under varlen its mask is
       bottom-right per sequence and its causal_offset must be 0;
       runtime_causal_offset is dense causal only, without a window.
@@ -294,6 +267,16 @@ def make_flash_attn_mha(
             " revisit a q slice while its rescale alpha is still pending."
         )
     is_varlen = varlen_max_seqlen_kv is not None
+    # Note (david): per-seq blocks address HBM at arbitrary token offsets, which
+    # only a second-minor (sublane) token axis supports.
+    if is_varlen and (
+        transposed_pv or block_sizes.qkv_layout != QKVLayout.HEAD_DIM_MINOR
+    ):
+        raise ValueError(
+            "the per-seq varlen schedule requires a HEAD_DIM_MINOR qkv_layout"
+            " and transposed_pv=False (token axis must stay second-minor)."
+        )
+    head_dim_v = head_dim if head_dim_v is None else head_dim_v
     if token_major is None:
         is_lane_paired = False
     else:
@@ -321,6 +304,15 @@ def make_flash_attn_mha(
                 f"token_major carries per-row heads ({token_major.num_q_heads},"
                 f" {token_major.num_kv_heads}) but the builder was given"
                 f" ({num_heads}, {expected_kv_heads})."
+            )
+        if (token_major.head_dim_qk, token_major.head_dim_v) != (
+            head_dim,
+            head_dim_v,
+        ):
+            raise ValueError(
+                f"token_major carries head widths ({token_major.head_dim_qk},"
+                f" {token_major.head_dim_v}) but the builder was given"
+                f" ({head_dim}, {head_dim_v})."
             )
         if token_major.batch is None and not is_varlen:
             raise ValueError(
@@ -417,27 +409,42 @@ def make_flash_attn_mha(
             " would be applied on top of it. Pass causal_offset=0."
         )
     left, right = variant.window
+    traits = FwdTraits(
+        block_sizes=block_sizes,
+        num_q_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim_qk=head_dim,
+        head_dim_v=head_dim_v,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+        token_major=token_major,
+        is_per_seq=is_varlen,
+        guard_threshold=guard_threshold,
+    )
 
     if is_varlen:
-        forward = flash_attn_forward_varlen
-        schedule_kwargs = {
-            "varlen_sched": VarlenSchedule(
+        return partial(
+            flash_attn_forward_varlen,
+            varlen_sched=VarlenSchedule(
                 padded_total_q=seqlen_q,
                 padded_total_k=seqlen_kv,
                 q_heads_per_kv_head=q_heads_per_kv_head,
                 left=left,
                 right=right,
-            )
-        }
-        kernel_variant = variant.without_mask()
+            ),
+            traits=traits,
+            variant=variant.without_mask(),
+            interpret=interpret,
+        )
     else:
         forward = (
             flash_attn_forward_runtime_offset
             if variant.runtime_causal_offset
             else flash_attn_forward
         )
-        schedule_kwargs = {
-            "dense_params": dense_fwd_params(
+        return partial(
+            forward,
+            dense_params=dense_fwd_params(
                 num_q_heads=num_q_heads,
                 head_fold=head_fold,
                 q_heads_per_kv_head=q_heads_per_kv_head,
@@ -449,18 +456,8 @@ def make_flash_attn_mha(
                 right=right,
                 offset=variant.causal_offset,
                 heads_outer_batch=heads_outer_batch,
-            )
-        }
-        kernel_variant = variant
-    return partial(
-        forward,
-        **schedule_kwargs,
-        block_sizes=block_sizes,
-        num_kv_heads=num_kv_heads,
-        interpret=interpret,
-        guard_threshold=guard_threshold,
-        head_fold=head_fold,
-        transposed_pv=transposed_pv,
-        token_major=token_major,
-        variant=kernel_variant,
-    )
+            ),
+            traits=traits,
+            variant=variant,
+            interpret=interpret,
+        )
