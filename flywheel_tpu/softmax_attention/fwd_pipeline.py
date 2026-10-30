@@ -12,8 +12,6 @@ from jax.experimental.pallas import tpu as pltpu
 from ..core.tiling import round_up
 from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
 from .config import (
-    NN_DIM_NUMBERS,
-    NT_DIM_NUMBERS,
     QKVLayout,
     from_head_minor,
     hbm_bf16_tile_rows,
@@ -25,8 +23,6 @@ from .fwd_blocks import (
     NUM_O_SLOTS,
     NUM_PENDING_FIELDS,
     NUM_SEMS,
-    PENDING_READ_PARITY,
-    PENDING_ROW_START,
     PENDING_WRITE_PARITY,
     SEM_LSE,
     SEM_OUT,
@@ -34,21 +30,25 @@ from .fwd_blocks import (
     KVBlock,
     KVRefs,
     PagedKVRefs,
+    PendingPVRefs,
     QRefs,
     RowFinish,
     RowStateRefs,
     ScoreMask,
+    cancel_pending_pv,
+    carry_out_pv,
     flag_overflow_risk,
     fold_lane,
+    fragment_pv,
+    issue_pending_pv,
     online_softmax,
+    pending_fragment,
     qk,
     rotate_staged,
     set_half,
     start_kv_block,
     start_paged_kv_block,
     start_q_row,
-    take_half,
-    tile_parity,
     unpack_paged_block,
     wait_kv_block,
     wait_paged_kv_block,
@@ -99,7 +99,6 @@ def fwd_body(
     bq, bkv = traits.bq, traits.bkv
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     num_stages = traits.num_stages
-    is_head_dim_minor = traits.is_head_dim_minor
     o_layout = traits.o_layout
     transposed_pv = traits.transposed_pv
     token_major = traits.token_major
@@ -115,7 +114,6 @@ def fwd_body(
     q_heads_per_row = traits.q_heads_per_row
     lane_width_v = traits.lane_width_v
     is_lane_paired = traits.is_lane_paired
-    heads_per_lane_tile = traits.heads_per_lane_tile
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     variant.check_operands(operands)
     return_lse = variant.return_lse
@@ -171,6 +169,9 @@ def fwd_body(
         o=o_scratch,
         parity=parity_smem,
         guard=guard_smem,
+    )
+    pending = PendingPVRefs(
+        probs=pending_probs, v=pending_v, fields=pending_smem
     )
     q_refs = QRefs(
         hbm=q_hbm,
@@ -344,114 +345,7 @@ def fwd_body(
         else:
             wait_kv_block(traits, kv_refs, slot)
 
-    def _pv(
-        g,
-        q_compute_index,
-        probs,
-        v_tile,
-        is_row_start,
-        rescale,
-        write_parity,
-        read_parity,
-    ):
-        """v_tile is the kv refs' v_tile operand, and rescale the fragment's
-        recovery rescale (None on the ordinary pass). The PV of a fragment
-        reads o from read_parity and writes it to write_parity."""
-        head_rows = pl.ds(g * group_bq, group_bq)
-        v_half = g % heads_per_lane_tile if is_lane_paired else None
-
-        if is_paged:
-            o_curr = lax.dot_general(
-                probs,
-                v_tile,
-                NN_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-        elif is_head_dim_minor:
-            o_curr = lax.dot_general(
-                probs,
-                take_half(v_tile, v_half, lane_width_v),
-                NN_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-        elif transposed_pv:
-            # Note (david): contracting the SEQ_MINOR (head_dim, bkv_compute) v
-            # slab against probs yields o^T and fills the MXU's K and N dims
-            # with bkv_compute and bq_compute instead of capping N at head_dim.
-            o_curr = lax.dot_general(
-                v_tile,
-                probs,
-                NT_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-        else:
-            o_curr = lax.dot_general(
-                probs,
-                v_tile,
-                NT_DIM_NUMBERS,
-                preferred_element_type=jnp.float32,
-            )
-
-        slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
-        if transposed_pv:
-            # Note (david): q is the lane axis of the transposed o scratch, and
-            # Mosaic only slices lanes dynamically at an offset that is static
-            # per unrolled copy, as q_compute_index is.
-            o_new_ref = o_scratch.at[write_parity, :, head_rows]
-            o_read_ref = o_scratch.at[read_parity, :, head_rows]
-            tile_index = (slice(None), slice_q)
-        else:
-            o_new_ref = o_scratch.at[write_parity, head_rows]
-            o_read_ref = o_scratch.at[read_parity, head_rows]
-            tile_index = (slice_q, slice(None))
-        o_read = o_read_ref[tile_index]
-        if rescale is None:
-            o_prev = o_read
-        elif transposed_pv:
-            # Note (david): every lane of the rescale holds the row value, so
-            # lane 0 transposed to (1, bq_compute) broadcasts over the
-            # head_dim_v sublanes without any lane tiling.
-            o_prev = rescale[:, 0:1].T * o_read
-        else:
-            o_prev = (
-                jnp.tile(rescale, (1, head_dim_v_repeats))[
-                    ..., : o_scratch.shape[-1]
-                ]
-                * o_read
-            )
-        o_new_ref[tile_index] = jnp.where(is_row_start, o_curr, o_prev + o_curr)
-
-    # Note (david): the mask-free copy leaves its last fragment's PV pending in
-    # scratch (a pl.when copy returns no values), and the next block's copy
-    # issues it after its own first QK and softmax, so the MXU never drains
-    # between blocks. Two row-state parities still suffice: block k's pending PV
-    # writes block k's new parity before block k + 1 reads it, and block k's
-    # replay runs inside block k's copy; a replay of the last head redoes the
-    # pending fragment, so it cancels the pending PV. Under defers_row_finish
-    # every copy carries its last PV out and a row's output finish runs after
-    # the next row's first block, so rows alternate parity to keep the finished
-    # row's state intact until then.
-    pending_g, pending_k, pending_q = (
-        head_fold - 1,
-        num_k_compute_tiles - 1,
-        num_q_compute_tiles - 1,
-    )
-
-    def _issue_pending_pv():
-        _pv(
-            pending_g,
-            pending_q,
-            pending_probs[...],
-            pending_v[...],
-            pending_smem[PENDING_ROW_START] > 0,
-            None,
-            write_parity=pending_smem[PENDING_WRITE_PARITY],
-            read_parity=pending_smem[PENDING_READ_PARITY],
-        )
-
-    def _cancel_pending_pv():
-        pending_smem[PENDING_WRITE_PARITY] = TRASH_PARITY
-        pending_smem[PENDING_READ_PARITY] = TRASH_PARITY
+    pending_g, pending_k, _ = pending_fragment(traits)
 
     def _block_step(si, kv, lo, hi, ctx, row, ahead, carry):
         """One kv block of row si. ahead holds the descriptors of the next row's
@@ -556,29 +450,8 @@ def fwd_body(
                 **flags,
             )
 
-        def _block_pv(
-            g,
-            kv_compute_index,
-            q_compute_index,
-            probs,
-            is_row_start,
-            rescale,
-            is_tile_zero=None,
-        ):
-            """is_tile_zero as in online_softmax."""
-            new_parity, old_parity = state.block_parities()
-            _pv(
-                g,
-                q_compute_index,
-                probs,
-                kv_refs.v_tile(traits, g, kv_compute_index, kv_slot),
-                is_row_start,
-                rescale,
-                write_parity=new_parity,
-                read_parity=tile_parity(
-                    kv_compute_index, is_tile_zero, new_parity, old_parity
-                ),
-            )
+        def _block_pv(*fragment):
+            fragment_pv(traits, state, kv_refs, block, *fragment)
 
         def _carry_out_pv(
             probs,
@@ -586,20 +459,16 @@ def fwd_body(
             kv_compute_index=pending_k,
             is_tile_zero=num_k_compute_tiles == 1,
         ):
-            """Leave the PV of the block's last fragment (head pending_g, q tile
-            pending_q, kv tile kv_compute_index) to the next block; is_tile_zero
-            as in online_softmax."""
-            new_parity, old_parity = state.block_parities()
-            pending_probs[...] = probs
-            pending_v[...] = kv_refs.v_tile(
-                traits, pending_g, kv_compute_index, kv_slot
-            )
-            pending_smem[PENDING_WRITE_PARITY] = new_parity
-            pending_smem[PENDING_READ_PARITY] = tile_parity(
-                kv_compute_index, is_tile_zero, new_parity, old_parity
-            )
-            pending_smem[PENDING_ROW_START] = jnp.asarray(
-                is_row_start, jnp.int32
+            carry_out_pv(
+                traits,
+                state,
+                pending,
+                kv_refs,
+                block,
+                probs,
+                is_row_start,
+                kv_compute_index,
+                is_tile_zero,
             )
 
         def _run_schedule(
@@ -620,9 +489,9 @@ def fwd_body(
 
             def _after_first_softmax():
                 if takes_pending:
-                    _issue_pending_pv()
+                    issue_pending_pv(traits, state, pending)
                     if not carries_out:
-                        _cancel_pending_pv()
+                        cancel_pending_pv(pending)
 
             # Note (david): static_g None is the fast path, one distance-1
             # pipeline across every folded head so head g + 1's first QK
@@ -955,7 +824,7 @@ def fwd_body(
                         skips_dead_tiles=skips_dead_tiles,
                     )
                     if g == pending_g:
-                        _cancel_pending_pv()
+                        cancel_pending_pv(pending)
 
         def _stage_bounds():
             # Note (david): synthesize the bounds rows once for the whole (1,
@@ -1512,9 +1381,9 @@ def fwd_body(
 
             @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
             def _drain_pending_pv():
-                _issue_pending_pv()
+                issue_pending_pv(traits, state, pending)
 
-            _cancel_pending_pv()
+            cancel_pending_pv(pending)
             _finish_row_out(finish)
             next_row_state = ()
         next_prev_out_tok = q_tok if is_per_seq else prev_out_tok
@@ -1528,7 +1397,7 @@ def fwd_body(
             next_row_state,
         )
 
-    _cancel_pending_pv()
+    cancel_pending_pv(pending)
     first_desc, second_desc, _ = _first_two_blocks(jnp.int32(0), jnp.int32(0))
     _start_block_data(first_desc, 0)
     is_second_fresh = _is_fresh(second_desc, first_desc).astype(jnp.int32)
@@ -1587,9 +1456,9 @@ def fwd_body(
 
         @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
         def _drain_last_pending_pv():
-            _issue_pending_pv()
+            issue_pending_pv(traits, state, pending)
 
-        _cancel_pending_pv()
+        cancel_pending_pv(pending)
 
         @pl.when(last_row_finish.is_live > 0)
         def _finish_last_row():

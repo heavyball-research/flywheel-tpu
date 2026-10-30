@@ -1040,3 +1040,210 @@ def online_softmax(
             traits, state, g, row_sum_new, kv_compute_index == last_kv_tile
         )
     return probs, is_row_start, rescale
+
+
+def pv(
+    traits: FwdTraits,
+    state: RowStateRefs,
+    g: jax.Array | int,
+    q_compute_index: jax.Array | int,
+    probs: jax.Array,
+    v_tile: jax.Array,
+    is_row_start: jax.Array,
+    rescale: jax.Array | None,
+    *,
+    write_parity: jax.Array,
+    read_parity: jax.Array,
+) -> None:
+    """Accumulate a fragment's probs @ V into pipeline head g's o rows of q
+    compute tile q_compute_index.
+
+    v_tile is the kv refs' v_tile operand, and rescale the fragment's
+    recovery rescale (None on the ordinary pass). The PV of a fragment reads
+    o from read_parity and writes it to write_parity.
+    """
+    group_bq, frag_rows = traits.group_bq, traits.frag_rows
+    transposed_pv = traits.transposed_pv
+    o_scratch = state.o
+    head_rows = pl.ds(g * group_bq, group_bq)
+    v_half = g % traits.heads_per_lane_tile if traits.is_lane_paired else None
+
+    if traits.is_paged:
+        o_curr = lax.dot_general(
+            probs,
+            v_tile,
+            NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+    elif traits.is_head_dim_minor:
+        o_curr = lax.dot_general(
+            probs,
+            take_half(v_tile, v_half, traits.lane_width_v),
+            NN_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+    elif transposed_pv:
+        # Note (david): contracting the SEQ_MINOR (head_dim, bkv_compute) v
+        # slab against probs yields o^T and fills the MXU's K and N dims
+        # with bkv_compute and bq_compute instead of capping N at head_dim.
+        o_curr = lax.dot_general(
+            v_tile,
+            probs,
+            NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+    else:
+        o_curr = lax.dot_general(
+            probs,
+            v_tile,
+            NT_DIM_NUMBERS,
+            preferred_element_type=jnp.float32,
+        )
+
+    slice_q = pl.ds(q_compute_index * frag_rows, frag_rows)
+    if transposed_pv:
+        # Note (david): q is the lane axis of the transposed o scratch, and
+        # Mosaic only slices lanes dynamically at an offset that is static
+        # per unrolled copy, as q_compute_index is.
+        o_new_ref = o_scratch.at[write_parity, :, head_rows]
+        o_read_ref = o_scratch.at[read_parity, :, head_rows]
+        tile_index = (slice(None), slice_q)
+    else:
+        o_new_ref = o_scratch.at[write_parity, head_rows]
+        o_read_ref = o_scratch.at[read_parity, head_rows]
+        tile_index = (slice_q, slice(None))
+    o_read = o_read_ref[tile_index]
+    if rescale is None:
+        o_prev = o_read
+    elif transposed_pv:
+        # Note (david): every lane of the rescale holds the row value, so
+        # lane 0 transposed to (1, bq_compute) broadcasts over the
+        # head_dim_v sublanes without any lane tiling.
+        o_prev = rescale[:, 0:1].T * o_read
+    else:
+        o_prev = (
+            jnp.tile(rescale, (1, traits.head_dim_v_repeats))[
+                ..., : o_scratch.shape[-1]
+            ]
+            * o_read
+        )
+    o_new_ref[tile_index] = jnp.where(is_row_start, o_curr, o_prev + o_curr)
+
+
+def fragment_pv(
+    traits: FwdTraits,
+    state: RowStateRefs,
+    kv_refs: KVRefs | PagedKVRefs,
+    block: KVBlock,
+    g: jax.Array | int,
+    kv_compute_index: jax.Array | int,
+    q_compute_index: jax.Array | int,
+    probs: jax.Array,
+    is_row_start: jax.Array,
+    rescale: jax.Array | None,
+    is_tile_zero: bool | None = None,
+) -> None:
+    """The PV of one of block's fragments, from the online_softmax that
+    returned probs, is_row_start and rescale; is_tile_zero as in
+    online_softmax."""
+    new_parity, old_parity = state.block_parities()
+    pv(
+        traits,
+        state,
+        g,
+        q_compute_index,
+        probs,
+        kv_refs.v_tile(traits, g, kv_compute_index, block.kv_slot),
+        is_row_start,
+        rescale,
+        write_parity=new_parity,
+        read_parity=tile_parity(
+            kv_compute_index, is_tile_zero, new_parity, old_parity
+        ),
+    )
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class PendingPVRefs:
+    """The PV a block leaves to the next one: its (frag_rows, bkv_compute)
+    f32 probs, its V tile and the SMEM (NUM_PENDING_FIELDS,) int32 fields
+    (write parity, read parity, row start), whose parities are TRASH_PARITY
+    when no PV is pending."""
+
+    probs: jax.Array
+    v: jax.Array
+    fields: jax.Array
+
+
+# Note (david): the mask-free copy leaves its last fragment's PV pending in
+# scratch (a pl.when copy returns no values), and the next block's copy
+# issues it after its own first QK and softmax, so the MXU never drains
+# between blocks. Two row-state parities still suffice: block k's pending PV
+# writes block k's new parity before block k + 1 reads it, and block k's
+# replay runs inside block k's copy; a replay of the last head redoes the
+# pending fragment, so it cancels the pending PV. Under defers_row_finish
+# every copy carries its last PV out and a row's output finish runs after
+# the next row's first block, so rows alternate parity to keep the finished
+# row's state intact until then.
+def pending_fragment(traits: FwdTraits) -> tuple[int, int, int]:
+    """The (pipeline head, kv compute tile, q compute tile) of a block's last
+    fragment, whose PV a copy leaves pending."""
+    return (
+        traits.head_fold - 1,
+        traits.num_k_compute_tiles - 1,
+        traits.num_q_compute_tiles - 1,
+    )
+
+
+def issue_pending_pv(
+    traits: FwdTraits, state: RowStateRefs, pending: PendingPVRefs
+) -> None:
+    """Run the pending PV; an empty one reads and writes the trash o slot."""
+    pending_g, _, pending_q = pending_fragment(traits)
+    fields = pending.fields
+    pv(
+        traits,
+        state,
+        pending_g,
+        pending_q,
+        pending.probs[...],
+        pending.v[...],
+        fields[PENDING_ROW_START] > 0,
+        None,
+        write_parity=fields[PENDING_WRITE_PARITY],
+        read_parity=fields[PENDING_READ_PARITY],
+    )
+
+
+def cancel_pending_pv(pending: PendingPVRefs) -> None:
+    """Empty the pending PV: point both of its parities at the trash slot."""
+    pending.fields[PENDING_WRITE_PARITY] = TRASH_PARITY
+    pending.fields[PENDING_READ_PARITY] = TRASH_PARITY
+
+
+def carry_out_pv(
+    traits: FwdTraits,
+    state: RowStateRefs,
+    pending: PendingPVRefs,
+    kv_refs: KVRefs | PagedKVRefs,
+    block: KVBlock,
+    probs: jax.Array,
+    is_row_start: jax.Array,
+    kv_compute_index: jax.Array | int,
+    is_tile_zero: bool | None,
+) -> None:
+    """Leave the PV of block's last fragment (pending_fragment's head and q
+    tile, kv tile kv_compute_index) to the next block; is_tile_zero as in
+    online_softmax."""
+    pending_g, _, _ = pending_fragment(traits)
+    fields = pending.fields
+    new_parity, old_parity = state.block_parities()
+    pending.probs[...] = probs
+    pending.v[...] = kv_refs.v_tile(
+        traits, pending_g, kv_compute_index, block.kv_slot
+    )
+    fields[PENDING_WRITE_PARITY] = new_parity
+    fields[PENDING_READ_PARITY] = tile_parity(
+        kv_compute_index, is_tile_zero, new_parity, old_parity
+    )
+    fields[PENDING_ROW_START] = jnp.asarray(is_row_start, jnp.int32)
