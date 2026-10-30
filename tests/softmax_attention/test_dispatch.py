@@ -9,8 +9,8 @@ import pytest
 from flywheel_tpu import flash_attn_with_kvcache
 from flywheel_tpu.core import tuning
 from flywheel_tpu.softmax_attention import dispatch
-from tests.test_flash_attn import INTERPRET, generate_block_kvcache
-from tests.test_util import merge_kv_heads, randn
+from tests.softmax_attention.test_prefill import INTERPRET, generate_block_kvcache
+from tests.softmax_attention.util import merge_kv_heads, randn
 
 # A TPU v7 decode entry, and the same shape at a batch with no entry.
 TUNED_DECODE = dict(

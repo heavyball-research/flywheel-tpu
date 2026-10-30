@@ -17,8 +17,8 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from tests.padding import pad_input, unpad_input
-from tests.test_util import (
+from tests.softmax_attention.padding import pad_input, unpad_input
+from tests.softmax_attention.util import (
     apply_rotary_emb,
     attention_ref,
     generate_qkv,

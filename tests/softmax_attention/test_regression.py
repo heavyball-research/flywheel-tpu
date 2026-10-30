@@ -1,4 +1,4 @@
-"""Regression tests for kernel paths the random grids of test_flash_attn.py do
+"""Regression tests for kernel paths the random grids of test_prefill.py do
 not reach: dense and packed flash_attn_func / flash_attn_varlen_func, and
 single-token decode through flash_attn_with_kvcache."""
 
@@ -15,7 +15,7 @@ from flywheel_tpu.core.tiling import next_pow2
 from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
 from flywheel_tpu.softmax_attention.inputs import fused_q_scale, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha
-from tests.test_util import attention_ref, randn
+from tests.softmax_attention.util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
 
@@ -31,7 +31,7 @@ def max_abs(x):
 
 
 def assert_output_close(out, q, k, v, rows=slice(None), **mask_kwargs):
-    """test_flash_attn.py's rule: at most twice the error of the bf16 reference
+    """test_prefill.py's rule: at most twice the error of the bf16 reference
     with reordered ops, plus the rounding of arithmetic on the f32 reference."""
     out_ref, _ = attention_ref(q, k, v, **mask_kwargs)
     out_bf16, _ = attention_ref(
@@ -290,7 +290,7 @@ def random_sinks(nheads):
 
 def assert_lse_close(lse, q, k, v, **mask_kwargs):
     """lse (batch, nheads, seqlen_q) against the f32 reference, by the out rule
-    plus test_flash_attn.py's fixed 1e-2."""
+    plus test_prefill.py's fixed 1e-2."""
     _, lse_ref = attention_ref(q, k, v, **mask_kwargs)
     _, lse_bf16 = attention_ref(
         q, k, v, upcast=False, reorder_ops=True, **mask_kwargs
