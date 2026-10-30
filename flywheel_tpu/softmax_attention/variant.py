@@ -12,7 +12,9 @@ Variant: it stages Q and K rather than transforming scores.
 fwd_body calls the hooks at fixed points: transform_q on each staged Q tile,
 transform_logits on each QK fragment, mask_logits where the static mask
 applies, fold_sink and lse at a row's end, and output_scale where the output
-is normalized.
+is normalized. The decode kernel (kernels/decode.py) calls transform_logits on
+each score fragment and fold_sink at a row's end; its caller scales Q, and it
+keeps its own window mask, output scale and lse, whose op order differs.
 """
 
 import dataclasses

@@ -38,7 +38,7 @@ from ..kv_layout import (
     resolve_merged_kv_heads,
     staged_words,
 )
-from ..softmax import fold_sink, overflow_guard_threshold
+from ..softmax import overflow_guard_threshold
 from ..variant import Variant
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
@@ -219,18 +219,16 @@ def kvcache_kernel(
     num_kv_stages: int,
     is_cache_head_major: bool,
     is_bitcast_load: bool,
-    return_lse: bool,
     has_new: bool,
-    left: int | None,
     query_tokens: int,
-    causal: bool,
-    log2_softcap: float,
     guard_threshold: float,
     page_size: int | None,
     pages_per_seq: int | None,
     is_merged_cache: bool,
-    has_sinks: bool,
+    variant: Variant,
 ) -> None:
+    return_lse = variant.return_lse
+    left, right = variant.window
     remaining_refs = list(refs)
     block_table_ref = remaining_refs.pop(0) if page_size is not None else None
     num_active = num_active_ref[0]
@@ -250,7 +248,7 @@ def kvcache_kernel(
             *remaining_refs,
         ) = remaining_refs
         new_kv_ref = None
-    sinks_ref = remaining_refs.pop(0) if has_sinks else None
+    sinks_ref = remaining_refs.pop(0) if variant.has_sinks else None
     if is_merged_cache:
         out_ref, k_out_ref, *remaining_refs = remaining_refs
         v_out_ref = None
@@ -347,7 +345,7 @@ def kvcache_kernel(
     # Note (david): a folded window lays a KV head's rows out token by token, so
     # row r is window token t = r // group, which causal stops
     # query_tokens - 1 - t keys short of total_len.
-    if causal and query_tokens > 1:
+    if right == 0 and query_tokens > 1:
         row_key_offset = lax.broadcasted_iota(
             jnp.int32, (rows_per_fragment, fragment_keys), 0
         ) % query_heads_per_kv_head // (
@@ -596,7 +594,7 @@ def kvcache_kernel(
         return first_key, first_key // block_kv, pl.cdiv(total_len, block_kv)
 
     # Note (deepolar): every sequence folds the same sinks, so they load once.
-    sinks = sinks_ref[...] if has_sinks else None
+    sinks = sinks_ref[...] if variant.has_sinks else None
 
     def _process_sequence(local_batch_index, sequence_carry):
         initial_slot, is_first_prefetched = sequence_carry
@@ -694,10 +692,7 @@ def kvcache_kernel(
             # Note (david): Q carries softmax_scale / softcap, so log2(e) rides
             # in the tanh output scale. The cap runs before the mask, since tanh
             # would lift a masked -inf to -softcap.
-            if log2_softcap:
-                capped_scores = jnp.tanh(scores) * log2_softcap
-            else:
-                capped_scores = scores
+            capped_scores = variant.transform_logits(scores)
             scores = jnp.where(is_valid, capped_scores, -jnp.inf)
 
             if left is None:
@@ -1134,7 +1129,9 @@ def kvcache_kernel(
         else:
             # Note (deepolar): fold_sink is the prefill and extend kernels'
             # fold; a row with nothing to attend returns out = 0 and lse = sink.
-            row_max, row_sum, out_scale = fold_sink(row_max, row_sum, sinks)
+            row_max, row_sum, out_scale = variant.fold_sink(
+                row_max, row_sum, sinks
+            )
             inverse_row_sum = out_scale * v_scale_ref[0]
         out_buffers[output_slot] = (
             accumulator_ref[...].astype(jnp.float32)
@@ -1568,17 +1565,13 @@ def flash_attn_kvcache_pallas(
         num_kv_stages=num_kv_stages,
         is_cache_head_major=is_cache_head_major,
         is_bitcast_load=is_bitcast_load,
-        return_lse=return_lse,
         has_new=has_new,
-        left=left,
         query_tokens=query_tokens,
-        causal=right == 0,
-        log2_softcap=variant.log2_softcap,
         guard_threshold=guard_threshold,
         page_size=page_size,
         pages_per_seq=pages_per_seq,
         is_merged_cache=merged_cache,
-        has_sinks=variant.has_sinks,
+        variant=variant,
     )
     # Note (deepolar): the sinks follow the caches, so the alias indices above
     # stay put; they arrive in log2 units, broadcast over the row-state lanes.
