@@ -9,7 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import pick_tile, round_up
+from ...core.tiling import round_up
 from ...core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
 from ..bwd_pipeline import (
     DQ_DIM_NUMBERS,
@@ -26,17 +26,16 @@ from ..bwd_pipeline import (
     bwd_body,
     bwd_out_shape,
     call_bwd,
-    default_bwd_block,
 )
 from ..config import (
     DEFAULT_MASK_VALUE,
     LOG2E,
-    MIN_NUM_STAGES,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     PAIRED_HEAD_DIM,
+    BlockSizes,
+    QKVLayout,
     TokenMajorInfo,
-    TunedConfig,
 )
 from ..dma import advance, drain, hbm_tm_slice
 from ..mask import apply_causal_kv_major
@@ -56,17 +55,6 @@ DQ_ACC_VMEM_LIMIT_BYTES: int | None = None
 # whole-scratch cap stays below the scoped limit to leave room for the
 # pipeline's live temporaries: 80 MiB of v6e's 100 MiB.
 FOLD_VMEM_LIMIT_FRACTION = 0.8
-
-# Note (david): the head-fold gain saturates by about 8 heads. The single-block
-# kernel halves its target past FULL_FOLD_MAX_BLOCK so the fold-scaled buffers
-# still fit VMEM.
-MAX_SINGLE_BLOCK_HEAD_FOLD = 8
-FULL_FOLD_MAX_BLOCK = 512
-
-# Note (david): a flat min(bkv, 256) breaks a bkv like 384, so the kv compute
-# tile is the largest of these dividing bkv; bkv % NUM_SUBLANES == 0 makes the
-# search always hit.
-BKV_COMPUTE_CANDIDATES = (256, 128, 64, 32, 16, 8)
 
 
 def fold_vmem_bytes(
@@ -417,7 +405,7 @@ def flash_attn_bwd_q_chunked(
     do: jax.Array,
     *,
     chunk_rows: int,
-    block_kv: int,
+    block_sizes: BlockSizes,
     causal: bool,
     causal_offset: int,
     **knobs: int | float | bool | None,
@@ -445,7 +433,9 @@ def flash_attn_bwd_q_chunked(
             dq_chunks.append(jnp.zeros_like(q[..., start:stop, :]))
             continue
         if causal:
-            kv_stop = min(kv_seq_len, round_up(stop + causal_offset, block_kv))
+            kv_stop = min(
+                kv_seq_len, round_up(stop + causal_offset, block_sizes.block_kv)
+            )
             chunk_causal_offset = causal_offset + start
         else:
             kv_stop = kv_seq_len
@@ -459,7 +449,7 @@ def flash_attn_bwd_q_chunked(
             do[..., start:stop, :],
             causal=causal,
             causal_offset=chunk_causal_offset,
-            block_kv=block_kv,
+            block_sizes=block_sizes,
             **knobs,
         )
         dq_chunks.append(chunk_dq)
@@ -480,19 +470,14 @@ def flash_attn_bwd(
     lse: jax.Array,
     do: jax.Array,
     *,
+    block_sizes: BlockSizes,
+    head_fold: int | None,
     causal: bool = False,
     causal_offset: int = 0,
     softmax_scale: float | None = None,
-    block: int | None = None,
-    block_kv: int | None = None,
-    block_q_compute: int | None = None,
-    block_kv_compute: int | None = None,
-    head_fold: int | None = None,
-    num_stages: int | None = None,
     interpret: bool = False,
     token_major: bool = False,
     head_dim: int | None = None,
-    tuned_config: TunedConfig | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Splash-attention backward -> (dq, dk, dv), laid out like q, k and v.
 
@@ -505,20 +490,14 @@ def flash_attn_bwd(
 
     The causal mask keeps q_idx + causal_offset >= kv_idx.
 
-    head_fold heads share one schedule step: an explicit MHA fold runs the
-    single-block kernel (square, zero offset, block == seq_len). GQA/MQA always
-    folds each kv head's q heads and rejects an explicit head_fold.
-    tuned_config, the entry dispatch.resolve_tuned_bwd_config found for this
-    build, sets block, block_kv, block_q_compute, block_kv_compute, head_fold
-    and num_stages together, so they must all be None with it. A build whose
-    f32 dq accumulator overflows VMEM runs as q-row chunks.
+    block_sizes (head-dim-minor) and head_fold are the build's, which
+    dispatch.resolve_bwd_config picks. head_fold heads share one schedule
+    step: an MHA fold > 1 runs the single-block kernel (square, zero offset,
+    block_q == seq_len). GQA/MQA always folds each kv head's q heads and takes
+    head_fold=None. A build whose f32 dq accumulator overflows VMEM runs as
+    q-row chunks.
     """
-    if num_stages is not None and (
-        type(num_stages) is not int or num_stages < MIN_NUM_STAGES
-    ):
-        raise ValueError(
-            f"num_stages must be at least {MIN_NUM_STAGES}; got {num_stages!r}."
-        )
+    assert block_sizes.qkv_layout == QKVLayout.HEAD_DIM_MINOR, block_sizes
     if token_major:
         if (
             head_dim is None
@@ -654,6 +633,11 @@ def flash_attn_bwd(
             f" head's {num_heads // num_kv_heads} q heads into one group; got"
             f" {head_fold=}."
         )
+    if not is_gqa and head_fold is None:
+        raise ValueError(
+            "an MHA backward takes the head_fold dispatch.resolve_bwd_config"
+            " picks; got None."
+        )
 
     if softmax_scale is None:
         scale = 1.0 / math.sqrt(head_dim_qk)
@@ -661,47 +645,8 @@ def flash_attn_bwd(
         scale = softmax_scale
 
     is_rectangular = q_seq_len != kv_seq_len
-    # Note (david): only a caller-chosen fold raises when illegal; the tuned
-    # table's and this function's own picks get clamped instead.
-    is_explicit_head_fold = head_fold is not None
-    # Note (david): the block knobs, head_fold and num_stages are co-tuned
-    # (head_fold > 1 needs block == seq_len, block_kv_compute must divide
-    # block), so the table applies only when all of them are unset. It is keyed
-    # on square, zero-offset MHA shapes.
-    if tuned_config is not None and any(
-        knob is not None
-        for knob in (
-            block,
-            block_kv,
-            block_q_compute,
-            block_kv_compute,
-            head_fold,
-            num_stages,
-        )
-    ):
-        raise ValueError(
-            "tuned_config sets block, block_kv, block_q_compute,"
-            " block_kv_compute, head_fold and num_stages together; pass it"
-            " with all of them None."
-        )
-    if tuned_config is None:
-        num_stages = MIN_NUM_STAGES if num_stages is None else num_stages
-    else:
-        (
-            block,
-            block_kv,
-            block_q_compute,
-            block_kv_compute,
-            num_stages,
-            head_fold,
-            qkv_layout_name,
-            is_transposed_pv,
-        ) = tuned_config
-        assert (
-            qkv_layout_name == "head_dim_minor" and not is_transposed_pv
-        ), tuned_config
-
-    bq = default_bwd_block(q_seq_len) if block is None else block
+    num_stages = block_sizes.num_stages
+    bq = block_sizes.block_q
     # Note (david): lse/di put seq on the lane axis, so a per-block slice at
     # qi * bq is only tile-aligned when bq is a multiple of NUM_LANES.
     if bq % NUM_LANES:
@@ -710,14 +655,14 @@ def flash_attn_bwd(
         raise ValueError(f"block {bq} must divide q_seq_len {q_seq_len}.")
     num_q_blocks = q_seq_len // bq
 
-    bq_compute = bq if block_q_compute is None else block_q_compute
+    bq_compute = block_sizes.block_q_compute
     if bq_compute % NUM_LANES or bq % bq_compute:
         raise ValueError(
             f"block_q_compute {bq_compute} must be a multiple of {NUM_LANES}"
             f" and divide block {bq}."
         )
 
-    bkv = default_bwd_block(kv_seq_len) if block_kv is None else block_kv
+    bkv = block_sizes.block_kv
     if bkv % NUM_SUBLANES:
         raise ValueError(
             f"block_kv {bkv} must be a multiple of {NUM_SUBLANES}."
@@ -731,83 +676,29 @@ def flash_attn_bwd(
     if is_gqa:
         # Note (david): a GQA/MQA schedule group is one kv head plus its q
         # heads, so the q-side fold is the group itself.
-        resolved_head_fold = num_heads // num_kv_heads
-    elif head_fold is not None:
-        resolved_head_fold = head_fold
+        head_fold = num_heads // num_kv_heads
     elif (
-        is_rectangular
-        or causal_offset != 0
-        or num_q_blocks != 1
-        or head_dim_v != head_dim_qk
-    ):
-        # Note (david): the single-block kernel is square, zero-offset and
-        # one-block only, and its fold was never modelled for MLA's wider
-        # do/v/dv.
-        resolved_head_fold = 1
-    else:
-        # Note (david): the fold-scaled buffers grow with the block and
-        # head_dim, so the target halves for large blocks and shrinks per extra
-        # lane tile.
-        if bq <= FULL_FOLD_MAX_BLOCK:
-            block_fold_target = MAX_SINGLE_BLOCK_HEAD_FOLD
-        else:
-            block_fold_target = MAX_SINGLE_BLOCK_HEAD_FOLD // 2
-        fold_target = max(
-            1, block_fold_target // max(1, head_dim_qk // NUM_LANES)
-        )
-        resolved_head_fold = 1
-        while (
-            resolved_head_fold * 2 <= min(fold_target, num_heads)
-            and num_heads % (resolved_head_fold * 2) == 0
-        ):
-            resolved_head_fold *= 2
-
-    # Note (david): a fold group is head_fold consecutive flat heads, which
-    # stays inside one token-major batch row only if head_fold also divides the
-    # per-row head count. Automatic picks are keyed on the flat count, so they
-    # halve to the largest legal group instead of raising.
-    if (
-        is_explicit_head_fold
-        and token_major
-        and resolved_head_fold > 1
-        and token_major_info.num_q_heads % resolved_head_fold
+        token_major
+        and head_fold > 1
+        and token_major_info.num_q_heads % head_fold
     ):
         raise ValueError(
-            f"token-major head_fold {resolved_head_fold} must also divide the"
+            f"token-major head_fold {head_fold} must also divide the"
             f" per-row head count {token_major_info.num_q_heads} (a fold group"
             " cannot cross a batch row boundary)."
         )
-    while (
-        token_major
-        and resolved_head_fold > 1
-        and token_major_info.num_q_heads % resolved_head_fold
-    ):
-        resolved_head_fold //= 2
-
-    # Note (david): on d64 the fold is the DMA-alignment mechanism (a group must
-    # span whole lane tiles), so it must be even, even where folding does not
-    # pay; 2 always divides the per-row head count, which was checked to be
-    # even.
     is_lane_paired = token_major and head_dim_qk % NUM_LANES != 0
-    if is_lane_paired and resolved_head_fold % 2:
-        if is_explicit_head_fold:
-            raise ValueError(
-                "token-major d64 requires an even head_fold (a DMA group must"
-                f" span whole 128-lane tiles); got {resolved_head_fold}."
-            )
-        head_fold = 2
-    else:
-        head_fold = resolved_head_fold
+    if is_lane_paired and head_fold % 2:
+        raise ValueError(
+            "token-major d64 requires an even head_fold (a DMA group must"
+            f" span whole 128-lane tiles); got {head_fold}."
+        )
 
     # Note (david): under GQA/MQA the group's kv side is one physical head, so
     # only the q side folds.
     kv_fold = 1 if is_gqa else head_fold
 
-    bkv_compute = (
-        pick_tile(BKV_COMPUTE_CANDIDATES, bkv)
-        if block_kv_compute is None
-        else block_kv_compute
-    )
+    bkv_compute = block_sizes.block_kv_compute
     if bkv_compute % NUM_SUBLANES or bkv % bkv_compute:
         raise ValueError(
             f"block_kv_compute {bkv_compute} must be a multiple of"
@@ -896,15 +787,11 @@ def flash_attn_bwd(
             lse,
             do,
             chunk_rows=-(-num_q_blocks // num_chunks) * bq,
+            block_sizes=block_sizes,
             causal=causal,
             causal_offset=causal_offset,
             softmax_scale=scale,
-            block=bq,
-            block_kv=bkv,
-            block_q_compute=bq_compute,
-            block_kv_compute=bkv_compute,
             head_fold=None if is_gqa else head_fold,
-            num_stages=num_stages,
             interpret=interpret,
             token_major=token_major,
             head_dim=head_dim,

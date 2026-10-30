@@ -16,8 +16,8 @@
 
 get_kernel builds the dense and packed forward kernels from a tuned config or
 the analytic default_block_sizes; resolve_paged_block_sizes picks the paged
-forward kernel's tiles; resolve_tuned_bwd_config finds the backward's tuned
-config and resolve_kvcache_config the KV-cache decode kernel's config. This
+forward kernel's tiles; resolve_bwd_config picks the backward's blocks and
+head fold and resolve_kvcache_config the KV-cache decode kernel's config. This
 is the only module that reads tuned_configs.json, the family's kernel configs
 measured per TPU generation and exact problem shape; the kernels never read
 it.
@@ -50,12 +50,12 @@ from .config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
+    MIN_NUM_STAGES,
     MIN_Q_TILES_PER_BLOCK,
     BlockSizes,
     KVCacheConfig,
     QKVLayout,
     TokenMajorInfo,
-    TunedConfig,
     default_block,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
@@ -77,6 +77,8 @@ CONFIG_FIELDS = (
     "qkv_layout",
     "transposed_pv",
 )
+# A dense fwd / bwd tuned_configs.json entry, in CONFIG_FIELDS order.
+TunedConfig = tuple[int | str | bool, ...]
 
 # Note (david): varlen runs a runtime multi-step schedule whose best fold
 # differs from a dense single-block kernel at the same physical block span.
@@ -151,6 +153,20 @@ STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
 # (1.82 ms when every tile of the block ran), while a 16K context took 15.53
 # against 15.33 ms.
 KVCACHE_MAX_BLOCK_KV = 1024
+# Note (david): the dq accumulator and stage buffers cap the useful backward
+# block at 1024, one rung below the forward's ladder.
+BWD_BLOCKS = (1024, 512, 256, 128)
+# Note (david): a flat min(bkv, 256) breaks a bkv like 384, so the kv compute
+# tile is the largest of these dividing bkv; bkv % NUM_SUBLANES == 0 makes the
+# search always hit.
+BWD_KV_COMPUTE_BLOCKS = (256, 128, 64, 32, 16, 8)
+# Note (david): the head-fold gain saturates by about 8 heads. The single-block
+# kernel halves its target past FULL_FOLD_MAX_BLOCK so the fold-scaled buffers
+# still fit VMEM.
+MAX_SINGLE_BLOCK_HEAD_FOLD = 8
+FULL_FOLD_MAX_BLOCK = 512
+
+default_bwd_block = functools.partial(default_block, candidates=BWD_BLOCKS)
 
 
 def get_varlen_head_fold(
@@ -394,7 +410,7 @@ def resolve_kvcache_config(
         )
 
 
-def resolve_tuned_bwd_config(
+def resolve_bwd_config(
     q: jax.Array,
     k: jax.Array,
     v: jax.Array,
@@ -403,13 +419,14 @@ def resolve_tuned_bwd_config(
     causal_offset: int,
     token_major: bool,
     head_dim: int | None,
-) -> TunedConfig | None:
-    """The tuned config of a flash_attn_bwd build with every block knob
-    unset, or None.
+) -> tuple[BlockSizes, int | None]:
+    """The (block_sizes, head_fold) of one flash_attn_bwd build.
 
     q, k, v, causal, causal_offset, token_major and head_dim are
     flash_attn_bwd's. The table is keyed on square, zero-offset MHA shapes, so
-    any other backward gets None without a lookup.
+    any other backward skips the lookup; it and a miss take the analytic
+    blocks and fold. head_fold is None under GQA/MQA, whose fold is each kv
+    head's q group.
     """
     if token_major:
         num_heads = q.shape[-1] // head_dim
@@ -422,15 +439,12 @@ def resolve_tuned_bwd_config(
         num_kv_heads = k.shape[0]
         batch = None
         head_dim_v = v.shape[-1]
-    q_seq_len = q.shape[-2]
-    if (
-        q_seq_len != k.shape[-2]
-        or causal_offset != 0
-        or num_heads != num_kv_heads
-    ):
-        return None
+    q_seq_len, kv_seq_len = q.shape[-2], k.shape[-2]
+    is_gqa = num_heads != num_kv_heads
+    if q_seq_len != kv_seq_len or causal_offset != 0 or is_gqa:
+        tuned_config = None
     else:
-        return get_tuned_config(
+        tuned_config = get_tuned_config(
             "bwd",
             token_major=token_major,
             num_heads=num_heads,
@@ -442,6 +456,80 @@ def resolve_tuned_bwd_config(
             max_seqlen=None,
             return_lse=False,
         )
+    if tuned_config is None:
+        block_q = default_bwd_block(q_seq_len)
+        block_kv = default_bwd_block(kv_seq_len)
+        block_sizes = BlockSizes(
+            block_q=block_q,
+            block_kv=block_kv,
+            block_kv_compute=pick_tile(BWD_KV_COMPUTE_BLOCKS, block_kv),
+            block_q_compute=block_q,
+            num_stages=MIN_NUM_STAGES,
+        )
+        head_fold = None
+    else:
+        # Note (david): the block knobs, head_fold and num_stages are co-tuned
+        # (head_fold > 1 needs block == seq_len, block_kv_compute must divide
+        # block), so the table applies only when all of them are unset. It is
+        # keyed on square, zero-offset MHA shapes.
+        tuned = dict(zip(CONFIG_FIELDS, tuned_config))
+        assert (
+            tuned["qkv_layout"] == "head_dim_minor"
+            and not tuned["transposed_pv"]
+        ), tuned_config
+        block_sizes = BlockSizes(
+            block_q=tuned["q_block"],
+            block_kv=tuned["kv_block"],
+            block_kv_compute=tuned["kv_cblock"],
+            block_q_compute=tuned["q_cblock"],
+            num_stages=tuned["stages"],
+        )
+        head_fold = tuned["head_fold"]
+    if is_gqa:
+        return block_sizes, None
+    elif head_fold is None and (
+        q_seq_len != kv_seq_len
+        or causal_offset != 0
+        or q_seq_len // block_sizes.block_q != 1
+        or head_dim_v != head_dim_qk
+    ):
+        # Note (david): the single-block kernel is square, zero-offset and
+        # one-block only, and its fold was never modelled for MLA's wider
+        # do/v/dv.
+        head_fold = 1
+    elif head_fold is None:
+        # Note (david): the fold-scaled buffers grow with the block and
+        # head_dim, so the target halves for large blocks and shrinks per extra
+        # lane tile.
+        if block_sizes.block_q <= FULL_FOLD_MAX_BLOCK:
+            block_fold_target = MAX_SINGLE_BLOCK_HEAD_FOLD
+        else:
+            block_fold_target = MAX_SINGLE_BLOCK_HEAD_FOLD // 2
+        fold_target = max(
+            1, block_fold_target // max(1, head_dim_qk // NUM_LANES)
+        )
+        flat_num_heads = num_heads if batch is None else batch * num_heads
+        head_fold = 1
+        while (
+            head_fold * 2 <= min(fold_target, flat_num_heads)
+            and flat_num_heads % (head_fold * 2) == 0
+        ):
+            head_fold *= 2
+    # Note (david): only a caller-chosen fold raises when illegal; the tuned
+    # table's and this function's own picks get clamped instead.
+    # Note (david): a fold group is head_fold consecutive flat heads, which
+    # stays inside one token-major batch row only if head_fold also divides the
+    # per-row head count. Automatic picks are keyed on the flat count, so they
+    # halve to the largest legal group instead of raising.
+    while token_major and head_fold > 1 and num_heads % head_fold:
+        head_fold //= 2
+    # Note (david): on d64 the fold is the DMA-alignment mechanism (a group must
+    # span whole lane tiles), so it must be even, even where folding does not
+    # pay; 2 always divides the per-row head count, which was checked to be
+    # even.
+    if token_major and head_dim_qk % NUM_LANES and head_fold % 2:
+        head_fold = 2
+    return block_sizes, head_fold
 
 
 def default_block_sizes(

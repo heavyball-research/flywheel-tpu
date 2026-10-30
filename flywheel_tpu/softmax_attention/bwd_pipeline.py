@@ -1,6 +1,5 @@
 """Kv-outer backward kernel body and its launcher."""
 
-import functools
 from collections.abc import Callable
 
 import jax
@@ -17,7 +16,6 @@ from .config import (
     NT_DIM_NUMBERS,
     QKVLayout,
     TokenMajorInfo,
-    default_block,
 )
 from .dma import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .mask import apply_causal_kv_major
@@ -37,12 +35,6 @@ SEM_ODQ = 6
 SEM_ODK = 7
 SEM_ODV = 8
 NUM_SEMS_BWD = 9
-
-# Note (david): the dq accumulator and stage buffers cap the useful backward
-# block at 1024, one rung below the forward's ladder.
-BWD_BLOCKS = (1024, 512, 256, 128)
-
-default_bwd_block = functools.partial(default_block, candidates=BWD_BLOCKS)
 
 
 def bwd_body(
