@@ -1,5 +1,4 @@
-"""Dense forward main loop, and the scratch and pallas_call the dense and
-varlen forward kernels share."""
+"""Dense forward main loop, and its scratch and pallas_call."""
 
 from collections.abc import Callable, Sequence
 from functools import partial, reduce
@@ -849,7 +848,7 @@ def forward_common(
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Validate q/k/v against traits, allocate scratch and run a dense
-    (fwd_body) or varlen (kernels/fwd_varlen.py) kernel.
+    (fwd_body) kernel.
 
     kernel is the mode kernel with its schedule already bound; traits and
     variant are bound here. smem_operands lead the kernel's inputs, among them
@@ -857,10 +856,10 @@ def forward_common(
     rotary is prepare_rotary's packed (batch, tokens, head_dim) Q and K pair
     (K None when K arrives rotated) that traits' rotary fields describe.
     Returns o shaped like q (head_dim_v wide), or (o, lse) with a (num_q_heads,
-    q_seq_len) float32 natural-log lse. A paged build allocates its own
-    scratch (kernels/fwd_paged.py).
+    q_seq_len) float32 natural-log lse. The varlen and paged builds allocate
+    their own scratch (kernels/fwd_varlen.py, kernels/fwd_paged.py).
     """
-    assert not traits.is_paged, traits
+    assert not (traits.is_paged or traits.is_per_seq), traits
     bq, bkv = traits.bq, traits.bkv
     bkv_compute = traits.bkv_compute
     bq_compute = traits.bq_compute
@@ -871,7 +870,6 @@ def forward_common(
     head_fold = traits.head_fold
     transposed_pv = traits.transposed_pv
     token_major = traits.token_major
-    is_per_seq = traits.is_per_seq
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     return_lse = variant.return_lse
     assert (rotary is None) == (rotary_dim == 0), rotary_dim
@@ -881,7 +879,7 @@ def forward_common(
     # Note (david): a per-seq schedule clamps its windows to the axis end and
     # checks that each block fits, so only the dense grid needs the
     # divisibility.
-    if not is_per_seq and (q_seq_len % bq or kv_seq_len % bkv):
+    if q_seq_len % bq or kv_seq_len % bkv:
         raise ValueError(f"{bq=} and {bkv=} must divide the sequence lengths.")
     rotary_dtype, rotary_operands = check_rotary_operands(
         rotary, traits, q.dtype, q_seq_len, kv_seq_len
@@ -907,15 +905,6 @@ def forward_common(
         v.dtype,
     )
     scratch_shapes = [q_buf, k_buf, v_buf]
-    if is_per_seq:
-        # Note (david): the per-seq kernel synthesizes its bounds rows (the q
-        # lower bound, plus the span under a left window) once per block
-        # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
-        # rows share one (8, 128) int32 tile, so the span row costs no extra
-        # VMEM.
-        scratch_shapes.append(
-            vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32)
-        )
     if rotary_dim:
         scratch_shapes += [
             vmem(
@@ -966,9 +955,7 @@ def forward_common(
         pending_smem,
         sems,
     ]
-    if return_lse and is_per_seq:
-        scratch_shapes.append(vmem((num_stages, bq, NUM_LANES), jnp.float32))
-    elif return_lse:
+    if return_lse:
         scratch_shapes.append(vmem((head_fold, bq), jnp.float32))
 
     if qkv_layout == QKVLayout.SEQ_MINOR:
@@ -995,15 +982,7 @@ def forward_common(
             q_seq_len,
             token_major.num_q_heads * head_dim_v,
         )
-    # Note (david): per-seq LSE gives every head group an explicit minor axis of
-    # whole 128-lane tiles, so the kernel DMAs complete tiles at offset zero
-    # and groups never alias in the physical layout; only the first
-    # group_heads lanes are returned.
-    lse_shape = (
-        (num_q_heads // group_heads, q_seq_len, NUM_LANES)
-        if is_per_seq
-        else (num_q_heads, q_seq_len)
-    )
+    lse_shape = (num_q_heads, q_seq_len)
     if return_lse:
         out_specs = [any_spec, any_spec]
         out_shape = [
@@ -1034,9 +1013,5 @@ def forward_common(
     o = o_kernel.swapaxes(-1, -2) if transposed_pv else o_kernel
     if not return_lse:
         return o
-    elif is_per_seq:
-        return o, lse_kernel[:, :, :group_heads].swapaxes(1, 2).reshape(
-            num_q_heads, q_seq_len
-        )
     else:
         return o, lse_kernel

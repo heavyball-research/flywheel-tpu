@@ -13,11 +13,16 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
-from ..config import hbm_bf16_tile_rows
+from ...core.tpu import NUM_LANES
+from ..config import QKVLayout, hbm_bf16_tile_rows, vmem_limit_bytes
 from ..dma import advance, drain
 from ..fwd_blocks import (
     NUM_KV_STAGES,
+    NUM_O_SLOTS,
+    NUM_PENDING_FIELDS,
+    NUM_SEMS,
     PENDING_WRITE_PARITY,
     TRASH_PARITY,
     KVBlock,
@@ -49,8 +54,12 @@ from ..fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from ..fwd_call import rotary_fields
-from ..fwd_pipeline import forward_common
+from ..fwd_call import (
+    check_qkv_operands,
+    check_rotary_operands,
+    rotary_fields,
+    staged_shape,
+)
 from ..schedule import (
     FwdSchedule,
     ScheduleTableLayout,
@@ -118,11 +127,11 @@ def varlen_fwd_body(
     yields.
 
     traits is the build's static configuration, variant its elementwise math
-    and operands the variant's traced values, and refs are forward_common's
-    rotary operands, outputs and scratch, in its allocation order. The logits
-    run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). K
-    and V are separate packed operands, head-major or token-major. The
-    per-seq schedule writes the packed padding rows past
+    and operands the variant's traced values, and refs are the rotary
+    operands, the outputs and the scratch, in varlen_scratch_shapes's order.
+    The logits run in log2 units: Q reaches the QK matmul pre-multiplied by
+    log2(e). K and V are separate packed operands, head-major or token-major.
+    The per-seq schedule writes the packed padding rows past
     schedule.packed_q_end as out = 0, lse = -inf, and applies the mask
     itself, so its variant has none.
 
@@ -173,7 +182,8 @@ def varlen_fwd_body(
     else:
         pipeline_refs, lse_stage = remaining_refs, None
     # Note (david): the exact unpack pins this variable-arity tail against
-    # forward_common's scratch list; a silent mismatch would shift every ref.
+    # varlen_scratch_shapes's scratch list; a silent mismatch would shift every
+    # ref.
     (
         o_stage,
         row_max_scratch,
@@ -983,6 +993,189 @@ def varlen_fwd_body(
     )
 
 
+def varlen_scratch_shapes(
+    traits: FwdTraits,
+    *,
+    q_dtype: jnp.dtype,
+    k_dtype: jnp.dtype,
+    v_dtype: jnp.dtype,
+    rotary_dtype: jnp.dtype | None,
+    return_lse: bool,
+) -> list[pl.MemoryRef]:
+    """Every scratch buffer of one varlen build, in the order varlen_fwd_body
+    unpacks them: Q, K and V stages, bounds rows per kv compute tile, Q and
+    (under rotary_k) K rotary coefficients, out stage, row max, row sum, f32
+    accumulator, pending probs, pending V tile, the SMEM guard flags, block
+    parity and pending-PV fields, the DMA semaphores and the lse stage.
+
+    Per-seq blocks keep the token axis second-minor, so every buffer is
+    HEAD_DIM_MINOR. rotary_dtype is None without rotary."""
+    bq, bkv = traits.bq, traits.bkv
+    bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
+    num_stages = traits.num_stages
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
+    head_fold = traits.head_fold
+    rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
+    num_rotary_streams = (1 + int(rotary_k)) if rotary_dim else 0
+    folded_bq = traits.group_heads * bq
+    layout = QKVLayout.HEAD_DIM_MINOR
+    vmem = pltpu.VMEM
+
+    scratch_shapes = [
+        vmem(
+            staged_shape(traits, bq, head_dim_qk, layout, num_stages), q_dtype
+        ),
+        vmem(
+            staged_shape(traits, bkv, head_dim_qk, layout, NUM_KV_STAGES),
+            k_dtype,
+        ),
+        vmem(
+            staged_shape(traits, bkv, head_dim_v, layout, NUM_KV_STAGES),
+            v_dtype,
+        ),
+    ]
+    # Note (david): the per-seq kernel synthesizes its bounds rows (the q
+    # lower bound, plus the span under a left window) once per block
+    # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
+    # rows share one (8, 128) int32 tile, so the span row costs no extra
+    # VMEM.
+    scratch_shapes.append(vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32))
+    if rotary_dim:
+        scratch_shapes += [
+            vmem(
+                (stages, traits.rotary_groups, block, rotary_dim),
+                rotary_dtype,
+            )
+            for block, stages in (
+                ((bq, num_stages), (bkv, NUM_KV_STAGES))
+                if rotary_k
+                else ((bq, num_stages),)
+            )
+        ]
+    # Note (david): a lane-paired fold's pending V tile is its pair's 128 lanes,
+    # as the forward loop loads it.
+    v_tile_width = NUM_LANES if traits.is_lane_paired else head_dim_v
+    scratch_shapes += [
+        vmem(staged_shape(traits, bq, head_dim_v, layout, num_stages), q_dtype),
+        vmem((folded_bq, NUM_LANES), jnp.float32),
+        vmem((2, folded_bq, NUM_LANES), jnp.float32),
+        vmem((NUM_O_SLOTS, folded_bq, head_dim_v), jnp.float32),
+        vmem((bq_compute, bkv_compute), jnp.float32),
+        vmem((bkv_compute, v_tile_width), v_dtype),
+        pltpu.SMEM((head_fold,), jnp.int32),
+        pltpu.SMEM((1,), jnp.int32),
+        pltpu.SMEM((NUM_PENDING_FIELDS,), jnp.int32),
+        pltpu.SemaphoreType.DMA(
+            (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
+        ),
+    ]
+    if return_lse:
+        scratch_shapes.append(vmem((num_stages, bq, NUM_LANES), jnp.float32))
+    return scratch_shapes
+
+
+def varlen_pallas_call(
+    smem_operands: list[jax.Array],
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    traits: FwdTraits,
+    variant: Variant,
+    *,
+    varlen_sched: VarlenSchedule,
+    layout: ScheduleTableLayout,
+    interpret: bool,
+    rotary: tuple[jax.Array, jax.Array | None] | None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Validate q/k/v against traits, allocate the varlen scratch and run the
+    varlen kernel.
+
+    smem_operands are the kernel's SMEM inputs (schedule table, then the sink
+    logits under has_sinks), and rotary is prepare_rotary's packed (batch,
+    tokens, head_dim) Q and K pair (K None when K arrives rotated) that
+    traits' rotary fields describe. Returns o shaped like q (head_dim_v wide),
+    or (o, lse) with a (num_q_heads, q_seq_len) float32 natural-log lse.
+    """
+    assert traits.is_per_seq and not traits.is_paged, traits
+    # make_flash_attn_mha rejects any other layout for a per-seq build.
+    assert traits.qkv_layout == QKVLayout.HEAD_DIM_MINOR, traits.qkv_layout
+    assert not traits.transposed_pv, traits
+    assert (rotary is None) == (traits.rotary_dim == 0), traits.rotary_dim
+    num_q_heads, head_dim_v = traits.num_q_heads, traits.head_dim_v
+    token_major = traits.token_major
+    return_lse = variant.return_lse
+
+    q_seq_len, kv_seq_len = check_qkv_operands(q, k, v, traits)
+    rotary_dtype, rotary_operands = check_rotary_operands(
+        rotary, traits, q.dtype, q_seq_len, kv_seq_len
+    )
+    scratch_shapes = varlen_scratch_shapes(
+        traits,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        v_dtype=v.dtype,
+        rotary_dtype=rotary_dtype,
+        return_lse=return_lse,
+    )
+    kernel_inputs = [q, k, v, *rotary_operands]
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    in_specs = [smem_spec] * len(smem_operands) + [any_spec] * len(
+        kernel_inputs
+    )
+
+    if token_major is None:
+        o_shape = (num_q_heads, q_seq_len, head_dim_v)
+    else:
+        o_shape = (
+            *q.shape[:-2],
+            q_seq_len,
+            token_major.num_q_heads * head_dim_v,
+        )
+    # Note (david): per-seq LSE gives every head group an explicit minor axis of
+    # whole 128-lane tiles, so the kernel DMAs complete tiles at offset zero
+    # and groups never alias in the physical layout; only the first
+    # group_heads lanes are returned.
+    group_heads = traits.group_heads
+    lse_shape = (num_q_heads // group_heads, q_seq_len, NUM_LANES)
+    if return_lse:
+        out_specs = [any_spec, any_spec]
+        out_shape = [
+            jax.ShapeDtypeStruct(o_shape, q.dtype),
+            jax.ShapeDtypeStruct(lse_shape, jnp.float32),
+        ]
+    else:
+        out_specs = any_spec
+        out_shape = jax.ShapeDtypeStruct(o_shape, q.dtype)
+
+    kernel_name = "flash_attn_mha_static_t1_guarded_fwd_varlen_per_seq"
+    with jax.named_scope(kernel_name):
+        outputs = pl.pallas_call(
+            partial(
+                flash_fwd_varlen_kernel,
+                traits=traits,
+                variant=variant,
+                varlen_sched=varlen_sched,
+                layout=layout,
+            ),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            out_shape=out_shape,
+            scratch_shapes=scratch_shapes,
+            name=kernel_name,
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=vmem_limit_bytes()
+            ),
+            interpret=pltpu.InterpretParams() if interpret else False,
+        )(*smem_operands, *kernel_inputs)
+    if not return_lse:
+        return outputs
+    o, lse_kernel = outputs
+    return o, lse_kernel[:, :, :group_heads].swapaxes(1, 2).reshape(
+        num_q_heads, q_seq_len
+    )
+
+
 def flash_attn_forward_varlen(
     q: jax.Array,
     k: jax.Array,
@@ -1035,18 +1228,15 @@ def flash_attn_forward_varlen(
             )
         smem_operands.append(variant.sink_logits(sinks))
 
-    kernel = partial(
-        flash_fwd_varlen_kernel, varlen_sched=varlen_sched, layout=layout
-    )
-    return forward_common(
-        kernel,
+    return varlen_pallas_call(
         smem_operands,
         q,
         k,
         v,
         traits,
         variant,
-        kernel_name="flash_attn_mha_static_t1_guarded_fwd_varlen_per_seq",
+        varlen_sched=varlen_sched,
+        layout=layout,
         interpret=interpret,
         rotary=rotary,
     )
