@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tiling import round_up
 from ...core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
@@ -26,11 +27,14 @@ from ..config import (
     PagedKVInfo,
     hbm_bf16_tile_rows,
     next_pow2,
+    vmem_limit_bytes,
 )
 from ..dma import advance, drain
 from ..fwd_blocks import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
+    NUM_PENDING_FIELDS,
+    NUM_SEMS,
     PENDING_WRITE_PARITY,
     TRASH_PARITY,
     KVBlock,
@@ -62,7 +66,7 @@ from ..fwd_blocks import (
     wait_paged_kv_block,
     wait_q_row,
 )
-from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
+from ..fwd_pipeline import fwd_body, rotary_fields
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
     FwdSchedule,
@@ -995,51 +999,74 @@ def paged_scratch_shapes(
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
     kv_dtype: jnp.dtype,
-) -> list[tuple[tuple[int, ...], jnp.dtype]]:
-    """(shape, dtype) of each VMEM scratch buffer forward_common allocates for
-    one paged build, in its order: Q stage, (K, V) word staging, K and V planes,
-    bounds rows per kv compute tile, Q rotary coefficients, out stage, row max,
-    row sum, f32 accumulator, pending probs, pending V tile, lse."""
+) -> list[pl.MemoryRef]:
+    """Every scratch buffer of one paged build, in the order the kernel
+    unpacks them: Q stage, (K, V) word staging, K and V planes, bounds rows
+    per kv compute tile, Q rotary coefficients, out stage, row max, row sum,
+    f32 accumulator, pending probs, pending V tile, the SMEM guard flags, block
+    parity and pending-PV fields, the DMA semaphores and the lse stage.
+
+    The kernel allocates them all, and estimate_vmem_bytes sums the VMEM
+    ones. The Q, out, plane and pending V buffers are bf16, q's dtype
+    (check_paged_inputs)."""
     bq, bkv = block_sizes.block_q, block_sizes.block_kv
     bkv_compute = block_sizes.block_kv_compute
     num_stages = block_sizes.num_stages
     bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
+    vmem, smem = pltpu.VMEM, pltpu.SMEM
     if gqa_fold > 1:
         stage_shape = (num_stages, gqa_fold, bq, head_dim)
     else:
         stage_shape = (num_stages, bq, head_dim)
     group_bq = gqa_fold * bq
     if rotary_dtype is None:
-        rotary_shapes = []
+        num_rotary_streams = 0
+        rotary_buffers = []
     else:
+        num_rotary_streams = 1
         # Note (david): prepare_rotary's one batch plane is shared by every
         # head, so one Q coefficient group is staged.
-        rotary_shapes = [
-            ((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))
+        rotary_buffers = [
+            vmem((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))
         ]
     if return_lse:
-        lse_shapes = [((num_stages, bq, NUM_LANES), f32)]
+        lse_buffers = [vmem((num_stages, bq, NUM_LANES), f32)]
     else:
-        lse_shapes = []
-    return [
-        (stage_shape, bf16),
-        ((NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype),
-        ((2, bkv, head_dim), bf16),
-        ((bkv // bkv_compute, 2, bkv_compute), jnp.dtype(jnp.int32)),
-        *rotary_shapes,
-        (stage_shape, bf16),
-        ((group_bq, NUM_LANES), f32),
-        ((2, group_bq, NUM_LANES), f32),
-        ((NUM_O_SLOTS, group_bq, head_dim), f32),
-        (
-            (
-                gqa_fold * block_sizes.block_q_compute,
-                block_sizes.block_kv_compute,
-            ),
-            f32,
+        lse_buffers = []
+    # Note (david): a paged block stages the u32 word rows holding one kv
+    # head's K and V, then unpacks them into one bf16 K and one bf16 V
+    # plane; a word's (kv_word_rows, head_dim) rows pad to nothing, so the
+    # staging costs what two dense planes of the cache dtype would.
+    kv_word_buffers = [
+        vmem(
+            (NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype
         ),
-        ((block_sizes.block_kv_compute, head_dim), bf16),
-        *lse_shapes,
+        vmem((2, bkv, head_dim), bf16),
+    ]
+    # Note (david): the per-seq kernel synthesizes its bounds rows (the q
+    # lower bound, plus the span under a left window) once per block
+    # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
+    # rows share one (8, 128) int32 tile, so the span row costs no extra
+    # VMEM.
+    bounds_buffer = vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32)
+    return [
+        vmem(stage_shape, bf16),
+        *kv_word_buffers,
+        bounds_buffer,
+        *rotary_buffers,
+        vmem(stage_shape, bf16),
+        vmem((group_bq, NUM_LANES), f32),
+        vmem((2, group_bq, NUM_LANES), f32),
+        vmem((NUM_O_SLOTS, group_bq, head_dim), f32),
+        vmem((gqa_fold * block_sizes.block_q_compute, bkv_compute), f32),
+        vmem((bkv_compute, head_dim), bf16),
+        smem((PAGED_HEAD_FOLD,), jnp.int32),
+        smem((1,), jnp.int32),
+        smem((NUM_PENDING_FIELDS,), jnp.int32),
+        pltpu.SemaphoreType.DMA(
+            (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
+        ),
+        *lse_buffers,
     ]
 
 
@@ -1052,11 +1079,11 @@ def estimate_vmem_bytes(
     gqa_fold: int,
     kv_dtype: jnp.dtype,
 ) -> int:
-    """Scoped VMEM bytes of one paged build: its scratch plus the score
+    """Scoped VMEM bytes of one paged build: its VMEM scratch plus the score
     temporaries of one compute fragment."""
     scratch_bytes = sum(
-        vmem_buffer_bytes(shape, dtype)
-        for shape, dtype in paged_scratch_shapes(
+        vmem_buffer_bytes(buffer.shape, buffer.dtype)
+        for buffer in paged_scratch_shapes(
             block_sizes,
             head_dim=head_dim,
             return_lse=return_lse,
@@ -1064,6 +1091,7 @@ def estimate_vmem_bytes(
             gqa_fold=gqa_fold,
             kv_dtype=kv_dtype,
         )
+        if buffer.memory_space == pltpu.VMEM
     )
     temporary_bytes = (
         gqa_fold
@@ -1168,6 +1196,114 @@ def check_paged_inputs(
             f" block_q_compute={block_sizes.block_q_compute}."
         )
     return num_kv_heads
+
+
+def paged_pallas_call(
+    smem_operands: list[jax.Array],
+    q: jax.Array,
+    kv_cache: jax.Array,
+    traits: PagedFwdTraits,
+    variant: Variant,
+    *,
+    layout: ScheduleTableLayout,
+    interpret: bool,
+    rotary: tuple[jax.Array, None] | None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Run the paged kernel over q, its rows padded to whole q blocks.
+
+    smem_operands are the kernel's SMEM inputs (schedule table, flat block
+    table, K and V descales, then the sink logits under has_sinks), and
+    rotary the padded (q coefficients, None) pair traits' rotary fields
+    describe. Returns o shaped like q, or (o, lse) with a (num_q_heads,
+    q_seq_len) float32 natural-log lse.
+    """
+    num_q_heads, q_seq_len, _ = q.shape
+    assert q.dtype == jnp.bfloat16, q.dtype
+    assert (rotary is None) == (traits.rotary_dim == 0), traits.rotary_dim
+    if rotary is None:
+        rotary_dtype = None
+        rotary_operands = []
+    else:
+        rotary_q_coeff, rotary_k_coeff = rotary
+        assert rotary_k_coeff is None, rotary_k_coeff.shape
+        if rotary_q_coeff.shape[1] != q_seq_len:
+            raise ValueError(
+                "rotary coefficients must be (batch, tokens, head_dim)."
+            )
+        # Note (david): float32 coefficients keep the in-kernel f32 rotation
+        # identical to an f32 RoPE computed outside the kernel.
+        rotary_dtype = rotary_q_coeff.dtype
+        if rotary_dtype not in (q.dtype, jnp.dtype(jnp.float32)):
+            raise ValueError("Invalid rotary dimension or coefficient dtype.")
+        rotary_operands = [rotary_q_coeff]
+    scratch_shapes = paged_scratch_shapes(
+        traits.block_sizes,
+        head_dim=traits.head_dim_qk,
+        return_lse=variant.return_lse,
+        rotary_dtype=rotary_dtype,
+        gqa_fold=traits.gqa_fold,
+        kv_dtype=kv_cache.dtype,
+    )
+    # Note (david): the pool is pinned to HBM because memory space
+    # assignment otherwise moves a pool that fits its VMEM budget there and
+    # back around every call, the whole pool however few pages the call
+    # reads (v6e, 16 MB e5m2 pool: 0.369 against 0.339 ms a chunk). The spec
+    # stays pl.ANY: a layout copy XLA inserts before the call escapes the
+    # constraint and can land in VMEM, where DMAs compiled for an HBM
+    # operand halt the chip.
+    kernel_inputs = [
+        q,
+        pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
+        *rotary_operands,
+    ]
+    smem_spec = pl.BlockSpec(memory_space=pltpu.SMEM)
+    any_spec = pl.BlockSpec(memory_space=pl.ANY)
+    in_specs = [smem_spec] * len(smem_operands) + [any_spec] * len(
+        kernel_inputs
+    )
+    o_shape = jax.ShapeDtypeStruct(
+        (num_q_heads, q_seq_len, traits.head_dim_v), q.dtype
+    )
+    # Note (david): per-seq LSE gives every head group an explicit minor axis of
+    # whole 128-lane tiles, so the kernel DMAs complete tiles at offset zero
+    # and groups never alias in the physical layout; only the first
+    # group_heads lanes are returned.
+    group_heads = traits.group_heads
+    lse_shape = jax.ShapeDtypeStruct(
+        (num_q_heads // group_heads, q_seq_len, NUM_LANES), jnp.float32
+    )
+    if variant.return_lse:
+        out_specs = [any_spec, any_spec]
+        out_shape = [o_shape, lse_shape]
+    else:
+        out_specs = any_spec
+        out_shape = o_shape
+
+    kernel_name = "flash_attn_varlen_paged_fwd"
+    with jax.named_scope(kernel_name):
+        outputs = pl.pallas_call(
+            partial(
+                flash_fwd_varlen_paged_kernel,
+                traits=traits,
+                variant=variant,
+                layout=layout,
+            ),
+            in_specs=in_specs,
+            out_specs=out_specs,
+            out_shape=out_shape,
+            scratch_shapes=scratch_shapes,
+            name=kernel_name,
+            compiler_params=pltpu.CompilerParams(
+                vmem_limit_bytes=vmem_limit_bytes()
+            ),
+            interpret=pltpu.InterpretParams() if interpret else False,
+        )(*smem_operands, *kernel_inputs)
+    if not variant.return_lse:
+        return outputs
+    o, lse_kernel = outputs
+    return o, lse_kernel[:, :, :group_heads].swapaxes(1, 2).reshape(
+        num_q_heads, q_seq_len
+    )
 
 
 def flash_attn_varlen_paged(
@@ -1294,18 +1430,15 @@ def flash_attn_varlen_paged(
     ]
     if sinks is not None:
         smem_operands.append(variant.sink_logits(sinks))
-    kernel = partial(flash_fwd_varlen_paged_kernel, layout=layout)
-    outputs = forward_common(
-        kernel,
+    outputs = paged_pallas_call(
         smem_operands,
         padded_q,
         kv_cache,
-        None,
         traits,
         # Note (david): as in make_flash_attn_mha, Q carries softmax_scale /
         # softcap, so log2(e) rides in the tanh output scale.
         variant,
-        kernel_name="flash_attn_varlen_paged_fwd",
+        layout=layout,
         interpret=interpret,
         rotary=padded_rotary,
     )
