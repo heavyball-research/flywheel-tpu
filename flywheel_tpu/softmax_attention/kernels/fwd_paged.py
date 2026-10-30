@@ -66,7 +66,7 @@ from ..fwd_blocks import (
     wait_paged_kv_block,
     wait_q_row,
 )
-from ..fwd_pipeline import fwd_body, rotary_fields
+from ..fwd_pipeline import rotary_fields
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
     FwdSchedule,
@@ -85,7 +85,7 @@ SCORE_TEMPORARY_BYTES = 5 * F32_BYTES + 1
 # head_fold * compute tiles, and folding a kv head's q heads that way measured
 # 2.1x slower on v6e (h32 k4 d256, 1024-token chunks over 16K: 22.6 against
 # 10.6 ms) with a 15x longer compile. The kv head's q heads are folded into the
-# fragment rows instead (fwd_body's gqa_fold).
+# fragment rows instead (paged_fwd_body's gqa_fold).
 PAGED_HEAD_FOLD = 1
 
 
@@ -122,14 +122,13 @@ def flash_fwd_varlen_paged_kernel(
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
     q_scale = variant.descaled_q_scale(kv_scales_ref[0])
     v_scale = kv_scales_ref[1]
-    # The schedule masks each sequence around its own diagonal, so fwd_body
+    # The schedule masks each sequence around its own diagonal, so the loop
     # runs without the Variant's static mask.
-    fwd_body(
+    paged_fwd_body(
         traits,
         variant.without_mask(),
         schedule,
         q_hbm,
-        kv_hbm,
         kv_hbm,
         refs,
         operands=VariantOperands(
