@@ -29,29 +29,27 @@ from .fwd_blocks import (
     PENDING_READ_PARITY,
     PENDING_ROW_START,
     PENDING_WRITE_PARITY,
-    SEM_K,
     SEM_LSE,
     SEM_OUT,
-    SEM_ROTARY_K,
-    SEM_V,
     TRASH_PARITY,
+    KVRefs,
+    PagedKVRefs,
     QRefs,
     RowFinish,
     fold_lane,
-    rotary_copies,
+    paged_fragment,
     rotate_staged,
     set_half,
+    start_kv_block,
+    start_paged_kv_block,
     start_q_row,
     take_half,
+    unpack_paged_block,
+    wait_kv_block,
+    wait_paged_kv_block,
     wait_q_row,
 )
-from .kv_layout import (
-    kv_heads_per_word,
-    kv_word_halves,
-    kv_word_rows,
-    load_staged_words,
-    staged_words,
-)
+from .kv_layout import kv_word_rows
 from .mask import apply_packed_bounds_mask
 from .schedule import FwdSchedule, window_fragment_plans
 from .softmax import (
@@ -99,7 +97,6 @@ def fwd_body(
     is_per_seq = traits.is_per_seq
     assert (schedule.q_token is not None) == is_per_seq, is_per_seq
     is_paged = traits.is_paged
-    paged = traits.paged
     bq, bkv = traits.bq, traits.bkv
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     num_stages = traits.num_stages
@@ -120,14 +117,12 @@ def fwd_body(
     frag_rows = traits.frag_rows
     token_tile_shape = traits.token_tile_shape
     defers_row_finish = traits.defers_row_finish
-    width_qk, width_v = traits.width_qk, traits.width_v
+    width_v = traits.width_v
     q_heads_per_row = traits.q_heads_per_row
-    kv_heads_per_row = traits.kv_heads_per_row
     lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
     is_lane_paired = traits.is_lane_paired
     heads_per_lane_tile = traits.heads_per_lane_tile
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
-    rotary_k_heads = traits.rotary_k_heads
     variant.check_operands(operands)
     return_lse = variant.return_lse
     window = variant.window
@@ -183,6 +178,20 @@ def fwd_body(
         rotary_buf=rotary_q_buf,
         sems=sems,
     )
+    if is_paged:
+        kv_refs = PagedKVRefs(
+            cache_hbm=k_hbm, pair_buf=kv_pair_buf, planes=kv_planes, sems=sems
+        )
+    else:
+        kv_refs = KVRefs(
+            k_hbm=k_hbm,
+            v_hbm=v_hbm,
+            k_buf=k_buf,
+            v_buf=v_buf,
+            rotary_hbm=rotary_k_hbm,
+            rotary_buf=rotary_k_buf,
+            sems=sems,
+        )
     if return_lse and is_per_seq:
         lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
@@ -227,40 +236,6 @@ def fwd_body(
     # the row's first visible key past the guard into a replay.
     defers_row_start = window[0] is not None or schedule.has_q_span
 
-    def _kv_copies(kv_head, tok, slot):
-        return [
-            pltpu.make_async_copy(
-                hbm_window(
-                    k_hbm,
-                    kv_head,
-                    tok,
-                    bkv,
-                    width=width_qk,
-                    heads_per_row=kv_heads_per_row,
-                    layout=qkv_layout,
-                    token_major=token_major,
-                    fold=head_fold,
-                ),
-                k_buf.at[slot],
-                sems.at[SEM_K, slot],
-            ),
-            pltpu.make_async_copy(
-                hbm_window(
-                    v_hbm,
-                    kv_head,
-                    tok,
-                    bkv,
-                    width=width_v,
-                    heads_per_row=kv_heads_per_row,
-                    layout=qkv_layout,
-                    token_major=token_major,
-                    fold=head_fold,
-                ),
-                v_buf.at[slot],
-                sems.at[SEM_V, slot],
-            ),
-        ]
-
     def _o_copy(head, tok, slot):
         return pltpu.make_async_copy(
             o_stage.at[slot],
@@ -277,45 +252,6 @@ def fwd_body(
             ),
             sems.at[SEM_OUT, slot],
         )
-
-    # Note (david): a paged group is the gqa_fold q heads of one kv head, which
-    # read its (K, V) rows; those of one page are the u32 word window of the
-    # interleaved cache's head axis that holds them, one DMA: a bf16 head's
-    # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
-    if is_paged:
-        word_rows = kv_word_rows(kv_pair_buf.dtype)
-        heads_per_word = kv_heads_per_word(kv_pair_buf.dtype)
-        num_cache_pages = k_hbm.shape[0]
-    else:
-        word_rows = heads_per_word = num_cache_pages = None
-
-    def _paged_buffer_tile(slot, token_start, num_tokens):
-        return kv_pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
-
-    def _paged_kv_source(physical_page, num_tokens, kv_head):
-        head_row = pl.multiple_of(
-            kv_head // heads_per_word * word_rows, word_rows
-        )
-        return k_hbm.at[
-            physical_page, pl.ds(0, num_tokens), pl.ds(head_row, word_rows), :
-        ]
-
-    def _paged_page_rows(kv_load_end, kv):
-        # Note (david): every page DMA of a block is issued, so its wait needs
-        # no branch. A page past the load extent moves one sublane tile of a
-        # clamped page, whose rows the unpack zeroes.
-        num_load_rows = jnp.clip(kv_load_end - kv * bkv, 0, bkv)
-        return [
-            pl.multiple_of(
-                jnp.clip(
-                    num_load_rows - page * paged.page_size,
-                    NUM_SUBLANES,
-                    paged.page_size,
-                ),
-                NUM_SUBLANES,
-            )
-            for page in range(bkv // paged.page_size)
-        ]
 
     # Note (david): the kv stream prefetches two blocks ahead in a
     # NUM_KV_STAGES ring. Mosaic's scheduler sinks a DMA start towards its
@@ -380,85 +316,26 @@ def fwd_body(
     def _start_block_data(desc, slot):
         if is_paged:
             page_base, kv_head, kv_load_end, _, kv = desc
-            for page, num_rows in enumerate(_paged_page_rows(kv_load_end, kv)):
-                physical_page = jnp.clip(
-                    schedule.kv_page(page_base, kv, page),
-                    0,
-                    num_cache_pages - 1,
-                )
-                pltpu.make_async_copy(
-                    _paged_kv_source(physical_page, num_rows, kv_head),
-                    _paged_buffer_tile(slot, page * paged.page_size, num_rows),
-                    sems.at[SEM_K, slot],
-                ).start()
+            start_paged_kv_block(
+                traits,
+                schedule,
+                kv_refs,
+                page_base,
+                kv_head,
+                kv_load_end,
+                kv,
+                slot,
+            )
         else:
             kv_head, kv_tok = desc
-            for dma in _kv_copies(kv_head, kv_tok, slot):
-                dma.start()
-            if rotary_dim and rotary_k:
-                for dma in rotary_copies(
-                    traits,
-                    sems,
-                    rotary_k_hbm,
-                    rotary_k_buf,
-                    kv_head,
-                    kv_tok,
-                    bkv,
-                    slot,
-                    rotary_k_heads,
-                    SEM_ROTARY_K,
-                ):
-                    dma.start()
+            start_kv_block(traits, kv_refs, kv_head, kv_tok, slot)
 
     def _wait_block_data(desc, slot):
         if is_paged:
             _, _, kv_load_end, _, kv = desc
-            # Note (david): every page signals the one semaphore by its size,
-            # and a DMA wait only needs a destination of the awaited size, so
-            # one wait on a window as long as all the pages together covers the
-            # block.
-            num_rows = pl.multiple_of(
-                sum(_paged_page_rows(kv_load_end, kv)), NUM_SUBLANES
-            )
-            staged_window = _paged_buffer_tile(slot, 0, num_rows)
-            pltpu.make_async_copy(
-                staged_window, staged_window, sems.at[SEM_K, slot]
-            ).wait()
+            wait_paged_kv_block(traits, kv_refs, kv_load_end, kv, slot)
         else:
-            for dma in _kv_copies(0, 0, slot):
-                dma.wait()
-            if rotary_dim and rotary_k:
-                for dma in rotary_copies(
-                    traits,
-                    sems,
-                    rotary_k_hbm,
-                    rotary_k_buf,
-                    0,
-                    0,
-                    bkv,
-                    slot,
-                    rotary_k_heads,
-                    SEM_ROTARY_K,
-                ):
-                    dma.wait()
-
-    def _paged_fragment(kv_compute_index, kv_part):
-        """The (bkv_compute, head_dim) K (kv_part 0) or V (kv_part 1) plane tile
-        of the unpacked paged block."""
-        tile_start = pl.multiple_of(kv_compute_index * bkv_compute, NUM_LANES)
-        return kv_planes[kv_part, pl.ds(tile_start, bkv_compute), :]
-
-    def _v_tile(g, kv_compute_index, kv_slot):
-        """A fragment's V operand as loaded, before a lane pair's half is
-        picked."""
-        if is_paged:
-            return _paged_fragment(kv_compute_index, 1)
-        else:
-            v_ref, _ = fold_lane(
-                traits, v_buf.at[kv_slot], g, bkv, lane_width_v, qkv_layout
-            )
-            slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
-            return v_ref[slice_k, :] if is_head_dim_minor else v_ref[:, slice_k]
+            wait_kv_block(traits, kv_refs, slot)
 
     def _pv(
         g,
@@ -470,9 +347,9 @@ def fwd_body(
         write_parity,
         read_parity,
     ):
-        """v_tile is _v_tile's operand, and rescale the fragment's recovery
-        rescale (None on the ordinary pass). The PV of a fragment reads o from
-        read_parity and writes it to write_parity."""
+        """v_tile is the kv refs' v_tile operand, and rescale the fragment's
+        recovery rescale (None on the ordinary pass). The PV of a fragment
+        reads o from read_parity and writes it to write_parity."""
         head_rows = pl.ds(g * group_bq, group_bq)
         v_half = g % heads_per_lane_tile if is_lane_paired else None
 
@@ -649,14 +526,19 @@ def fwd_body(
                         qkv_layout,
                     )
                     q = q_ref[slice_q, :]
-                k = _paged_fragment(kv_compute_index, 0)
+                k = paged_fragment(traits, kv_refs, kv_compute_index, 0)
                 dim_numbers = NT_DIM_NUMBERS
             else:
                 q_ref, q_half = fold_lane(
                     traits, q_buf.at[q_slot], g, bq, lane_width_qk, qkv_layout
                 )
                 k_ref, k_half = fold_lane(
-                    traits, k_buf.at[kv_slot], g, bkv, lane_width_qk, qkv_layout
+                    traits,
+                    kv_refs.k_buf.at[kv_slot],
+                    g,
+                    bkv,
+                    lane_width_qk,
+                    qkv_layout,
                 )
                 slice_k = pl.ds(kv_compute_index * bkv_compute, bkv_compute)
                 if is_head_dim_minor:
@@ -905,7 +787,7 @@ def fwd_body(
                 g,
                 q_compute_index,
                 probs,
-                _v_tile(g, kv_compute_index, kv_slot),
+                kv_refs.v_tile(traits, g, kv_compute_index, kv_slot),
                 is_row_start,
                 rescale,
                 write_parity=new_parity,
@@ -925,7 +807,9 @@ def fwd_body(
             as in _online_softmax."""
             new_parity, old_parity = _block_parities()
             pending_probs[...] = probs
-            pending_v[...] = _v_tile(pending_g, kv_compute_index, kv_slot)
+            pending_v[...] = kv_refs.v_tile(
+                traits, pending_g, kv_compute_index, kv_slot
+            )
             pending_smem[PENDING_WRITE_PARITY] = new_parity
             pending_smem[PENDING_READ_PARITY] = _tile_parity(
                 kv_compute_index, is_tile_zero, new_parity, old_parity
@@ -1225,71 +1109,19 @@ def fwd_body(
                 _, staged_kv_head, kv_load_end, kv_used_end, staged_kv = (
                     block_desc
                 )
-                valid_rows = jnp.clip(
-                    jnp.minimum(
-                        kv_used_end - staged_kv * bkv,
-                        jnp.clip(kv_load_end - staged_kv * bkv, 0, bkv),
-                    ),
-                    0,
-                    bkv,
+                unpack_paged_block(
+                    traits,
+                    kv_refs,
+                    kv_slot,
+                    staged_kv_head,
+                    kv_load_end,
+                    kv_used_end,
+                    staged_kv,
                 )
-                # Note (david): a staged word holds the kv head's K and V rows,
-                # split into planes once per compute tile, not once per q tile.
-                # Staged rows from valid_rows on may hold NaN (cache slots past
-                # seqused_k or stale VMEM), and a zero probability times a NaN
-                # value is still NaN, so they unpack as zero values; the keys
-                # are masked and skip the select, which keeps it off the path to
-                # the first QK.
-                for tile in range(num_k_compute_tiles):
-                    tile_rows = pl.ds(tile * bkv_compute, bkv_compute)
-
-                    def _valid_only(rows, tile=tile):
-                        row_ids = tile * bkv_compute + lax.broadcasted_iota(
-                            jnp.int32, rows.shape, 0
-                        )
-                        return jnp.where(
-                            row_ids < valid_rows, rows, jnp.zeros_like(rows)
-                        )
-
-                    if paged.is_bitcast_load:
-                        words = load_staged_words(
-                            staged_words(kv_pair_buf, kv_slot),
-                            tile * bkv_compute,
-                            bkv_compute,
-                            1,
-                        )
-                        k_rows, _ = kv_word_halves(
-                            words, staged_kv_head, kv_pair_buf.dtype
-                        )
-                        _, v_rows = kv_word_halves(
-                            _valid_only(words),
-                            staged_kv_head,
-                            kv_pair_buf.dtype,
-                        )
-                    else:
-                        k_rows, v_rows = (
-                            kv_pair_buf[
-                                kv_slot,
-                                tile_rows,
-                                0,
-                                kv_part * heads_per_word
-                                + staged_kv_head % heads_per_word,
-                                :,
-                            ]
-                            for kv_part in range(2)
-                        )
-                        v_rows = _valid_only(v_rows)
-                    # Note (david): an fp8 block is widened to bf16 once per
-                    # staged block rather than fed to the MXU as fp8, which
-                    # makes Mosaic rescale every f32 score and output tile for
-                    # e4m3fn's bias (v6e: 0.356 against 0.349 ms a 1024-token
-                    # chunk).
-                    for kv_part, plane_rows in enumerate((k_rows, v_rows)):
-                        kv_planes[kv_part, tile_rows, :] = plane_rows.astype(
-                            kv_planes.dtype
-                        )
             elif rotary_dim and rotary_k:
-                rotate_staged(traits, k_buf, rotary_k_buf, kv_slot, bkv)
+                rotate_staged(
+                    traits, kv_refs.k_buf, kv_refs.rotary_buf, kv_slot, bkv
+                )
             # Note (david): a path that loads every block starts the block two
             # ahead inside the copy, where the page DMAs' scalar work rides the
             # copy's idle scalar slots.
