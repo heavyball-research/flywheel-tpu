@@ -232,8 +232,8 @@ class FwdTraits(QKVTraits):
                     "rotary batch must match token-major batch or be shared."
                 )
         # A per-seq schedule indexes its kv compute tiles at runtime, which
-        # only a sublane token axis allows (see fwd_body's
-        # skips_past_frontier).
+        # only a sublane token axis allows (see the live-tile copy of
+        # kernels/fwd_varlen.py's varlen_fwd_body).
         assert not self.is_per_seq or (
             self.is_head_dim_minor and not self.transposed_pv
         ), (self.qkv_layout, self.transposed_pv)

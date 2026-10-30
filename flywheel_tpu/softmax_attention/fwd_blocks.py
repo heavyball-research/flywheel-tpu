@@ -1,6 +1,7 @@
 """Building blocks of the forward fragment pipeline.
 
-A forward main loop (fwd_pipeline.fwd_body, or kernels/fwd_paged.py's
+A forward main loop (fwd_pipeline.fwd_body for dense builds,
+kernels/fwd_varlen.py's varlen_fwd_body or kernels/fwd_paged.py's
 paged_fwd_body) runs these at fixed points: the Q and rotary staging copies
 and their in-place rotation, the K and V staging copies, the QK fragment and
 its masks, the online softmax, the PV with its pending-PV hand-off across

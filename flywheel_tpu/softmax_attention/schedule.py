@@ -91,7 +91,8 @@ ScheduleContext = ScheduleRow | None
 @dataclasses.dataclass(frozen=True)
 class FwdSchedule:
     """Nested-loop bounds and per-block arithmetic for a forward main loop
-    (fwd_pipeline.fwd_body, kernels/fwd_paged.paged_fwd_body).
+    (fwd_pipeline.fwd_body, kernels/fwd_varlen.varlen_fwd_body,
+    kernels/fwd_paged.paged_fwd_body).
 
     Loop order: head group g (static bound), q block row si (static bound,
     qi = first_row + si), kv block in [lo, hi] (runtime bounds).

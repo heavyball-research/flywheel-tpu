@@ -1,4 +1,5 @@
-"""Forward fragment pipeline shared by the batch and varlen flash kernels."""
+"""Dense forward main loop, and the operand checks, scratch and pallas_call
+the dense and varlen forward kernels share."""
 
 from collections.abc import Callable, Sequence
 from functools import partial, reduce
@@ -13,7 +14,6 @@ from ..core.tpu import NUM_LANES
 from .config import (
     QKVLayout,
     from_head_minor,
-    hbm_bf16_tile_rows,
     vmem_limit_bytes,
 )
 from .dma import advance, drain
@@ -34,8 +34,6 @@ from .fwd_blocks import (
     ScoreMask,
     cancel_pending_pv,
     carry_out_pv,
-    flag_overflow_risk,
-    fill_packed_tail,
     finish_row_lse,
     finish_row_out,
     fold_out_sinks,
@@ -48,7 +46,6 @@ from .fwd_blocks import (
     qk,
     rotate_staged,
     start_kv_block,
-    stage_bounds,
     start_q_row,
     wait_kv_block,
     wait_q_row,
@@ -69,24 +66,22 @@ def fwd_body(
     *,
     operands: VariantOperands,
 ) -> None:
-    """Run the fragment pipeline over every block the schedule yields.
+    """Run the dense fragment pipeline over every block the schedule yields.
 
     traits is the build's static configuration, variant its elementwise math
     and operands the variant's traced values, and refs are forward_common's
     rotary operands, outputs and scratch, in its allocation order. The logits
-    run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). A
-    per-seq schedule writes the packed padding rows past schedule.packed_q_end
-    as out = 0, lse = -inf, and applies the mask itself, so its variant has
-    none. A paged build runs kernels/fwd_paged.py's own loop instead.
+    run in log2 units: Q reaches the QK matmul pre-multiplied by log2(e). The
+    varlen and paged builds run their own loops (kernels/fwd_varlen.py,
+    kernels/fwd_paged.py).
 
     operands.sinks_ref is None or an SMEM (nheads,) float32 of per-head sink
     logits in log2 units, one per sequence head (flat q head f reads
     f % nheads, or f // heads_outer_batch heads-outer), each added to its
     head's softmax denominator.
     """
-    assert not traits.is_paged, traits
-    is_per_seq = traits.is_per_seq
-    assert (schedule.q_token is not None) == is_per_seq, is_per_seq
+    assert not (traits.is_paged or traits.is_per_seq), traits
+    assert schedule.q_token is None and schedule.num_live_tiles is None
     bq, bkv = traits.bq, traits.bkv
     bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
     num_stages = traits.num_stages
@@ -94,8 +89,7 @@ def fwd_body(
     num_q_compute_tiles = traits.num_q_compute_tiles
     num_compute_tiles = traits.num_compute_tiles
     head_fold = traits.head_fold
-    group_heads, group_bq = traits.group_heads, traits.group_bq
-    defers_row_finish = traits.defers_row_finish
+    group_heads = traits.group_heads
     is_lane_paired = traits.is_lane_paired
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     variant.check_operands(operands)
@@ -114,7 +108,6 @@ def fwd_body(
     lse_hbm = remaining_refs.pop(0) if return_lse else None
     q_buf = remaining_refs.pop(0)
     k_buf, v_buf = remaining_refs.pop(0), remaining_refs.pop(0)
-    bounds_buf = remaining_refs.pop(0) if is_per_seq else None
     if rotary_dim:
         rotary_q_buf = remaining_refs.pop(0)
         rotary_k_buf = remaining_refs.pop(0) if rotary_k else None
@@ -171,8 +164,6 @@ def fwd_body(
         rotary_buf=rotary_k_buf,
         sems=sems,
     )
-    if return_lse and is_per_seq:
-        lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
     has_static_mask = window != (None, None)
     num_head_groups = schedule.num_head_groups
@@ -188,12 +179,7 @@ def fwd_body(
     # masks every fragment of a partial block, which costs compute, never
     # correctness. A runtime causal_offset is a traced scalar, so the isinstance
     # keeps it off.
-    if (
-        has_static_mask
-        and not is_per_seq
-        and isinstance(causal_offset, int)
-        and bq % bkv == 0
-    ):
+    if has_static_mask and isinstance(causal_offset, int) and bq % bkv == 0:
         window_plans = window_fragment_plans(
             bq=bq,
             bkv=bkv,
@@ -205,19 +191,15 @@ def fwd_body(
         )
     else:
         window_plans = None
-    # Note (david): a per-seq q block's kv frontier is a runtime scalar, so a
-    # masked block runs only its kv compute tiles below it, in a tile loop that
-    # indexes the tile at runtime; only a sublane token axis allows that.
-    skips_past_frontier = schedule.num_live_tiles is not None
-    assert skips_past_frontier == is_per_seq, (skips_past_frontier, is_per_seq)
     # Note (david): only a left window can mask a row's whole first fragment
     # while later keys stay visible; anchoring on that masked score would push
     # the row's first visible key past the guard into a replay.
-    defers_row_start = window[0] is not None or schedule.has_q_span
+    defers_row_start = window[0] is not None
+    # A dense build has no per-seq bounds rows.
     mask = ScoreMask(
         causal_offset=causal_offset,
-        bounds=bounds_buf,
-        has_q_span=schedule.has_q_span,
+        bounds=None,
+        has_q_span=False,
         defers_row_start=defers_row_start,
     )
 
@@ -229,8 +211,8 @@ def fwd_body(
     # against 2330 for the whole copy). Blocks j and j + 1 hold at most two
     # slots, so the slot block j + 2 takes is free for its start anywhere in
     # block j's step.
-    def _block_desc(head, kv, ctx):
-        """The DMA inputs of kv block kv of head's group in the row of ctx."""
+    def _block_desc(head, kv):
+        """The DMA inputs of kv block kv of head's group."""
         # Note (david): the heads-outer fold flattens (heads, batch) with
         # B = heads_outer_batch, so q index n * B + b reads kv index
         # (n // q_heads_per_kv_head) * B + b; the batch-outer fold flattens
@@ -241,10 +223,7 @@ def fwd_body(
             kv_head = (
                 head // heads_outer_batch // q_heads_per_kv_head
             ) * heads_outer_batch + head % heads_outer_batch
-        if is_per_seq:
-            desc = (kv_head, schedule.kv_token(kv, ctx))
-        else:
-            desc = (kv_head, kv * bkv)
+        desc = (kv_head, kv * bkv)
         # Note (david): the descriptors ride the loop carry, which needs strong
         # int32 scalars.
         return tuple(jnp.asarray(field, jnp.int32) for field in desc)
@@ -287,7 +266,7 @@ def fwd_body(
         """One kv block of row si. ahead holds the descriptors of the next row's
         first two blocks in the flattened block order, and carry this block's
         and the next block's ring slot, freshness and descriptor."""
-        q_tok, base_head, q_slot, row_parity, prev_row_finish = row
+        q_tok, base_head, q_slot, row_parity = row
         (
             kv_slot,
             next_slot,
@@ -296,16 +275,9 @@ def fwd_body(
             block_desc,
             next_block_desc,
         ) = carry
-        if is_per_seq:
-            kv_tok = schedule.kv_token(kv, ctx)
-        else:
-            kv_tok = kv * bkv
+        kv_tok = kv * bkv
         is_first = kv == lo
-        is_partial, needs_bounds = schedule.block_flags(si, kv, ctx)
-        if skips_past_frontier:
-            num_live_tiles = schedule.num_live_tiles(kv, ctx)
-        else:
-            num_live_tiles = None
+        is_partial, _ = schedule.block_flags(si, kv, ctx)
         # Note (david): row_sum and o scratch ping-pong, so a block's first kv
         # tile reads the previous block's exit state while later tiles update in
         # place; each head keeps its own guard flag, so one head's overflow
@@ -317,7 +289,7 @@ def fwd_body(
         first_next_row_desc, second_ahead_desc = ahead
         ahead_desc = _select_desc(
             kv + 2 <= hi,
-            _block_desc(base_head, kv + 2, ctx),
+            _block_desc(base_head, kv + 2),
             _select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc),
         )
         is_ahead_fresh = _is_fresh(ahead_desc, next_block_desc).astype(
@@ -369,8 +341,8 @@ def fwd_body(
             last_kv_tile=num_k_compute_tiles - 1,
             **flags,
         ):
-            """online_softmax of one of this block's fragments, flags its
-            keyword flags."""
+            """online_softmax of one of this block's fragments, which no
+            bounds row touches, flags its keyword flags."""
             return online_softmax(
                 traits,
                 variant,
@@ -382,6 +354,7 @@ def fwd_body(
                 q_compute_index,
                 logits,
                 needs_mask,
+                apply_bounds=False,
                 last_kv_tile=last_kv_tile,
                 **flags,
             )
@@ -411,17 +384,14 @@ def fwd_body(
             is_causal,
             guard_recovery,
             static_g,
-            apply_bounds,
             window_fragments=None,
             *,
-            skips_dead_tiles=False,
             takes_pending=False,
             carries_out=False,
         ):
             """takes_pending issues the previous block's pending PV after the
             first softmax, and carries_out leaves the last fragment's PV
-            pending; a replay passes neither. skips_dead_tiles runs a
-            bounds-masked block's live tiles alone."""
+            pending; a replay passes neither."""
 
             def _after_first_softmax():
                 if takes_pending:
@@ -434,109 +404,7 @@ def fwd_body(
             # overlaps head g's last PV. An int static_g is the rare per-head
             # overflow replay, kept simple on purpose.
             heads = range(head_fold) if static_g is None else (static_g,)
-            if skips_dead_tiles:
-                # Note (david): the live tiles run in a loop whose body is the q
-                # tiles of one kv tile, straight-line, with the pending PV in
-                # the carry; a cond around every fragment instead ran 17.4
-                # against 3.78 ms (v6e, 32:8 d128, paged (512, 2048, 128, 512)).
-                # A live tile past a q tile's own frontier scores fully masked
-                # fragments, which leave every anchored row's state as it was.
-                # Tile 0 is peeled so the carry always holds a pending PV, and
-                # with two tiles per block only tile 0 is live.
-                last_q_tile = num_q_compute_tiles - 1
-                has_tile_loop = num_k_compute_tiles > 2
-                last_live_tile = num_live_tiles - 1 if has_tile_loop else 0
-
-                def _tile_fragments(
-                    g, kv_compute_index, is_tile_zero, pending_pv
-                ):
-                    for q_compute_index in range(num_q_compute_tiles):
-                        logits = _qk(g, kv_compute_index, q_compute_index)
-                        probs, is_row_start, rescale = _online_softmax(
-                            g,
-                            kv_compute_index,
-                            q_compute_index,
-                            logits,
-                            is_causal,
-                            guard_recovery=guard_recovery,
-                            apply_bounds=True,
-                            is_tile_zero=is_tile_zero,
-                            last_kv_tile=None if has_tile_loop else 0,
-                        )
-                        if pending_pv is None:
-                            _after_first_softmax()
-                        else:
-                            _block_pv(*pending_pv)
-                        pending_pv = (
-                            g,
-                            kv_compute_index,
-                            q_compute_index,
-                            probs,
-                            is_row_start,
-                            rescale,
-                            is_tile_zero,
-                        )
-                    return pending_pv
-
-                pending_pv = None
-                for g in heads:
-                    pending_pv = _tile_fragments(g, 0, True, pending_pv)
-                    if has_tile_loop:
-
-                        def _tile_step(kv_compute_index, carry, g=g):
-                            # Note (david): the carried PV is tile 0's on the
-                            # first iteration, so its parity stays runtime.
-                            pending = (
-                                g,
-                                kv_compute_index - 1,
-                                last_q_tile,
-                                *carry,
-                                None,
-                            )
-                            *_, probs, is_row_start, rescale, _ = (
-                                _tile_fragments(
-                                    g, kv_compute_index, False, pending
-                                )
-                            )
-                            return probs, is_row_start, rescale
-
-                        carry = lax.fori_loop(
-                            1,
-                            num_live_tiles,
-                            _tile_step,
-                            tuple(pending_pv[3:6]),
-                        )
-                        pending_pv = (
-                            g,
-                            last_live_tile,
-                            last_q_tile,
-                            *carry,
-                            None,
-                        )
-                if carries_out:
-                    assert not guard_recovery
-                    _, last_k, _, probs, is_row_start, _, is_tile_zero = (
-                        pending_pv
-                    )
-                    _carry_out_pv(probs, is_row_start, last_k, is_tile_zero)
-                else:
-                    _block_pv(*pending_pv)
-                if has_tile_loop and not guard_recovery:
-                    # Note (david): once the loop ends each head's new-parity
-                    # row sums are its last live tile's, so one check replaces a
-                    # runtime tile compare in every fragment.
-                    for g in heads:
-                        new_parity, _ = state.block_parities()
-                        flag_overflow_risk(
-                            traits,
-                            state,
-                            g,
-                            row_sum_scratch[
-                                new_parity, pl.ds(g * group_bq, group_bq), :
-                            ],
-                            True,
-                        )
-            elif window_fragments is not None:
+            if window_fragments is not None:
                 assert not carries_out
                 pending_pv = None
                 for g in heads:
@@ -549,7 +417,6 @@ def fwd_body(
                             logits,
                             fragment.needs_mask,
                             guard_recovery=guard_recovery,
-                            apply_bounds=False,
                             window_fragment=fragment,
                         )
                         if pending_pv is None:
@@ -606,7 +473,6 @@ def fwd_body(
                         logits,
                         needs_mask=is_causal,
                         guard_recovery=guard_recovery,
-                        apply_bounds=apply_bounds,
                     )
                 )
                 _after_first_softmax()
@@ -630,7 +496,6 @@ def fwd_body(
                             logits,
                             is_causal,
                             guard_recovery=guard_recovery,
-                            apply_bounds=apply_bounds,
                         )
                     )
                     _block_pv(
@@ -686,13 +551,7 @@ def fwd_body(
                         rescale_last,
                     )
 
-        def _run_group(
-            is_causal,
-            apply_bounds,
-            window_fragments=None,
-            skips_dead_tiles=False,
-            carries_out=False,
-        ):
+        def _run_group(is_causal, window_fragments=None, carries_out=False):
             # Note (david): the unpack (or K rotation) leads the copy in program
             # order, where the scheduler overlaps it with the pending PV, which
             # reads only scratch.
@@ -716,9 +575,7 @@ def fwd_body(
                         is_causal,
                         guard_recovery=False,
                         static_g=g,
-                        apply_bounds=apply_bounds,
                         window_fragments=window_fragments,
-                        skips_dead_tiles=skips_dead_tiles,
                         takes_pending=g == 0,
                         carries_out=carries_out and g == head_fold - 1,
                     )
@@ -727,9 +584,7 @@ def fwd_body(
                     is_causal,
                     guard_recovery=False,
                     static_g=None,
-                    apply_bounds=apply_bounds,
                     window_fragments=window_fragments,
-                    skips_dead_tiles=skips_dead_tiles,
                     takes_pending=True,
                     carries_out=carries_out,
                 )
@@ -742,9 +597,7 @@ def fwd_body(
                         is_causal,
                         guard_recovery=True,
                         static_g=g,
-                        apply_bounds=apply_bounds,
                         window_fragments=window_fragments,
-                        skips_dead_tiles=skips_dead_tiles,
                     )
                     if g == pending_g:
                         cancel_pending_pv(pending)
@@ -757,72 +610,24 @@ def fwd_body(
         # window (dense) or the per-seq bounds (varlen), never both, and
         # has_static_mask still gates the former so a full-attention build never
         # loses its upper triangle.
-        if is_per_seq:
-            needs_any_mask = jnp.logical_or(is_partial, needs_bounds)
-        else:
-            needs_any_mask = is_partial
-
-        @pl.when(jnp.logical_not(needs_any_mask))
+        @pl.when(jnp.logical_not(is_partial))
         def _run_unmasked_block():
-            _run_group(is_causal=False, apply_bounds=False, carries_out=True)
-
-        # Note (david): each tile loop step ends a basic block the fragment
-        # pipeline cannot overlap across, so only a block with dead tiles takes
-        # the loop: running every masked block through it slowed the packed
-        # varlen kernel by 7% (v6e, 32:8 d128: 7.35 against 6.85 ms).
-        if skips_past_frontier and num_k_compute_tiles > 1:
-            skips_dead_tiles = num_live_tiles < num_k_compute_tiles
-            runs_every_tile = jnp.logical_and(
-                needs_any_mask, jnp.logical_not(skips_dead_tiles)
-            )
-
-            @pl.when(jnp.logical_and(needs_any_mask, skips_dead_tiles))
-            def _run_live_tile_block():
-                stage_bounds(traits, schedule, bounds_buf, ctx, kv, kv_tok)
-                _run_group(
-                    is_causal=has_static_mask,
-                    apply_bounds=True,
-                    skips_dead_tiles=True,
-                    carries_out=defers_row_finish,
-                )
-
-        else:
-            runs_every_tile = needs_any_mask
+            _run_group(is_causal=False, carries_out=True)
 
         if window_plans is not None:
             for block_offset, fragments in window_plans.items():
 
                 @pl.when(
-                    jnp.logical_and(
-                        runs_every_tile, kv_tok - q_tok == block_offset
-                    )
+                    jnp.logical_and(is_partial, kv_tok - q_tok == block_offset)
                 )
                 def _run_window_block(fragments=fragments):
-                    _run_group(
-                        is_causal=True,
-                        apply_bounds=False,
-                        window_fragments=fragments,
-                    )
+                    _run_group(is_causal=True, window_fragments=fragments)
 
         else:
 
-            @pl.when(runs_every_tile)
+            @pl.when(is_partial)
             def _run_masked_block():
-                if is_per_seq:
-                    stage_bounds(traits, schedule, bounds_buf, ctx, kv, kv_tok)
-                _run_group(
-                    is_causal=has_static_mask,
-                    apply_bounds=is_per_seq,
-                    carries_out=defers_row_finish,
-                )
-
-        if defers_row_finish:
-            # Note (david): the previous row's last PV ran inside this block's
-            # copy, and its final parity stays untouched until this row's second
-            # block.
-            @pl.when(jnp.logical_and(is_first, prev_row_finish.is_live > 0))
-            def _finish_previous_row():
-                _finish_row_out(prev_row_finish)
+                _run_group(is_causal=has_static_mask)
 
         return (
             next_slot,
@@ -860,27 +665,18 @@ def fwd_body(
         row si of group g on, and that row's (lo, hi, ctx)."""
         lo, hi, ctx = schedule.row_interval(si)
         after_g, after_si = _row_after(g, si)
-        after_lo, _, after_ctx = schedule.row_interval(after_si)
-        first_desc = _block_desc(g * group_heads, lo, ctx)
+        after_lo, _, _ = schedule.row_interval(after_si)
+        first_desc = _block_desc(g * group_heads, lo)
         second_desc = _select_desc(
             lo < hi,
-            _block_desc(g * group_heads, lo + 1, ctx),
-            _block_desc(after_g * group_heads, after_lo, after_ctx),
+            _block_desc(g * group_heads, lo + 1),
+            _block_desc(after_g * group_heads, after_lo),
         )
         return first_desc, second_desc, (lo, hi, ctx)
 
-    def _carried_finish(row_state):
-        # Note (david): a loop carry drops q_token's pl.multiple_of, and the
-        # output DMA window must start on the hbm_bf16_tile_rows() grid, where
-        # q_token put it.
-        row_parity, finish = row_state
-        return row_parity, finish._replace(
-            q_tok=pl.multiple_of(finish.q_tok, hbm_bf16_tile_rows())
-        )
-
     def _row_body(g, si, carry):
-        """carry ends with (the row's first block's new parity, the previous
-        row's RowFinish) under defers_row_finish, else with ()."""
+        """A dense row drains its own last PV and finishes at its end, so its
+        first block starts at parity 0."""
         (
             q_loaded,
             q_inflight,
@@ -888,28 +684,20 @@ def fwd_body(
             kv_carry,
             prev_out_tok,
             num_out_copies,
-            row_state,
         ) = carry
-        if defers_row_finish:
-            row_parity, prev_row_finish = _carried_finish(row_state)
-        else:
-            row_parity, prev_row_finish = 0, None
+        row_parity = 0
         lo, hi, ctx = schedule.row_interval(si)
         # Note (david): past the grid's last row the lookahead is that row
         # itself, so the q stream prefetches nothing, and the kv stream reloads
         # blocks the kernel waits out after its loop.
         next_g, next_si = _row_after(g, si)
-        first_next_desc, second_next_desc, (_, _, next_ctx) = _first_two_blocks(
+        first_next_desc, second_next_desc, _ = _first_two_blocks(
             next_g, next_si
         )
         base_head = g * group_heads
         next_head = next_g * group_heads
-        if is_per_seq:
-            q_tok = schedule.q_token(ctx)
-            next_q_tok = schedule.q_token(next_ctx)
-        else:
-            q_tok = (schedule.first_row + si) * bq
-            next_q_tok = (schedule.first_row + next_si) * bq
+        q_tok = (schedule.first_row + si) * bq
+        next_q_tok = (schedule.first_row + next_si) * bq
 
         q_loaded, q_inflight, q_slot = advance(
             g * num_rows + si,
@@ -933,7 +721,7 @@ def fwd_body(
                 lo,
                 hi,
                 ctx,
-                (q_tok, base_head, q_slot, row_parity, prev_row_finish),
+                (q_tok, base_head, q_slot, row_parity),
                 (first_next_desc, second_next_desc),
                 block_carry,
             ),
@@ -945,11 +733,7 @@ def fwd_body(
             si=si,
             q_tok=q_tok,
             base_head=base_head,
-            num_blend_rows=(
-                schedule.blend_start(ctx) - q_tok
-                if is_per_seq
-                else jnp.int32(0)
-            ),
+            num_blend_rows=jnp.int32(0),
             prev_out_tok=prev_out_tok,
             out_count=num_out_copies,
             parity=lax.rem(row_parity + hi - lo, 2),
@@ -972,26 +756,20 @@ def fwd_body(
             )
         if sinks is not None:
             fold_out_sinks(traits, variant, state, finish, sinks)
-        if defers_row_finish:
-            next_row_state = (1 - finish.parity, finish)
-        else:
 
-            @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
-            def _drain_pending_pv():
-                issue_pending_pv(traits, state, pending)
+        @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
+        def _drain_pending_pv():
+            issue_pending_pv(traits, state, pending)
 
-            cancel_pending_pv(pending)
-            _finish_row_out(finish)
-            next_row_state = ()
-        next_prev_out_tok = q_tok if is_per_seq else prev_out_tok
+        cancel_pending_pv(pending)
+        _finish_row_out(finish)
         return (
             q_loaded,
             q_inflight,
             q_slot,
             kv_carry,
-            next_prev_out_tok,
+            prev_out_tok,
             num_out_copies + 1,
-            next_row_state,
         )
 
     cancel_pending_pv(pending)
@@ -1006,10 +784,6 @@ def fwd_body(
 
     minus_one = jnp.int32(-1)
     zero = jnp.int32(0)
-    if defers_row_finish:
-        init_row_state = (zero, RowFinish(*([zero] * len(RowFinish._fields))))
-    else:
-        init_row_state = ()
     init_carry = (
         minus_one,
         minus_one,
@@ -1024,9 +798,8 @@ def fwd_body(
         ),
         zero,
         zero,
-        init_row_state,
     )
-    *_, kv_carry, _, num_out_copies, row_state = lax.fori_loop(
+    *_, kv_carry, _, num_out_copies = lax.fori_loop(
         0,
         num_head_groups,
         lambda g, group_carry: lax.fori_loop(
@@ -1046,21 +819,6 @@ def fwd_body(
         after_last_desc,
     ) = kv_carry
 
-    if defers_row_finish:
-        # Note (david): the last row has no next row to run its pending PV and
-        # finish its output.
-        _, last_row_finish = _carried_finish(row_state)
-
-        @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
-        def _drain_last_pending_pv():
-            issue_pending_pv(traits, state, pending)
-
-        cancel_pending_pv(pending)
-
-        @pl.when(last_row_finish.is_live > 0)
-        def _finish_last_row():
-            _finish_row_out(last_row_finish)
-
     @pl.when(is_last_fresh > 0)
     def _wait_last():
         _wait_block_data(last_desc, last_slot)
@@ -1074,11 +832,6 @@ def fwd_body(
         num_stages,
         lambda slot: o_copy(traits, out_refs, 0, 0, slot).wait(),
     )
-
-    if is_per_seq:
-        fill_packed_tail(
-            traits, variant, out_refs, schedule.packed_q_end, num_head_groups
-        )
 
 
 def rotary_fields(
@@ -1134,8 +887,8 @@ def forward_common(
     interpret: bool,
     rotary: tuple[jax.Array, jax.Array | None] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """Validate q/k/v against traits, allocate scratch and run a fwd_body
-    kernel.
+    """Validate q/k/v against traits, allocate scratch and run a dense
+    (fwd_body) or varlen (kernels/fwd_varlen.py) kernel.
 
     kernel is the mode kernel with its schedule already bound; traits and
     variant are bound here. smem_operands lead the kernel's inputs, among them
@@ -1328,7 +1081,7 @@ def forward_common(
         jnp.float32,
     )
     # Note (david): a lane-paired fold's pending V tile is its pair's 128 lanes,
-    # as fwd_body loads it.
+    # as the forward loop loads it.
     pending_probs = vmem((bq_compute, bkv_compute), jnp.float32)
     v_tile_width = NUM_LANES if traits.is_lane_paired else head_dim_v
     pending_v = vmem(
@@ -1382,9 +1135,9 @@ def forward_common(
             token_major.num_q_heads * head_dim_v,
         )
     # Note (david): per-seq LSE gives every head group an explicit minor axis of
-    # whole 128-lane tiles, so fwd_body DMAs complete tiles at offset zero and
-    # groups never alias in the physical layout; only the first group_heads
-    # lanes are returned.
+    # whole 128-lane tiles, so the kernel DMAs complete tiles at offset zero
+    # and groups never alias in the physical layout; only the first
+    # group_heads lanes are returned.
     lse_shape = (
         (num_q_heads // group_heads, q_seq_len, NUM_LANES)
         if is_per_seq
