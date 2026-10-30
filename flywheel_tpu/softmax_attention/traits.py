@@ -1,20 +1,30 @@
-"""Static traits of the forward builds.
+"""Static traits of the forward and decode builds.
 
 A traits object holds what one build fixes at trace time: its tile sizes and
 layout, head counts and widths, head folds and rotary layout, plus the
 constants derived from them as properties. forward_common sizes its scratch
 from it and fwd_body reads it; schedules, refs and traced scalars stay
-arguments.
+arguments. DecodeTraits does the same for the KV-cache decode kernel
+(kernels/decode.py).
 """
 
 import dataclasses
 import math
 
+import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
-from .config import BlockSizes, PagedKVInfo, QKVLayout, TokenMajorInfo
+from .config import (
+    BlockSizes,
+    KVCacheConfig,
+    PagedKVInfo,
+    QKVLayout,
+    TokenMajorInfo,
+)
+from .kv_layout import kv_heads_per_word, kv_word_rows, merged_cache_heads
 from .rotary import ROTARY_DIM_MULTIPLE
+from .softmax import overflow_guard_threshold
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -340,3 +350,163 @@ class PagedFwdTraits(FwdTraits):
             )
         assert head_fold == 1, head_fold
         super().__post_init__()
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class DecodeTraits:
+    """Static configuration of a KV-cache decode build (kernels/decode.py).
+
+    num_query_heads counts every query row of a cache row: query_tokens > 1
+    folds a verify window's tokens into the query heads. kv_config is
+    dispatch's (block_kv, block_kv_compute, num_kv_stages). is_merged_cache
+    reads one cache whose token rows interleave the KV heads' K and V rows,
+    else a K / V pair of cache_dtype. is_cache_head_major stages tokens on the
+    sublane axis, and is_bitcast_load reads staged head pairs as u32 words,
+    which only the TPU build supports. has_new appends one token per row.
+    capacity is a row's token capacity, which every row's keys stay within.
+    page_size and pages_per_seq, the flat block table's pages per row padded
+    to whole blocks, are None for an unpaged cache.
+    """
+
+    batch: int
+    num_query_heads: int
+    num_kv_heads: int
+    head_dim: int
+    query_tokens: int
+    kv_config: KVCacheConfig
+    cache_dtype: jnp.dtype
+    is_merged_cache: bool
+    is_cache_head_major: bool
+    is_bitcast_load: bool
+    has_new: bool
+    capacity: int
+    page_size: int | None
+    pages_per_seq: int | None
+
+    @property
+    def block_kv(self) -> int:
+        return self.kv_config[0]
+
+    @property
+    def block_kv_compute(self) -> int:
+        return self.kv_config[1]
+
+    @property
+    def num_kv_stages(self) -> int:
+        return self.kv_config[2]
+
+    @property
+    def guard_threshold(self) -> float:
+        # Note (david): a row's keys stay within the caller's capacity, which
+        # the padded table does not raise, so the guard is sized on it.
+        return overflow_guard_threshold(self.capacity)
+
+    @property
+    def query_heads_per_kv_head(self) -> int:
+        return self.num_query_heads // self.num_kv_heads
+
+    @property
+    def staged_kv_heads(self) -> int:
+        # Note (david): a merged build stages whole token rows, every KV head's
+        # (K, V) pair (and an fp8 cache's zero pad head).
+        if self.is_merged_cache:
+            return merged_cache_heads(self.num_kv_heads, self.cache_dtype)
+        else:
+            return self.num_kv_heads
+
+    @property
+    def word_rows(self) -> int:
+        return kv_word_rows(self.cache_dtype)
+
+    @property
+    def num_kv_compute_fragments(self) -> int:
+        return self.block_kv // self.block_kv_compute
+
+    # Note (david): a bitcast head-pair tile interleaves its two heads per
+    # token, so both heads' query groups ride one MXU pass with the off-parity
+    # columns masked. That is free while the pair's query rows fit one 8-sublane
+    # f32 tile; past it the masked half doubles the softmax work, so larger
+    # groups unpack one head per fragment. A merged row's u32 word pairs a
+    # head's K with its V instead, so a merged build always unpacks one head per
+    # fragment.
+    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
+    # V bytes in its high half, so the pair rides one fragment like the bf16
+    # head-pair bitcast.
+    @property
+    def is_pair_word_fragment(self) -> bool:
+        return (
+            self.is_merged_cache
+            and kv_heads_per_word(self.cache_dtype) == 2
+            and NUM_SUBLANES // 2
+            < 2 * self.query_heads_per_kv_head
+            <= NUM_SUBLANES
+            and self.num_kv_heads % 2 == 0
+        )
+
+    @property
+    def kv_heads_per_fragment(self) -> int:
+        if (
+            self.is_bitcast_load
+            and 2 * self.query_heads_per_kv_head <= NUM_SUBLANES
+            and not self.is_merged_cache
+        ) or self.is_pair_word_fragment:
+            return 2
+        else:
+            return 1
+
+    @property
+    def kv_heads_per_group(self) -> int:
+        # Note (david): a merged build whose KV head serves fewer than 8 query
+        # heads scores several KV heads through one 8-row query tile: each
+        # head's keys are pushed once, as before, but the LHS carries the whole
+        # group's query rows, and the head keeps its own rows of the result. The
+        # group then runs one softmax over a full f32 tile instead of one per
+        # head over a mostly empty one, and its running max, sum and accumulator
+        # are whole tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block
+        # loop went from 7149 to 5223 bundles (RPA v3: 7165), losing the
+        # per-head cross-lane broadcasts, sublane rotates and single-row state
+        # stores.
+        query_heads_per_kv_head = self.query_heads_per_kv_head
+        if (
+            self.is_merged_cache
+            and not self.is_pair_word_fragment
+            and NUM_SUBLANES % query_heads_per_kv_head == 0
+            and self.num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head)
+            == 0
+        ):
+            return NUM_SUBLANES // query_heads_per_kv_head
+        else:
+            return 1
+
+    @property
+    def num_head_groups(self) -> int:
+        return (
+            self.num_kv_heads
+            // self.kv_heads_per_fragment
+            // self.kv_heads_per_group
+        )
+
+    @property
+    def rows_per_fragment(self) -> int:
+        return (
+            self.query_heads_per_kv_head
+            * self.kv_heads_per_fragment
+            * self.kv_heads_per_group
+        )
+
+    @property
+    def fragment_keys(self) -> int:
+        return self.kv_heads_per_fragment * self.block_kv_compute
+
+    @property
+    def cache_tile_rows(self) -> int:
+        # Note (david): every cache DMA on the token axis moves whole
+        # cache_tile_rows tiles. A head-major stage puts tokens on its bf16
+        # sublane axis, which v7x tiles 16 rows deep (BF16_TILE_ROWS; v6e 8),
+        # and Mosaic sizes a DMA and its wait between the 8-row HBM tiles and
+        # that stage in whole 16-row tiles, so an 8-row remainder was dropped
+        # from the copy and the wait returned before the DMA landed (v7x read
+        # stale tokens; the leftover semaphore count then released later waits
+        # early). A token-major stage puts tokens on a leading axis, where each
+        # token is whole tiles and the 8-row granule is exact.
+        return BF16_TILE_ROWS if self.is_cache_head_major else NUM_SUBLANES

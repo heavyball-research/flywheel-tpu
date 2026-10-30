@@ -11,13 +11,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tiling import round_up
-from ...core.tpu import (
-    BF16_BYTES,
-    BF16_TILE_ROWS,
-    F32_BYTES,
-    NUM_LANES,
-    NUM_SUBLANES,
-)
+from ...core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES, NUM_LANES
 from ..config import (
     LOG2E,
     NN_DIM_NUMBERS,
@@ -34,11 +28,10 @@ from ..kv_layout import (
     kv_word_rows,
     load_kv_fragment,
     load_staged_words,
-    merged_cache_heads,
     resolve_merged_kv_heads,
     staged_words,
 )
-from ..softmax import overflow_guard_threshold
+from ..traits import DecodeTraits
 from ..variant import Variant
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
@@ -210,23 +203,36 @@ def kvcache_kernel(
     num_active_ref: jax.Array,
     v_scale_ref: jax.Array,
     *refs: jax.Array,
-    batch: int,
-    num_query_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
-    block_kv: int,
-    block_kv_compute: int,
-    num_kv_stages: int,
-    is_cache_head_major: bool,
-    is_bitcast_load: bool,
-    has_new: bool,
-    query_tokens: int,
-    guard_threshold: float,
-    page_size: int | None,
-    pages_per_seq: int | None,
-    is_merged_cache: bool,
+    traits: DecodeTraits,
     variant: Variant,
 ) -> None:
+    """Attend each active row's cache, appending the row's new token first
+    under traits.has_new.
+
+    traits is the build's static configuration and variant its elementwise
+    math; the softmax runs in log2 units on a q its caller has scaled.
+    """
+    batch = traits.batch
+    num_kv_heads, head_dim = traits.num_kv_heads, traits.head_dim
+    block_kv, block_kv_compute = traits.block_kv, traits.block_kv_compute
+    num_kv_stages = traits.num_kv_stages
+    is_cache_head_major = traits.is_cache_head_major
+    is_bitcast_load = traits.is_bitcast_load
+    is_merged_cache = traits.is_merged_cache
+    has_new = traits.has_new
+    query_tokens = traits.query_tokens
+    guard_threshold = traits.guard_threshold
+    page_size, pages_per_seq = traits.page_size, traits.pages_per_seq
+    query_heads_per_kv_head = traits.query_heads_per_kv_head
+    staged_kv_heads = traits.staged_kv_heads
+    word_rows = traits.word_rows
+    num_kv_compute_fragments = traits.num_kv_compute_fragments
+    kv_heads_per_fragment = traits.kv_heads_per_fragment
+    kv_heads_per_group = traits.kv_heads_per_group
+    num_head_groups = traits.num_head_groups
+    rows_per_fragment = traits.rows_per_fragment
+    fragment_keys = traits.fragment_keys
+    cache_tile_rows = traits.cache_tile_rows
     return_lse = variant.return_lse
     left, right = variant.window
     remaining_refs = list(refs)
@@ -268,65 +274,6 @@ def kvcache_kernel(
         sems,
     ) = remaining_refs
 
-    query_heads_per_kv_head = num_query_heads // num_kv_heads
-    cache_dtype = k_cache_ref.dtype
-    # Note (david): a merged build stages whole token rows, every KV head's
-    # (K, V) pair (and an fp8 cache's zero pad head).
-    if is_merged_cache:
-        staged_kv_heads = merged_cache_heads(num_kv_heads, cache_dtype)
-    else:
-        staged_kv_heads = num_kv_heads
-    word_rows = kv_word_rows(cache_dtype)
-    num_kv_compute_fragments = block_kv // block_kv_compute
-    # Note (david): a bitcast head-pair tile interleaves its two heads per
-    # token, so both heads' query groups ride one MXU pass with the off-parity
-    # columns masked. That is free while the pair's query rows fit one 8-sublane
-    # f32 tile; past it the masked half doubles the softmax work, so larger
-    # groups unpack one head per fragment. A merged row's u32 word pairs a
-    # head's K with its V instead, so a merged build always unpacks one head per
-    # fragment.
-    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
-    # V bytes in its high half, so the pair rides one fragment like the bf16
-    # head-pair bitcast.
-    is_pair_word_fragment = (
-        is_merged_cache
-        and kv_heads_per_word(cache_dtype) == 2
-        and NUM_SUBLANES // 2 < 2 * query_heads_per_kv_head <= NUM_SUBLANES
-        and num_kv_heads % 2 == 0
-    )
-    if (
-        is_bitcast_load
-        and 2 * query_heads_per_kv_head <= NUM_SUBLANES
-        and not is_merged_cache
-    ) or is_pair_word_fragment:
-        kv_heads_per_fragment = 2
-    else:
-        kv_heads_per_fragment = 1
-    # Note (david): a merged build whose KV head serves fewer than 8 query
-    # heads scores several KV heads through one 8-row query tile: each head's
-    # keys are pushed once, as before, but the LHS carries the whole group's
-    # query rows, and the head keeps its own rows of the result. The group then
-    # runs one softmax over a full f32 tile instead of one per head over a
-    # mostly empty one, and its running max, sum and accumulator are whole
-    # tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block loop went
-    # from 7149 to 5223 bundles (RPA v3: 7165), losing the per-head cross-lane
-    # broadcasts, sublane rotates and single-row state stores.
-    if (
-        is_merged_cache
-        and not is_pair_word_fragment
-        and NUM_SUBLANES % query_heads_per_kv_head == 0
-        and num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head) == 0
-    ):
-        kv_heads_per_group = NUM_SUBLANES // query_heads_per_kv_head
-    else:
-        kv_heads_per_group = 1
-    num_head_groups = (
-        num_kv_heads // kv_heads_per_fragment // kv_heads_per_group
-    )
-    rows_per_fragment = (
-        query_heads_per_kv_head * kv_heads_per_fragment * kv_heads_per_group
-    )
-    fragment_keys = kv_heads_per_fragment * block_kv_compute
     # Note (david): row r of a group's tile belongs to the group's KV head
     # r // query_heads_per_kv_head.
     if kv_heads_per_group == 1:
@@ -381,17 +328,6 @@ def kvcache_kernel(
             is_cache_head_major=is_cache_head_major,
             is_bitcast_load=is_bitcast_load,
         )
-
-    # Note (david): every cache DMA on the token axis moves whole
-    # cache_tile_rows tiles. A head-major stage puts tokens on its bf16 sublane
-    # axis, which v7x tiles 16 rows deep (BF16_TILE_ROWS; v6e 8), and Mosaic
-    # sizes a DMA and its wait between the 8-row HBM tiles and that stage in
-    # whole 16-row tiles, so an 8-row remainder was dropped from the copy and
-    # the wait returned before the DMA landed (v7x read stale tokens; the
-    # leftover semaphore count then released later waits early). A token-major
-    # stage puts tokens on a leading axis, where each token is whole tiles and
-    # the 8-row granule is exact.
-    cache_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
 
     def _cache_copy_size(cache_len, block_index):
         copy_limit = (
@@ -1422,10 +1358,7 @@ def flash_attn_kvcache_pallas(
         raise ValueError(
             f"capacity must be a multiple of {MIN_BLOCK_KV}; got {capacity}."
         )
-    block_kv, block_kv_compute, num_kv_stages = kv_config
-    # Note (david): a row's keys stay within the caller's capacity, which the
-    # padded table does not raise, so the guard is sized on it.
-    guard_threshold = overflow_guard_threshold(capacity)
+    block_kv, _, num_kv_stages = kv_config
     if page_size is not None:
         # Note (david): the padded entries lie past every row's length and each
         # page's load is clipped to it, so page 0 stands in and is never read.
@@ -1435,6 +1368,25 @@ def flash_attn_kvcache_pallas(
             ((0, 0), (0, padded_pages_per_seq - pages_per_seq)),
         ).reshape(-1)
         pages_per_seq = padded_pages_per_seq
+    # Note (david): the pair-packed load bitcasts refs, which only the TPU build
+    # supports; interpret mode reads the staged heads as bf16.
+    is_bitcast_load = not interpret and not is_cache_head_major
+    traits = DecodeTraits(
+        batch=batch,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        query_tokens=query_tokens,
+        kv_config=kv_config,
+        cache_dtype=k_cache.dtype,
+        is_merged_cache=merged_cache,
+        is_cache_head_major=is_cache_head_major,
+        is_bitcast_load=is_bitcast_load,
+        has_new=has_new,
+        capacity=capacity,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+    )
     kv_spec = pl.BlockSpec(
         (batch, num_kv_heads, head_dim), lambda *_: (0, 0, 0)
     )
@@ -1458,11 +1410,8 @@ def flash_attn_kvcache_pallas(
     else:
         out_shapes = aliased_out_shapes
         out_specs = (hbm_spec,) * len(aliased_out_shapes)
-    # Note (david): the pair-packed load bitcasts refs, which only the TPU build
-    # supports; interpret mode reads the staged heads as bf16.
-    is_bitcast_load = not interpret and not is_cache_head_major
-    staged_kv_heads = cache_shape[2] if merged_cache else num_kv_heads
-    word_rows = kv_word_rows(k_cache.dtype)
+    staged_kv_heads = traits.staged_kv_heads
+    word_rows = traits.word_rows
 
     def _staging_shape(num_tokens, word_stride):
         if is_cache_head_major:
@@ -1481,7 +1430,7 @@ def flash_attn_kvcache_pallas(
     cache_buffer_shape = _staging_shape(
         block_kv, bank_safe_word_stride(token_words)
     )
-    write_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
+    write_tile_rows = traits.cache_tile_rows
     write_buffer_shape = _staging_shape(write_tile_rows, token_words)
     # Note (david): a merged build never touches the V staging, so it shrinks to
     # the write-tile size instead of a whole KV block.
@@ -1554,25 +1503,7 @@ def flash_attn_kvcache_pallas(
         num_prefetch + len(dense_inputs) + index: 1 + index
         for index in range(len(kernel_caches))
     }
-    kernel = functools.partial(
-        kvcache_kernel,
-        batch=batch,
-        num_query_heads=num_query_heads,
-        num_kv_heads=num_kv_heads,
-        head_dim=head_dim,
-        block_kv=block_kv,
-        block_kv_compute=block_kv_compute,
-        num_kv_stages=num_kv_stages,
-        is_cache_head_major=is_cache_head_major,
-        is_bitcast_load=is_bitcast_load,
-        has_new=has_new,
-        query_tokens=query_tokens,
-        guard_threshold=guard_threshold,
-        page_size=page_size,
-        pages_per_seq=pages_per_seq,
-        is_merged_cache=merged_cache,
-        variant=variant,
-    )
+    kernel = functools.partial(kvcache_kernel, traits=traits, variant=variant)
     # Note (deepolar): the sinks follow the caches, so the alias indices above
     # stay put; they arrive in log2 units, broadcast over the row-state lanes.
     if sinks is None:
