@@ -9,7 +9,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tiling import round_up
-from ...core.tpu import NUM_LANES, NUM_SUBLANES
+from ...core.tpu import NUM_LANES
 from ..bwd_pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
@@ -619,61 +619,12 @@ def flash_attn_bwd(
             " picks; got None."
         )
 
-    is_rectangular = q_seq_len != kv_seq_len
-    num_stages = block_sizes.num_stages
-    bq = block_sizes.block_q
-    # Note (david): lse/di put seq on the lane axis, so a per-block slice at
-    # qi * bq is only tile-aligned when bq is a multiple of NUM_LANES.
-    if bq % NUM_LANES:
-        raise ValueError(f"block {bq} must be a multiple of {NUM_LANES}.")
-    if q_seq_len % bq:
-        raise ValueError(f"block {bq} must divide q_seq_len {q_seq_len}.")
-    num_q_blocks = q_seq_len // bq
-
-    bq_compute = block_sizes.block_q_compute
-    if bq_compute % NUM_LANES or bq % bq_compute:
-        raise ValueError(
-            f"block_q_compute {bq_compute} must be a multiple of {NUM_LANES}"
-            f" and divide block {bq}."
-        )
-
-    bkv = block_sizes.block_kv
-    if bkv % NUM_SUBLANES:
-        raise ValueError(
-            f"block_kv {bkv} must be a multiple of {NUM_SUBLANES}."
-        )
-    if kv_seq_len % bkv:
-        raise ValueError(f"block_kv {bkv} must divide kv_seq_len {kv_seq_len}.")
-
     # Note (david): the general kernel folds only a GQA/MQA group or a d64 lane
     # pair; any other fold goes to the single-block kernel.
     if is_gqa:
         # Note (david): a GQA/MQA schedule group is one kv head plus its q
         # heads, so the q-side fold is the group itself.
         head_fold = num_heads // num_kv_heads
-    elif (
-        token_major
-        and head_fold > 1
-        and token_major_info.num_q_heads % head_fold
-    ):
-        raise ValueError(
-            f"token-major head_fold {head_fold} must also divide the"
-            f" per-row head count {token_major_info.num_q_heads} (a fold group"
-            " cannot cross a batch row boundary)."
-        )
-    is_lane_paired = token_major and head_dim_qk % NUM_LANES != 0
-    if is_lane_paired and head_fold % 2:
-        raise ValueError(
-            "token-major d64 requires an even head_fold (a DMA group must"
-            f" span whole 128-lane tiles); got {head_fold}."
-        )
-
-    bkv_compute = block_sizes.block_kv_compute
-    if bkv_compute % NUM_SUBLANES or bkv % bkv_compute:
-        raise ValueError(
-            f"block_kv_compute {bkv_compute} must be a multiple of"
-            f" {NUM_SUBLANES} and divide block_kv {bkv}."
-        )
 
     traits = BwdTraits(
         block_sizes=block_sizes,
@@ -704,9 +655,9 @@ def flash_attn_bwd(
     # build past that gate runs as q-row chunks that each fit. Chunks are
     # equalized rather than filled to the gate, so a full-mask build compiles
     # one kernel, not two.
-    chunk_blocks = dq_acc_limit // (dq_acc_bytes // num_q_blocks)
+    chunk_blocks = dq_acc_limit // (dq_acc_bytes // traits.num_q_blocks)
     should_chunk = (
-        (head_fold == 1 or is_gqa or is_lane_paired)
+        (head_fold == 1 or is_gqa or traits.is_lane_paired)
         and dq_acc_bytes > dq_acc_limit
         and chunk_blocks > 0
     )
@@ -749,7 +700,7 @@ def flash_attn_bwd(
         return lse_log2, delta[:, None, :]
 
     if should_chunk:
-        num_chunks = -(-num_q_blocks // chunk_blocks)
+        num_chunks = -(-traits.num_q_blocks // chunk_blocks)
         return flash_attn_bwd_q_chunked(
             q,
             k,
@@ -757,7 +708,7 @@ def flash_attn_bwd(
             o,
             lse,
             do,
-            chunk_rows=-(-num_q_blocks // num_chunks) * bq,
+            chunk_rows=-(-traits.num_q_blocks // num_chunks) * traits.bq,
             block_sizes=block_sizes,
             variant=variant,
             head_fold=None if is_gqa else head_fold,
@@ -766,14 +717,15 @@ def flash_attn_bwd(
             head_dim=head_dim,
         )
     elif traits.is_single_block_fold:
-        if bq_compute != bq:
+        if traits.bq_compute != traits.bq:
             raise ValueError(
                 "head_fold > 1 does not support split Q compute tiles;"
-                f" block_q_compute must equal block ({bq}), got {bq_compute}."
+                f" block_q_compute must equal block ({traits.bq}), got"
+                f" {traits.bq_compute}."
             )
         # Note (david): automatic picks never fold a rectangular, offset or MLA
         # build, so those raises only fire for an explicit head_fold.
-        if is_rectangular:
+        if traits.is_rectangular:
             raise ValueError(
                 "head_fold > 1 requires q_seq_len == kv_seq_len (square); got"
                 f" {q_seq_len} vs {kv_seq_len}."
@@ -783,10 +735,10 @@ def flash_attn_bwd(
                 "head_fold > 1 requires causal_offset == 0 (square,"
                 f" zero-offset diagonal); got {causal_offset}."
             )
-        if num_q_blocks != 1:
+        if traits.num_q_blocks != 1:
             raise ValueError(
                 "head_fold > 1 requires a single block (block == seq_len); got"
-                f" block {bq}, seq_len {q_seq_len}."
+                f" block {traits.bq}, seq_len {q_seq_len}."
             )
         if num_heads % head_fold:
             raise ValueError(
@@ -821,23 +773,23 @@ def flash_attn_bwd(
         if head_fold > 1 and scratch_bytes > fold_limit:
             raise ValueError(
                 f"head_fold {head_fold} needs ~{scratch_bytes} bytes of scratch"
-                f" VMEM at block {bq}, block_kv {bkv}, num_stages {num_stages},"
-                f" above the {fold_limit} byte limit; use a smaller head_fold"
-                " or smaller blocks."
+                f" VMEM at block {traits.bq}, block_kv {traits.bkv}, num_stages"
+                f" {traits.num_stages}, above the {fold_limit} byte limit; use"
+                " a smaller head_fold or smaller blocks."
             )
         if dq_acc_bytes > dq_acc_limit:
             raise ValueError(
                 f"dq accumulator needs seq_len {q_seq_len} * head_fold"
                 f" {head_fold} * head_dim {head_dim_qk} * 4 = {dq_acc_bytes}"
                 f" bytes of VMEM, above the {dq_acc_limit} byte limit and not"
-                f" one q block's dq fits; lower block {bq}, or shard the"
+                f" one q block's dq fits; lower block {traits.bq}, or shard the"
                 " sequence across chips."
             )
         lse_log2, delta = _lse_log2_and_delta()
         # Note (david): the general kernel runs unfolded for MHA, one kv head's
         # q group for GQA/MQA, or an even DMA-alignment fold for d64
         # token-major, so dense_params' group count is num_heads // head_fold.
-        assert head_fold == 1 or is_gqa or is_lane_paired, (
+        assert head_fold == 1 or is_gqa or traits.is_lane_paired, (
             head_fold,
             num_kv_heads,
         )

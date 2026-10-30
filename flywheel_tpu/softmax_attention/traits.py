@@ -572,6 +572,52 @@ class BwdTraits:
     token_major: TokenMajorInfo | None
     dtype: jnp.dtype
 
+    def __post_init__(self) -> None:
+        bq, bkv = self.bq, self.bkv
+        bq_compute, bkv_compute = self.bq_compute, self.bkv_compute
+        q_seq_len, kv_seq_len = self.q_seq_len, self.kv_seq_len
+        head_fold = self.head_fold
+        # Note (david): lse/di put seq on the lane axis, so a per-block slice at
+        # qi * bq is only tile-aligned when bq is a multiple of NUM_LANES.
+        if bq % NUM_LANES:
+            raise ValueError(f"block {bq} must be a multiple of {NUM_LANES}.")
+        if q_seq_len % bq:
+            raise ValueError(f"block {bq} must divide q_seq_len {q_seq_len}.")
+        if bq_compute % NUM_LANES or bq % bq_compute:
+            raise ValueError(
+                f"block_q_compute {bq_compute} must be a multiple of"
+                f" {NUM_LANES} and divide block {bq}."
+            )
+        if bkv % NUM_SUBLANES:
+            raise ValueError(
+                f"block_kv {bkv} must be a multiple of {NUM_SUBLANES}."
+            )
+        if kv_seq_len % bkv:
+            raise ValueError(
+                f"block_kv {bkv} must divide kv_seq_len {kv_seq_len}."
+            )
+        if (
+            not self.is_gqa
+            and self.token_major is not None
+            and head_fold > 1
+            and self.token_major.num_q_heads % head_fold
+        ):
+            raise ValueError(
+                f"token-major head_fold {head_fold} must also divide the"
+                f" per-row head count {self.token_major.num_q_heads} (a fold"
+                " group cannot cross a batch row boundary)."
+            )
+        if self.is_lane_paired and head_fold % 2:
+            raise ValueError(
+                "token-major d64 requires an even head_fold (a DMA group must"
+                f" span whole 128-lane tiles); got {head_fold}."
+            )
+        if bkv_compute % NUM_SUBLANES or bkv % bkv_compute:
+            raise ValueError(
+                f"block_kv_compute {bkv_compute} must be a multiple of"
+                f" {NUM_SUBLANES} and divide block_kv {bkv}."
+            )
+
     @property
     def bq(self) -> int:
         return self.block_sizes.block_q
