@@ -1305,7 +1305,7 @@ def flash_attn_kvcache_pallas(
 
     merged_cache (v_cache=None, token-major) makes k_cache one
     (rows, capacity, merged_cache_heads(nheads_k), head_dim) array whose token
-    rows hold the KV heads' K and V rows in copy_utils' merged order (bf16
+    rows hold the KV heads' K and V rows in kv_layout's merged order (bf16
     [k0, v0, k1, v1, ...], RPA v3's; fp8 [k0, k1, v0, v1, ...]), and returns
     (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[, lse]). nheads_k
     defaults to half the cache's head axis; an fp8 cache, which pads an odd

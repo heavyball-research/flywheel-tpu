@@ -19,7 +19,7 @@ from .config import (
     TokenMajorInfo,
     default_block,
 )
-from .kv_layout import advance, drain, fold_row, hbm_head_slice, hbm_window
+from .dma import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .mask import apply_causal_kv_major
 from .schedule import BwdSchedule
 

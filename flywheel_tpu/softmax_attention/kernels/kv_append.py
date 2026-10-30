@@ -10,9 +10,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tpu import vmem_limit_bytes
-from ..kv_layout import interleave_kv_rows
+from ..kv_layout import INTERLEAVE_STEP_ELEMENTS, interleave_kv_rows
 from .fwd_paged import flash_attn_varlen_paged
-from .kv_cache_write import INTERLEAVE_STEP_ELEMENTS
 
 
 def append_kernel(

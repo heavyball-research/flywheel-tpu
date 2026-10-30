@@ -29,11 +29,8 @@ from .config import (
     TokenMajorInfo,
     from_head_minor,
 )
+from .dma import advance, drain, fold_row, hbm_window
 from .kv_layout import (
-    advance,
-    drain,
-    fold_row,
-    hbm_window,
     kv_heads_per_word,
     kv_word_halves,
     kv_word_rows,

@@ -3,7 +3,7 @@
 Each sequence attends its own cache prefix [0, seqused_k[r]), staged page by
 page through its block table row. The cache is one merged (num_pages,
 page_size, cache_heads, head_dim) pool whose token rows interleave the kv
-heads' K and V rows in copy_utils' merged order. Every head group is one kv
+heads' K and V rows in kv_layout's merged order. Every head group is one kv
 head, which stages only the u32 word rows of each page that hold its K and
 V, and whose q heads are stacked over the rows of every score fragment.
 """
@@ -393,7 +393,7 @@ def flash_attn_varlen_paged(
     q is (nheads, total_q, head_dim) bf16 packed by cu_seqlens_q, whose first
     entry is 0. kv_cache is the merged (num_pages, page_size,
     merged_cache_heads(nheads_k), head_dim) pool, bf16 or fp8, whose token rows
-    interleave the kv heads' K and V rows (copy_utils' merged order); nheads_k
+    interleave the kv heads' K and V rows (kv_layout's merged order); nheads_k
     defaults to half its head axis, and an fp8 pool, which pads an odd head
     count, needs it. An fp8 pool is widened to bf16 once per staged block;
     k_scale multiplies every score and v_scale the output, both scalars that

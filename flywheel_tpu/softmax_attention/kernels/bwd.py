@@ -38,7 +38,7 @@ from ..config import (
     PAIRED_HEAD_DIM,
     TokenMajorInfo,
 )
-from ..kv_layout import advance, drain, hbm_tm_slice
+from ..dma import advance, drain, hbm_tm_slice
 from ..mask import apply_causal_kv_major
 from ..schedule import (
     DenseBwdParams,

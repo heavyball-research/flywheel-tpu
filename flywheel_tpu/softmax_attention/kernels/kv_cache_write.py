@@ -3,7 +3,7 @@
 The cache is (num_pages, page_size, cache_heads, head_dim) whose token rows
 interleave the kv heads' K and V rows: bf16 [k0, v0, k1, v1, ...] with
 cache_heads = 2 * nheads_k, fp8 [k0, k1, v0, v1, ...] with nheads_k padded to
-even (copy_utils.merged_cache_heads). K and V rows share one u32 word per
+even (kv_layout.merged_cache_heads). K and V rows share one u32 word per
 lane, so they cannot be written into their rows separately (a size-1 window
 of the tiled head axis does not compile, and a strided one is not
 expressible); the writer stages both in VMEM, interleaves them there and
@@ -19,6 +19,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..kv_layout import (
+    INTERLEAVE_STEP_ELEMENTS,
     check_merged_kv_dtype,
     interleave_kv_rows,
     merged_cache_heads,
@@ -31,9 +32,6 @@ KV_WRITE_VMEM_HEADROOM_BYTES = 16 * 1024 * 1024
 # Note (david): more in-flight page DMAs raise HBM utilization, but 128 per
 # program regressed on v6e (scalar registers run out), so 64 is the cap.
 MAX_PIECES_PER_BLOCK = 64
-# Note (david): one interleave step packs about 8 u32 vregs (32 KiB) per
-# operand.
-INTERLEAVE_STEP_ELEMENTS = 8192
 
 
 def kv_write_pieces_per_block(
