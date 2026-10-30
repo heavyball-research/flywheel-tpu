@@ -363,7 +363,16 @@ def trace_cell(cell, step, state, directory):
             out, state = step(state)
         jax.block_until_ready(out)
     trace = segments_lib.load(target)
-    return segments_lib.segments(trace) if trace is not None else None
+    if trace is None:
+        return None
+    split = segments_lib.segments(trace)
+    if split is not None and split["calls"] != TRACE_CALLS:
+        raise RuntimeError(
+            f"{cell.key}: the trace holds {split['calls']} module executions "
+            f"for {TRACE_CALLS} calls, so module_ms and every segment are "
+            f"off by {split['calls'] / TRACE_CALLS:.2f}x"
+        )
+    return split
 
 
 def run(cell, args):

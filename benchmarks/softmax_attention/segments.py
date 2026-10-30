@@ -10,8 +10,8 @@ re-split a directory of traces. Each subdirectory is one cell.
 
 The segments come from the same executable whose wall clock attention_block.py
 reports, so they need no separately compiled variants and no assumption that
-the parts add up. The `jit_block` event is the denominator, and only leaf ops
-go into the segments, since the nesting would count them twice.
+the parts add up. The trace's XLA Modules row is the denominator, and only
+leaf ops go into the segments, since the nesting would count them twice.
 
 Ops are sorted by what they are, not by which jax.named_scope XLA filed them
 under, because a fusion that spans two scopes carries only one of their names:
@@ -34,6 +34,8 @@ import re
 from collections import defaultdict
 
 SEGMENTS = ("qkv_proj", "layout", "attn_kernel", "out_proj", "other")
+# The device timeline row that holds one event per module execution.
+MODULE_ROW = "xla modules"
 KERNEL_NAMES = ("flash_attn", "splash_mha", "RPAm", "ragged_paged")
 MOVERS = (
     "copy",
@@ -82,6 +84,19 @@ def device_pids(trace):
     return keep
 
 
+def module_rows(trace, pids):
+    """The (pid, tid) of each device process's XLA Modules row."""
+    keep = set()
+    for event in trace.get("traceEvents", []):
+        if event.get("ph") != "M" or event.get("name") != "thread_name":
+            continue
+        if pids and event.get("pid") not in pids:
+            continue
+        if event.get("args", {}).get("name", "").lower() == MODULE_ROW:
+            keep.add((event["pid"], event["tid"]))
+    return keep
+
+
 def segment_of(event):
     name = event.get("name", "")
     if any(kernel in name for kernel in KERNEL_NAMES):
@@ -102,6 +117,7 @@ def segment_of(event):
 def segments(trace):
     """Per-call ms of each segment and of the whole module, or None."""
     pids = device_pids(trace)
+    modules = module_rows(trace, pids)
     per_segment = defaultdict(float)
     module_ms = 0.0
     calls = 0
@@ -110,7 +126,7 @@ def segments(trace):
             continue
         if pids and event.get("pid") not in pids:
             continue
-        if event.get("name", "").startswith("jit_"):
+        if (event.get("pid"), event.get("tid")) in modules:
             module_ms += event["dur"] / 1e3
             calls += 1
             continue
