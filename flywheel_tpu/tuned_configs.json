@@ -3107,6 +3107,51 @@
       2048,
       2
     ],
+    "kvcache|float8_e4m3fn|h4|k1|b128|s16384|d256|a1|w-|l0": [
+      16384,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b16|s16384|d256|a1|w-|l0": [
+      4096,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b32|s16384|d256|a1|w-|l0": [
+      4096,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b64|s16384|d256|a1|w-|l0": [
+      8192,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b8|s16384|d256|a1|w-|l0": [
+      4096,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b128|s10240|d256|a1|w-|l0": [
+      10240,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b16|s10240|d256|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b32|s10240|d256|a1|w-|l0": [
+      10240,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b64|s10240|d256|a1|w-|l0": [
+      10240,
+      2048,
+      2
+    ],
     "kvcache|float8_e5m2|h16|k4|b128|s5120|d128|a0|w-|l0": [
       5120,
       5120,
