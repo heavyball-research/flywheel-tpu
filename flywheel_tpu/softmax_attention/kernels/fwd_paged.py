@@ -709,6 +709,10 @@ def paged_fwd_body(
         def _run_unmasked_block():
             _run_group(apply_bounds=False)
 
+        # Note (david): a per-seq q block's kv frontier is a runtime scalar, so
+        # a masked block runs only its kv compute tiles below it, in a tile
+        # loop that indexes the tile at runtime; only a sublane token axis
+        # allows that.
         # Note (david): each tile loop step ends a basic block the fragment
         # pipeline cannot overlap across, so only a block with dead tiles takes
         # the loop: running every masked block through it slowed the packed
