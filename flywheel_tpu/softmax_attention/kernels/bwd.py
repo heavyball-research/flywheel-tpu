@@ -44,6 +44,7 @@ from ..schedule import (
     dense_bwd_params,
     make_dense_bwd_schedule,
 )
+from ..traits import BwdTraits
 from ..variant import Variant
 
 # Note (david): dq_acc is the only scratch that grows with q_seq_len; capping it
@@ -58,23 +59,19 @@ DQ_ACC_VMEM_LIMIT_BYTES: int | None = None
 FOLD_VMEM_LIMIT_FRACTION = 0.8
 
 
-def fold_vmem_bytes(
-    head_fold: int,
-    kv_fold: int,
-    q_seq_len: int,
-    bq: int,
-    bkv: int,
-    head_dim_qk: int,
-    head_dim_v: int,
-    num_stages: int,
-    itemsize: int,
-) -> tuple[int, int]:
-    """(dq_acc bytes, total scratch bytes) of a general-kernel build at a fold.
+def fold_vmem_bytes(traits: BwdTraits) -> tuple[int, int]:
+    """(dq_acc bytes, total scratch bytes) of a general-kernel build at
+    traits' fold.
 
     The staged terms over-count on purpose: this is a fail-fast gate, not a
     memory model. dq_acc comes back separately because it is the one scratch
     that grows with q_seq_len, so it carries its own tighter limit.
     """
+    head_fold, kv_fold = traits.head_fold, traits.kv_fold
+    q_seq_len, bq, bkv = traits.q_seq_len, traits.bq, traits.bkv
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
+    num_stages = traits.num_stages
+    itemsize = traits.dtype.itemsize
     # Note (david): VMEM pads every minor head_dim axis to a whole lane tile, so
     # a sub-tile head_dim costs its padded width, which the slack does not
     # cover.
@@ -106,9 +103,12 @@ def fold_vmem_bytes(
 
 
 def flash_bwd_kernel(
-    *refs: jax.Array, dense_params: DenseBwdParams, **body
+    *refs: jax.Array,
+    traits: BwdTraits,
+    variant: Variant,
+    dense_params: DenseBwdParams,
 ) -> None:
-    bwd_body(make_dense_bwd_schedule(dense_params), refs, **body)
+    bwd_body(traits, variant, make_dense_bwd_schedule(dense_params), refs)
 
 
 def flash_bwd_folded_kernel(
@@ -132,33 +132,30 @@ def flash_bwd_folded_kernel(
     dv_stage: jax.Array,
     sems: jax.Array,
     *,
-    num_head_groups: int,
-    head_fold: int,
-    seq_len: int,
-    num_stages: int,
+    traits: BwdTraits,
     variant: Variant,
-    out_dtype: jnp.dtype,
-    token_major: TokenMajorInfo | None,
 ) -> None:
     """Single-block (block == seq_len) backward over head_fold heads per step.
 
     Batching heads amortizes the per-step DMA and loop overhead that dominates
     many-head short-sequence builds. With one kv block dq needs no reduction and
-    is written straight out. variant gives the softmax scale and the causal
-    flag; the single block's diagonal has no offset.
+    is written straight out. traits is the build's static configuration, and
+    variant gives the softmax scale and the causal flag; the single block's
+    diagonal has no offset.
     """
+    num_head_groups = traits.num_head_groups
+    head_fold = traits.head_fold
+    seq_len = traits.q_seq_len
+    num_stages = traits.num_stages
+    out_dtype = traits.dtype
+    token_major = traits.token_major
+    lane_width_qk, lane_width_v = traits.lane_width_qk, traits.lane_width_v
     scale = float(variant.softmax_scale)
     causal = variant.causal
     f32 = jnp.float32
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
     score_scale = scale * LOG2E
-    if token_major is None:
-        lane_width_qk = None
-        lane_width_v = None
-    else:
-        lane_width_qk = token_major.head_dim_qk
-        lane_width_v = token_major.head_dim_v
 
     def _group_window(hbm, lane_width, group):
         if token_major is None:
@@ -323,25 +320,22 @@ def flash_attn_bwd_folded(
     lse_log2: jax.Array,
     delta: jax.Array,
     *,
-    num_heads: int,
-    q_seq_len: int,
-    head_dim_qk: int,
-    head_dim_v: int,
-    head_fold: int,
+    traits: BwdTraits,
     variant: Variant,
     interpret: bool,
-    num_stages: int,
-    token_major: TokenMajorInfo | None,
 ) -> list[jax.Array]:
-    """Launch flash_bwd_folded_kernel with one head group of scratch per
-    stage."""
+    """Launch flash_bwd_folded_kernel for traits with one head group of
+    scratch per stage."""
+    num_stages, head_fold = traits.num_stages, traits.head_fold
+    q_seq_len = traits.q_seq_len
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
     vmem = pltpu.VMEM
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
 
     # Note (david): head-major folds on a leading axis and token-major on the
     # lanes, matching the single group-wide DMA window each layout issues per
     # stream.
-    if token_major is None:
+    if traits.token_major is None:
         q_group_shape = (num_stages, head_fold, q_seq_len, head_dim_qk)
         v_group_shape = (num_stages, head_fold, q_seq_len, head_dim_v)
     else:
@@ -363,14 +357,7 @@ def flash_attn_bwd_folded(
         pltpu.SemaphoreType.DMA((NUM_SEMS_BWD, num_stages)),
     ]
     kernel = functools.partial(
-        flash_bwd_folded_kernel,
-        num_head_groups=num_heads // head_fold,
-        head_fold=head_fold,
-        seq_len=q_seq_len,
-        variant=variant,
-        out_dtype=q.dtype,
-        num_stages=num_stages,
-        token_major=token_major,
+        flash_bwd_folded_kernel, traits=traits, variant=variant
     )
     operands = (q, k, v, do, lse_log2, delta)
     with jax.named_scope("flash_attn_bwd_folded"):
@@ -378,16 +365,7 @@ def flash_attn_bwd_folded(
             kernel,
             in_specs=[any_spec] * len(operands),
             out_specs=[any_spec, any_spec, any_spec],
-            out_shape=bwd_out_shape(
-                token_major,
-                q.dtype,
-                num_heads,
-                num_heads,
-                q_seq_len,
-                q_seq_len,
-                head_dim_qk,
-                head_dim_v,
-            ),
+            out_shape=bwd_out_shape(traits),
             scratch_shapes=scratch_shapes,
             name="flash_attn_bwd_folded",
             compiler_params=pltpu.CompilerParams(
@@ -666,7 +644,6 @@ def flash_attn_bwd(
         )
     if kv_seq_len % bkv:
         raise ValueError(f"block_kv {bkv} must divide kv_seq_len {kv_seq_len}.")
-    num_kv_blocks = kv_seq_len // bkv
 
     # Note (david): the general kernel folds only a GQA/MQA group or a d64 lane
     # pair; any other fold goes to the single-block kernel.
@@ -691,10 +668,6 @@ def flash_attn_bwd(
             f" span whole 128-lane tiles); got {head_fold}."
         )
 
-    # Note (david): under GQA/MQA the group's kv side is one physical head, so
-    # only the q side folds.
-    kv_fold = 1 if is_gqa else head_fold
-
     bkv_compute = block_sizes.block_kv_compute
     if bkv_compute % NUM_SUBLANES or bkv % bkv_compute:
         raise ValueError(
@@ -702,27 +675,29 @@ def flash_attn_bwd(
             f" {NUM_SUBLANES} and divide block_kv {bkv}."
         )
 
+    traits = BwdTraits(
+        block_sizes=block_sizes,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        q_seq_len=q_seq_len,
+        kv_seq_len=kv_seq_len,
+        head_dim_qk=head_dim_qk,
+        head_dim_v=head_dim_v,
+        head_fold=head_fold,
+        token_major=token_major_info,
+        dtype=q.dtype,
+    )
     dense_params = dense_bwd_params(
-        num_heads=num_heads // head_fold,
-        num_q_blocks=num_q_blocks,
-        num_kv_blocks=num_kv_blocks,
-        bq=bq,
-        bkv=bkv,
+        num_heads=traits.num_head_groups,
+        num_q_blocks=traits.num_q_blocks,
+        num_kv_blocks=traits.num_kv_blocks,
+        bq=traits.bq,
+        bkv=traits.bkv,
         causal=causal,
         offset=causal_offset,
     )
 
-    dq_acc_bytes, scratch_bytes = fold_vmem_bytes(
-        head_fold,
-        kv_fold,
-        q_seq_len=q_seq_len,
-        bq=bq,
-        bkv=bkv,
-        head_dim_qk=head_dim_qk,
-        head_dim_v=head_dim_v,
-        num_stages=num_stages,
-        itemsize=q.dtype.itemsize,
-    )
+    dq_acc_bytes, scratch_bytes = fold_vmem_bytes(traits)
     dq_acc_limit = DQ_ACC_VMEM_LIMIT_BYTES or vmem_limit_bytes() // 2
     fold_limit = int(vmem_limit_bytes() * FOLD_VMEM_LIMIT_FRACTION)
     # Note (david): the general kernel keeps the whole group's dq in VMEM, so a
@@ -735,7 +710,6 @@ def flash_attn_bwd(
         and dq_acc_bytes > dq_acc_limit
         and chunk_blocks > 0
     )
-    is_single_block_fold = head_fold > 1 and not (is_gqa or is_lane_paired)
 
     def _lse_log2_and_delta():
         if token_major:
@@ -791,7 +765,7 @@ def flash_attn_bwd(
             token_major=token_major,
             head_dim=head_dim,
         )
-    elif is_single_block_fold:
+    elif traits.is_single_block_fold:
         if bq_compute != bq:
             raise ValueError(
                 "head_fold > 1 does not support split Q compute tiles;"
@@ -835,15 +809,9 @@ def flash_attn_bwd(
             do,
             lse_log2,
             delta,
-            num_heads=num_heads,
-            q_seq_len=q_seq_len,
-            head_dim_qk=head_dim_qk,
-            head_dim_v=head_dim_v,
-            head_fold=head_fold,
+            traits=traits,
             variant=variant,
             interpret=interpret,
-            num_stages=num_stages,
-            token_major=token_major_info,
         )
     else:
         if num_heads % head_fold:
@@ -875,17 +843,9 @@ def flash_attn_bwd(
         )
         kernel = functools.partial(
             flash_bwd_kernel,
-            dense_params=dense_params,
-            bq=bq,
-            bkv=bkv,
-            bq_compute=bq_compute,
-            bkv_compute=bkv_compute,
-            num_stages=num_stages,
+            traits=traits,
             variant=variant,
-            out_dtype=q.dtype,
-            head_fold=head_fold,
-            kv_fold=kv_fold,
-            token_major=token_major_info,
+            dense_params=dense_params,
         )
         dq, dk, dv = call_bwd(
             kernel,
@@ -895,20 +855,9 @@ def flash_attn_bwd(
             do,
             lse_log2,
             delta,
-            bq=bq,
-            bkv=bkv,
-            head_fold=head_fold,
-            kv_fold=kv_fold,
-            num_stages=num_stages,
-            num_heads=num_heads,
-            num_kv_heads=num_kv_heads,
-            q_seq_len=q_seq_len,
-            kv_seq_len=kv_seq_len,
-            head_dim_qk=head_dim_qk,
-            head_dim_v=head_dim_v,
+            traits=traits,
             interpret=interpret,
             kernel_name="flash_attn_bwd",
-            token_major=token_major_info,
         )
         if causal and causal_offset < 0:
             # Note (david): q blocks wholly below the diagonal never enter the

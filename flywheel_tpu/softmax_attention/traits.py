@@ -1,11 +1,12 @@
-"""Static traits of the forward and decode builds.
+"""Static traits of the forward, decode and backward builds.
 
 A traits object holds what one build fixes at trace time: its tile sizes and
 layout, head counts and widths, head folds and rotary layout, plus the
 constants derived from them as properties. forward_common sizes its scratch
 from it and fwd_body reads it; schedules, refs and traced scalars stay
 arguments. DecodeTraits does the same for the KV-cache decode kernel
-(kernels/decode.py).
+(kernels/decode.py), and BwdTraits for the backward kernels (kernels/bwd.py,
+bwd_pipeline.py).
 """
 
 import dataclasses
@@ -547,3 +548,132 @@ class DecodeTraits:
         # early). A token-major stage puts tokens on a leading axis, where each
         # token is whole tiles and the 8-row granule is exact.
         return BF16_TILE_ROWS if self.is_cache_head_major else NUM_SUBLANES
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class BwdTraits:
+    """Static configuration of a backward build (kernels/bwd.py).
+
+    num_heads and num_kv_heads count flat heads (token-major: batch rows times
+    the per-row heads), and q_seq_len / kv_seq_len are the build's q and kv
+    lengths. head_fold q heads share one schedule step: an MHA fold, a d64
+    lane pair, or under GQA/MQA one kv head's whole q group. dtype is q's,
+    which dq, dk and dv are written in.
+    """
+
+    block_sizes: BlockSizes
+    num_heads: int
+    num_kv_heads: int
+    q_seq_len: int
+    kv_seq_len: int
+    head_dim_qk: int
+    head_dim_v: int
+    head_fold: int
+    token_major: TokenMajorInfo | None
+    dtype: jnp.dtype
+
+    @property
+    def bq(self) -> int:
+        return self.block_sizes.block_q
+
+    @property
+    def bkv(self) -> int:
+        return self.block_sizes.block_kv
+
+    @property
+    def bq_compute(self) -> int:
+        return self.block_sizes.block_q_compute
+
+    @property
+    def bkv_compute(self) -> int:
+        return self.block_sizes.block_kv_compute
+
+    @property
+    def num_stages(self) -> int:
+        return self.block_sizes.num_stages
+
+    @property
+    def num_q_blocks(self) -> int:
+        return self.q_seq_len // self.bq
+
+    @property
+    def num_kv_blocks(self) -> int:
+        return self.kv_seq_len // self.bkv
+
+    @property
+    def num_q_tiles(self) -> int:
+        return self.bq // self.bq_compute
+
+    @property
+    def num_kv_tiles(self) -> int:
+        return self.bkv // self.bkv_compute
+
+    @property
+    def is_gqa(self) -> bool:
+        return self.num_kv_heads != self.num_heads
+
+    @property
+    def is_rectangular(self) -> bool:
+        return self.q_seq_len != self.kv_seq_len
+
+    @property
+    def kv_fold(self) -> int:
+        # Note (david): under GQA/MQA the group's kv side is one physical head,
+        # so only the q side folds.
+        return 1 if self.is_gqa else self.head_fold
+
+    @property
+    def num_head_groups(self) -> int:
+        return self.num_heads // self.head_fold
+
+    @property
+    def lane_width_qk(self) -> int | None:
+        if self.token_major is None:
+            return None
+        else:
+            return self.token_major.head_dim_qk
+
+    @property
+    def lane_width_v(self) -> int | None:
+        if self.token_major is None:
+            return None
+        else:
+            return self.token_major.head_dim_v
+
+    @property
+    def q_heads_per_row(self) -> int | None:
+        if self.token_major is None:
+            return None
+        else:
+            return self.token_major.num_q_heads
+
+    @property
+    def kv_heads_per_row(self) -> int | None:
+        if self.token_major is None:
+            return None
+        else:
+            return self.token_major.num_kv_heads
+
+    @property
+    def is_lane_paired(self) -> bool:
+        # Note (david): Mosaic takes a lane window of a scratch ref only at
+        # whole-tile offset and size once another axis is sliced too, so
+        # 64-wide heads are addressed a lane tile (a head pair) at a time:
+        # loads take the head's half out of the value and stores go through a
+        # tile-wide read-modify-write. The head loop is sequential Python, so
+        # the partner half is never stale.
+        return (
+            self.token_major is not None
+            and self.token_major.head_dim_qk % NUM_LANES != 0
+        )
+
+    @property
+    def heads_per_lane_tile(self) -> int:
+        if self.is_lane_paired:
+            return NUM_LANES // self.token_major.head_dim_qk
+        else:
+            return 1
+
+    @property
+    def is_single_block_fold(self) -> bool:
+        return self.head_fold > 1 and not (self.is_gqa or self.is_lane_paired)
