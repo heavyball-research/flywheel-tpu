@@ -27,6 +27,7 @@ from ..config import (
     FWD_KV_COMPUTE_BLOCKS,
     LOG2E,
     MIN_Q_TILES_PER_BLOCK,
+    PAGE_SIZE_MULTIPLE,
     BlockSizes,
     PagedKVInfo,
 )
@@ -44,9 +45,6 @@ from ..schedule import (
 )
 from ..softmax import overflow_guard_threshold
 
-# Note (david): each page is its own DMA, so smaller pages would leave the
-# kv stream descriptor-bound.
-PAGE_SIZE_MULTIPLE = 128
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.
 SCORE_TEMPORARY_BYTES = 5 * F32_BYTES + 1
@@ -431,6 +429,8 @@ def flash_attn_varlen_paged(
             f"head_dim must be a multiple of {NUM_LANES} shared by q and the"
             f" cache; got q {head_dim}, cache {cache_head_dim}."
         )
+    # Note (david): each page is its own DMA, so smaller pages would leave the
+    # kv stream descriptor-bound.
     if page_size % PAGE_SIZE_MULTIPLE:
         raise ValueError(
             f"page_size must be a multiple of {PAGE_SIZE_MULTIPLE}; got"

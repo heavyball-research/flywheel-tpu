@@ -10,6 +10,7 @@ import math
 import jax
 import jax.numpy as jnp
 
+from .config import PAGE_SIZE_MULTIPLE
 from .dispatch import resolve_tuned_kvcache_config
 from .inputs import (
     check_common_kwargs,
@@ -23,9 +24,6 @@ from .kernels.fwd_paged import flash_attn_varlen_paged
 from .kernels.kv_append import append_ragged
 from .kv_layout import resolve_merged_kv_heads
 
-# Note (david): each page is its own DMA, so smaller pages would leave the
-# decode kernel descriptor-bound.
-PAGE_SIZE_MULTIPLE = 128
 # Note (david): the paged varlen kernel pads every request to a 128-token q
 # block, so a short window folded into the decode kernel's query heads reads
 # the cache once instead; the decode kernel keeps all of a row's query heads
@@ -324,6 +322,8 @@ def flash_attn_with_kvcache(
         pool_heads = resolve_merged_kv_heads(
             k_cache.shape[2], k_cache.dtype, nheads_k
         )
+        # Note (david): each page is its own DMA, so smaller pages would leave
+        # the decode kernel descriptor-bound.
         if k_cache.shape[1] % PAGE_SIZE_MULTIPLE:
             raise ValueError(
                 "page_size (k_cache.shape[1]) must be a multiple of"

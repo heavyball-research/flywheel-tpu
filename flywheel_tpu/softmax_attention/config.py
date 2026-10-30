@@ -1,4 +1,5 @@
-"""Shared tile-size and layout types for Pallas kernels."""
+"""Softmax-attention family constants and the tile-size and layout types its
+kernels are built with."""
 
 import dataclasses
 import enum
@@ -16,6 +17,9 @@ DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 PAIRED_HEAD_DIM = NUM_LANES // 2
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
+
+# The page-size unit of a paged KV cache.
+PAGE_SIZE_MULTIPLE = 128
 
 MIN_NUM_STAGES = 2
 # Note (david): the KV-cache kernel issues the next block's DMA into slot
