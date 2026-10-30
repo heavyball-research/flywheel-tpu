@@ -467,16 +467,6 @@ def paged_fwd_body(
             for field_true, field_false in zip(desc_true, desc_false)
         )
 
-    # Note (david): a block whose DMA inputs equal the previous block's holds
-    # the same staged data, so it runs from the previous block's slot; dense GQA
-    # at one kv block per row otherwise re-staged each block once per q head
-    # (v6e, 32:4 d256, 1024 tokens: 63.4 against 60.6 us). Paged blocks start
-    # their DMAs inside the copy and a rotary K is rotated in place, so both
-    # load every block.
-    def _is_fresh(desc, prev_desc):
-        del desc, prev_desc
-        return jnp.bool_(True)
-
     def _start_block_data(desc, slot):
         page_base, kv_head, kv_load_end, _, kv = desc
         start_paged_kv_block(
@@ -499,16 +489,9 @@ def paged_fwd_body(
     def _block_step(si, kv, lo, hi, ctx, row, ahead, carry):
         """One kv block of row si. ahead holds the descriptors of the next row's
         first two blocks in the flattened block order, and carry this block's
-        and the next block's ring slot, freshness and descriptor."""
+        and the next block's ring slot and descriptor."""
         q_tok, base_head, q_slot, row_parity, prev_row_finish = row
-        (
-            kv_slot,
-            next_slot,
-            is_fresh,
-            is_next_fresh,
-            block_desc,
-            next_block_desc,
-        ) = carry
+        kv_slot, next_slot, block_desc, next_block_desc = carry
         kv_tok = schedule.kv_token(kv, ctx)
         is_first = kv == lo
         is_partial, needs_bounds = schedule.block_flags(si, kv, ctx)
@@ -527,18 +510,11 @@ def paged_fwd_body(
             _block_desc(base_head, kv + 2, ctx),
             _select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc),
         )
-        is_ahead_fresh = _is_fresh(ahead_desc, next_block_desc).astype(
-            jnp.int32
-        )
-        ahead_slot = jnp.where(
-            is_ahead_fresh > 0, lax.rem(next_slot + 1, NUM_KV_STAGES), next_slot
-        )
+        ahead_slot = lax.rem(next_slot + 1, NUM_KV_STAGES)
         for g in range(head_fold):
             guard_smem[g] = 0
 
-        @pl.when(is_fresh > 0)
-        def _wait_fresh_block():
-            _wait_block_data(block_desc, kv_slot)
+        _wait_block_data(block_desc, kv_slot)
 
         block = KVBlock(
             q_slot=q_slot,
@@ -760,6 +736,12 @@ def paged_fwd_body(
                 kv_used_end,
                 staged_kv,
             )
+            # Note (david): a block whose DMA inputs equal the previous block's
+            # holds the same staged data, so it runs from the previous block's
+            # slot; dense GQA at one kv block per row otherwise re-staged each
+            # block once per q head (v6e, 32:4 d256, 1024 tokens: 63.4 against
+            # 60.6 us). Paged blocks start their DMAs inside the copy and a
+            # rotary K is rotated in place, so both load every block.
             # Note (david): a path that loads every block starts the block two
             # ahead inside the copy, where the page DMAs' scalar work rides the
             # copy's idle scalar slots.
@@ -821,14 +803,7 @@ def paged_fwd_body(
         def _finish_previous_row():
             _finish_row_out(prev_row_finish)
 
-        return (
-            next_slot,
-            ahead_slot,
-            is_next_fresh,
-            is_ahead_fresh,
-            next_block_desc,
-            ahead_desc,
-        )
+        return next_slot, ahead_slot, next_block_desc, ahead_desc
 
     def _finish_row_out(finish):
         finish_row_out(
@@ -972,12 +947,8 @@ def paged_fwd_body(
     cancel_pending_pv(pending)
     first_desc, second_desc, _ = _first_two_blocks(jnp.int32(0), jnp.int32(0))
     _start_block_data(first_desc, 0)
-    is_second_fresh = _is_fresh(second_desc, first_desc).astype(jnp.int32)
-    second_slot = is_second_fresh
-
-    @pl.when(is_second_fresh > 0)
-    def _start_second():
-        _start_block_data(second_desc, second_slot)
+    second_slot = jnp.int32(1)
+    _start_block_data(second_desc, second_slot)
 
     minus_one = jnp.int32(-1)
     zero = jnp.int32(0)
@@ -985,14 +956,7 @@ def paged_fwd_body(
         minus_one,
         minus_one,
         zero,
-        (
-            zero,
-            second_slot,
-            jnp.int32(1),
-            is_second_fresh,
-            first_desc,
-            second_desc,
-        ),
+        (zero, second_slot, first_desc, second_desc),
         zero,
         zero,
         (zero, RowFinish(*([zero] * len(RowFinish._fields)))),
@@ -1008,14 +972,7 @@ def paged_fwd_body(
         ),
         init_carry,
     )
-    (
-        last_slot,
-        after_last_slot,
-        is_last_fresh,
-        is_after_last_fresh,
-        last_desc,
-        after_last_desc,
-    ) = kv_carry
+    last_slot, after_last_slot, last_desc, after_last_desc = kv_carry
 
     # Note (david): the last row has no next row to run its pending PV and
     # finish its output.
@@ -1031,13 +988,8 @@ def paged_fwd_body(
     def _finish_last_row():
         _finish_row_out(last_row_finish)
 
-    @pl.when(is_last_fresh > 0)
-    def _wait_last():
-        _wait_block_data(last_desc, last_slot)
-
-    @pl.when(is_after_last_fresh > 0)
-    def _wait_after_last():
-        _wait_block_data(after_last_desc, after_last_slot)
+    _wait_block_data(last_desc, last_slot)
+    _wait_block_data(after_last_desc, after_last_slot)
 
     drain(
         num_out_copies,
