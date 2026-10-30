@@ -49,7 +49,8 @@ from ..fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from ..fwd_pipeline import forward_common, rotary_fields
+from ..fwd_call import rotary_fields
+from ..fwd_pipeline import forward_common
 from ..schedule import (
     FwdSchedule,
     ScheduleTableLayout,

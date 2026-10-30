@@ -66,7 +66,7 @@ from ..fwd_blocks import (
     wait_paged_kv_block,
     wait_q_row,
 )
-from ..fwd_pipeline import rotary_fields
+from ..fwd_call import rotary_fields
 from ..kv_layout import kv_word_rows, resolve_merged_kv_heads
 from ..schedule import (
     FwdSchedule,

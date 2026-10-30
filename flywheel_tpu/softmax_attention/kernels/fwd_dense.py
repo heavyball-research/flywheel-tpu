@@ -8,7 +8,8 @@ import jax
 import jax.numpy as jnp
 
 from ..config import TokenMajorInfo
-from ..fwd_pipeline import forward_common, fwd_body, rotary_fields
+from ..fwd_call import rotary_fields
+from ..fwd_pipeline import forward_common, fwd_body
 from ..schedule import (
     DenseFwdParams,
     make_dense_fwd_schedule,
