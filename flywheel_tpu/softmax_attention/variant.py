@@ -30,6 +30,9 @@ from jax import lax
 from .config import DEFAULT_MASK_VALUE, LOG2E
 from .softmax import fold_sink
 
+# The Variant fields a tuned block entry may vary in (matches_tuned_table).
+TUNED_TABLE_FIELDS = ("softmax_scale", "causal", "has_sinks", "return_lse")
+
 
 def fused_q_scale(softmax_scale: float, softcap: float) -> float:
     # Note (david): the kernel softmax runs in log2 units, so log2(e) rides in
@@ -138,6 +141,22 @@ class Variant:
         # so the log2(e) the exp2 softmax needs is folded into the tanh output
         # scale; 0.0 stays 0.0, so the kernel never traces the tanh.
         return self.softcap * LOG2E
+
+    @property
+    def matches_tuned_table(self) -> bool:
+        """Whether dispatch may use a tuned block entry for this variant.
+
+        The tuned entries key on causal and return_lse, scale-free blocks
+        serve every softmax_scale, and sink builds share the sink-free entries;
+        every other field was never measured, so it must hold its default. A
+        new field thus keeps its builds on the analytic blocks until it is
+        measured and named in TUNED_TABLE_FIELDS.
+        """
+        return all(
+            getattr(self, field.name) == field.default
+            for field in dataclasses.fields(self)
+            if field.name not in TUNED_TABLE_FIELDS
+        )
 
     @property
     def window(self) -> tuple[int | None, int | None]:

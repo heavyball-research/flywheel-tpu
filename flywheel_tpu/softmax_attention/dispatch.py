@@ -509,7 +509,7 @@ def resolve_bwd_config(
         head_dim_v = v.shape[-1]
     q_seq_len, kv_seq_len = q.shape[-2], k.shape[-2]
     is_gqa = num_heads != num_kv_heads
-    if q_seq_len != kv_seq_len or causal_offset != 0 or is_gqa:
+    if q_seq_len != kv_seq_len or not variant.matches_tuned_table or is_gqa:
         tuned_config = None
     else:
         tuned_config = get_tuned_config(
@@ -694,8 +694,7 @@ def get_kernel(
     # rectangular masks were never measured and never consult it.
     if (
         blocks_override is None
-        and not has_window
-        and variant.softcap == 0.0
+        and variant.matches_tuned_table
         and not is_rectangular
     ):
         tuned_config = get_tuned_config(
