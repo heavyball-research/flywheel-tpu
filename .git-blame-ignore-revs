@@ -3,3 +3,6 @@
 
 # format: run pyink over the tree
 7be1e873a366182bd2d8ded722eace7e4a94dbbc
+
+# softmax_attention: move pallas/ into the family package (git mv + imports)
+d0c2b0b6d30fd5e2b0b124642109b4d990f288f6
