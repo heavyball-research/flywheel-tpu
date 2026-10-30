@@ -17,7 +17,6 @@ from ...core.tpu import (
     F32_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
-    vmem_limit_bytes,
 )
 from ..config import (
     LOG2E,
@@ -25,6 +24,7 @@ from ..config import (
     NT_DIM_NUMBERS,
     STAGES,
     KVCacheConfig,
+    vmem_limit_bytes,
 )
 from ..kv_layout import (
     MIN_BLOCK_KV,

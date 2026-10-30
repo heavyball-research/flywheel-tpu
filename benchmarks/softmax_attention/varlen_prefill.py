@@ -75,7 +75,7 @@ from benchmarks.softmax_attention.kvcache_scenarios import (
     trace_scenario,
 )
 from flywheel_tpu import flash_attn_varlen_func
-from flywheel_tpu.core.tiling import next_pow2
+from flywheel_tpu.softmax_attention.config import next_pow2
 
 IMPLS = ("flywheel", "rpa", "batched_rpa")
 PATTERNS = ("uniform", "spiky", "longtail")

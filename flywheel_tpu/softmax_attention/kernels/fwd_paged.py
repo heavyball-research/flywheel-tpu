@@ -14,7 +14,7 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from ...core.tiling import next_pow2, round_up
+from ...core.tiling import round_up
 from ...core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
 from ..config import (
     LOG2E,
@@ -22,6 +22,7 @@ from ..config import (
     PAGE_SIZE_MULTIPLE,
     BlockSizes,
     PagedKVInfo,
+    next_pow2,
 )
 from ..fwd_pipeline import (
     NUM_KV_STAGES,

@@ -52,7 +52,8 @@ Internal entry points (no public wrapper; a commit that moves them updates
 the imports here): softmax_attention.prefill._flash_attn_func_pcp_causal_offset
 (the runtime-offset kernel tpu-inference's PCP attention calls),
 softmax_attention.page.write_kv_cache_pages, and
-core.tuning.lookup / _warn_untuned_once, which the tuned lookup record wraps.
+softmax_attention.dispatch.lookup / _warn_untuned_once, which the tuned
+lookup record wraps.
 
 Out of reach by construction: interpret=True (plain XLA, no
 tpu_custom_call); the dense head_fold % 8 == 0 group lse copy, since a dense
@@ -88,8 +89,7 @@ from jaxlib.mosaic.python import tpu as mosaic_tpu
 
 import flywheel_tpu
 from flywheel_tpu import linear_attention
-from flywheel_tpu.core import tuning
-from flywheel_tpu.softmax_attention import prefill
+from flywheel_tpu.softmax_attention import dispatch, prefill
 
 # Note: the page writer has no public wrapper.
 from flywheel_tpu.softmax_attention.page import write_kv_cache_pages
@@ -1208,26 +1208,26 @@ def record_tuned_lookups() -> None:
     """Wrap the tuned-table lookup, so that every lowering records in
     TUNED_LOOKUPS each key it looked up: hit, miss, or an entry the build
     rejected (with the reason). Every lookup and rejection goes through
-    these two core.tuning functions; the wrappers replace them for the
-    process, so a caller has to reach lookup through the module
-    (tuning.lookup), not a name it imported.
+    these two dispatch functions; the wrappers replace them in dispatch's
+    globals for the process, so a caller has to reach lookup through
+    dispatch (dispatch.lookup), not a name it imported.
     """
-    lookup = tuning.lookup
+    lookup = dispatch.lookup
     # pylint: disable-next=protected-access
-    warn_untuned_once = tuning._warn_untuned_once
+    warn_untuned_once = dispatch._warn_untuned_once
     if getattr(lookup, "is_recorder", False):
         raise RuntimeError("the tuned lookups are recorded already.")
     bound_by_name = [
         name
         for name, module in list(sys.modules.items())
         if name.startswith(PACKAGE_DIR + ".")
-        and module is not tuning
+        and module is not dispatch
         and any(value is lookup for value in vars(module).values())
     ]
     if bound_by_name:
         raise RuntimeError(
-            f"{bound_by_name} import core.tuning.lookup by name, so their"
-            " lookups would not be recorded; call tuning.lookup instead."
+            f"{bound_by_name} import dispatch.lookup by name, so their"
+            " lookups would not be recorded; call dispatch.lookup instead."
         )
 
     def _lookup(table: pathlib.Path, key: str) -> list[int | str | bool] | None:
@@ -1245,9 +1245,9 @@ def record_tuned_lookups() -> None:
         warn_untuned_once(table, device_name, key, reason)
 
     _lookup.is_recorder = True
-    tuning.lookup = _lookup
+    dispatch.lookup = _lookup
     # pylint: disable-next=protected-access
-    tuning._warn_untuned_once = _warn_once
+    dispatch._warn_untuned_once = _warn_once
 
 
 def clear_caches() -> None:

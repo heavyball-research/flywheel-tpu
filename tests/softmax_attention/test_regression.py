@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.core.tiling import next_pow2
+from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
 from flywheel_tpu.softmax_attention.inputs import fused_q_scale, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels.fwd_dense import make_flash_attn_mha

@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tpu import NUM_LANES, vmem_limit_bytes
+from ..core.tpu import NUM_LANES
 from .config import (
     DEFAULT_MASK_VALUE,
     LOG2E,
@@ -16,6 +16,7 @@ from .config import (
     NT_DIM_NUMBERS,
     QKVLayout,
     TokenMajorInfo,
+    vmem_limit_bytes,
 )
 from .dma import advance, drain, fold_row, hbm_head_slice, hbm_window
 from .mask import apply_causal_kv_major

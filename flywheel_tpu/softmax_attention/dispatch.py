@@ -20,7 +20,9 @@ forward kernel's tiles; resolve_bwd_config picks the backward's blocks and
 head fold and resolve_kvcache_config the KV-cache decode kernel's config. This
 is the only module that reads tuned_configs.json, the family's kernel configs
 measured per TPU generation and exact problem shape; the kernels never read
-it.
+it. The table maps a device name (get_device_name: 'TPU v6', 'TPU v7', ...) to
+the configs measured on that chip, each under the exact key of the kernel
+build it was measured for.
 
 Keys are exact, not bucketed: q_block must divide the real seq_len and
 head_fold the real num_heads, so a rounded-up entry could hand back a config
@@ -32,20 +34,17 @@ CONFIG_FIELDS tuple.
 """
 
 import functools
+import json
 import pathlib
+import re
+import warnings
 
 import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from ..core import tuning
-from ..core.tiling import next_pow2, pick_tile, round_up
-from ..core.tpu import (
-    BF16_TILE_ROWS,
-    NUM_LANES,
-    get_device_name,
-    vmem_limit_bytes,
-)
+from ..core.tiling import round_up
+from ..core.tpu import BF16_TILE_ROWS, NUM_LANES
 from .config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
@@ -57,6 +56,9 @@ from .config import (
     QKVLayout,
     TokenMajorInfo,
     default_block,
+    next_pow2,
+    pick_tile,
+    vmem_limit_bytes,
 )
 from .kernels.fwd_dense import make_flash_attn_mha
 from .kernels.decode import validate_kvcache_config
@@ -79,6 +81,8 @@ CONFIG_FIELDS = (
 )
 # A dense fwd / bwd tuned_configs.json entry, in CONFIG_FIELDS order.
 TunedConfig = tuple[int | str | bool, ...]
+# A tuning table's entry as loaded, before its reader checks it.
+TableConfig = list[int | str | bool]
 
 # Note (david): varlen runs a runtime multi-step schedule whose best fold
 # differs from a dense single-block kernel at the same physical block span.
@@ -169,6 +173,68 @@ FULL_FOLD_MAX_BLOCK = 512
 default_bwd_block = functools.partial(default_block, candidates=BWD_BLOCKS)
 
 
+def get_device_variant_name(device_kind: str | None = None) -> str:
+    """'TPU v6 lite' / 'TPU7x' -> 'TPU v6e' / 'TPU v7' (generation plus e/p).
+
+    device_kind defaults to the chip JAX runs on.
+    """
+    if device_kind is None:
+        device_kind = jax.devices()[0].device_kind
+    kind_match = re.fullmatch(r"TPU\s*v?(\d+)(?:(e|p)|\s+(lite))?", device_kind)
+    if device_kind == "TPU7x":
+        return "TPU v7"
+    elif kind_match is None:
+        return device_kind
+    elif kind_match.group(2):
+        return f"TPU v{kind_match.group(1)}{kind_match.group(2)}"
+    elif kind_match.group(3):
+        return f"TPU v{kind_match.group(1)}e"
+    else:
+        return f"TPU v{kind_match.group(1)}"
+
+
+def get_device_name(device_kind: str | None = None) -> str:
+    """'TPU v6 lite' / 'TPU v5e' / ... -> 'TPU v6' (generation key, as JAX
+    does)."""
+    return re.sub(
+        r"^(TPU v\d+)[ep]$", r"\1", get_device_variant_name(device_kind)
+    )
+
+
+@functools.cache
+def load_table(table: pathlib.Path) -> dict[str, dict[str, TableConfig]]:
+    return json.loads(table.read_text(encoding="utf-8"))
+
+
+@functools.cache
+def _warn_untuned_once(
+    table: pathlib.Path, device_name: str, key: str, reason: str
+) -> None:
+    detail = f" ({reason})" if reason else ""
+    warnings.warn(
+        f"flywheel_tpu: no usable tuned config for {key} on {device_name} in"
+        f" {table.name}{detail}; falling back to the default config."
+    )
+
+
+def warn_untuned(table: pathlib.Path, key: str, reason: str = "") -> None:
+    """Warn, once per table, device, key and reason, that a kernel build on a
+    TPU falls back to its default config. Off TPU there are no tables to
+    miss."""
+    device_name = get_device_name()
+    if device_name.startswith("TPU"):
+        _warn_untuned_once(table, device_name, key, reason)
+
+
+def lookup(table: pathlib.Path, key: str) -> TableConfig | None:
+    """The current device's entry for key in table, warning when there is
+    none."""
+    config = load_table(table).get(get_device_name(), {}).get(key)
+    if config is None:
+        warn_untuned(table, key)
+    return config
+
+
 def get_varlen_head_fold(
     key: tuple[int, int, bool],
     num_heads: int,
@@ -246,7 +312,7 @@ def get_tuned_config(
     if head_dim_v != key_fields["head_dim"]:
         return None
     key = tuned_config_key(direction, **key_fields)
-    config = tuning.lookup(TUNED_CONFIGS_PATH, key)
+    config = lookup(TUNED_CONFIGS_PATH, key)
     if config is None:
         return None
     elif len(config) != len(CONFIG_FIELDS):
@@ -282,7 +348,7 @@ def kvcache_config_key(
 def get_tuned_kvcache_config(
     **key_fields: DTypeLike | int | bool | None,
 ) -> KVCacheConfig | None:
-    config = tuning.lookup(TUNED_CONFIGS_PATH, kvcache_config_key(**key_fields))
+    config = lookup(TUNED_CONFIGS_PATH, kvcache_config_key(**key_fields))
     return None if config is None else tuple(config)
 
 
@@ -304,7 +370,7 @@ def resolve_tuned_kvcache_config(
         and page_size is not None
         and tuned_config[0] % page_size
     ):
-        tuning.warn_untuned(
+        warn_untuned(
             TUNED_CONFIGS_PATH,
             kvcache_config_key(**key_fields),
             f"the entry's block_kv {tuned_config[0]} is not a multiple of the"

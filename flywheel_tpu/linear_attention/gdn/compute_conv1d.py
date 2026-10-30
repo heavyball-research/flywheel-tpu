@@ -18,9 +18,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import BF16_TILE_ROWS, MXU_LANES, NUM_LANES
+from ...core.tpu import BF16_TILE_ROWS, NUM_LANES
 from . import config
 
+MXU_LANES = 256
 # Note (david): one bf16 sublane tile, whose last prev_kernel_size rows are the
 # tokens preceding a chunk.
 HALO_ROWS = BF16_TILE_ROWS

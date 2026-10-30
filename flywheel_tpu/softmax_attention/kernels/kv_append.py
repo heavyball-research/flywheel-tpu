@@ -8,7 +8,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import vmem_limit_bytes
+from ..config import vmem_limit_bytes
 from ..kv_layout import INTERLEAVE_STEP_ELEMENTS, interleave_kv_rows
 
 

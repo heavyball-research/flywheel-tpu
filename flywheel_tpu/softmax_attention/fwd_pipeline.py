@@ -12,13 +12,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..core.tiling import round_up
-from ..core.tpu import (
-    BF16_TILE_ROWS,
-    NUM_LANES,
-    NUM_SUBLANES,
-    hbm_bf16_tile_rows,
-    vmem_limit_bytes,
-)
+from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
 from .config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
@@ -28,6 +22,8 @@ from .config import (
     QKVLayout,
     TokenMajorInfo,
     from_head_minor,
+    hbm_bf16_tile_rows,
+    vmem_limit_bytes,
 )
 from .dma import advance, drain, fold_row, hbm_window
 from .kv_layout import (

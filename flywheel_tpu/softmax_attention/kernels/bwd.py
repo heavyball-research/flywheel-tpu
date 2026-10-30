@@ -10,7 +10,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ...core.tiling import round_up
-from ...core.tpu import NUM_LANES, NUM_SUBLANES, vmem_limit_bytes
+from ...core.tpu import NUM_LANES, NUM_SUBLANES
 from ..bwd_pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
@@ -36,6 +36,7 @@ from ..config import (
     BlockSizes,
     QKVLayout,
     TokenMajorInfo,
+    vmem_limit_bytes,
 )
 from ..dma import advance, drain, hbm_tm_slice
 from ..mask import apply_causal_kv_major

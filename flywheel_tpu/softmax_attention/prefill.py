@@ -11,10 +11,10 @@ import math
 import jax
 import jax.numpy as jnp
 
-from ..core.tiling import next_pow2, round_up
+from ..core.tiling import round_up
 from ..core.tpu import NUM_LANES
 from .autograd import attn_with_vjp, forward_only_attn
-from .config import BlockSizes
+from .config import BlockSizes, next_pow2
 from .dispatch import (
     default_block_sizes,
     get_kernel,
