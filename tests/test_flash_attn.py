@@ -28,6 +28,9 @@ from tests.test_util import (
     split_kv_heads,
 )
 
+# The quick checkpoint (pytest --subset) samples one case in ten here.
+pytestmark = pytest.mark.subset_sample(10)
+
 INTERPRET = jax.default_backend() != "tpu"
 # Note (david): interpret mode emulates the kernels on CPU and only affords
 # short sequences.
