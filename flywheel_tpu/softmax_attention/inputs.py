@@ -251,9 +251,13 @@ def make_variant(
 ) -> Variant:
     """The Variant of one call from its user kwargs: softmax_scale resolved,
     window_size as check_common_kwargs returns it, and learnable_sink, which
-    stays a kernel operand, only marking that the build takes sinks."""
+    stays a kernel operand, only marking that the build takes sinks.
+
+    softmax_scale may be any concrete scalar, a 0-d array included; it is
+    taken as a Python float, since the Variant keys the kernel cache.
+    """
     return Variant(
-        softmax_scale=softmax_scale,
+        softmax_scale=float(softmax_scale),
         softcap=softcap,
         causal=causal,
         window_size=window_size,

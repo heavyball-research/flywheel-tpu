@@ -86,8 +86,39 @@ class Variant:
     return_lse: bool = False
 
     def __post_init__(self) -> None:
-        if type(self.return_lse) is not bool:
-            raise TypeError("return_lse must be a bool.")
+        # A Variant keys functools caches and jit statics, so every field must
+        # be a hashable Python value; make_variant converts the user's.
+        for name in ("softmax_scale", "softcap"):
+            if type(getattr(self, name)) is not float:
+                raise TypeError(
+                    f"{name} must be a Python float; got"
+                    f" {type(getattr(self, name)).__name__}."
+                )
+        for name in (
+            "causal",
+            "runtime_causal_offset",
+            "has_sinks",
+            "has_kv_scales",
+            "return_lse",
+        ):
+            if type(getattr(self, name)) is not bool:
+                raise TypeError(f"{name} must be a bool.")
+        if type(self.window_size) is not tuple or len(self.window_size) != 2:
+            raise TypeError(
+                "window_size must be a (left, right) tuple; got"
+                f" {self.window_size!r}."
+            )
+        if type(self.causal_offset) is not int:
+            raise TypeError(
+                "causal_offset must be a Python int (a traced offset is"
+                " runtime_causal_offset's operand); got"
+                f" {type(self.causal_offset).__name__}."
+            )
+        if self.runtime_causal_offset and self.causal_offset != 0:
+            raise ValueError(
+                "a runtime causal offset replaces the static one, so"
+                f" causal_offset must stay 0; got {self.causal_offset}."
+            )
         if self.softcap < 0.0:
             raise ValueError(
                 f"softcap must be non-negative; got {self.softcap}."

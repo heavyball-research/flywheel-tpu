@@ -160,6 +160,40 @@ def test_flash_attn_varlen_func_feeds_the_program(seqlens):
     assert jnp.array_equal(layer(q, k, v, cu).reshape(expected.shape), expected)
 
 
+@pytest.mark.parametrize("entry", ["dense", "varlen"])
+@pytest.mark.parametrize("array_type", ["jax", "numpy"])
+def test_flash_attn_array_softmax_scale(entry, array_type):
+    # A concrete 0-d array scale, such as 1 / jnp.sqrt(d), keys the kernel
+    # cache as the Python float it holds.
+    d = 128
+    array_scale = 1.0 / jnp.sqrt(jnp.float32(d))
+    if array_type == "numpy":
+        array_scale = np.asarray(array_scale)
+    seqlens = [100, 156]
+    q, k, v, _ = packed_qkv(seqlens, 2, 2, d)
+    if entry == "dense":
+        q, k, v = (operand[None] for operand in (q, k, v))
+
+    def attend(softmax_scale):
+        if entry == "dense":
+            return dense_attn(q, k, v, causal=True, softmax_scale=softmax_scale)
+        cu = cu_seqlens_of(seqlens)
+        return varlen_attn(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            softmax_scale=softmax_scale,
+        )
+
+    expected = attend(float(array_scale))
+    assert jnp.array_equal(attend(array_scale), expected)
+
+
 @pytest.mark.parametrize(
     "seqlens_q,num_pad",
     [
