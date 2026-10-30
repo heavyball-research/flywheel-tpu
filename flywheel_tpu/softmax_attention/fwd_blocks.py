@@ -46,13 +46,7 @@ from .config import (
     hbm_bf16_tile_rows,
 )
 from .dma import fold_row, hbm_window
-from .kv_layout import (
-    kv_heads_per_word,
-    kv_word_halves,
-    kv_word_rows,
-    load_staged_words,
-    staged_words,
-)
+from .kv_layout import kv_heads_per_word, kv_word_rows
 from .mask import apply_packed_bounds_mask
 from .rotary import rotate_tile
 from .schedule import FwdSchedule, ScheduleRow, WindowFragment
@@ -501,103 +495,6 @@ class PagedKVRefs:
         return paged_fragment(traits, self, kv_compute_index, 1)
 
 
-def paged_buffer_tile(
-    kv_refs: PagedKVRefs,
-    slot: jax.Array | int,
-    token_start: int,
-    num_tokens: jax.Array | int,
-) -> jax.Array:
-    """Rows [token_start, token_start + num_tokens) of staging slot slot."""
-    return kv_refs.pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
-
-
-def paged_kv_source(
-    kv_refs: PagedKVRefs,
-    physical_page: jax.Array,
-    num_tokens: jax.Array,
-    kv_head: jax.Array,
-) -> jax.Array:
-    """The word rows of kv_head in the first num_tokens tokens of a cache
-    page."""
-    word_rows = kv_refs.word_rows
-    head_row = pl.multiple_of(
-        kv_head // kv_refs.heads_per_word * word_rows, word_rows
-    )
-    return kv_refs.cache_hbm.at[
-        physical_page, pl.ds(0, num_tokens), pl.ds(head_row, word_rows), :
-    ]
-
-
-def paged_page_rows(
-    traits: FwdTraits, kv_load_end: jax.Array, kv: jax.Array
-) -> list[jax.Array]:
-    """The rows each page DMA of kv block kv moves."""
-    page_size = traits.paged.page_size
-    bkv = traits.bkv
-    # Note (david): every page DMA of a block is issued, so its wait needs
-    # no branch. A page past the load extent moves one sublane tile of a
-    # clamped page, whose rows the unpack zeroes.
-    num_load_rows = jnp.clip(kv_load_end - kv * bkv, 0, bkv)
-    return [
-        pl.multiple_of(
-            jnp.clip(
-                num_load_rows - page * page_size,
-                NUM_SUBLANES,
-                page_size,
-            ),
-            NUM_SUBLANES,
-        )
-        for page in range(bkv // page_size)
-    ]
-
-
-def start_paged_kv_block(
-    traits: FwdTraits,
-    schedule: FwdSchedule,
-    kv_refs: PagedKVRefs,
-    page_base: jax.Array,
-    kv_head: jax.Array,
-    kv_load_end: jax.Array,
-    kv: jax.Array,
-    slot: jax.Array | int,
-) -> None:
-    """Start the page DMAs of kv_head's word rows of kv block kv, whose pages
-    the block table row at page_base names, into staging slot slot."""
-    page_size = traits.paged.page_size
-    for page, num_rows in enumerate(paged_page_rows(traits, kv_load_end, kv)):
-        physical_page = jnp.clip(
-            schedule.kv_page(page_base, kv, page),
-            0,
-            kv_refs.num_cache_pages - 1,
-        )
-        pltpu.make_async_copy(
-            paged_kv_source(kv_refs, physical_page, num_rows, kv_head),
-            paged_buffer_tile(kv_refs, slot, page * page_size, num_rows),
-            kv_refs.sems.at[SEM_K, slot],
-        ).start()
-
-
-def wait_paged_kv_block(
-    traits: FwdTraits,
-    kv_refs: PagedKVRefs,
-    kv_load_end: jax.Array,
-    kv: jax.Array,
-    slot: jax.Array | int,
-) -> None:
-    """Wait for the page DMAs of kv block kv into staging slot slot."""
-    # Note (david): every page signals the one semaphore by its size,
-    # and a DMA wait only needs a destination of the awaited size, so
-    # one wait on a window as long as all the pages together covers the
-    # block.
-    num_rows = pl.multiple_of(
-        sum(paged_page_rows(traits, kv_load_end, kv)), NUM_SUBLANES
-    )
-    staged_window = paged_buffer_tile(kv_refs, slot, 0, num_rows)
-    pltpu.make_async_copy(
-        staged_window, staged_window, kv_refs.sems.at[SEM_K, slot]
-    ).wait()
-
-
 def paged_fragment(
     traits: FwdTraits,
     kv_refs: PagedKVRefs,
@@ -609,77 +506,6 @@ def paged_fragment(
     bkv_compute = traits.bkv_compute
     tile_start = pl.multiple_of(kv_compute_index * bkv_compute, NUM_LANES)
     return kv_refs.planes[kv_part, pl.ds(tile_start, bkv_compute), :]
-
-
-def unpack_paged_block(
-    traits: FwdTraits,
-    kv_refs: PagedKVRefs,
-    kv_slot: jax.Array,
-    kv_head: jax.Array,
-    kv_load_end: jax.Array,
-    kv_used_end: jax.Array,
-    kv: jax.Array,
-) -> None:
-    """Unpack kv_head's K and V rows of kv block kv, staged in slot kv_slot,
-    into the K and V planes; V rows from kv_used_end (or past the load extent
-    kv_load_end) on unpack as zero."""
-    bkv, bkv_compute = traits.bkv, traits.bkv_compute
-    pair_buf, planes = kv_refs.pair_buf, kv_refs.planes
-    heads_per_word = kv_refs.heads_per_word
-    valid_rows = jnp.clip(
-        jnp.minimum(
-            kv_used_end - kv * bkv,
-            jnp.clip(kv_load_end - kv * bkv, 0, bkv),
-        ),
-        0,
-        bkv,
-    )
-    # Note (david): a staged word holds the kv head's K and V rows,
-    # split into planes once per compute tile, not once per q tile.
-    # Staged rows from valid_rows on may hold NaN (cache slots past
-    # seqused_k or stale VMEM), and a zero probability times a NaN
-    # value is still NaN, so they unpack as zero values; the keys
-    # are masked and skip the select, which keeps it off the path to
-    # the first QK.
-    for tile in range(traits.num_k_compute_tiles):
-        tile_rows = pl.ds(tile * bkv_compute, bkv_compute)
-
-        def _valid_only(rows, tile=tile):
-            row_ids = tile * bkv_compute + lax.broadcasted_iota(
-                jnp.int32, rows.shape, 0
-            )
-            return jnp.where(row_ids < valid_rows, rows, jnp.zeros_like(rows))
-
-        if traits.paged.is_bitcast_load:
-            words = load_staged_words(
-                staged_words(pair_buf, kv_slot),
-                tile * bkv_compute,
-                bkv_compute,
-                1,
-            )
-            k_rows, _ = kv_word_halves(words, kv_head, pair_buf.dtype)
-            _, v_rows = kv_word_halves(
-                _valid_only(words), kv_head, pair_buf.dtype
-            )
-        else:
-            k_rows, v_rows = (
-                pair_buf[
-                    kv_slot,
-                    tile_rows,
-                    0,
-                    kv_part * heads_per_word + kv_head % heads_per_word,
-                    :,
-                ]
-                for kv_part in range(2)
-            )
-            v_rows = _valid_only(v_rows)
-        # Note (david): an fp8 block is widened to bf16 once per
-        # staged block rather than fed to the MXU as fp8, which
-        # makes Mosaic rescale every f32 score and output tile for
-        # e4m3fn's bias (v6e: 0.356 against 0.349 ms a 1024-token
-        # chunk).
-        for kv_part, plane_rows in enumerate((k_rows, v_rows)):
-            planes[kv_part, tile_rows, :] = plane_rows.astype(planes.dtype)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
