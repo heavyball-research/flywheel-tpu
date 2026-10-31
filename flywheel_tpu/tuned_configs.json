@@ -2692,6 +2692,296 @@
       "head_dim_minor",
       false
     ],
+    "fwd|hm|bfloat16|h4|b-|s1024|d256|c1|m-|l0|k1|o1": [
+      1024,
+      1024,
+      256,
+      256,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s1024|d256|c1|m1024|l0|k1": [
+      1024,
+      1024,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s1024|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s1024|d256|c1|m512|l0|k1": [
+      512,
+      512,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s128|d256|c1|m-|l0|k1|o1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s128|d256|c1|m128|l0|k1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s128|d256|c1|m16|l0|k1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s128|d256|c1|m32|l0|k1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s128|d256|c1|m64|l0|k1": [
+      128,
+      128,
+      64,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s2048|d256|c1|m-|l0|k1|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s2048|d256|c1|m1024|l0|k1": [
+      512,
+      1024,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s2048|d256|c1|m2048|l0|k1": [
+      1024,
+      1024,
+      256,
+      256,
+      3,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s2048|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s2048|d256|c1|m512|l0|k1": [
+      512,
+      512,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s256|d256|c1|m-|l0|k1|o1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s256|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s4096|d256|c1|m-|l0|k1|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s4096|d256|c1|m1024|l0|k1": [
+      1024,
+      1024,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s4096|d256|c1|m2048|l0|k1": [
+      1024,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s4096|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s4096|d256|c1|m512|l0|k1": [
+      512,
+      512,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s512|d256|c1|m-|l0|k1|o1": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s512|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s512|d256|c1|m512|l0|k1": [
+      512,
+      512,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s8192|d256|c1|m-|l0|k1|o1": [
+      2048,
+      2048,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s8192|d256|c1|m1024|l0|k1": [
+      1024,
+      1024,
+      256,
+      512,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s8192|d256|c1|m2048|l0|k1": [
+      1024,
+      2048,
+      256,
+      256,
+      4,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s8192|d256|c1|m256|l0|k1": [
+      256,
+      256,
+      128,
+      128,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
+    "fwd|hm|bfloat16|h4|b-|s8192|d256|c1|m512|l0|k1": [
+      512,
+      512,
+      256,
+      256,
+      2,
+      1,
+      "head_dim_minor",
+      false
+    ],
     "kvcache|bfloat16|h128|k8|b128|s2048|d128|a0|w-|l0": [
       2048,
       2048,
@@ -3104,6 +3394,51 @@
     ],
     "kvcache|float8_e4m3fn|h32|k8|b64|s8192|d128|a1|w-|l0": [
       8192,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b128|s16384|d256|a1|w-|l0": [
+      16384,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b16|s16384|d256|a1|w-|l0": [
+      4096,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b32|s16384|d256|a1|w-|l0": [
+      4096,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b64|s16384|d256|a1|w-|l0": [
+      8192,
+      4096,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h4|k1|b8|s16384|d256|a1|w-|l0": [
+      4096,
+      2048,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b128|s10240|d256|a1|w-|l0": [
+      10240,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b16|s10240|d256|a1|w-|l0": [
+      5120,
+      2560,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b32|s10240|d256|a1|w-|l0": [
+      10240,
+      5120,
+      2
+    ],
+    "kvcache|float8_e4m3fn|h8|k1|b64|s10240|d256|a1|w-|l0": [
+      10240,
       2048,
       2
     ],
