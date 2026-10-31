@@ -1108,7 +1108,10 @@ def fused_conv1d_gdn(
         conv_state: Convolution state cache [num_slots, kernel_size - 1,
             dim_size] holding the last kernel_size - 1 tokens of the previous
             invocation. Slot 0 is the null block for padded or invalid tokens.
-            A slot may hold garbage on the first invocation of a sequence.
+            A slot may hold garbage on the first invocation of a sequence. A
+            slot-major pool [num_slots, kernel_size - 1, 1, dim_size] (GDN
+            v3's conv state, vllm-torchtpu's compact pool) is read and
+            written in place, and comes back in that shape.
         recurrent_state: Recurrent state cache [num_slots, n_v, d_k, d_v],
             with the same null block and garbage caveat.
         conv_weight: Convolution weight [dim_size, 1, kernel_size].
@@ -1489,7 +1492,27 @@ def launch_fused_conv1d_gdn(
     # ({2,0,1:T(8,128)}), so its [kernel_size - 1, num_slots, dim] view is a
     # bitcast, while a slot-major kernel operand cost a transposing copy of the
     # whole cache around every call (v6e: 67 us at 257 slots, 373 us at 1025).
-    conv_state = jnp.swapaxes(conv_state.astype(jnp.float32), 0, 1)
+    # Note: a slot-major [num_slots, kernel_size - 1, 1, dim] pool is (1, 128)
+    # tiled, so the same swap would copy the whole pool in and out of that
+    # layout around every call (v7x, vllm-torchtpu's 129-slot pool: about
+    # 4 us a copy, two per GDN layer). The kernel reads and writes such a pool
+    # where it is.
+    conv_slot_major = conv_state.ndim == 4
+    if conv_slot_major:
+        expected = (
+            recurrent_state.shape[0],
+            kernel_size - 1,
+            1,
+            qkv.shape[1],
+        )
+        if conv_state.shape != expected:
+            raise ValueError(
+                "a slot-major conv state must be [num_slots, kernel_size - 1,"
+                f" 1, dim] = {expected}, got {conv_state.shape}"
+            )
+        conv_state = conv_state.astype(jnp.float32)
+    else:
+        conv_state = jnp.swapaxes(conv_state.astype(jnp.float32), 0, 1)
 
     num_seqs = state_indices.size
     batch_size, dim = qkv.shape
@@ -1643,6 +1666,7 @@ def launch_fused_conv1d_gdn(
             window_size=window_size,
             replay_window=kernel_replay_window,
             split_checkpoint=replay_window > 0,
+            conv_slot_major=conv_slot_major,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -1831,8 +1855,10 @@ def launch_fused_conv1d_gdn(
         None,
     )
 
+    if not conv_slot_major:
+        conv_state_out = jnp.swapaxes(conv_state_out, 0, 1)
     return (
-        jnp.swapaxes(conv_state_out, 0, 1).astype(conv_out_dtype),
+        conv_state_out.astype(conv_out_dtype),
         recurrent_state_out.astype(recurrent_out_dtype),
         replay_state_out,
         replay_gates_out,

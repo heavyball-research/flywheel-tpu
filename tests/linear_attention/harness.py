@@ -157,8 +157,10 @@ class Fused:
         state_indices: np.ndarray | None = None,
         state_pool: np.ndarray | None = None,
         conv_pool: np.ndarray | None = None,
+        slot_major_conv: bool = False,
     ) -> None:
         self.ops = ops
+        self.slot_major_conv = slot_major_conv
         batch, seq_len, self.n_kq, self.d_k = q.shape
         self.n_v, self.d_v = v.shape[2:]
         self.batch_shape = (batch, seq_len)
@@ -223,6 +225,16 @@ class Fused:
         self.k = acts[:, key_dim : 2 * key_dim].reshape(k.shape)
         self.v = acts[:, 2 * key_dim :].reshape(v.shape)
 
+    def _conv_pool_in(self) -> jax.Array:
+        """The conv pool as the kernel takes it: [N, K - 1, dim], or with
+        slot_major_conv the slot-major [N, K - 1, 1, dim] pool."""
+        pool = jnp.asarray(self.conv_pool)
+        return pool[:, :, None] if self.slot_major_conv else pool
+
+    def _conv_pool_out(self, pool: jax.Array) -> jax.Array:
+        """A returned conv pool as [N, K - 1, dim]."""
+        return pool[:, :, 0] if self.slot_major_conv else pool
+
     def _activate(self, seq: int, start: int, end: int) -> jax.Array:
         """silu(conv1d(qkv)) of one sequence in f32."""
         rows = self.qkv[start:end].astype(jnp.float32)
@@ -281,7 +293,7 @@ class Fused:
             self.qkv,
             beta.reshape(-1, self.n_v),
             self._gate_rows(g),
-            jnp.asarray(self.conv_pool),
+            self._conv_pool_in(),
             jnp.asarray(self.state_pool),
             self.conv_weight,
             self.conv_bias,
@@ -299,7 +311,8 @@ class Fused:
             compute_chunk_size=chunk_size,
             **kernel_kwargs,
         )
-        self.final_conv_pool, self.final_state_pool = conv_pool, state_pool
+        self.final_conv_pool = self._conv_pool_out(conv_pool)
+        self.final_state_pool = state_pool
         return self._output(out), state_pool[slots]
 
     def recurrent(
@@ -328,7 +341,7 @@ class Fused:
             self.conv_bias,
             *self._gate_params(A_log, dt_bias),
         )
-        conv_pool = jnp.asarray(self.conv_pool)
+        conv_pool = self._conv_pool_in()
         state_pool = jnp.asarray(self.state_pool)
         num_seqs = self.lengths.size
         if record_dtype is not None:
@@ -417,7 +430,8 @@ class Fused:
         )
         if record_dtype is not None:
             state_pool = self.ops.merge_checkpoint(state_pool)
-        self.final_conv_pool, self.final_state_pool = conv_pool, state_pool
+        self.final_conv_pool = self._conv_pool_out(conv_pool)
+        self.final_state_pool = state_pool
         if record_dtype is None:
             return self._output(out), state_pool[self.state_indices]
         final_states = [
