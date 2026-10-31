@@ -116,6 +116,13 @@ class GDNConfig:
     # bits), so a decode step reads only the hi plane and a flush or a PER_SEQ
     # tile rebuilds the f32 checkpoint exactly from both.
     split_checkpoint: bool = False
+    # Note: the conv state cache arrives either as the [prev_kernel_size,
+    # num_slots, dim_size] view of a slot-minor cache, or (True) as a
+    # slot-major [num_slots, prev_kernel_size, 1, dim_size] pool, whose unit
+    # axis keeps it in a (1, 128)-tiled layout that needs no relayout copy
+    # around the kernel. The VMEM slots are [prev_kernel_size, dim_size]
+    # either way; only the DMAs differ.
+    conv_slot_major: bool = False
 
     def __post_init__(self) -> None:
         assert (
