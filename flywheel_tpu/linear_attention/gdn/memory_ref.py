@@ -509,6 +509,22 @@ def wait_state_out(
 # num_slots, dim_size] view, whose slot axis is tiled. Mosaic rejects a traced
 # row count there, so each conv checkpoint moves as its own pl.when-guarded
 # DMA, waited on with its own descriptor.
+# Note: a slot-major [num_slots, prev_kernel_size, 1, dim_size] pool
+# (cfg.conv_slot_major) holds each of a checkpoint's rows as its own (1, 128)
+# tiled row, so the checkpoint moves as prev_kernel_size row DMAs into the
+# rows of its [prev_kernel_size, dim_size] VMEM slot.
+
+
+def _conv_rows(hbm_ref, slot, vmem_ref, cfg):
+    """(HBM, VMEM) ref pairs that move one conv checkpoint: its whole
+    [prev_kernel_size, dim_size] slot of a slot-minor cache, or each row of a
+    slot-major pool's slot."""
+    if not cfg.conv_slot_major:
+        return [(hbm_ref.at[:, slot], vmem_ref)]
+    return [
+        (hbm_ref.at[slot, row], vmem_ref.at[pl.ds(row, 1)])
+        for row in range(cfg.prev_kernel_size)
+    ]
 
 
 def conv_in_copies(
@@ -533,12 +549,8 @@ def conv_in_copies(
         is_read = jnp.logical_and(
             record.is_first_tile, metadata_ref.s_idx_has_initial_state[s_idx]
         )
-        copies.append((
-            is_read,
-            pltpu.make_async_copy(
-                hbm_ref.at[:, read_slot], buf_ref.at[idx, 0], sem
-            ),
-        ))
+        for src, dst in _conv_rows(hbm_ref, read_slot, buf_ref.at[idx, 0], cfg):
+            copies.append((is_read, pltpu.make_async_copy(src, dst, sem)))
     return copies
 
 
@@ -588,12 +600,12 @@ def conv_out_copies(
             record.is_last_tile, jnp.minimum(record.r_size, cfg.window_size), 0
         )
         for pos in range(cfg.window_size):
-            copies.append((
-                pos < num_ckpts,
-                pltpu.make_async_copy(
-                    buf_ref.at[idx, pos], hbm_ref.at[:, write_slot + pos], sem
-                ),
-            ))
+            for dst, src in _conv_rows(
+                hbm_ref, write_slot + pos, buf_ref.at[idx, pos], cfg
+            ):
+                copies.append(
+                    (pos < num_ckpts, pltpu.make_async_copy(src, dst, sem))
+                )
     return copies
 
 
