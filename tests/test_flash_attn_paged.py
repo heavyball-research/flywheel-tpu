@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.pallas import flash_fwd_kvcache
 from tests.test_util import apply_rotary_emb
 
 INTERPRET = jax.default_backend() != "tpu"
@@ -1015,6 +1016,48 @@ def run_decode(q, kc, vc, k, v, cu, lengths, table, **kwargs):
         **kwargs,
     )
     return (out[:, 0], lse[:, :, 0].T, *deinterleave(kv_cache))
+
+
+@pytest.mark.parametrize(
+    "config",
+    [(4096, 4096, 2), (4096, 1024, 2), (2048, 512, 3)],
+    ids=lambda config: "-".join(map(str, config)),
+)
+@pytest.mark.parametrize("heads,kv_heads", [(4, 1), (8, 2)])
+def test_decode_tail_tiles(monkeypatch, config, heads, kv_heads):
+    # Note: a row's last block whose keys fit half a compute tile runs them as
+    # one narrower tile (flash_fwd_kvcache's tail_tiles). The cached lengths
+    # put the row's last key on each side of every tail width's edge, and of
+    # the full width's. The config is not in the jit cache key, hence the
+    # clear. Each row's new key points along its query heads, so it carries
+    # the row's softmax: a tail tile that misses the row's last key moves the
+    # output past the tolerance.
+    monkeypatch.setattr(
+        flash_fwd_kvcache, "get_tuned_kvcache_config", lambda **_: config
+    )
+    jax.clear_caches()
+    prefixes = (0, 1, 254, 255, 256, 510, 511, 512, 1022, 1023, 1024, 2046)
+    prefixes += (2047, 2048, 3000, 4094, 4095, 4096, 5000)
+    q, kc, vc, _, v, cu, lengths, table = random_ragged_case(
+        lengths=(1,) * len(prefixes),
+        prefixes=prefixes,
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        page_size=256,
+        capacity=8192,
+        padding=0,
+    )
+    direction = (
+        np.asarray(q, np.float32)
+        .reshape(len(prefixes), kv_heads, heads // kv_heads, -1)
+        .sum(axis=2)
+    )
+    direction /= np.linalg.norm(direction, axis=-1, keepdims=True)
+    case = (q, kc, vc, bf16(28 * direction), v, cu, lengths, table)
+    expected = ragged_reference(*case, causal=True)
+    actual = run_decode(*case, causal=True)
+    assert_extend_matches(actual, expected, case[5], case[6])
 
 
 @pytest.mark.parametrize("entry", ["varlen", "kvcache", "decode"])

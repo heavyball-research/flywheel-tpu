@@ -3,6 +3,8 @@ new token and attends its whole cache."""
 
 import functools
 import math
+from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -62,6 +64,26 @@ STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
 # (1.82 ms when every tile of the block ran), while a 16K context took 15.53
 # against 15.33 ms.
 MAX_BLOCK_KV = 1024
+
+
+# Note: a partial block's last tile takes the narrowest of up to TAIL_WIDTHS
+# widths, block_kv_compute halved each time down to MIN_TAIL_KV keys.
+TAIL_WIDTHS = 4
+MIN_TAIL_KV = 256
+
+
+class TileLayout(NamedTuple):
+    """The width-dependent pieces of one compute tile: its width in keys per
+    KV head, its key columns (width times the KV heads a fragment pairs), the
+    score row heads, verify-window key offsets and head-pair parity mask at
+    that width (None where unused), and the K/V fragment loader."""
+
+    width: int
+    keys: int
+    score_row_head: jax.Array | None
+    row_key_offset: jax.Array | None
+    parity_mask: jax.Array | None
+    load: Callable[..., Any]
 
 
 def lane_broadcast(value: jax.Array, width: int) -> jax.Array:
@@ -340,61 +362,84 @@ def kvcache_kernel(
     rows_per_fragment = (
         query_heads_per_kv_head * kv_heads_per_fragment * kv_heads_per_group
     )
-    fragment_keys = kv_heads_per_fragment * block_kv_compute
     # Note (david): row r of a group's tile belongs to the group's KV head
     # r // query_heads_per_kv_head.
     if kv_heads_per_group == 1:
-        score_row_head = pv_row_head = None
+        pv_row_head = None
     else:
-        score_row_head = (
-            lax.broadcasted_iota(
-                jnp.int32, (rows_per_fragment, fragment_keys), 0
-            )
-            // query_heads_per_kv_head
-        )
         pv_row_head = (
             lax.broadcasted_iota(jnp.int32, (rows_per_fragment, head_dim), 0)
             // query_heads_per_kv_head
         )
-    # Note (david): a folded window lays a KV head's rows out token by token, so
-    # row r is window token t = r // group, which causal stops
-    # query_tokens - 1 - t keys short of total_len.
-    if causal and query_tokens > 1:
-        row_key_offset = lax.broadcasted_iota(
-            jnp.int32, (rows_per_fragment, fragment_keys), 0
-        ) % query_heads_per_kv_head // (
-            query_heads_per_kv_head // query_tokens
-        ) - (
-            query_tokens - 1
+
+    def tile_layout(width: int) -> TileLayout:
+        """The pieces of a compute tile of width keys per KV head that depend
+        on its width."""
+        keys = kv_heads_per_fragment * width
+        if kv_heads_per_group == 1:
+            score_row_head = None
+        else:
+            score_row_head = (
+                lax.broadcasted_iota(jnp.int32, (rows_per_fragment, keys), 0)
+                // query_heads_per_kv_head
+            )
+        # Note (david): a folded window lays a KV head's rows out token by
+        # token, so row r is window token t = r // group, which causal stops
+        # query_tokens - 1 - t keys short of total_len.
+        if causal and query_tokens > 1:
+            row_key_offset = lax.broadcasted_iota(
+                jnp.int32, (rows_per_fragment, keys), 0
+            ) % query_heads_per_kv_head // (
+                query_heads_per_kv_head // query_tokens
+            ) - (
+                query_tokens - 1
+            )
+        else:
+            row_key_offset = None
+        if kv_heads_per_fragment == 1:
+            parity_mask = None
+        else:
+            column_index = jnp.arange(keys, dtype=jnp.int32)
+            row_parity = (
+                jnp.arange(rows_per_fragment, dtype=jnp.int32)
+                // query_heads_per_kv_head
+            )
+            parity_mask = (
+                column_index[None, :] % kv_heads_per_fragment
+                == row_parity[:, None]
+            )
+        if is_merged_cache:
+            load = functools.partial(
+                load_kv_pair_fragment,
+                block_kv_compute=width,
+                is_bitcast_load=is_bitcast_load,
+                kv_heads_per_fragment=kv_heads_per_fragment,
+            )
+        else:
+            load = functools.partial(
+                load_kv_fragment,
+                block_kv_compute=width,
+                kv_heads_per_fragment=kv_heads_per_fragment,
+                is_cache_head_major=is_cache_head_major,
+                is_bitcast_load=is_bitcast_load,
+            )
+        return TileLayout(
+            width, keys, score_row_head, row_key_offset, parity_mask, load
         )
-    else:
-        row_key_offset = None
-    if kv_heads_per_fragment == 1:
-        parity_mask = None
-    else:
-        column_index = jnp.arange(fragment_keys, dtype=jnp.int32)
-        row_parity = (
-            jnp.arange(rows_per_fragment, dtype=jnp.int32)
-            // query_heads_per_kv_head
-        )
-        parity_mask = (
-            column_index[None, :] % kv_heads_per_fragment == row_parity[:, None]
-        )
-    if is_merged_cache:
-        kv_pair_fragment = functools.partial(
-            load_kv_pair_fragment,
-            block_kv_compute=block_kv_compute,
-            is_bitcast_load=is_bitcast_load,
-            kv_heads_per_fragment=kv_heads_per_fragment,
-        )
-    else:
-        kv_fragment = functools.partial(
-            load_kv_fragment,
-            block_kv_compute=block_kv_compute,
-            kv_heads_per_fragment=kv_heads_per_fragment,
-            is_cache_head_major=is_cache_head_major,
-            is_bitcast_load=is_bitcast_load,
-        )
+
+    main_tile = tile_layout(block_kv_compute)
+    # Note: a partial block's last live tile is computed at the narrowest of
+    # block_kv_compute / 2**i (i < TAIL_WIDTHS, at least MIN_TAIL_KV keys) that
+    # holds its keys, not at block_kv_compute: a row's last tile is mostly
+    # masked when its length is short of the tile. v7x, 4 query heads per KV
+    # head of 256, fp8, batch 64, 4096-key tiles: 95.6 -> 84.6 us at 1792
+    # cached tokens, 90.8 -> 57.8 us at 256.
+    tail_tiles = [main_tile]
+    while (
+        len(tail_tiles) < TAIL_WIDTHS
+        and tail_tiles[-1].width // 2 >= MIN_TAIL_KV
+    ):
+        tail_tiles.append(tile_layout(tail_tiles[-1].width // 2))
 
     # Note (david): every cache DMA on the token axis moves whole
     # cache_tile_rows tiles. A head-major stage puts tokens on its bf16 sublane
@@ -657,6 +702,7 @@ def kvcache_kernel(
             is_first,
             row_max_prev,
             row_sum_prev,
+            tile=main_tile,
         ):
             # Note (david): the query heads of one head group are consecutive
             # rows of q, so one (rows_per_fragment, head_dim) tile rides a
@@ -673,7 +719,7 @@ def kvcache_kernel(
                 scores = None
                 values = []
                 for group_member in range(kv_heads_per_group):
-                    key, value = kv_pair_fragment(
+                    key, value = tile.load(
                         k_buffers,
                         slot,
                         (head_group * kv_heads_per_group + group_member)
@@ -693,12 +739,12 @@ def kvcache_kernel(
                         scores = member_scores
                     else:
                         scores = jnp.where(
-                            score_row_head == group_member,
+                            tile.score_row_head == group_member,
                             member_scores,
                             scores,
                         )
             else:
-                key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
+                key = tile.load(k_buffers, slot, head_group, kv_compute_index)
                 values = None
                 scores = jnp.dot(
                     query, key.T, preferred_element_type=jnp.float32
@@ -766,6 +812,7 @@ def kvcache_kernel(
             probabilities,
             rescale,
             merged_values,
+            tile=main_tile,
         ):
             group_slice = pl.ds(
                 head_group * rows_per_fragment, rows_per_fragment
@@ -789,7 +836,7 @@ def kvcache_kernel(
                             weighted_values,
                         )
             else:
-                value = kv_fragment(
+                value = tile.load(
                     value_buffers, slot, head_group, kv_compute_index
                 )
                 weighted_values = jnp.dot(
@@ -939,35 +986,35 @@ def kvcache_kernel(
                 for head_group in range(num_head_groups)
             ]
 
-            def _fragment_masks(kv_compute_index):
-                key_start = block_start + kv_compute_index * block_kv_compute
+            def _fragment_masks(kv_compute_index, tile=main_tile):
+                key_start = block_start + kv_compute_index * tile.width
                 # Note (david): build the mask at full fragment shape; a (1, N)
                 # mask needs a sublane-broadcast relayout inside every
                 # fragment's select, which measured ~40% of MQA decode time.
                 key_position = (
                     key_start
                     + lax.broadcasted_iota(
-                        jnp.int32, (rows_per_fragment, fragment_keys), 1
+                        jnp.int32, (rows_per_fragment, tile.keys), 1
                     )
                     // kv_heads_per_fragment
                 )
-                if row_key_offset is None:
+                if tile.row_key_offset is None:
                     key_end = total_len
                 else:
-                    key_end = total_len + row_key_offset
+                    key_end = total_len + tile.row_key_offset
                 if left is None:
                     is_in_window = key_position < key_end
                 else:
                     is_in_window = (key_position < key_end) & (
                         key_position >= first_key
                     )
-                if parity_mask is None:
+                if tile.parity_mask is None:
                     is_valid = is_in_window
                 else:
-                    is_valid = is_in_window & parity_mask
+                    is_valid = is_in_window & tile.parity_mask
                 fragment_has_valid_key = jnp.logical_and(
                     key_start < total_len,
-                    key_start + block_kv_compute > first_key,
+                    key_start + tile.width > first_key,
                 )
                 return is_valid, fragment_has_valid_key
 
@@ -1018,9 +1065,9 @@ def kvcache_kernel(
                 _pv(slot, *pending_fragment)
 
             def _attend_live_tiles():
-                def _attend_tile(kv_compute_index, row_states):
+                def _attend_tile(kv_compute_index, row_states, tile=main_tile):
                     is_valid, fragment_has_valid_key = _fragment_masks(
-                        kv_compute_index
+                        kv_compute_index, tile
                     )
                     # Note (david): without a window the row's first tile is
                     # tile 0 of its first block; a window's state starts at its
@@ -1047,10 +1094,11 @@ def kvcache_kernel(
                                 is_first,
                                 row_max_prev,
                                 row_sum_prev,
+                                tile=tile,
                             )
                         )
                         if pending_fragment is not None:
-                            _pv(slot, *pending_fragment)
+                            _pv(slot, *pending_fragment, tile=tile)
                         pending_fragment = (
                             head_group,
                             kv_compute_index,
@@ -1059,36 +1107,84 @@ def kvcache_kernel(
                             values,
                         )
                         next_row_states.append((row_max, row_sum))
-                    _pv(slot, *pending_fragment)
+                    _pv(slot, *pending_fragment, tile=tile)
                     return tuple(next_row_states)
 
-                first_fragment = (
-                    jnp.maximum(first_key - block_start, 0) // block_kv_compute
-                )
-                end_fragment = jnp.minimum(
-                    pl.cdiv(total_len - block_start, block_kv_compute),
-                    num_kv_compute_fragments,
-                )
-                row_states = lax.fori_loop(
-                    first_fragment,
-                    end_fragment,
-                    _attend_tile,
-                    tuple(
+                def _load_row_states():
+                    return tuple(
                         (
                             row_max_ref[group_slice, :],
                             row_sum_ref[group_slice, :],
                         )
                         for group_slice in group_slices
-                    ),
-                )
-                for group_slice, (row_max, row_sum) in zip(
-                    group_slices, row_states
-                ):
-                    row_max_ref[group_slice, :] = row_max
-                    row_sum_ref[group_slice, :] = row_sum
+                    )
 
-            if num_kv_compute_fragments == 1:
+                def _store_row_states(row_states):
+                    for group_slice, (row_max, row_sum) in zip(
+                        group_slices, row_states
+                    ):
+                        row_max_ref[group_slice, :] = row_max
+                        row_sum_ref[group_slice, :] = row_sum
+
+                # Note: a tail of more than half a tile runs at block_kv_compute
+                # with the tiles below it, as before; a narrower one, the last
+                # tail_keys keys, runs as one tile of the narrowest tail_tiles
+                # width holding them.
+                first_fragment = (
+                    jnp.maximum(first_key - block_start, 0) // block_kv_compute
+                )
+                live_end = jnp.minimum(total_len - block_start, block_kv)
+                num_full_tiles = live_end // block_kv_compute
+                tail_start = num_full_tiles * block_kv_compute
+                tail_keys = live_end - tail_start
+                if len(tail_tiles) > 1:
+                    is_wide_tail = tail_keys > tail_tiles[1].width
+                else:
+                    is_wide_tail = tail_keys > 0
+                num_wide_tiles = num_full_tiles + is_wide_tail.astype(jnp.int32)
+                # Note: a one-tile block comes here only with a narrow tail; the
+                # dispatch below runs its wide ones straight-line.
+                if num_kv_compute_fragments > 1:
+                    _store_row_states(
+                        lax.fori_loop(
+                            first_fragment,
+                            num_wide_tiles,
+                            _attend_tile,
+                            _load_row_states(),
+                        )
+                    )
+                for index in range(1, len(tail_tiles)):
+                    tile = tail_tiles[index]
+                    if index + 1 < len(tail_tiles):
+                        narrower = tail_tiles[index + 1].width
+                    else:
+                        narrower = 0
+
+                    @pl.when(
+                        jnp.logical_and(
+                            tail_keys > narrower, tail_keys <= tile.width
+                        )
+                    )
+                    def _attend_tail(tile=tile):
+                        _store_row_states(
+                            _attend_tile(
+                                tail_start // tile.width,
+                                _load_row_states(),
+                                tile,
+                            )
+                        )
+
+            if num_kv_compute_fragments == 1 and len(tail_tiles) == 1:
                 _attend_every_tile()
+            elif num_kv_compute_fragments == 1:
+                # Note: a one-tile block runs its straight-line pipeline, as
+                # before, unless its keys fit a narrower tail tile.
+                is_narrow = (
+                    jnp.minimum(total_len - block_start, block_kv)
+                    <= tail_tiles[1].width
+                )
+                pl.when(jnp.logical_not(is_narrow))(_attend_every_tile)
+                pl.when(is_narrow)(_attend_live_tiles)
             else:
                 # Note (david): a block whose every compute tile holds keys runs
                 # one pipeline over all its fragments, as before; only a partial
