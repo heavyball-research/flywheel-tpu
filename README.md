@@ -234,10 +234,9 @@ Arguments:
     k_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         seqlen_cache a multiple of 128,
         or (num_blocks, page_block_size, 2 * nheads_k, headdim) if there's a block_table
-        (i.e. paged KV cache). The paged cache merges K and V: a bfloat16 cache interleaves
+        (i.e. paged KV cache). The paged cache merges K and V: its token rows interleave
         each KV head's K row and V row, [k0, v0, k1, v1, ...] (RPA v3's head order); a
-        float8_e4m3fn or float8_e5m2 cache holds each head pair's two K rows then its two
-        V rows, [k0, k1, v0, v1, ...], an odd nheads_k padded with one zero head.
+        float8_e4m3fn or float8_e5m2 cache pads an odd nheads_k with one zero head.
         page_block_size must be a multiple of 128.
     v_cache: (batch_size_cache, seqlen_cache, nheads_k, headdim) if there's no block_table,
         or None if there's a block_table.

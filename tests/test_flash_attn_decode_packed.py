@@ -30,40 +30,22 @@ PREFIXES = (0, 300, 1, 1022, 255, 256, 511, 700)
 
 
 def merge_pages(kc, vc):
-    """The merged cache of K and V pages in copy_utils' order: bf16 token rows
-    [k0, v0, k1, v1, ...], fp8 [k0, k1, v0, v1, ...] with an odd head count
-    padded by a zero head."""
+    """The merged cache of K and V pages: each head's K row then its V row,
+    [k0, v0, k1, v1, ...], an fp8 cache's odd head count padded by a zero
+    head."""
     num_pages, page_size, kv_heads, head_dim = kc.shape
-    if kc.dtype == jnp.bfloat16:
-        return jnp.stack((kc, vc), axis=3).reshape(
-            num_pages, page_size, 2 * kv_heads, head_dim
-        )
-    pad = ((0, 0), (0, 0), (0, kv_heads % 2), (0, 0))
-    words = (kv_heads + 1) // 2
-    halves = [
-        jnp.pad(pages, pad).reshape(num_pages, page_size, words, 2, head_dim)
-        for pages in (kc, vc)
-    ]
-    return jnp.stack(halves, axis=3).reshape(
-        num_pages, page_size, 4 * words, head_dim
+    pad = ((0, 0), (0, 0), (0, kv_heads % 2 if kc.dtype.itemsize == 1 else 0))
+    kc, vc = (jnp.pad(pages, pad + ((0, 0),)) for pages in (kc, vc))
+    return jnp.stack((kc, vc), axis=3).reshape(
+        num_pages, page_size, -1, head_dim
     )
 
 
 def split_pages(cache, kv_heads):
     """merge_pages' inverse: the (K pages, V pages) of a merged cache."""
     num_pages, page_size, cache_heads, head_dim = cache.shape
-    if cache.dtype == jnp.bfloat16:
-        pairs = cache.reshape(
-            num_pages, page_size, cache_heads // 2, 2, head_dim
-        )
-        return pairs[..., 0, :], pairs[..., 1, :]
-    words = cache.reshape(num_pages, page_size, cache_heads // 4, 2, 2, head_dim)
-    return tuple(
-        words[:, :, :, part].reshape(num_pages, page_size, -1, head_dim)[
-            :, :, :kv_heads
-        ]
-        for part in range(2)
-    )
+    pairs = cache.reshape(num_pages, page_size, cache_heads // 2, 2, head_dim)
+    return pairs[:, :, :kv_heads, 0, :], pairs[:, :, :kv_heads, 1, :]
 
 
 @pytest.fixture(name="force_config")

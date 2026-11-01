@@ -31,6 +31,7 @@ from .block_sizes import (
     vmem_limit_bytes,
 )
 from .copy_utils import (
+    FP8_BITS,
     MIN_BLOCK_KV,
     bank_safe_word_stride,
     kv_heads_per_word,
@@ -188,20 +189,21 @@ def load_kv_pair_fragment(
     )
     if kv_heads_per_fragment == 2:
         if not is_bitcast_load:
-            pair_row = kv_head // heads_per_word * kv_word_rows(dtype)
+            # Note (david): the pair's word window is its rows [k, v, k', v'].
+            window = kv_stage[
+                slot,
+                pl.ds(compute_start, block_kv_compute),
+                pl.ds(2 * kv_head, 2 * heads_per_word),
+                :,
+            ].reshape(block_kv_compute, heads_per_word, 2, head_dim)
             return tuple(
-                kv_stage[
-                    slot,
-                    pl.ds(compute_start, block_kv_compute),
-                    pl.ds(pair_row + kv_part * heads_per_word, heads_per_word),
-                    :,
-                ].reshape(2 * block_kv_compute, head_dim)
+                window[:, :, kv_part, :].reshape(2 * block_kv_compute, head_dim)
                 for kv_part in range(2)
             )
-        # Note: a word's low 16 bits are the pair's two K bytes and its high 16
-        # bits their two V bytes, so one u32 -> u16 pack per half yields a
-        # head-interleaved fp8 tile, as the bf16 head-pair bitcast does; no byte
-        # unpacking per head.
+        # Note: a word's 16-bit halves are the pair's two heads, each its K
+        # byte then its V byte, so the u16 view packed to bytes is the
+        # head-interleaved K tile, and the words shifted by a byte give the V
+        # tile the same way.
         word_stride = kv_stage.shape[2]
         words = load_staged_words(
             staged_words(kv_stage, slot),
@@ -210,20 +212,18 @@ def load_kv_pair_fragment(
             word_stride,
             no_deps=no_deps,
         )
-        return (
-            pltpu.bitcast(words.astype(jnp.uint16), dtype),
-            pltpu.bitcast((words >> 16).astype(jnp.uint16), dtype),
+        return tuple(
+            pltpu.bitcast(
+                pltpu.bitcast(part_bits, jnp.uint16).astype(jnp.uint8), dtype
+            )
+            for part_bits in (words, words >> jnp.uint32(FP8_BITS))
         )
     if not is_bitcast_load:
-        key_row = (
-            kv_head // heads_per_word * kv_word_rows(dtype)
-            + kv_head % heads_per_word
-        )
         keys, values = (
             kv_stage[
                 slot,
                 pl.ds(compute_start, block_kv_compute),
-                pl.ds(key_row + kv_part * heads_per_word, 1),
+                pl.ds(2 * kv_head + kv_part, 1),
                 :,
             ].reshape(block_kv_compute, head_dim)
             for kv_part in range(2)
@@ -269,8 +269,8 @@ def fragment_geometry(
     # groups unpack one head per fragment. A merged row's u32 word pairs a
     # head's K with its V instead, so a merged build always unpacks one head per
     # fragment.
-    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
-    # V bytes in its high half, so the pair rides one fragment like the bf16
+    # Note: an fp8 merged word holds a head pair, each head's K byte then its
+    # V byte in one 16-bit half, so the pair rides one fragment like the bf16
     # head-pair bitcast.
     is_pair_word_fragment = (
         is_merged_cache
@@ -2118,7 +2118,7 @@ def flash_attn_kvcache_pallas(
     merged_cache (v_cache=None, token-major) makes k_cache one
     (rows, capacity, merged_cache_heads(nheads_k), head_dim) array whose token
     rows hold the KV heads' K and V rows in copy_utils' merged order (bf16
-    [k0, v0, k1, v1, ...], RPA v3's; fp8 [k0, k1, v0, v1, ...]), and returns
+    [k0, v0, k1, v1, ...], RPA v3's, for bf16 and fp8), and returns
     (out, kv_cache[, lse]) instead of (out, k_cache, v_cache[, lse]). nheads_k
     defaults to half the cache's head axis; an fp8 cache, which pads an odd
     head count, needs it. An fp8 merged cache feeds K and V to the MXU as
@@ -2496,18 +2496,8 @@ def flash_attn_kvcache_pallas(
         # appended tile back with one contiguous DMA.
         new_kv_shape = (batch, staged_kv_heads, head_dim)
         head_pad = ((0, 0), (0, staged_kv_heads // 2 - num_kv_heads), (0, 0))
-        word_heads_shape = (
-            batch,
-            -1,
-            kv_heads_per_word(k_cache.dtype),
-            head_dim,
-        )
         new_kv = jnp.stack(
-            [
-                jnp.pad(new_rows, head_pad).reshape(word_heads_shape)
-                for new_rows in (k, v)
-            ],
-            axis=2,
+            [jnp.pad(new_rows, head_pad) for new_rows in (k, v)], axis=2
         ).reshape(new_kv_shape)
         dense_inputs = (q, new_kv)
         new_token_specs = (pl.BlockSpec(new_kv_shape, lambda *_: (0, 0, 0)),)
