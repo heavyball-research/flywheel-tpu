@@ -1623,8 +1623,11 @@ def kvcache_kernel(
         ]
 
     def _attend_packed_step(slot, items, states, value_base):
-        """Score, softmax and PV every fragment of the step's items, continuing
-        states (per head group (row_max, row_sum, accumulator)).
+        """Run the step's items through the prefill kernels' fragment pipeline
+        (fwd_pipeline) in two halves: a half scores its items and continues
+        the online softmax through them, then issues the PV the previous half
+        left pending; the last half's PV runs at the step's end. states are
+        per head group (row_max, row_sum, accumulator).
 
         Returns the new states and, per item and head group, the (out, lse)
         its row would finish with after that item.
@@ -1632,113 +1635,131 @@ def kvcache_kernel(
         # Note (david): value_base is 0, but a runtime 0: at static indices
         # the V tiles' VMEM stores and loads were promoted back to values,
         # and the scheduler again reloaded the staged words.
-        # Note (david): the step runs in three passes, every item's QK, then
-        # the online softmax chain through the items, then every PV, as
-        # batched RPA's step does. Item by item, each item's softmax waited on
-        # its own QK results and its PV on its softmax: the same MXU work
-        # stalled 17.1k cycles a call on v7x (batched RPA: 3.1k).
-        scores = {}
-        for item in items:
-            queries = q_ref[item["row"]]
-            for head_group, fragment in _fragments():
-                kv_compute_index = (
-                    item["position"] * num_kv_compute_fragments + fragment
-                )
-                is_valid, has_valid_key = _key_masks(
-                    item["block_start"] + fragment * block_kv_compute,
-                    item["total_len"],
-                    item["first_key"],
-                )
-                fragment_scores, values = _scores(
-                    queries, slot, head_group, kv_compute_index, is_valid
-                )
-                # Note (david): the V words the QK pass loaded are unpacked
-                # there and kept in VMEM for the PV pass. Left as values, the
-                # scheduler loaded every staged word twice, once per pass
-                # (v7x, 768 x 8: 3064 word loads a step for 1536 word vregs).
-                for member, value in enumerate(values):
-                    staged_values_ref[
-                        _staged_value_index(
-                            value_base,
-                            item["position"],
-                            head_group,
-                            fragment,
-                            member,
-                        )
-                    ] = value
-                scores[item["position"], head_group, fragment] = (
-                    fragment_scores,
-                    has_valid_key,
-                )
-
-        softmax = {}
-        row_states = {}
+        # Note (david): a PV matmul waits for its P, ~214 cycles after the QK
+        # matmul plus the softmax, and the in-order MXU pushes at most one V
+        # tile ahead of it, so only the K pushes ahead of it in program order
+        # fill that wait. Two halves put the second half's K ahead of the
+        # first half's PV and every K push ahead of every V push (v7x,
+        # 768 x 8: 1491 cycles a step, 1 spill). Groups of 1 or 2 items left
+        # the MXU waiting at each PV while the K unpack ran ahead into spills
+        # (2328 and 1881 cycles, 190 and 254 spills).
+        half_size = -(-len(items) // 2)
         running = [(row_max, row_sum) for row_max, row_sum, _ in states]
-        for item in items:
-            for head_group in range(num_head_groups):
-                row_max, row_sum = running[head_group]
-                if left is not None:
-                    row_sum = jnp.where(item["is_row_first"], 0.0, row_sum)
-                for fragment in range(num_kv_compute_fragments):
-                    fragment_scores, has_valid_key = scores[
-                        item["position"], head_group, fragment
-                    ]
-                    probabilities, rescale, row_max, row_sum = _softmax(
-                        fragment_scores,
-                        has_valid_key,
-                        item["is_row_first"] if fragment == 0 else False,
-                        row_max,
-                        row_sum,
-                    )
-                    softmax[item["position"], head_group, fragment] = (
-                        probabilities,
-                        rescale,
-                    )
-                running[head_group] = (row_max, row_sum)
-                row_states[item["position"], head_group] = (row_max, row_sum)
-
         accumulators = [accumulator for _, _, accumulator in states]
-        item_outputs = []
-        for item in items:
-            outputs = []
-            for head_group in range(num_head_groups):
-                accumulator = jnp.where(
-                    item["is_row_first"], 0.0, accumulators[head_group]
-                )
-                for fragment in range(num_kv_compute_fragments):
-                    key = (item["position"], head_group, fragment)
-                    probabilities, rescale = softmax[key]
-                    accumulator = accumulator * lane_broadcast(
-                        rescale, head_dim
-                    ) + _weighted_values(
-                        slot,
-                        head_group,
-                        item["position"] * num_kv_compute_fragments
-                        + fragment,
-                        probabilities,
-                        [
+        item_outputs = [None] * len(items)
+
+        def _half_pv(half_items, softmax, row_states):
+            for item in half_items:
+                outputs = []
+                for head_group in range(num_head_groups):
+                    accumulator = jnp.where(
+                        item["is_row_first"], 0.0, accumulators[head_group]
+                    )
+                    for fragment in range(num_kv_compute_fragments):
+                        key = (item["position"], head_group, fragment)
+                        probabilities, rescale = softmax[key]
+                        kv_compute_index = (
+                            item["position"] * num_kv_compute_fragments
+                            + fragment
+                        )
+                        values = [
                             staged_values_ref[
                                 _staged_value_index(value_base, *key, member)
                             ]
                             for member in range(kv_heads_per_group)
-                        ],
+                        ]
+                        accumulator = accumulator * lane_broadcast(
+                            rescale, head_dim
+                        ) + _weighted_values(
+                            slot,
+                            head_group,
+                            kv_compute_index,
+                            probabilities,
+                            values,
+                        )
+                    accumulators[head_group] = accumulator
+                    row_max, row_sum = row_states[item["position"], head_group]
+                    group_start = head_group * rows_per_fragment
+                    outputs.append(
+                        _row_output(
+                            jnp.where(item["has_keys"], row_max, -jnp.inf),
+                            jnp.where(item["has_keys"], row_sum, 0.0),
+                            jnp.where(item["has_keys"], accumulator, 0.0),
+                            None
+                            if sinks is None
+                            else sinks[
+                                group_start : group_start + rows_per_fragment
+                            ],
+                        )
                     )
-                accumulators[head_group] = accumulator
-                row_max, row_sum = row_states[item["position"], head_group]
-                group_start = head_group * rows_per_fragment
-                outputs.append(
-                    _row_output(
-                        jnp.where(item["has_keys"], row_max, -jnp.inf),
-                        jnp.where(item["has_keys"], row_sum, 0.0),
-                        jnp.where(item["has_keys"], accumulator, 0.0),
-                        None
-                        if sinks is None
-                        else sinks[
-                            group_start : group_start + rows_per_fragment
-                        ],
+                item_outputs[item["position"]] = outputs
+
+        pending_pv = None
+        for half_start in range(0, len(items), half_size):
+            half_items = items[half_start : half_start + half_size]
+            scores = {}
+            for item in half_items:
+                queries = q_ref[item["row"]]
+                for head_group, fragment in _fragments():
+                    kv_compute_index = (
+                        item["position"] * num_kv_compute_fragments + fragment
                     )
-                )
-            item_outputs.append(outputs)
+                    is_valid, has_valid_key = _key_masks(
+                        item["block_start"] + fragment * block_kv_compute,
+                        item["total_len"],
+                        item["first_key"],
+                    )
+                    fragment_scores, values = _scores(
+                        queries, slot, head_group, kv_compute_index, is_valid
+                    )
+                    # Note (david): the V words the QK loaded are unpacked
+                    # there and kept in VMEM for the PV. Left as values, the
+                    # scheduler loaded every staged word twice, for the QK and
+                    # for the PV (v7x, 768 x 8: 3064 word loads a step for
+                    # 1536 word vregs).
+                    for member, value in enumerate(values):
+                        staged_values_ref[
+                            _staged_value_index(
+                                value_base,
+                                item["position"],
+                                head_group,
+                                fragment,
+                                member,
+                            )
+                        ] = value
+                    scores[item["position"], head_group, fragment] = (
+                        fragment_scores,
+                        has_valid_key,
+                    )
+            softmax = {}
+            row_states = {}
+            for item in half_items:
+                for head_group in range(num_head_groups):
+                    row_max, row_sum = running[head_group]
+                    if left is not None:
+                        row_sum = jnp.where(item["is_row_first"], 0.0, row_sum)
+                    for fragment in range(num_kv_compute_fragments):
+                        fragment_scores, has_valid_key = scores[
+                            item["position"], head_group, fragment
+                        ]
+                        probabilities, rescale, row_max, row_sum = _softmax(
+                            fragment_scores,
+                            has_valid_key,
+                            item["is_row_first"] if fragment == 0 else False,
+                            row_max,
+                            row_sum,
+                        )
+                        softmax[item["position"], head_group, fragment] = (
+                            probabilities,
+                            rescale,
+                        )
+                    row_state = (row_max, row_sum)
+                    running[head_group] = row_state
+                    row_states[item["position"], head_group] = row_state
+            if pending_pv is not None:
+                _half_pv(*pending_pv)
+            pending_pv = (half_items, softmax, row_states)
+        _half_pv(*pending_pv)
         new_states = [
             (*running[head_group], accumulators[head_group])
             for head_group in range(num_head_groups)
