@@ -90,11 +90,10 @@ def kv_staging_slots(num_kv_stages: int, items_per_step: int) -> int:
 
 
 def cache_write_slots(num_kv_stages: int, items_per_step: int) -> int:
-    """Append write-back tiles; row r writes through tile r % slots."""
-    # Note (david): the rows of two consecutive packed steps are at most
-    # 2 * items_per_step consecutive rows, so a row's append never waits on a
-    # write-back its own step or the one before issued.
-    return num_kv_stages if items_per_step == 1 else 2 * items_per_step
+    """Append write-back tiles; row r writes through tile r % slots. A packed
+    call writes its new tokens straight from the new_kv block and takes
+    none."""
+    return num_kv_stages if items_per_step == 1 else 0
 
 
 def lane_broadcast(value: jax.Array, width: int) -> jax.Array:
@@ -314,25 +313,32 @@ class DecodeScheduleLayout(NamedTuple):
     in its window gets one empty item that only finishes its output. A step is
     items_per_step consecutive items, and max_items is whole steps. Field f of
     item i sits at f * max_items + i, then each step's staged token count, then
-    the item count.
+    each write row's target, then the item count.
 
-    A packed schedule (items_per_step > 1) also carries each item's append
-    tile: the block-local start of the cache tile holding its row's new token
-    (-1 for an item without it), the token's row in that tile, and the cache
-    row (the physical page when paged) and tile start its write-back targets.
+    A packed paged schedule (pages_per_item > 0) also carries each item's
+    copies: the block_table index of its block's first page (table_base) and
+    page p's staged token count (tokens_p).
+    A packed schedule with an append (write_rows > 0) carries each row's write
+    target: the cache row (the physical page when paged) at
+    row_write_offset + row, and the token's offset in it write_rows later.
     """
 
     max_items: int
     items_per_step: int = 1
+    pages_per_item: int = 0
+    write_rows: int = 0
 
     ITEM_FIELDS = ("row", "block", "load", "flags")
-    APPEND_FIELDS = ("append_tile", "append_row", "write_page", "write_offset")
 
     @property
     def item_fields(self) -> tuple[str, ...]:
-        if self.items_per_step == 1:
+        if not self.pages_per_item:
             return self.ITEM_FIELDS
-        return self.ITEM_FIELDS + self.APPEND_FIELDS
+        return (
+            self.ITEM_FIELDS
+            + ("table_base",)
+            + tuple(f"tokens_{page}" for page in range(self.pages_per_item))
+        )
 
     def item_offset(self, name: str) -> int:
         return self.item_fields.index(name) * self.max_items
@@ -346,8 +352,12 @@ class DecodeScheduleLayout(NamedTuple):
         return len(self.item_fields) * self.max_items
 
     @property
-    def num_items_offset(self) -> int:
+    def row_write_offset(self) -> int:
         return self.step_load_offset + self.max_steps
+
+    @property
+    def num_items_offset(self) -> int:
+        return self.row_write_offset + 2 * self.write_rows
 
     @property
     def size(self) -> int:
@@ -372,7 +382,7 @@ def build_decode_schedule(
     """The decode schedule of one call, a pure function of the call's lengths,
     so XLA builds it once for every layer that shares them. A packed layout
     also reads cache_batch_idx and, when paged, the (padded, flat)
-    block_table, to resolve each row's append write-back.
+    block_table, to resolve its items' pages and its rows' write targets.
 
     Each item carries its row, block index, staged token count (whole cache
     tiles, as the block's wait sizes them) and its ITEM_* flags. The kernel
@@ -442,52 +452,56 @@ def build_decode_schedule(
     step_load = item_load.reshape(layout.max_steps, layout.items_per_step).sum(
         axis=1
     )
-    if layout.items_per_step == 1:
-        append_fields = []
-    else:
-        # Note (david): only the item whose block holds cache_len appends;
-        # without has_new none does.
-        local_index = _at_row(cache_len) - item_block * block_kv
-        is_append = (
-            is_item
-            & (local_index >= 0)
-            & (local_index < block_kv)
-            & bool(has_new)
+    item_row = jnp.where(is_item, _at_row(rows), last_row)
+    item_block = jnp.where(is_item, item_block, padding_block)
+    # Note (david): rows past num_active never copy or append, and the clips
+    # keep their arbitrary cache_batch_idx inside the table.
+    cache_row = jnp.where(is_active, cache_batch_idx.astype(jnp.int32), 0)
+    if layout.pages_per_item:
+        # Note (david): a copy then issues with one block_table read, not a
+        # ~18-op cache_batch_idx / block_table / clip chain. Gathering every
+        # item's pages here instead cost 20 us a call at capacity 16128 (v6e).
+        # A padding item's base is clipped into the table, and its copies are
+        # empty.
+        table_base = jnp.clip(
+            _at_row(cache_row) * pages_per_seq
+            + item_block * layout.pages_per_item,
+            0,
+            block_table.shape[0] - layout.pages_per_item,
         )
-        # Note (david): a row's write-back target is one gather over the
-        # batch, here, so the kernel's append reads no cache_batch_idx /
-        # block_table chain. Rows past num_active never append, and the clip
-        # keeps their arbitrary cache_batch_idx inside the table.
-        cache_row = jnp.where(is_active, cache_batch_idx.astype(jnp.int32), 0)
-        if page_size is None:
-            row_write_page = cache_row
-            row_write_offset = cache_len // cache_tile_rows * cache_tile_rows
-        else:
-            row_write_page = jnp.take(
+        pages = jnp.arange(layout.pages_per_item, dtype=jnp.int32)
+        item_tokens = jnp.clip(
+            item_load[:, None] - pages[None, :] * page_size, 0, page_size
+        )
+        page_fields = [table_base] + [
+            item_tokens[:, page] for page in range(layout.pages_per_item)
+        ]
+    else:
+        page_fields = []
+    # Note (david): a packed call writes each row's new token straight to its
+    # cache slot before staging any block, so the target is the token itself,
+    # not a cache tile.
+    if not layout.write_rows:
+        row_write_fields = []
+    elif page_size is None:
+        row_write_fields = [cache_row, cache_len]
+    else:
+        row_write_fields = [
+            jnp.take(
                 block_table,
                 cache_row * pages_per_seq + cache_len // page_size,
                 mode="clip",
-            )
-            row_write_offset = (
-                cache_len % page_size // cache_tile_rows * cache_tile_rows
-            )
-        append_fields = [
-            jnp.where(
-                is_append,
-                local_index // cache_tile_rows * cache_tile_rows,
-                -1,
             ),
-            jnp.where(is_append, local_index % cache_tile_rows, 0),
-            jnp.where(is_append, _at_row(row_write_page), 0),
-            jnp.where(is_append, _at_row(row_write_offset), 0),
+            cache_len % page_size,
         ]
     return jnp.concatenate([
-        jnp.where(is_item, _at_row(rows), last_row),
-        jnp.where(is_item, item_block, padding_block),
+        item_row,
+        item_block,
         item_load,
         item_flags,
-        *append_fields,
+        *page_fields,
         step_load,
+        *row_write_fields,
         row_item_end[-1:],
     ]).astype(jnp.int32)
 
@@ -635,11 +649,11 @@ def kvcache_kernel(
             block_kv_compute=block_kv_compute,
             is_bitcast_load=is_bitcast_load,
             kv_heads_per_fragment=kv_heads_per_fragment,
-            # Note (david): the packed step orders its appends ahead of its
-            # loads with a fence, so its loads drop every other dependency on
-            # the staging (batched RPA's annotation): the next step's copies
-            # then issue among the step's vector work, where they were one
-            # ~25-bundle scalar chain per item ahead of the first K load.
+            # Note (david): a packed step issues the next step's copies ahead of
+            # its K loads, into another slot of the same staging, so the loads
+            # drop every other dependency on the staging (batched RPA's
+            # annotation); they were one ~25-bundle scalar chain per item
+            # behind those copies.
             no_deps=is_packed,
         )
     else:
@@ -726,13 +740,6 @@ def kvcache_kernel(
         semaphore. branch_free issues one copy per page of the block, empty
         pages at size 0, with no branch; is_live False makes every copy
         empty."""
-        if branch_free:
-            load_size = pl.multiple_of(
-                jnp.where(is_live, _item_field("load", item), 0),
-                cache_tile_rows,
-            )
-        else:
-            load_size = _item_load(item)
 
         def _issue(hbm_row, hbm_start, num_tokens, buffer_start):
             for cache_ref, buffers, sem_index in load_parts:
@@ -751,36 +758,33 @@ def kvcache_kernel(
             # load_size and looped over the block's live pages, they ran as
             # their own basic blocks: 10.1k of 64.1k bundles a call held no
             # vector op (v7x, 64 rows of 1300-2300 tokens, 768 x 8).
-            row = _item_field("row", item)
             if page_size is None:
                 _issue(
-                    cache_batch_idx_ref[row],
+                    cache_batch_idx_ref[_item_field("row", item)],
                     _item_field("block", item) * block_kv,
-                    load_size,
+                    pl.multiple_of(
+                        jnp.where(is_live, _item_field("load", item), 0),
+                        cache_tile_rows,
+                    ),
                     0,
                 )
             else:
-                table_base = cache_batch_idx_ref[
-                    row
-                ] * pages_per_seq + _item_field("block", item) * (
-                    block_kv // page_size
-                )
-                for page in range(block_kv // page_size):
-                    # Note (david): a padding item's block lies past its row's
-                    # table entries, so its empty copies read the last entry.
-                    entry = jnp.minimum(
-                        table_base + page, block_table_ref.shape[0] - 1
-                    )
+                table_base = _item_field("table_base", item)
+                for page in range(layout.pages_per_item):
                     _issue(
-                        block_table_ref[entry],
+                        block_table_ref[table_base + page],
                         0,
                         pl.multiple_of(
-                            jnp.clip(load_size - page * page_size, 0, page_size),
+                            jnp.where(
+                                is_live, _item_field(f"tokens_{page}", item), 0
+                            ),
                             cache_tile_rows,
                         ),
                         page * page_size,
                     )
             return
+
+        load_size = _item_load(item)
 
         @pl.when(load_size > 0)
         def _start():
@@ -831,17 +835,10 @@ def kvcache_kernel(
                     tile, tile, sems.at[sem_index, slot, 0]
                 ).wait()
 
-    def _cache_write_copies(row, slot, num_tokens=None, target=None):
-        """Copies of write tile slot to row's appended cache tile; num_tokens
-        (token-major only) shortens them, to 0 for a copy that writes
-        nothing. target, (hbm_row, tile_start) resolved by the schedule,
-        stands in for row's lookup."""
-        if target is not None:
-            hbm_row, tile_start = target
-            tile_start = pl.multiple_of(tile_start, cache_tile_rows)
-        else:
-            hbm_row, tile_start = _cache_write_target(row)
-        return _write_tile_copies(hbm_row, tile_start, slot, num_tokens)
+    def _cache_write_copies(row, slot):
+        """Copies of write tile slot to row's appended cache tile."""
+        hbm_row, tile_start = _cache_write_target(row)
+        return _write_tile_copies(hbm_row, tile_start, slot)
 
     def _cache_write_target(row):
         cache_row = cache_batch_idx_ref[row]
@@ -864,9 +861,8 @@ def kvcache_kernel(
             )
         return hbm_row, tile_start
 
-    def _write_tile_copies(hbm_row, tile_start, slot, num_tokens):
+    def _write_tile_copies(hbm_row, tile_start, slot):
         if is_cache_head_major:
-            assert num_tokens is None, "a head-major write is whole tiles"
             # Note (david): one copy per head, since the head axis of a cache
             # row is not contiguous.
             return [
@@ -883,7 +879,7 @@ def kvcache_kernel(
                 for head_offset in range(num_kv_heads)
                 for buffers, out_ref_hbm, sem_index in write_parts
             ]
-        elif num_tokens is None:
+        else:
             return [
                 pltpu.make_async_copy(
                     buffers.at[slot].reshape(
@@ -894,21 +890,6 @@ def kvcache_kernel(
                     out_ref_hbm.at[
                         hbm_row, pl.ds(tile_start, cache_tile_rows), :, :
                     ],
-                    sems.at[sem_index, slot, 0],
-                )
-                for buffers, out_ref_hbm, sem_index in write_parts
-            ]
-        else:
-            return [
-                pltpu.make_async_copy(
-                    (
-                        buffers.at[slot].reshape(
-                            cache_tile_rows, staged_kv_heads, head_dim
-                        )
-                        if is_bitcast_load
-                        else buffers.at[slot]
-                    ).at[pl.ds(0, num_tokens)],
-                    out_ref_hbm.at[hbm_row, pl.ds(tile_start, num_tokens), :, :],
                     sems.at[sem_index, slot, 0],
                 )
                 for buffers, out_ref_hbm, sem_index in write_parts
@@ -950,7 +931,7 @@ def kvcache_kernel(
     def _new_token_tile(slot, token_base, local_tile_start, new_row):
         """(tile_index, is_new_row, expand) of the staged cache tile at
         local_tile_start of the block staged in slot at token_base, whose row
-        new_row (-1 for none) takes the new token."""
+        new_row takes the new token."""
         token_row = jnp.arange(cache_tile_rows, dtype=jnp.int32)
         tile_tokens = pl.ds(
             pl.multiple_of(token_base + local_tile_start, cache_tile_rows),
@@ -992,39 +973,25 @@ def kvcache_kernel(
             return (new_kv_ref[row, :, :],)
         return (k_ref[row, :, :], v_ref[row, :, :])
 
-    def _start_cache_write(
-        row,
-        updated_tiles,
-        write_slot,
-        waits_previous,
-        write_tokens,
-        target=None,
-    ):
+    def _start_cache_write(row, updated_tiles, write_slot, waits_previous):
         """Copy row's updated tiles into write tile write_slot and start their
-        write-back, once the write-back that last used the slot is done;
-        target as in _cache_write_copies."""
+        write-back, once the write-back that last used the slot is done."""
 
         # Note (david): a wait reads only its size and semaphore, so the
-        # clamped row (or this write's own target) stands in for the row that
-        # last wrote the slot, and where a predicated wait does not run.
+        # clamped row stands in for the row that last wrote the slot, and where
+        # a predicated wait does not run.
         @pl.when(waits_previous)
         def _wait_previous_cache_write():
-            if target is None:
-                copies = _cache_write_copies(
-                    jnp.maximum(row - num_write_slots, 0), write_slot
-                )
-            else:
-                copies = _cache_write_copies(row, write_slot, target=target)
-            for copy in copies:
+            for copy in _cache_write_copies(
+                jnp.maximum(row - num_write_slots, 0), write_slot
+            ):
                 copy.wait()
 
         for (write_buffers, _, _), updated_tile in zip(
             write_parts, updated_tiles
         ):
             write_buffers[write_slot] = updated_tile
-        for copy in _cache_write_copies(
-            row, write_slot, write_tokens, target
-        ):
+        for copy in _cache_write_copies(row, write_slot):
             copy.start()
 
     def _append_new_token(slot, token_base, row, block_index):
@@ -1051,72 +1018,7 @@ def kvcache_kernel(
             updated_tiles,
             lax.rem(row, num_write_slots),
             row >= num_write_slots,
-            None,
         )
-
-    def _stage_packed_appends(slot, items):
-        """Write each of a packed step's items' new token, if its block holds
-        one, into the step's staged blocks; returns what each item's
-        write-back needs. Every item runs it with no branch: one without the
-        token rewrites its block's first tile unchanged."""
-        # Note (david): the schedule's tiles keep the staged tiles' addresses
-        # off the cache_seqlens / block chain, and every tile is read before
-        # any is written: the tiles' addresses are dynamic, so a write ahead of
-        # the next item's read chained the step's appends end to end, all
-        # ahead of the K loads they precede.
-        tiles = []
-        for item in items:
-            append_tile = _item_field("append_tile", item["index"])
-            is_append = append_tile >= 0
-            tile_index, is_new_row, expand = _new_token_tile(
-                slot,
-                item["position"] * block_kv,
-                jnp.maximum(append_tile, 0),
-                jnp.where(
-                    is_append, _item_field("append_row", item["index"]), -1
-                ),
-            )
-            staged = [buffers[tile_index] for _, buffers, _ in load_parts]
-            tiles.append((item, is_append, tile_index, is_new_row, expand, staged))
-        appends = []
-        for item, is_append, tile_index, is_new_row, expand, staged in tiles:
-            updated_tiles = [
-                jnp.where(is_new_row, expand(new_token), staged_tile)
-                for new_token, staged_tile in zip(
-                    _new_tokens(item["row"]), staged
-                )
-            ]
-            for (_, buffers, _), updated_tile in zip(load_parts, updated_tiles):
-                buffers[tile_index] = updated_tile
-            appends.append(
-                (item["index"], item["row"], is_append, updated_tiles)
-            )
-        return appends
-
-    def _write_back_packed_appends(appends):
-        """Start the write-backs _stage_packed_appends prepared."""
-        for index, row, is_append, updated_tiles in appends:
-            # Note (david): an item that appends nothing writes the spare
-            # tile past the ring, which no write-back reads, so a write-back
-            # in flight from its row's tile keeps its source. The schedule's
-            # target keeps the cache_batch_idx / block_table chain out of the
-            # step (two chains an item, 304 scalar-only bundles a step of the
-            # step's 501-bundle append fence; v7x, 768 x 8).
-            _start_cache_write(
-                row,
-                updated_tiles,
-                jnp.where(
-                    is_append, lax.rem(row, num_write_slots), num_write_slots
-                ),
-                jnp.logical_and(is_append, row >= num_write_slots),
-                pl.multiple_of(
-                    jnp.where(is_append, cache_tile_rows, 0), cache_tile_rows
-                ),
-                target=(
-                    _item_field("write_page", index),
-                    _item_field("write_offset", index),
-                ),
-            )
 
     def _key_masks(key_start, total_len, first_key):
         """(is_valid, fragment_has_valid_key) of the fragment at key_start."""
@@ -1685,15 +1587,14 @@ def kvcache_kernel(
                 is_live=is_live,
             )
 
-    def _packed_item(index, position, row, block_index, flags):
-        """Scalars of the step's item at position, schedule item index."""
+    def _packed_item(position, row, block_index, flags):
+        """Scalars of the step's item at position."""
         total_len = cache_seqlens_ref[row] + int(has_new)
         if left is None:
             first_key = jnp.int32(0)
         else:
             first_key = jnp.maximum(0, total_len - 1 - left)
         return dict(
-            index=index,
             position=position,
             row=row,
             block_index=block_index,
@@ -1844,28 +1745,22 @@ def kvcache_kernel(
         ]
         return new_states, item_outputs
 
+    # Note (david): a packed ring stages num_kv_stages steps, so a step's
+    # copies start num_kv_stages - 1 steps ahead of it, into the slot the step
+    # before this one freed.
+    prefetch_distance = num_kv_stages - 1
+
     def _process_step(step, carry):
         """items_per_step consecutive items in one straight-line body after
-        the step's append fence: the scheduler overlaps the next step's DMA
-        issue and the items' QK, softmax and PV."""
+        the step's wait: the scheduler overlaps the DMA issue of the step
+        prefetch_distance ahead and the items' QK, softmax and PV."""
         slot = lax.rem(step, num_kv_stages)
-        items = []
-        for position in range(items_per_step):
-            item = step * items_per_step + position
-            items.append(
-                _packed_item(
-                    item,
-                    position,
-                    _item_field("row", item),
-                    _item_field("block", item),
-                    _item_field("flags", item),
-                )
-            )
-        # Note (david): a region that always runs is a basic block boundary,
-        # the barrier the K loads' no_hazard_no_deps keeps: the step's copies
-        # have landed and its appends are in the staged blocks before any K
-        # load reads them, and the appends' write-backs leave first (batched
-        # RPA's stitch_and_issue_writeback fence).
+
+        # Note (david): the wait comes first, so the items' scalar header below
+        # rides the vector work after it; behind the header it held 57
+        # scalar-only bundles of every step (v7x, 768 x 8). The K loads keep
+        # no_hazard_no_deps and still follow the wait, which no vector op
+        # crosses (the region, if-converted, is no block boundary).
         @pl.when(step >= 0)
         def _stage_fence():
             _wait_kv(
@@ -1875,15 +1770,25 @@ def kvcache_kernel(
                 ),
                 slot,
             )
-            if has_new:
-                _write_back_packed_appends(_stage_packed_appends(slot, items))
 
-        # Note (david): the last step's prefetch issues empty copies, with no
+        items = []
+        for position in range(items_per_step):
+            item = step * items_per_step + position
+            items.append(
+                _packed_item(
+                    position,
+                    _item_field("row", item),
+                    _item_field("block", item),
+                    _item_field("flags", item),
+                )
+            )
+
+        # Note (david): the last steps' prefetches issue empty copies, with no
         # branch.
         _start_step_kv(
-            step + 1,
-            lax.rem(step + 1, num_kv_stages),
-            is_live=step + 1 < num_steps,
+            step + prefetch_distance,
+            lax.rem(step + prefetch_distance, num_kv_stages),
+            is_live=step + prefetch_distance < num_steps,
         )
         states = [
             (
@@ -1914,11 +1819,42 @@ def kvcache_kernel(
         return carry
 
     if is_packed:
+        if has_new:
+            # Note (david): every staged block then already holds its row's
+            # new token, so a step stitches no append into its staging.
+            # Stitched per step, the 8 items' tile read-modify-writes and
+            # write-backs were a 317-bundle basic block of every 1865-bundle
+            # step, and the step's spills fell 55 -> 1 without them (v7x,
+            # 768 x 8). A row past num_active writes 0 tokens, with no branch.
+            num_writes = jnp.minimum(num_active, batch)
+            for row in range(batch):
+                num_tokens = jnp.where(row < num_writes, 1, 0)
+                pltpu.make_async_copy(
+                    new_kv_ref.at[pl.ds(row, num_tokens)],
+                    k_out_ref.at[
+                        schedule_ref[layout.row_write_offset + row],
+                        pl.ds(
+                            schedule_ref[layout.row_write_offset + batch + row],
+                            num_tokens,
+                        ),
+                    ],
+                    sems.at[SEM_K_WRITE, 0, 0],
+                ).start()
 
-        @pl.when(num_steps > 0)
-        def _prefetch_first_step():
-            _start_step_kv(0, 0)
+            # Note (david): a DMA semaphore counts bytes, so one wait sized to
+            # every row's token covers all the writes (src == dst: only the
+            # size matters).
+            @pl.when(num_writes > 0)
+            def _wait_new_tokens():
+                tokens = new_kv_ref.at[pl.ds(0, num_writes)]
+                pltpu.make_async_copy(
+                    tokens, tokens, sems.at[SEM_K_WRITE, 0, 0]
+                ).wait()
 
+        for first_step in range(prefetch_distance):
+            _start_step_kv(
+                first_step, first_step, is_live=first_step < num_steps
+            )
         lax.fori_loop(0, num_steps, _process_step, 0)
     else:
         # Note (david): the first item takes a pending PV aimed at the trash
@@ -1946,11 +1882,12 @@ def kvcache_kernel(
         # Note (david): the last block's PV and its row's finish run here.
         _take_pending()
 
-    # Note (david): the kernel must not exit with DMAs in flight, and the loop
-    # leaves the last NUM_IO_STAGES output copies (none when packed, whose
-    # output stays in VMEM) and the last num_write_slots cache writes running.
-    # The candidate rows are the static tail of a full batch, each guarded
-    # against running past the active prefix.
+    # Note (david): the kernel must not exit with DMAs in flight, and the
+    # one-item loop leaves its last NUM_IO_STAGES output copies and last
+    # num_write_slots cache writes running (a packed call's output stays in
+    # VMEM and its new tokens land before its loop). The candidate rows are the
+    # static tail of a full batch, each guarded against running past the
+    # active prefix.
     def _drain(tail_length, wait_row):
         for tail_offset in range(min(batch, tail_length)):
             batch_index = num_active - 1 - tail_offset
@@ -1967,7 +1904,7 @@ def kvcache_kernel(
     if not is_packed:
         _drain(NUM_IO_STAGES, _wait_output)
 
-    if has_new:
+    if has_new and not is_packed:
 
         def _wait_cache_write(batch_index):
             write_slot = lax.rem(batch_index, num_write_slots)
@@ -2379,9 +2316,9 @@ def flash_attn_kvcache_pallas(
         bank_safe_word_stride(token_words),
     )
     write_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
-    # Note (david): a packed step's items that append nothing write one spare
-    # tile past the ring (see _append_new_token in the kernel).
-    num_write_tiles = num_write_slots + int(is_packed)
+    # Note (david): a packed call writes no tile (see cache_write_slots); one
+    # unused tile keeps its write scratch from being empty.
+    num_write_tiles = max(num_write_slots, 1)
     write_buffer_shape = _staging_shape(
         num_write_tiles, write_tile_rows, token_words
     )
@@ -2466,6 +2403,10 @@ def flash_attn_kvcache_pallas(
     layout = DecodeScheduleLayout(
         max_items=round_up(batch * -(-capacity // block_kv), items_per_step),
         items_per_step=items_per_step,
+        pages_per_item=(
+            block_kv // page_size if is_packed and page_size is not None else 0
+        ),
+        write_rows=batch if is_packed and has_new else 0,
     )
     schedule = build_decode_schedule(
         cache_seqlens,
