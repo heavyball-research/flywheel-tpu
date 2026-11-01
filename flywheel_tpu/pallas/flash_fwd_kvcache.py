@@ -166,7 +166,6 @@ def load_kv_pair_fragment(
     block_kv_compute: int,
     is_bitcast_load: bool,
     kv_heads_per_fragment: int = 1,
-    no_deps: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """(keys, values) of kv_head, each (block_kv_compute, head_dim) in the
     cache dtype, read from a merged-cache staging slot.
@@ -209,7 +208,6 @@ def load_kv_pair_fragment(
             compute_start * word_stride + kv_head // heads_per_word,
             block_kv_compute,
             word_stride,
-            no_deps=no_deps,
         )
         return tuple(
             pltpu.bitcast(
@@ -245,7 +243,6 @@ def load_kv_pair_fragment(
             compute_start * word_stride + kv_head // heads_per_word,
             block_kv_compute,
             word_stride,
-            no_deps=no_deps,
         )
         return kv_word_halves(words, kv_head, dtype)
 
@@ -649,12 +646,6 @@ def kvcache_kernel(
             block_kv_compute=block_kv_compute,
             is_bitcast_load=is_bitcast_load,
             kv_heads_per_fragment=kv_heads_per_fragment,
-            # Note (david): a packed step issues the next step's copies ahead of
-            # its K loads, into another slot of the same staging, so the loads
-            # drop every other dependency on the staging (batched RPA's
-            # annotation); they were one ~25-bundle scalar chain per item
-            # behind those copies.
-            no_deps=is_packed,
         )
     else:
         kv_fragment = functools.partial(
@@ -1766,22 +1757,27 @@ def kvcache_kernel(
         ]
         return new_states, item_outputs
 
-    # Note (david): a packed ring stages num_kv_stages steps, so a step's
-    # copies start num_kv_stages - 1 steps ahead of it, into the slot the step
-    # before this one freed.
-    prefetch_distance = num_kv_stages - 1
+    # Note (david): a step issues the copies num_kv_stages steps ahead after
+    # its compute, into the slot it just read, so they overlap a whole step of
+    # compute even at two stages. Issued before the compute, num_kv_stages - 1
+    # steps ahead into the slot the step before freed, they still sank to the
+    # step's end, where the next step waited on them at once (v6e, 768 x 8,
+    # 1300-2300 tokens: 117.1 us at two stages and 84.8 at three, against
+    # 83.2 at two issued after the compute).
+    prefetch_distance = num_kv_stages
 
     def _process_step(step, carry):
         """items_per_step consecutive items in one straight-line body after
-        the step's wait: the scheduler overlaps the DMA issue of the step
-        prefetch_distance ahead and the items' QK, softmax and PV."""
+        the step's wait, then the copies prefetch_distance steps ahead, into
+        the slot the items read: the scheduler hides their issue behind the
+        last PV's result latency."""
         slot = lax.rem(step, num_kv_stages)
 
         # Note (david): the wait comes first, so the items' scalar header below
         # rides the vector work after it; behind the header it held 57
-        # scalar-only bundles of every step (v7x, 768 x 8). The K loads keep
-        # no_hazard_no_deps and still follow the wait, which no vector op
-        # crosses (the region, if-converted, is no block boundary).
+        # scalar-only bundles of every step (v7x, 768 x 8). The K loads follow
+        # the wait, which no vector op crosses (the region, if-converted, is no
+        # block boundary).
         @pl.when(step >= 0)
         def _stage_fence():
             _wait_kv(
@@ -1804,13 +1800,6 @@ def kvcache_kernel(
                 )
             )
 
-        # Note (david): the last steps' prefetches issue empty copies, with no
-        # branch.
-        _start_step_kv(
-            step + prefetch_distance,
-            lax.rem(step + prefetch_distance, num_kv_stages),
-            is_live=step + prefetch_distance < num_steps,
-        )
         states = [
             (
                 row_max_ref[0, group_slice, :],
@@ -1837,6 +1826,15 @@ def kvcache_kernel(
             row_max_ref[0, group_slice, :] = row_max
             row_sum_ref[0, group_slice, :] = row_sum
             accumulator_ref[0, group_slice, :] = accumulator
+        # Note (david): the copies overwrite the slot the items read, and the
+        # staged loads keep their hazards on it, so each copy follows the
+        # slot's last load. The last steps' prefetches issue empty copies, with
+        # no branch.
+        _start_step_kv(
+            step + prefetch_distance,
+            slot,
+            is_live=step + prefetch_distance < num_steps,
+        )
         return carry
 
     if is_packed:
