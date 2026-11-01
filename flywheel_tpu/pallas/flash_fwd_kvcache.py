@@ -561,6 +561,7 @@ def kvcache_kernel(
         pending_probabilities_ref,
         pending_rescale_ref,
         pending_ref,
+        staged_values_ref,
         sems,
     ) = remaining_refs
 
@@ -1707,6 +1708,12 @@ def kvcache_kernel(
             has_keys=total_len > 0,
         )
 
+    def _staged_value_index(base, position, head_group, fragment, member):
+        return base + (
+            (position * num_kv_compute_fragments + fragment) * num_head_groups
+            + head_group
+        ) * kv_heads_per_group + member
+
     def _fragments():
         return [
             (head_group, fragment)
@@ -1714,13 +1721,16 @@ def kvcache_kernel(
             for fragment in range(num_kv_compute_fragments)
         ]
 
-    def _attend_packed_step(slot, items, states):
+    def _attend_packed_step(slot, items, states, value_base):
         """Score, softmax and PV every fragment of the step's items, continuing
         states (per head group (row_max, row_sum, accumulator)).
 
         Returns the new states and, per item and head group, the (out, lse)
         its row would finish with after that item.
         """
+        # Note (david): value_base is 0, but a runtime 0: at static indices
+        # the V tiles' VMEM stores and loads were promoted back to values,
+        # and the scheduler again reloaded the staged words.
         # Note (david): the step runs in three passes, every item's QK, then
         # the online softmax chain through the items, then every PV, as
         # batched RPA's step does. Item by item, each item's softmax waited on
@@ -1738,10 +1748,25 @@ def kvcache_kernel(
                     item["total_len"],
                     item["first_key"],
                 )
+                fragment_scores, values = _scores(
+                    queries, slot, head_group, kv_compute_index, is_valid
+                )
+                # Note (david): the V words the QK pass loaded are unpacked
+                # there and kept in VMEM for the PV pass. Left as values, the
+                # scheduler loaded every staged word twice, once per pass
+                # (v7x, 768 x 8: 3064 word loads a step for 1536 word vregs).
+                for member, value in enumerate(values):
+                    staged_values_ref[
+                        _staged_value_index(
+                            value_base,
+                            item["position"],
+                            head_group,
+                            fragment,
+                            member,
+                        )
+                    ] = value
                 scores[item["position"], head_group, fragment] = (
-                    *_scores(
-                        queries, slot, head_group, kv_compute_index, is_valid
-                    ),
+                    fragment_scores,
                     has_valid_key,
                 )
 
@@ -1754,7 +1779,7 @@ def kvcache_kernel(
                 if left is not None:
                     row_sum = jnp.where(item["is_row_first"], 0.0, row_sum)
                 for fragment in range(num_kv_compute_fragments):
-                    fragment_scores, _, has_valid_key = scores[
+                    fragment_scores, has_valid_key = scores[
                         item["position"], head_group, fragment
                     ]
                     probabilities, rescale, row_max, row_sum = _softmax(
@@ -1790,7 +1815,12 @@ def kvcache_kernel(
                         item["position"] * num_kv_compute_fragments
                         + fragment,
                         probabilities,
-                        scores[key][1],
+                        [
+                            staged_values_ref[
+                                _staged_value_index(value_base, *key, member)
+                            ]
+                            for member in range(kv_heads_per_group)
+                        ],
                     )
                 accumulators[head_group] = accumulator
                 row_max, row_sum = row_states[item["position"], head_group]
@@ -1863,7 +1893,9 @@ def kvcache_kernel(
             )
             for group_slice in group_slices
         ]
-        states, item_outputs = _attend_packed_step(slot, items, states)
+        states, item_outputs = _attend_packed_step(
+            slot, items, states, jnp.minimum(step, 0)
+        )
         # Note (david): every output store follows all of the step's compute.
         # The rows are dynamic, so the scheduler cannot tell an out store from
         # a later item's q and K loads. In item order, a row's last item
@@ -2012,6 +2044,8 @@ def validate_kvcache_config(
         )
         q_o_rows = batch
         accumulator_itemsize = F32_BYTES
+        # Note (david): the step's unpacked V, every KV head of every item.
+        staged_tokens += items_per_step * block_kv // 2
     kv_staging_bytes = (
         2 * staged_tokens * (num_kv_heads + 2) * head_dim * kv_itemsize
     )
@@ -2371,6 +2405,24 @@ def flash_attn_kvcache_pallas(
         * kv_heads_per_fragment
         * kv_heads_per_group
     )
+    num_head_groups = (
+        num_kv_heads // kv_heads_per_fragment // kv_heads_per_group
+    )
+    staged_value_tiles = (
+        items_per_step
+        * (block_kv // block_kv_compute)
+        * num_head_groups
+        * kv_heads_per_group
+        if is_packed
+        else 1
+    )
+    # Note (david): the one-item kernel never touches it, so it takes one
+    # 32-row tile, whole for every cache dtype.
+    staged_values_shape = (
+        staged_value_tiles,
+        kv_heads_per_fragment * block_kv_compute if is_packed else 32,
+        head_dim,
+    )
     scratch_shapes = (
         pltpu.VMEM(cache_buffer_shape, k_cache.dtype),
         pltpu.VMEM(value_buffer_shape, k_cache.dtype),
@@ -2392,6 +2444,9 @@ def flash_attn_kvcache_pallas(
         ),
         pltpu.VMEM((rows_per_fragment, NUM_LANES), jnp.float32),
         pltpu.SMEM((NUM_PENDING_FIELDS,), jnp.int32),
+        # Note (david): a packed step's unpacked V tiles, one per item,
+        # fragment, head group and group member (see _attend_packed_step).
+        pltpu.VMEM(staged_values_shape, k_cache.dtype),
         pltpu.SemaphoreType.DMA(
             (
                 NUM_SEMS,
