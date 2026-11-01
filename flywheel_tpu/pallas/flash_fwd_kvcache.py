@@ -3,6 +3,7 @@ new token and attends its whole cache."""
 
 import functools
 import math
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -53,6 +54,19 @@ SEM_V_WRITE = 3
 SEM_Q = 4
 SEM_OUT = 5
 NUM_SEMS = 6
+# Note (david): a row's running state alternates between two parities, so a
+# row's last PV and output finish can run inside the next row's first block;
+# the trash accumulator takes the pending PV issued before any block left one.
+NUM_ROW_PARITIES = 2
+TRASH_PARITY = NUM_ROW_PARITIES
+PENDING_SLOT = 0
+PENDING_KV_COMPUTE = 1
+PENDING_PARITY = 2
+PENDING_FINISH_ROW = 3
+NUM_PENDING_FIELDS = 4
+ITEM_ROW_FIRST = 1
+ITEM_ROW_LAST = 2
+ITEM_EMPTY_ROW = 4
 BLOCK_KV_COMPUTE_CANDIDATES = (1024, 512, 384, 256, 128)
 STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
 # Note (david): a row runs only the kv compute tiles that hold its keys, but a
@@ -216,12 +230,168 @@ def load_kv_pair_fragment(
         return kv_word_halves(words, kv_head, dtype)
 
 
+def fragment_geometry(
+    *,
+    num_query_heads: int,
+    num_kv_heads: int,
+    cache_dtype: jnp.dtype,
+    is_merged_cache: bool,
+    is_bitcast_load: bool,
+) -> tuple[int, int]:
+    """(kv_heads_per_fragment, kv_heads_per_group): the KV heads one score tile
+    reads and the head groups one 8-row query tile folds."""
+    query_heads_per_kv_head = num_query_heads // num_kv_heads
+    # Note (david): a bitcast head-pair tile interleaves its two heads per
+    # token, so both heads' query groups ride one MXU pass with the off-parity
+    # columns masked. That is free while the pair's query rows fit one 8-sublane
+    # f32 tile; past it the masked half doubles the softmax work, so larger
+    # groups unpack one head per fragment. A merged row's u32 word pairs a
+    # head's K with its V instead, so a merged build always unpacks one head per
+    # fragment.
+    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
+    # V bytes in its high half, so the pair rides one fragment like the bf16
+    # head-pair bitcast.
+    is_pair_word_fragment = (
+        is_merged_cache
+        and kv_heads_per_word(cache_dtype) == 2
+        and NUM_SUBLANES // 2 < 2 * query_heads_per_kv_head <= NUM_SUBLANES
+        and num_kv_heads % 2 == 0
+    )
+    if (
+        is_bitcast_load
+        and 2 * query_heads_per_kv_head <= NUM_SUBLANES
+        and not is_merged_cache
+    ) or is_pair_word_fragment:
+        kv_heads_per_fragment = 2
+    else:
+        kv_heads_per_fragment = 1
+    # Note (david): a merged build whose KV head serves fewer than 8 query
+    # heads scores several KV heads through one 8-row query tile: each head's
+    # keys are pushed once, as before, but the LHS carries the whole group's
+    # query rows, and the head keeps its own rows of the result. The group then
+    # runs one softmax over a full f32 tile instead of one per head over a
+    # mostly empty one, and its running max, sum and accumulator are whole
+    # tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block loop went
+    # from 7149 to 5223 bundles (RPA v3: 7165), losing the per-head cross-lane
+    # broadcasts, sublane rotates and single-row state stores.
+    if (
+        is_merged_cache
+        and not is_pair_word_fragment
+        and NUM_SUBLANES % query_heads_per_kv_head == 0
+        and num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head) == 0
+    ):
+        kv_heads_per_group = NUM_SUBLANES // query_heads_per_kv_head
+    else:
+        kv_heads_per_group = 1
+    return kv_heads_per_fragment, kv_heads_per_group
+
+
+class DecodeScheduleLayout(NamedTuple):
+    """Static layout of the decode schedule, one flat int32 SMEM array.
+
+    An item is one KV block of one row, items in row order; a row with no block
+    in its window gets one empty item that only finishes its output. Field f of
+    item i sits at f * max_items + i, then the item count.
+    """
+
+    max_items: int
+
+    ITEM_FIELDS = ("row", "block", "load", "flags")
+
+    def item_offset(self, name: str) -> int:
+        return self.ITEM_FIELDS.index(name) * self.max_items
+
+    @property
+    def num_items_offset(self) -> int:
+        return len(self.ITEM_FIELDS) * self.max_items
+
+    @property
+    def size(self) -> int:
+        return self.num_items_offset + 1
+
+
+def build_decode_schedule(
+    cache_seqlens: jax.Array,
+    num_active: jax.Array,
+    *,
+    batch: int,
+    layout: DecodeScheduleLayout,
+    block_kv: int,
+    has_new: bool,
+    left: int | None,
+    cache_tile_rows: int,
+) -> jax.Array:
+    """The decode schedule of one call, a pure function of the call's lengths,
+    so XLA builds it once for every layer that shares them.
+
+    Each item carries its row, block index, staged token count (whole cache
+    tiles, as the block's wait sizes them) and its ITEM_* flags. The kernel
+    copies only the pages that hold those tokens.
+    """
+    rows = jnp.arange(batch, dtype=jnp.int32)
+    is_active = rows < num_active
+    cache_len = jnp.where(is_active, cache_seqlens.astype(jnp.int32), 0)
+    total_len = cache_len + int(has_new)
+    if left is None:
+        first_key = jnp.zeros_like(total_len)
+    else:
+        first_key = jnp.maximum(0, total_len - 1 - left)
+    first_block = first_key // block_kv
+    num_blocks = jnp.maximum(
+        (total_len + block_kv - 1) // block_kv - first_block, 0
+    )
+    row_items = jnp.where(is_active, jnp.maximum(num_blocks, 1), 0)
+    row_item_end = jnp.cumsum(row_items)
+    row_item_start = row_item_end - row_items
+    copy_limit = (
+        (total_len + cache_tile_rows - 1) // cache_tile_rows * cache_tile_rows
+    )
+
+    # Note (david): items find their row through a (max_items, batch)
+    # membership mask and its row reductions, all vector work; gathering and
+    # scattering over a compacted page list instead cost ~300 us a step on v6e
+    # (batch 64, 4096 pages).
+    items = jnp.arange(layout.max_items, dtype=jnp.int32)
+    is_in_row = (items[:, None] >= row_item_start[None, :]) & (
+        items[:, None] < row_item_end[None, :]
+    )
+
+    def _at_row(values):
+        return jnp.sum(jnp.where(is_in_row, values[None, :], 0), axis=1)
+
+    is_item = items < row_item_end[-1]
+    block_in_row = items - _at_row(row_item_start)
+    item_block = _at_row(first_block) + block_in_row
+    is_empty = _at_row((num_blocks == 0).astype(jnp.int32)) > 0
+    item_load = jnp.where(
+        is_item & jnp.logical_not(is_empty),
+        jnp.clip(_at_row(copy_limit) - item_block * block_kv, 0, block_kv),
+        0,
+    )
+    item_flags = jnp.where(
+        is_item,
+        jnp.where(block_in_row == 0, ITEM_ROW_FIRST, 0)
+        | jnp.where(block_in_row == _at_row(row_items) - 1, ITEM_ROW_LAST, 0)
+        | jnp.where(is_empty, ITEM_EMPTY_ROW, 0),
+        0,
+    )
+    return jnp.concatenate([
+        _at_row(rows),
+        jnp.where(is_item, item_block, 0),
+        item_load,
+        item_flags,
+        row_item_end[-1:],
+    ]).astype(jnp.int32)
+
+
 def kvcache_kernel(
     cache_seqlens_ref: jax.Array,
     cache_batch_idx_ref: jax.Array,
     num_active_ref: jax.Array,
     v_scale_ref: jax.Array,
+    schedule_ref: jax.Array,
     *refs: jax.Array,
+    layout: DecodeScheduleLayout,
     batch: int,
     num_query_heads: int,
     num_kv_heads: int,
@@ -279,6 +449,9 @@ def kvcache_kernel(
         row_max_ref,
         row_sum_ref,
         accumulator_ref,
+        pending_probabilities_ref,
+        pending_rescale_ref,
+        pending_ref,
         sems,
     ) = remaining_refs
 
@@ -292,48 +465,13 @@ def kvcache_kernel(
         staged_kv_heads = num_kv_heads
     word_rows = kv_word_rows(cache_dtype)
     num_kv_compute_fragments = block_kv // block_kv_compute
-    # Note (david): a bitcast head-pair tile interleaves its two heads per
-    # token, so both heads' query groups ride one MXU pass with the off-parity
-    # columns masked. That is free while the pair's query rows fit one 8-sublane
-    # f32 tile; past it the masked half doubles the softmax work, so larger
-    # groups unpack one head per fragment. A merged row's u32 word pairs a
-    # head's K with its V instead, so a merged build always unpacks one head per
-    # fragment.
-    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
-    # V bytes in its high half, so the pair rides one fragment like the bf16
-    # head-pair bitcast.
-    is_pair_word_fragment = (
-        is_merged_cache
-        and kv_heads_per_word(cache_dtype) == 2
-        and NUM_SUBLANES // 2 < 2 * query_heads_per_kv_head <= NUM_SUBLANES
-        and num_kv_heads % 2 == 0
+    kv_heads_per_fragment, kv_heads_per_group = fragment_geometry(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        cache_dtype=cache_dtype,
+        is_merged_cache=is_merged_cache,
+        is_bitcast_load=is_bitcast_load,
     )
-    if (
-        is_bitcast_load
-        and 2 * query_heads_per_kv_head <= NUM_SUBLANES
-        and not is_merged_cache
-    ) or is_pair_word_fragment:
-        kv_heads_per_fragment = 2
-    else:
-        kv_heads_per_fragment = 1
-    # Note (david): a merged build whose KV head serves fewer than 8 query
-    # heads scores several KV heads through one 8-row query tile: each head's
-    # keys are pushed once, as before, but the LHS carries the whole group's
-    # query rows, and the head keeps its own rows of the result. The group then
-    # runs one softmax over a full f32 tile instead of one per head over a
-    # mostly empty one, and its running max, sum and accumulator are whole
-    # tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block loop went
-    # from 7149 to 5223 bundles (RPA v3: 7165), losing the per-head cross-lane
-    # broadcasts, sublane rotates and single-row state stores.
-    if (
-        is_merged_cache
-        and not is_pair_word_fragment
-        and NUM_SUBLANES % query_heads_per_kv_head == 0
-        and num_kv_heads % (NUM_SUBLANES // query_heads_per_kv_head) == 0
-    ):
-        kv_heads_per_group = NUM_SUBLANES // query_heads_per_kv_head
-    else:
-        kv_heads_per_group = 1
     num_head_groups = (
         num_kv_heads // kv_heads_per_fragment // kv_heads_per_group
     )
@@ -406,15 +544,15 @@ def kvcache_kernel(
     # stage puts tokens on a leading axis, where each token is whole tiles and
     # the 8-row granule is exact.
     cache_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
+    # Note (david): the staging ring holds one block more than the prefetch
+    # needs. A block's last PV runs in the next item, after that item's first
+    # softmax, and reads its V where the block was staged, so the prefetch the
+    # next item starts must land in another slot.
+    num_slots = num_kv_stages + 1
+    num_items = schedule_ref[layout.num_items_offset]
 
-    def _cache_copy_size(cache_len, block_index):
-        copy_limit = (
-            (cache_len + int(has_new) + (cache_tile_rows - 1))
-            // cache_tile_rows
-            * cache_tile_rows
-        )
-        copy_size = jnp.clip(copy_limit - block_index * block_kv, 0, block_kv)
-        return pl.multiple_of(copy_size, cache_tile_rows)
+    def _item_field(name, item):
+        return schedule_ref[layout.item_offset(name) + item]
 
     def _cache_tile(ref, hbm_row, token_start, num_tokens):
         if is_cache_head_major:
@@ -463,50 +601,57 @@ def kvcache_kernel(
         write_parts = (k_write, (v_write_buffers, v_out_ref, SEM_V_WRITE))
         value_buffers = v_buffers
 
-    def _load_segments(cache_row, block_index, load_size):
-        # Note (david): a paged block is one piece per page, each a full page
-        # except the clipped last one (RPA sizing; zero-length tails are issued
-        # as-is). block_index * pages_per_block + page never leaves the row's
-        # table entries because the table is padded to whole blocks and the
-        # caller keeps cache_len + has_new <= capacity.
-        if page_size is None:
-            return [(cache_row, block_index * block_kv, load_size, 0)]
-        else:
-            pages_per_block = block_kv // page_size
-            table_base = (
-                cache_row * pages_per_seq + block_index * pages_per_block
-            )
-            return [
-                (
-                    block_table_ref[table_base + page],
-                    0,
-                    pl.multiple_of(
-                        jnp.clip(load_size - page * page_size, 0, page_size),
-                        cache_tile_rows,
-                    ),
-                    page * page_size,
-                )
-                for page in range(pages_per_block)
-            ]
+    def _item_load(item):
+        return pl.multiple_of(_item_field("load", item), cache_tile_rows)
 
-    def _start_kv(cache_row, cache_len, block_index, slot):
-        load_size = _cache_copy_size(cache_len, block_index)
+    def _start_item_kv(item, slot):
+        load_size = _item_load(item)
+
+        def _issue(hbm_row, hbm_start, num_tokens, buffer_start):
+            for cache_ref, buffers, sem_index in load_parts:
+                pltpu.make_async_copy(
+                    _cache_tile(cache_ref, hbm_row, hbm_start, num_tokens),
+                    _buffer_tile(buffers, slot, buffer_start, num_tokens),
+                    sems.at[sem_index, slot, 0],
+                ).start()
 
         @pl.when(load_size > 0)
         def _start():
-            for hbm_row, hbm_start, num_tokens, buffer_start in _load_segments(
-                cache_row, block_index, load_size
-            ):
-                for cache_ref, buffers, sem_index in load_parts:
-                    pltpu.make_async_copy(
-                        _cache_tile(cache_ref, hbm_row, hbm_start, num_tokens),
-                        _buffer_tile(buffers, slot, buffer_start, num_tokens),
-                        sems.at[sem_index, slot, 0],
-                    ).start()
+            if page_size is None:
+                _issue(
+                    cache_batch_idx_ref[_item_field("row", item)],
+                    _item_field("block", item) * block_kv,
+                    load_size,
+                    0,
+                )
+            else:
+                # Note (david): a block copies only the pages that hold its
+                # tokens, each a full page but the clipped last; issuing every
+                # page of a large block, most empty at short context, cost
+                # about 1 us a row at 8192-token blocks (v6e, batch 8).
+                row = _item_field("row", item)
+                table_base = cache_batch_idx_ref[
+                    row
+                ] * pages_per_seq + _item_field("block", item) * (
+                    block_kv // page_size
+                )
 
-    def _wait_kv(cache_len, block_index, slot):
-        load_size = _cache_copy_size(cache_len, block_index)
+                def _issue_page(page, carry):
+                    buffer_start = pl.multiple_of(page * page_size, page_size)
+                    _issue(
+                        block_table_ref[table_base + page],
+                        0,
+                        pl.multiple_of(
+                            jnp.minimum(load_size - buffer_start, page_size),
+                            cache_tile_rows,
+                        ),
+                        buffer_start,
+                    )
+                    return carry
 
+                lax.fori_loop(0, pl.cdiv(load_size, page_size), _issue_page, 0)
+
+    def _wait_kv(load_size, slot):
         # Note (david): every segment of a block signals the same K (or V)
         # semaphore and a DMA semaphore counts bytes, so one wait sized to the
         # whole staged window covers them all (the RPA pattern); src == dst
@@ -519,7 +664,9 @@ def kvcache_kernel(
                     tile, tile, sems.at[sem_index, slot, 0]
                 ).wait()
 
-    def _cache_write_copies(cache_row, cache_len, slot):
+    def _cache_write_copies(row, slot):
+        cache_row = cache_batch_idx_ref[row]
+        cache_len = cache_seqlens_ref[row]
         if page_size is None:
             hbm_row = cache_row
             tile_start = pl.multiple_of(
@@ -588,7 +735,7 @@ def kvcache_kernel(
         # zeroes in whole 8-row stores; the 5-D view's one-word token rows took
         # one store per row. v7x, 32:8 heads, two 2048-token stages: 18450 ->
         # 2322 bundles a call.
-        for zero_slot in range(num_kv_stages):
+        for zero_slot in range(num_slots):
             slot_words = staged_words(value_buffers, zero_slot)
             slot_words[...] = jnp.zeros(slot_words.shape, jnp.uint32)
     else:
@@ -599,541 +746,172 @@ def kvcache_kernel(
         )
         value_words[...] = jnp.zeros(value_words.shape, value_words.dtype)
 
-    def _block_range(cache_len):
-        total_len = cache_len + int(has_new)
-        if left is None:
-            first_key = jnp.int32(0)
-        else:
-            first_key = jnp.maximum(0, total_len - 1 - left)
-        return first_key, first_key // block_kv, pl.cdiv(total_len, block_kv)
-
     # Note (deepolar): every sequence folds the same sinks, so they load once.
     sinks = sinks_ref[...] if has_sinks else None
 
-    def _process_sequence(local_batch_index, sequence_carry):
-        initial_slot, is_first_prefetched = sequence_carry
-        cache_row = cache_batch_idx_ref[local_batch_index]
-        cache_len = cache_seqlens_ref[local_batch_index]
-        total_len = cache_len + int(has_new)
-        first_key, first_block, end_block = _block_range(cache_len)
-
-        row_max_ref[...] = jnp.full(row_max_ref.shape, -jnp.inf, jnp.float32)
-        row_sum_ref[...] = jnp.zeros(row_sum_ref.shape, jnp.float32)
-        accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, q_ref.dtype)
-
-        @pl.when(
-            jnp.logical_and(
-                first_block < end_block, jnp.logical_not(is_first_prefetched)
-            )
-        )
-        def _prefetch_first_block():
-            _start_kv(cache_row, cache_len, first_block, initial_slot)
-
-        next_local_batch_index = jnp.minimum(
-            local_batch_index + 1, num_active - 1
-        )
-        has_next_sequence = local_batch_index + 1 < num_active
-        next_cache_row = cache_batch_idx_ref[next_local_batch_index]
-        next_cache_len = cache_seqlens_ref[next_local_batch_index]
-        _, next_first_block, next_end_block = _block_range(next_cache_len)
-        next_has_blocks = jnp.logical_and(
-            has_next_sequence, next_first_block < next_end_block
-        )
-        q_slot = lax.rem(local_batch_index, NUM_IO_STAGES)
-        _q_copy(local_batch_index, q_slot).wait()
-        queries = q_buffers[q_slot]
-        next_q_slot = lax.rem(q_slot + 1, NUM_IO_STAGES)
-
-        @pl.when(has_next_sequence)
-        def _prefetch_next_q():
-            _q_copy(next_local_batch_index, next_q_slot).start()
-
-        def _score_and_softmax(
-            slot,
-            head_group,
-            kv_compute_index,
-            is_valid,
-            fragment_has_valid_key,
-            is_first,
-            row_max_prev,
-            row_sum_prev,
-        ):
-            # Note (david): the query heads of one head group are consecutive
-            # rows of q, so one (rows_per_fragment, head_dim) tile rides a
-            # single K load and MXU pass.
-            group_start = head_group * rows_per_fragment
-            query = queries[group_start : group_start + rows_per_fragment, :]
-            if is_merged_cache:
-                # Note (david): a head's K and V share their u32 words, so the
-                # score's word load also yields the values, held until this
-                # fragment's pv. Loading the words again for pv cost 1.30x the
-                # blocked layout's MHA decode (32 KV heads of 256, batch 32,
-                # v6e), whose 32-row word stride takes the costly strided load;
-                # one load is at parity.
-                scores = None
-                values = []
-                for group_member in range(kv_heads_per_group):
-                    key, value = kv_pair_fragment(
-                        k_buffers,
-                        slot,
-                        (head_group * kv_heads_per_group + group_member)
-                        * kv_heads_per_fragment,
-                        kv_compute_index,
-                    )
-                    values.append(value)
-                    # Note (david): K and V stay in the cache dtype; the MXU
-                    # widens an fp8 latched operand to bf16 itself.
-                    member_scores = lax.dot_general(
-                        query,
-                        key,
-                        NT_DIM_NUMBERS,
-                        preferred_element_type=jnp.float32,
-                    )
-                    if scores is None:
-                        scores = member_scores
-                    else:
-                        scores = jnp.where(
-                            score_row_head == group_member,
-                            member_scores,
-                            scores,
-                        )
-            else:
-                key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
-                values = None
-                scores = jnp.dot(
-                    query, key.T, preferred_element_type=jnp.float32
+    def _score_and_softmax(
+        queries,
+        slot,
+        head_group,
+        kv_compute_index,
+        is_valid,
+        fragment_has_valid_key,
+        is_first,
+        row_max_prev,
+        row_sum_prev,
+    ):
+        # Note (david): the query heads of one head group are consecutive
+        # rows of q, so one (rows_per_fragment, head_dim) tile rides a
+        # single K load and MXU pass.
+        group_start = head_group * rows_per_fragment
+        query = queries[group_start : group_start + rows_per_fragment, :]
+        if is_merged_cache:
+            # Note (david): a head's K and V share their u32 words, so the
+            # score's word load also yields the values, held until this
+            # fragment's pv. Loading the words again for pv cost 1.30x the
+            # blocked layout's MHA decode (32 KV heads of 256, batch 32,
+            # v6e), whose 32-row word stride takes the costly strided load;
+            # one load is at parity.
+            scores = None
+            values = []
+            for group_member in range(kv_heads_per_group):
+                key, value = kv_pair_fragment(
+                    k_buffers,
+                    slot,
+                    (head_group * kv_heads_per_group + group_member)
+                    * kv_heads_per_fragment,
+                    kv_compute_index,
                 )
-            # Note (david): Q carries softmax_scale / softcap, so log2(e) rides
-            # in the tanh output scale. The cap runs before the mask, since tanh
-            # would lift a masked -inf to -softcap.
-            if log2_softcap:
-                capped_scores = jnp.tanh(scores) * log2_softcap
-            else:
-                capped_scores = scores
-            scores = jnp.where(is_valid, capped_scores, -jnp.inf)
-
-            if left is None:
-                probabilities, row_max, row_sum, rescale = static_anchor_update(
-                    scores,
-                    row_max_prev,
-                    row_sum_prev,
-                    is_first=is_first,
-                    guard_threshold=guard_threshold,
+                values.append(value)
+                # Note (david): K and V stay in the cache dtype; the MXU
+                # widens an fp8 latched operand to bf16 itself.
+                member_scores = lax.dot_general(
+                    query,
+                    key,
+                    NT_DIM_NUMBERS,
+                    preferred_element_type=jnp.float32,
                 )
-            else:
-                # Note (david): a sliding window can leave a fragment with no
-                # visible key, whose all -inf scores would turn the update into
-                # NaN; score it as zeros and keep the old state. The state stays
-                # empty until the first visible key, hence is_first =
-                # row_sum_prev == 0.
-                safe_scores = jnp.where(
-                    fragment_has_valid_key, scores, jnp.zeros_like(scores)
-                )
-                (
-                    candidate_probabilities,
-                    candidate_row_max,
-                    candidate_row_sum,
-                    candidate_rescale,
-                ) = static_anchor_update(
-                    safe_scores,
-                    row_max_prev,
-                    row_sum_prev,
-                    is_first=row_sum_prev == 0,
-                    guard_threshold=guard_threshold,
-                )
-                probabilities = jnp.where(
-                    fragment_has_valid_key,
-                    candidate_probabilities,
-                    jnp.zeros_like(candidate_probabilities),
-                )
-                row_max = jnp.where(
-                    fragment_has_valid_key, candidate_row_max, row_max_prev
-                )
-                row_sum = jnp.where(
-                    fragment_has_valid_key, candidate_row_sum, row_sum_prev
-                )
-                rescale = jnp.where(
-                    fragment_has_valid_key,
-                    candidate_rescale,
-                    jnp.ones_like(candidate_rescale),
-                )
-            return probabilities, rescale, values, row_max, row_sum
-
-        def _pv(
-            slot,
-            head_group,
-            kv_compute_index,
-            probabilities,
-            rescale,
-            merged_values,
-        ):
-            group_slice = pl.ds(
-                head_group * rows_per_fragment, rows_per_fragment
-            )
-            probabilities = probabilities.astype(jnp.bfloat16)
-            if is_merged_cache:
-                weighted_values = None
-                for group_member, value in enumerate(merged_values):
-                    member_values = lax.dot_general(
-                        probabilities,
-                        value,
-                        NN_DIM_NUMBERS,
-                        preferred_element_type=jnp.float32,
-                    )
-                    if weighted_values is None:
-                        weighted_values = member_values
-                    else:
-                        weighted_values = jnp.where(
-                            pv_row_head == group_member,
-                            member_values,
-                            weighted_values,
-                        )
-            else:
-                value = kv_fragment(
-                    value_buffers, slot, head_group, kv_compute_index
-                )
-                weighted_values = jnp.dot(
-                    probabilities, value, preferred_element_type=jnp.float32
-                )
-            # Note (david): the accumulator is stored in q's dtype while rescale
-            # and weighted_values are f32; the explicit upcast keeps the kernel
-            # tracing under jax_numpy_dtype_promotion=strict.
-            accumulator_ref[group_slice, :] = (
-                accumulator_ref[group_slice, :].astype(jnp.float32)
-                * lane_broadcast(rescale, head_dim)
-                + weighted_values
-            ).astype(q_ref.dtype)
-
-        def _attend_block(block_index, has_prefetched_next_sequence):
-            slot = lax.rem(
-                initial_slot + block_index - first_block, num_kv_stages
-            )
-            next_block = block_index + 1
-            next_slot = lax.rem(slot + 1, num_kv_stages)
-
-            @pl.when(next_block < end_block)
-            def _prefetch_next_block():
-                _start_kv(cache_row, cache_len, next_block, next_slot)
-
-            should_prefetch_next_sequence = jnp.logical_and(
-                next_block == end_block, next_has_blocks
-            )
-
-            @pl.when(should_prefetch_next_sequence)
-            def _prefetch_next_sequence():
-                _start_kv(
-                    next_cache_row, next_cache_len, next_first_block, next_slot
-                )
-
-            _wait_kv(cache_len, block_index, slot)
-
-            if has_new:
-                append_block = cache_len // block_kv
-
-                @pl.when(block_index == append_block)
-                def _append():
-                    # Note (david): the append reads, updates and writes back
-                    # the whole cache tile holding the new token,
-                    # cache_tile_rows tokens at a tile-aligned offset, which the
-                    # block load has staged in full.
-                    local_index = cache_len - block_index * block_kv
-                    local_tile_start = pl.multiple_of(
-                        local_index // cache_tile_rows * cache_tile_rows,
-                        cache_tile_rows,
-                    )
-                    new_row = local_index - local_tile_start
-                    token_row = jnp.arange(cache_tile_rows, dtype=jnp.int32)
-                    tile_tokens = pl.ds(local_tile_start, cache_tile_rows)
-                    if is_cache_head_major:
-                        tile_index = (
-                            slot,
-                            slice(None),
-                            tile_tokens,
-                            slice(None),
-                        )
-                        token_rows = token_row[None, :, None]
-
-                        def expand(token):
-                            return token[:, None, :]
-
-                    elif is_bitcast_load:
-                        tile_index = (
-                            slot,
-                            tile_tokens,
-                            pl.ds(0, staged_kv_heads // word_rows),
-                            slice(None),
-                            slice(None),
-                        )
-                        token_rows = token_row[:, None, None, None]
-
-                        def expand(token):
-                            return token.reshape(
-                                staged_kv_heads // word_rows,
-                                word_rows,
-                                head_dim,
-                            )[None]
-
-                    else:
-                        tile_index = (
-                            slot,
-                            tile_tokens,
-                            slice(None),
-                            slice(None),
-                        )
-                        token_rows = token_row[:, None, None]
-
-                        def expand(token):
-                            return token[None]
-
-                    is_new_row = token_rows == new_row
-                    if is_merged_cache:
-                        new_tokens = (new_kv_ref[local_batch_index, :, :],)
-                    else:
-                        new_tokens = (
-                            k_ref[local_batch_index, :, :],
-                            v_ref[local_batch_index, :, :],
-                        )
-                    updated_tiles = []
-                    for (_, buffers, _), new_token in zip(
-                        load_parts, new_tokens
-                    ):
-                        staged_tile = buffers[tile_index]
-                        updated_tile = jnp.where(
-                            is_new_row, expand(new_token), staged_tile
-                        )
-                        buffers[tile_index] = updated_tile
-                        updated_tiles.append(updated_tile)
-
-                    write_slot = lax.rem(local_batch_index, num_kv_stages)
-
-                    @pl.when(local_batch_index >= num_kv_stages)
-                    def _wait_previous_cache_write():
-                        previous_batch_index = local_batch_index - num_kv_stages
-                        previous_cache_row = cache_batch_idx_ref[
-                            previous_batch_index
-                        ]
-                        previous_cache_len = cache_seqlens_ref[
-                            previous_batch_index
-                        ]
-                        for copy in _cache_write_copies(
-                            previous_cache_row, previous_cache_len, write_slot
-                        ):
-                            copy.wait()
-
-                    for (write_buffers, _, _), updated_tile in zip(
-                        write_parts, updated_tiles
-                    ):
-                        write_buffers[write_slot] = updated_tile
-                    for copy in _cache_write_copies(
-                        cache_row, cache_len, write_slot
-                    ):
-                        copy.start()
-
-            block_start = block_index * block_kv
-            # Note (david): the running state is read as whole (rows, 128) tiles
-            # with every lane holding its row's value, so every broadcast
-            # against the scores or the accumulator is a vreg repeat, not a
-            # cross-lane op.
-            group_slices = [
-                pl.ds(head_group * rows_per_fragment, rows_per_fragment)
-                for head_group in range(num_head_groups)
-            ]
-
-            def _fragment_masks(kv_compute_index):
-                key_start = block_start + kv_compute_index * block_kv_compute
-                # Note (david): build the mask at full fragment shape; a (1, N)
-                # mask needs a sublane-broadcast relayout inside every
-                # fragment's select, which measured ~40% of MQA decode time.
-                key_position = (
-                    key_start
-                    + lax.broadcasted_iota(
-                        jnp.int32, (rows_per_fragment, fragment_keys), 1
-                    )
-                    // kv_heads_per_fragment
-                )
-                if row_key_offset is None:
-                    key_end = total_len
+                if scores is None:
+                    scores = member_scores
                 else:
-                    key_end = total_len + row_key_offset
-                if left is None:
-                    is_in_window = key_position < key_end
-                else:
-                    is_in_window = (key_position < key_end) & (
-                        key_position >= first_key
+                    scores = jnp.where(
+                        score_row_head == group_member,
+                        member_scores,
+                        scores,
                     )
-                if parity_mask is None:
-                    is_valid = is_in_window
-                else:
-                    is_valid = is_in_window & parity_mask
-                fragment_has_valid_key = jnp.logical_and(
-                    key_start < total_len,
-                    key_start + block_kv_compute > first_key,
-                )
-                return is_valid, fragment_has_valid_key
+        else:
+            key = kv_fragment(k_buffers, slot, head_group, kv_compute_index)
+            values = None
+            scores = jnp.dot(query, key.T, preferred_element_type=jnp.float32)
+        # Note (david): Q carries softmax_scale / softcap, so log2(e) rides
+        # in the tanh output scale. The cap runs before the mask, since tanh
+        # would lift a masked -inf to -softcap.
+        if log2_softcap:
+            capped_scores = jnp.tanh(scores) * log2_softcap
+        else:
+            capped_scores = scores
+        scores = jnp.where(is_valid, capped_scores, -jnp.inf)
 
-            def _attend_every_tile():
-                fragment_masks = [
-                    _fragment_masks(kv_compute_index)
-                    for kv_compute_index in range(num_kv_compute_fragments)
-                ]
-                # Note (david): software pipeline; each fragment's scores are
-                # issued one step ahead of its own pv, so the MXU has the next
-                # matmul queued while pv runs.
-                pending_fragment = None
-                for fragment_index in range(
-                    num_head_groups * num_kv_compute_fragments
-                ):
-                    head_group, kv_compute_index = divmod(
-                        fragment_index, num_kv_compute_fragments
-                    )
-                    group_slice = group_slices[head_group]
-                    if kv_compute_index == 0:
-                        row_max = row_max_ref[group_slice, :]
-                        row_sum = row_sum_ref[group_slice, :]
-                    probabilities, rescale, values, row_max, row_sum = (
-                        _score_and_softmax(
-                            slot,
-                            head_group,
-                            kv_compute_index,
-                            *fragment_masks[kv_compute_index],
-                            block_index == first_block
-                            if kv_compute_index == 0
-                            else False,
-                            row_max,
-                            row_sum,
-                        )
-                    )
-                    if kv_compute_index == num_kv_compute_fragments - 1:
-                        row_max_ref[group_slice, :] = row_max
-                        row_sum_ref[group_slice, :] = row_sum
-                    if pending_fragment is not None:
-                        _pv(slot, *pending_fragment)
-                    pending_fragment = (
-                        head_group,
-                        kv_compute_index,
-                        probabilities,
-                        rescale,
-                        values,
-                    )
-                _pv(slot, *pending_fragment)
-
-            def _attend_live_tiles():
-                def _attend_tile(kv_compute_index, row_states):
-                    is_valid, fragment_has_valid_key = _fragment_masks(
-                        kv_compute_index
-                    )
-                    # Note (david): without a window the row's first tile is
-                    # tile 0 of its first block; a window's state starts at its
-                    # first visible key instead (row_sum_prev == 0 in
-                    # _score_and_softmax).
-                    is_first = jnp.logical_and(
-                        block_index == first_block, kv_compute_index == 0
-                    )
-                    # Note (david): each head group's scores are issued one step
-                    # ahead of the previous group's pv; the pipeline drains at
-                    # every tile.
-                    next_row_states = []
-                    pending_fragment = None
-                    for head_group, (row_max_prev, row_sum_prev) in enumerate(
-                        row_states
-                    ):
-                        probabilities, rescale, values, row_max, row_sum = (
-                            _score_and_softmax(
-                                slot,
-                                head_group,
-                                kv_compute_index,
-                                is_valid,
-                                fragment_has_valid_key,
-                                is_first,
-                                row_max_prev,
-                                row_sum_prev,
-                            )
-                        )
-                        if pending_fragment is not None:
-                            _pv(slot, *pending_fragment)
-                        pending_fragment = (
-                            head_group,
-                            kv_compute_index,
-                            probabilities,
-                            rescale,
-                            values,
-                        )
-                        next_row_states.append((row_max, row_sum))
-                    _pv(slot, *pending_fragment)
-                    return tuple(next_row_states)
-
-                first_fragment = (
-                    jnp.maximum(first_key - block_start, 0) // block_kv_compute
-                )
-                end_fragment = jnp.minimum(
-                    pl.cdiv(total_len - block_start, block_kv_compute),
-                    num_kv_compute_fragments,
-                )
-                row_states = lax.fori_loop(
-                    first_fragment,
-                    end_fragment,
-                    _attend_tile,
-                    tuple(
-                        (
-                            row_max_ref[group_slice, :],
-                            row_sum_ref[group_slice, :],
-                        )
-                        for group_slice in group_slices
-                    ),
-                )
-                for group_slice, (row_max, row_sum) in zip(
-                    group_slices, row_states
-                ):
-                    row_max_ref[group_slice, :] = row_max
-                    row_sum_ref[group_slice, :] = row_sum
-
-            if num_kv_compute_fragments == 1:
-                _attend_every_tile()
-            else:
-                # Note (david): a block whose every compute tile holds keys runs
-                # one pipeline over all its fragments, as before; only a partial
-                # block (a row's last, or a window's first) loops over the tiles
-                # holding its keys, as RPA v3 runs cdiv(kv_len, bkv_csz) tiles.
-                # Running every tile of a partial block made a row cost the
-                # whole block: at Qwen3-4B's 16:4 heads, batch 128 and kv_len
-                # 256 on v6e, the 8192-token blocks of 2048-token tiles of #14's
-                # v7x entries took 4.33 us a row against 1.67 us looping over
-                # the first tile alone (RPA v3: 3.32 us). The loop drains the
-                # pipeline at every tile, so full blocks keep the single
-                # pipeline: looping over them took 1.21x as long at 2048-token
-                # blocks of 256-token tiles and kv_len 4608.
-                is_block_full = jnp.logical_and(
-                    block_start + block_kv <= total_len,
-                    first_key <= block_start,
-                )
-                pl.when(is_block_full)(_attend_every_tile)
-                pl.when(jnp.logical_not(is_block_full))(_attend_live_tiles)
-            return jnp.logical_or(
-                has_prefetched_next_sequence, should_prefetch_next_sequence
+        if left is None:
+            probabilities, row_max, row_sum, rescale = static_anchor_update(
+                scores,
+                row_max_prev,
+                row_sum_prev,
+                is_first=is_first,
+                guard_threshold=guard_threshold,
             )
-
-        has_prefetched_next_sequence = lax.fori_loop(
-            first_block, end_block, _attend_block, False
-        )
-        current_has_blocks = first_block < end_block
-        should_prefetch_after_empty = jnp.logical_and(
-            jnp.logical_not(current_has_blocks), next_has_blocks
-        )
-
-        @pl.when(should_prefetch_after_empty)
-        def _prefetch_after_empty_sequence():
-            _start_kv(
-                next_cache_row, next_cache_len, next_first_block, initial_slot
+        else:
+            # Note (david): a sliding window can leave a fragment with no
+            # visible key, whose all -inf scores would turn the update into
+            # NaN; score it as zeros and keep the old state. The state stays
+            # empty until the first visible key, hence is_first =
+            # row_sum_prev == 0.
+            safe_scores = jnp.where(
+                fragment_has_valid_key, scores, jnp.zeros_like(scores)
             )
+            (
+                candidate_probabilities,
+                candidate_row_max,
+                candidate_row_sum,
+                candidate_rescale,
+            ) = static_anchor_update(
+                safe_scores,
+                row_max_prev,
+                row_sum_prev,
+                is_first=row_sum_prev == 0,
+                guard_threshold=guard_threshold,
+            )
+            probabilities = jnp.where(
+                fragment_has_valid_key,
+                candidate_probabilities,
+                jnp.zeros_like(candidate_probabilities),
+            )
+            row_max = jnp.where(
+                fragment_has_valid_key, candidate_row_max, row_max_prev
+            )
+            row_sum = jnp.where(
+                fragment_has_valid_key, candidate_row_sum, row_sum_prev
+            )
+            rescale = jnp.where(
+                fragment_has_valid_key,
+                candidate_rescale,
+                jnp.ones_like(candidate_rescale),
+            )
+        return probabilities, rescale, values, row_max, row_sum
 
-        output_slot = lax.rem(local_batch_index, NUM_IO_STAGES)
+    def _pv(
+        slot,
+        head_group,
+        kv_compute_index,
+        probabilities,
+        rescale,
+        merged_values,
+        parity,
+    ):
+        group_slice = pl.ds(head_group * rows_per_fragment, rows_per_fragment)
+        probabilities = probabilities.astype(jnp.bfloat16)
+        if is_merged_cache:
+            weighted_values = None
+            for group_member, value in enumerate(merged_values):
+                member_values = lax.dot_general(
+                    probabilities,
+                    value,
+                    NN_DIM_NUMBERS,
+                    preferred_element_type=jnp.float32,
+                )
+                if weighted_values is None:
+                    weighted_values = member_values
+                else:
+                    weighted_values = jnp.where(
+                        pv_row_head == group_member,
+                        member_values,
+                        weighted_values,
+                    )
+        else:
+            value = kv_fragment(
+                value_buffers, slot, head_group, kv_compute_index
+            )
+            weighted_values = jnp.dot(
+                probabilities, value, preferred_element_type=jnp.float32
+            )
+        # Note (david): the accumulator is stored in q's dtype while rescale
+        # and weighted_values are f32; the explicit upcast keeps the kernel
+        # tracing under jax_numpy_dtype_promotion=strict.
+        accumulator_ref[parity, group_slice, :] = (
+            accumulator_ref[parity, group_slice, :].astype(jnp.float32)
+            * lane_broadcast(rescale, head_dim)
+            + weighted_values
+        ).astype(q_ref.dtype)
 
-        @pl.when(local_batch_index >= NUM_IO_STAGES)
+    def _finish_row(row, parity):
+        output_slot = lax.rem(row, NUM_IO_STAGES)
+
+        @pl.when(row >= NUM_IO_STAGES)
         def _wait_previous_output():
-            _output_copy(local_batch_index - NUM_IO_STAGES, output_slot).wait()
+            _output_copy(row - NUM_IO_STAGES, output_slot).wait()
 
-        row_max = row_max_ref[...]
-        row_sum = row_sum_ref[...]
+        row_max = row_max_ref[parity]
+        row_sum = row_sum_ref[parity]
         # Note (david): a quantized cache's V descale is one per-tensor factor,
         # so it rides in the softmax normalization. It arrives in SMEM, so a
         # new descale value compiles no new kernel.
@@ -1149,7 +927,7 @@ def kvcache_kernel(
             row_max, row_sum, out_scale = fold_sink(row_max, row_sum, sinks)
             inverse_row_sum = out_scale * v_scale_ref[0]
         out_buffers[output_slot] = (
-            accumulator_ref[...].astype(jnp.float32)
+            accumulator_ref[parity].astype(jnp.float32)
             * lane_broadcast(inverse_row_sum, head_dim)
         ).astype(q_ref.dtype)
         if return_lse:
@@ -1157,24 +935,430 @@ def kvcache_kernel(
             lse = jnp.where(
                 row_sum > 0, lse_log2 * math.log(2.0), -jnp.inf
             ).astype(jnp.float32)
-            lse_ref[pl.ds(local_batch_index, 1), :, :] = lse[None, :, :]
-        _output_copy(local_batch_index, output_slot).start()
-        num_blocks = end_block - first_block
-        next_initial_slot = lax.rem(
-            initial_slot + jnp.maximum(num_blocks, 0), num_kv_stages
+            lse_ref[pl.ds(row, 1), :, :] = lse[None, :, :]
+        _output_copy(row, output_slot).start()
+
+    # Note (david): the mask-free and live-tile copies leave their last
+    # fragment's PV pending, and the next copy issues it after its own first
+    # score and softmax, as the varlen kernels do across blocks and rows: a
+    # 4:1-head row's score, softmax and PV are one dependent chain, and the
+    # pending PV gives the MXU independent work while the next chain waits on
+    # its matmul. The PV lands in its row's parity, and the row's output
+    # finish follows it when it was the row's last.
+    last_head_group = num_head_groups - 1
+
+    def _take_pending():
+        slot = pending_ref[PENDING_SLOT]
+        kv_compute_index = pending_ref[PENDING_KV_COMPUTE]
+        parity = pending_ref[PENDING_PARITY]
+        finish_row = pending_ref[PENDING_FINISH_ROW]
+        if is_merged_cache:
+            values = [
+                kv_pair_fragment(
+                    k_buffers,
+                    slot,
+                    (last_head_group * kv_heads_per_group + group_member)
+                    * kv_heads_per_fragment,
+                    kv_compute_index,
+                )[1]
+                for group_member in range(kv_heads_per_group)
+            ]
+        else:
+            values = None
+        _pv(
+            slot,
+            last_head_group,
+            kv_compute_index,
+            pending_probabilities_ref[...],
+            pending_rescale_ref[...],
+            values,
+            parity,
         )
-        return (
-            next_initial_slot,
-            jnp.logical_or(
-                has_prefetched_next_sequence, should_prefetch_after_empty
-            ),
+
+        @pl.when(finish_row >= 0)
+        def _finish_pending_row():
+            _finish_row(finish_row, parity)
+
+    def _carry_out(
+        slot, kv_compute_index, probabilities, rescale, parity, finish_row
+    ):
+        pending_probabilities_ref[...] = probabilities.astype(
+            pending_probabilities_ref.dtype
         )
+        pending_rescale_ref[...] = rescale
+        pending_ref[PENDING_SLOT] = slot
+        pending_ref[PENDING_KV_COMPUTE] = kv_compute_index
+        pending_ref[PENDING_PARITY] = parity
+        pending_ref[PENDING_FINISH_ROW] = finish_row
+
+    def _attend_item(item, slot, row, block_index, flags, parity):
+        is_row_first = (flags & ITEM_ROW_FIRST) != 0
+        finish_row = jnp.where((flags & ITEM_ROW_LAST) != 0, row, -1)
+        cache_len = cache_seqlens_ref[row]
+        total_len = cache_len + int(has_new)
+        if left is None:
+            first_key = jnp.int32(0)
+        else:
+            first_key = jnp.maximum(0, total_len - 1 - left)
+        queries = q_buffers[lax.rem(row, NUM_IO_STAGES)]
+        _wait_kv(_item_load(item), slot)
+
+        if has_new:
+            append_block = cache_len // block_kv
+
+            @pl.when(block_index == append_block)
+            def _append():
+                # Note (david): the append reads, updates and writes back
+                # the whole cache tile holding the new token,
+                # cache_tile_rows tokens at a tile-aligned offset, which the
+                # block load has staged in full.
+                local_index = cache_len - block_index * block_kv
+                local_tile_start = pl.multiple_of(
+                    local_index // cache_tile_rows * cache_tile_rows,
+                    cache_tile_rows,
+                )
+                new_row = local_index - local_tile_start
+                token_row = jnp.arange(cache_tile_rows, dtype=jnp.int32)
+                tile_tokens = pl.ds(local_tile_start, cache_tile_rows)
+                if is_cache_head_major:
+                    tile_index = (
+                        slot,
+                        slice(None),
+                        tile_tokens,
+                        slice(None),
+                    )
+                    token_rows = token_row[None, :, None]
+
+                    def expand(token):
+                        return token[:, None, :]
+
+                elif is_bitcast_load:
+                    tile_index = (
+                        slot,
+                        tile_tokens,
+                        pl.ds(0, staged_kv_heads // word_rows),
+                        slice(None),
+                        slice(None),
+                    )
+                    token_rows = token_row[:, None, None, None]
+
+                    def expand(token):
+                        return token.reshape(
+                            staged_kv_heads // word_rows,
+                            word_rows,
+                            head_dim,
+                        )[None]
+
+                else:
+                    tile_index = (
+                        slot,
+                        tile_tokens,
+                        slice(None),
+                        slice(None),
+                    )
+                    token_rows = token_row[:, None, None]
+
+                    def expand(token):
+                        return token[None]
+
+                is_new_row = token_rows == new_row
+                if is_merged_cache:
+                    new_tokens = (new_kv_ref[row, :, :],)
+                else:
+                    new_tokens = (k_ref[row, :, :], v_ref[row, :, :])
+                updated_tiles = []
+                for (_, buffers, _), new_token in zip(load_parts, new_tokens):
+                    staged_tile = buffers[tile_index]
+                    updated_tile = jnp.where(
+                        is_new_row, expand(new_token), staged_tile
+                    )
+                    buffers[tile_index] = updated_tile
+                    updated_tiles.append(updated_tile)
+
+                write_slot = lax.rem(row, num_kv_stages)
+
+                @pl.when(row >= num_kv_stages)
+                def _wait_previous_cache_write():
+                    for copy in _cache_write_copies(
+                        row - num_kv_stages, write_slot
+                    ):
+                        copy.wait()
+
+                for (write_buffers, _, _), updated_tile in zip(
+                    write_parts, updated_tiles
+                ):
+                    write_buffers[write_slot] = updated_tile
+                for copy in _cache_write_copies(row, write_slot):
+                    copy.start()
+
+        block_start = block_index * block_kv
+        # Note (david): the running state is read as whole (rows, 128) tiles
+        # with every lane holding its row's value, so every broadcast
+        # against the scores or the accumulator is a vreg repeat, not a
+        # cross-lane op.
+        group_slices = [
+            pl.ds(head_group * rows_per_fragment, rows_per_fragment)
+            for head_group in range(num_head_groups)
+        ]
+
+        def _fragment_masks(kv_compute_index):
+            key_start = block_start + kv_compute_index * block_kv_compute
+            # Note (david): build the mask at full fragment shape; a (1, N)
+            # mask needs a sublane-broadcast relayout inside every
+            # fragment's select, which measured ~40% of MQA decode time.
+            key_position = (
+                key_start
+                + lax.broadcasted_iota(
+                    jnp.int32, (rows_per_fragment, fragment_keys), 1
+                )
+                // kv_heads_per_fragment
+            )
+            if row_key_offset is None:
+                key_end = total_len
+            else:
+                key_end = total_len + row_key_offset
+            if left is None:
+                is_in_window = key_position < key_end
+            else:
+                is_in_window = (key_position < key_end) & (
+                    key_position >= first_key
+                )
+            if parity_mask is None:
+                is_valid = is_in_window
+            else:
+                is_valid = is_in_window & parity_mask
+            fragment_has_valid_key = jnp.logical_and(
+                key_start < total_len,
+                key_start + block_kv_compute > first_key,
+            )
+            return is_valid, fragment_has_valid_key
+
+        def _attend_every_tile():
+            fragment_masks = [
+                _fragment_masks(kv_compute_index)
+                for kv_compute_index in range(num_kv_compute_fragments)
+            ]
+            # Note (david): software pipeline; each fragment's scores are
+            # issued one step ahead of its own pv, so the MXU has the next
+            # matmul queued while pv runs.
+            pending_fragment = None
+            for fragment_index in range(
+                num_head_groups * num_kv_compute_fragments
+            ):
+                head_group, kv_compute_index = divmod(
+                    fragment_index, num_kv_compute_fragments
+                )
+                group_slice = group_slices[head_group]
+                if kv_compute_index == 0:
+                    row_max = row_max_ref[parity, group_slice, :]
+                    row_sum = row_sum_ref[parity, group_slice, :]
+                probabilities, rescale, values, row_max, row_sum = (
+                    _score_and_softmax(
+                        queries,
+                        slot,
+                        head_group,
+                        kv_compute_index,
+                        *fragment_masks[kv_compute_index],
+                        is_row_first if kv_compute_index == 0 else False,
+                        row_max,
+                        row_sum,
+                    )
+                )
+                if fragment_index == 0:
+                    _take_pending()
+                if kv_compute_index == num_kv_compute_fragments - 1:
+                    row_max_ref[parity, group_slice, :] = row_max
+                    row_sum_ref[parity, group_slice, :] = row_sum
+                if pending_fragment is not None:
+                    _pv(slot, *pending_fragment, parity)
+                pending_fragment = (
+                    head_group,
+                    kv_compute_index,
+                    probabilities,
+                    rescale,
+                    values,
+                )
+            _, last_kv_compute_index, probabilities, rescale, _ = (
+                pending_fragment
+            )
+            _carry_out(
+                slot,
+                last_kv_compute_index,
+                probabilities,
+                rescale,
+                parity,
+                finish_row,
+            )
+
+        def _attend_live_tiles():
+            first_fragment = (
+                jnp.maximum(first_key - block_start, 0) // block_kv_compute
+            )
+            end_fragment = jnp.minimum(
+                pl.cdiv(total_len - block_start, block_kv_compute),
+                num_kv_compute_fragments,
+            )
+
+            def _attend_tile(kv_compute_index, row_states):
+                is_valid, fragment_has_valid_key = _fragment_masks(
+                    kv_compute_index
+                )
+                # Note (david): without a window the row's first tile is
+                # tile 0 of its first block; a window's state starts at its
+                # first visible key instead (row_sum_prev == 0 in
+                # _score_and_softmax).
+                is_first = jnp.logical_and(is_row_first, kv_compute_index == 0)
+                # Note (david): each head group's scores are issued one step
+                # ahead of the previous group's pv, and the tile's last pv is
+                # left pending for the next tile, block or row.
+                next_row_states = []
+                pending_fragment = None
+                for head_group, (row_max_prev, row_sum_prev) in enumerate(
+                    row_states
+                ):
+                    probabilities, rescale, values, row_max, row_sum = (
+                        _score_and_softmax(
+                            queries,
+                            slot,
+                            head_group,
+                            kv_compute_index,
+                            is_valid,
+                            fragment_has_valid_key,
+                            is_first,
+                            row_max_prev,
+                            row_sum_prev,
+                        )
+                    )
+                    if head_group == 0:
+                        _take_pending()
+                    if pending_fragment is not None:
+                        _pv(slot, *pending_fragment, parity)
+                    pending_fragment = (
+                        head_group,
+                        kv_compute_index,
+                        probabilities,
+                        rescale,
+                        values,
+                    )
+                    next_row_states.append((row_max, row_sum))
+                _, _, probabilities, rescale, _ = pending_fragment
+                _carry_out(
+                    slot,
+                    kv_compute_index,
+                    probabilities,
+                    rescale,
+                    parity,
+                    jnp.where(
+                        kv_compute_index == end_fragment - 1, finish_row, -1
+                    ),
+                )
+                return tuple(next_row_states)
+
+            row_states = lax.fori_loop(
+                first_fragment,
+                end_fragment,
+                _attend_tile,
+                tuple(
+                    (
+                        row_max_ref[parity, group_slice, :],
+                        row_sum_ref[parity, group_slice, :],
+                    )
+                    for group_slice in group_slices
+                ),
+            )
+            for group_slice, (row_max, row_sum) in zip(
+                group_slices, row_states
+            ):
+                row_max_ref[parity, group_slice, :] = row_max
+                row_sum_ref[parity, group_slice, :] = row_sum
+
+        if num_kv_compute_fragments == 1:
+            _attend_every_tile()
+        else:
+            # Note (david): a block whose every compute tile holds keys runs
+            # one pipeline over all its fragments, as before; only a partial
+            # block (a row's last, or a window's first) loops over the tiles
+            # holding its keys, as RPA v3 runs cdiv(kv_len, bkv_csz) tiles.
+            # Running every tile of a partial block made a row cost the
+            # whole block: at Qwen3-4B's 16:4 heads, batch 128 and kv_len
+            # 256 on v6e, the 8192-token blocks of 2048-token tiles of #14's
+            # v7x entries took 4.33 us a row against 1.67 us looping over
+            # the first tile alone (RPA v3: 3.32 us). The loop drains the
+            # pipeline at every tile, so full blocks keep the single
+            # pipeline: looping over them took 1.21x as long at 2048-token
+            # blocks of 256-token tiles and kv_len 4608.
+            is_block_full = jnp.logical_and(
+                block_start + block_kv <= total_len,
+                first_key <= block_start,
+            )
+            pl.when(is_block_full)(_attend_every_tile)
+            pl.when(jnp.logical_not(is_block_full))(_attend_live_tiles)
+
+    def _process_item(item, carry):
+        slot = lax.rem(item, num_slots)
+        row = _item_field("row", item)
+        block_index = _item_field("block", item)
+        flags = _item_field("flags", item)
+        parity = lax.rem(row, NUM_ROW_PARITIES)
+
+        @pl.when(item + 1 < num_items)
+        def _prefetch_next_item():
+            _start_item_kv(item + 1, lax.rem(item + 1, num_slots))
+
+        @pl.when((flags & ITEM_ROW_FIRST) != 0)
+        def _start_row():
+            row_max_ref[parity] = jnp.full(
+                row_max_ref.shape[1:], -jnp.inf, jnp.float32
+            )
+            row_sum_ref[parity] = jnp.zeros(row_sum_ref.shape[1:], jnp.float32)
+            accumulator_ref[parity] = jnp.zeros(
+                accumulator_ref.shape[1:], accumulator_ref.dtype
+            )
+            _q_copy(row, lax.rem(row, NUM_IO_STAGES)).wait()
+
+            @pl.when(row + 1 < num_active)
+            def _prefetch_next_q():
+                _q_copy(row + 1, lax.rem(row + 1, NUM_IO_STAGES)).start()
+
+        is_empty_row = (flags & ITEM_EMPTY_ROW) != 0
+
+        # Note (david): a row with no key in its window still writes its
+        # output (zeros, or its sinks' fold), after the previous row's.
+        @pl.when(is_empty_row)
+        def _finish_empty_row():
+            _take_pending()
+            pending_ref[PENDING_PARITY] = TRASH_PARITY
+            pending_ref[PENDING_FINISH_ROW] = -1
+            _finish_row(row, parity)
+
+        @pl.when(jnp.logical_not(is_empty_row))
+        def _attend():
+            _attend_item(item, slot, row, block_index, flags, parity)
+
+        return carry
+
+    # Note (david): the first item takes a pending PV aimed at the trash
+    # accumulator, so no copy branches on whether one is pending.
+    pending_ref[PENDING_SLOT] = 0
+    pending_ref[PENDING_KV_COMPUTE] = 0
+    pending_ref[PENDING_PARITY] = TRASH_PARITY
+    pending_ref[PENDING_FINISH_ROW] = -1
+    pending_probabilities_ref[...] = jnp.zeros(
+        pending_probabilities_ref.shape, pending_probabilities_ref.dtype
+    )
+    pending_rescale_ref[...] = jnp.zeros(pending_rescale_ref.shape, jnp.float32)
 
     @pl.when(num_active > 0)
     def _prefetch_first_q():
         _q_copy(0, 0).start()
 
-    lax.fori_loop(0, num_active, _process_sequence, (0, False))
+    @pl.when(num_items > 0)
+    def _prefetch_first_item():
+        _start_item_kv(0, 0)
+
+    lax.fori_loop(0, num_items, _process_item, 0)
+    # Note (david): the last block's PV and its row's finish run here.
+    _take_pending()
 
     # Note (david): the kernel must not exit with DMAs in flight, and the loop
     # leaves the last NUM_IO_STAGES output copies and the last num_kv_stages
@@ -1198,10 +1382,8 @@ def kvcache_kernel(
     if has_new:
 
         def _wait_cache_write(batch_index):
-            cache_row = cache_batch_idx_ref[batch_index]
-            cache_len = cache_seqlens_ref[batch_index]
             write_slot = lax.rem(batch_index, num_kv_stages)
-            for copy in _cache_write_copies(cache_row, cache_len, write_slot):
+            for copy in _cache_write_copies(batch_index, write_slot):
                 copy.wait()
 
         _drain(num_kv_stages, _wait_cache_write)
@@ -1242,23 +1424,35 @@ def validate_kvcache_config(
         )
     # Note (david): this must mirror the scratch shapes below; the extra
     # BF16_TILE_ROWS rows per stage bound the cache write tile, and the two
-    # extra heads per token bound a staged block's bank pad word row.
+    # extra heads per token bound a staged block's bank pad word row. The
+    # staging ring holds one block more than num_kv_stages, the pending PV's,
+    # whose probabilities are at most one 8-row query tile of a head pair's
+    # keys.
     kv_staging_bytes = (
         2
-        * num_kv_stages
+        * (num_kv_stages + 1)
         * (block_kv + BF16_TILE_ROWS)
         * (num_kv_heads + 2)
         * head_dim
         * kv_itemsize
     )
     q_o_buffer_bytes = 2 * 2 * num_query_heads * head_dim * BF16_BYTES
-    row_state_bytes = 2 * num_query_heads * NUM_LANES * F32_BYTES
-    accumulator_bytes = num_query_heads * head_dim * BF16_BYTES
+    row_state_bytes = (
+        NUM_ROW_PARITIES * 2 * num_query_heads * NUM_LANES * F32_BYTES
+    )
+    accumulator_bytes = (
+        (NUM_ROW_PARITIES + 1) * num_query_heads * head_dim * BF16_BYTES
+    )
+    pending_bytes = (
+        NUM_SUBLANES * 2 * block_kv_compute * BF16_BYTES
+        + NUM_SUBLANES * NUM_LANES * F32_BYTES
+    )
     required_vmem = (
         kv_staging_bytes
         + q_o_buffer_bytes
         + row_state_bytes
         + accumulator_bytes
+        + pending_bytes
     )
     if required_vmem > vmem_limit_bytes():
         raise ValueError(
@@ -1528,14 +1722,17 @@ def flash_attn_kvcache_pallas(
     is_bitcast_load = not interpret and not is_cache_head_major
     staged_kv_heads = cache_shape[2] if merged_cache else num_kv_heads
     word_rows = kv_word_rows(k_cache.dtype)
+    # Note (david): see num_slots in the kernel: the pending PV keeps its
+    # block staged while the prefetch fills the others.
+    num_slots = num_kv_stages + 1
 
-    def _staging_shape(num_tokens, word_stride):
+    def _staging_shape(num_stages, num_tokens, word_stride):
         if is_cache_head_major:
-            return (num_kv_stages, num_kv_heads, num_tokens, head_dim)
+            return (num_stages, num_kv_heads, num_tokens, head_dim)
         elif is_bitcast_load:
-            return (num_kv_stages, num_tokens, word_stride, word_rows, head_dim)
+            return (num_stages, num_tokens, word_stride, word_rows, head_dim)
         else:
-            return (num_kv_stages, num_tokens, staged_kv_heads, head_dim)
+            return (num_stages, num_tokens, staged_kv_heads, head_dim)
 
     # Note (david): only the staged blocks are read with strided word loads,
     # so only they take the bank pad; the write tiles stay dense for their
@@ -1544,17 +1741,32 @@ def flash_attn_kvcache_pallas(
     # (see cache_tile_rows in the kernel).
     token_words = staged_kv_heads // word_rows
     cache_buffer_shape = _staging_shape(
-        block_kv, bank_safe_word_stride(token_words)
+        num_slots, block_kv, bank_safe_word_stride(token_words)
     )
     write_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
-    write_buffer_shape = _staging_shape(write_tile_rows, token_words)
+    write_buffer_shape = _staging_shape(
+        num_kv_stages, write_tile_rows, token_words
+    )
     # Note (david): a merged build never touches the V staging, so it shrinks to
     # the write-tile size instead of a whole KV block.
     value_buffer_shape = (
         write_buffer_shape if merged_cache else cache_buffer_shape
     )
     io_buffer_shape = (NUM_IO_STAGES, num_query_heads, head_dim)
-    state_shape = (num_query_heads, NUM_LANES)
+    state_shape = (NUM_ROW_PARITIES, num_query_heads, NUM_LANES)
+    kv_heads_per_fragment, kv_heads_per_group = fragment_geometry(
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        cache_dtype=k_cache.dtype,
+        is_merged_cache=merged_cache,
+        is_bitcast_load=is_bitcast_load,
+    )
+    rows_per_fragment = (
+        num_query_heads
+        // num_kv_heads
+        * kv_heads_per_fragment
+        * kv_heads_per_group
+    )
     scratch_shapes = (
         pltpu.VMEM(cache_buffer_shape, k_cache.dtype),
         pltpu.VMEM(value_buffer_shape, k_cache.dtype),
@@ -1564,29 +1776,41 @@ def flash_attn_kvcache_pallas(
         pltpu.VMEM(io_buffer_shape, q.dtype),
         pltpu.VMEM(state_shape, jnp.float32),
         pltpu.VMEM(state_shape, jnp.float32),
-        pltpu.VMEM((num_query_heads, head_dim), q.dtype),
-        pltpu.SemaphoreType.DMA((NUM_SEMS, num_kv_stages, num_kv_heads)),
+        pltpu.VMEM((NUM_ROW_PARITIES + 1, num_query_heads, head_dim), q.dtype),
+        pltpu.VMEM(
+            (rows_per_fragment, kv_heads_per_fragment * block_kv_compute),
+            jnp.bfloat16,
+        ),
+        pltpu.VMEM((rows_per_fragment, NUM_LANES), jnp.float32),
+        pltpu.SMEM((NUM_PENDING_FIELDS,), jnp.int32),
+        pltpu.SemaphoreType.DMA((NUM_SEMS, num_slots, num_kv_heads)),
     )
     if num_active is None:
         num_active_array = jnp.full((1,), batch, jnp.int32)
     else:
         num_active_array = jnp.asarray(num_active, jnp.int32).reshape(1)
     v_scale_array = jnp.asarray(v_scale, jnp.float32).reshape(1)
-    if page_size is None:
-        scalar_prefetches = (
-            cache_seqlens,
-            cache_batch_idx,
-            num_active_array,
-            v_scale_array,
-        )
-    else:
-        scalar_prefetches = (
-            cache_seqlens,
-            cache_batch_idx,
-            num_active_array,
-            v_scale_array,
-            block_table,
-        )
+    # Note (david): a row's keys stay within capacity, so it spans at most
+    # cdiv(capacity, block_kv) blocks; a row with none still takes one (empty)
+    # item.
+    layout = DecodeScheduleLayout(max_items=batch * -(-capacity // block_kv))
+    schedule = build_decode_schedule(
+        cache_seqlens,
+        num_active_array[0],
+        batch=batch,
+        layout=layout,
+        block_kv=block_kv,
+        has_new=has_new,
+        left=left,
+        cache_tile_rows=write_tile_rows,
+    )
+    scalar_prefetches = (
+        cache_seqlens,
+        cache_batch_idx,
+        num_active_array,
+        v_scale_array,
+        schedule,
+    ) + (() if page_size is None else (block_table,))
     num_prefetch = len(scalar_prefetches)
     if merged_cache:
         # Note (david): the new K and V are interleaved into the cache's head
@@ -1621,6 +1845,7 @@ def flash_attn_kvcache_pallas(
     }
     kernel = functools.partial(
         kvcache_kernel,
+        layout=layout,
         batch=batch,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
