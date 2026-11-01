@@ -49,7 +49,9 @@ CONFIG_FIELDS = (
 )
 
 TunedConfig = tuple[int | str | bool, ...]
-KVCacheConfig = tuple[int, int, int]
+# Note (david): (block_kv, block_kv_compute, num_kv_stages[, items_per_step]);
+# an entry without items_per_step runs one (row, block) item per loop step.
+KVCacheConfig = tuple[int, int, int] | tuple[int, int, int, int]
 
 # Note (david): varlen runs a runtime multi-step schedule whose best fold
 # differs from a dense single-block kernel at the same physical block span.

@@ -366,11 +366,18 @@ def load_staged_words(
     word_start: jax.Array | int,
     num_rows: int,
     stride: int,
+    no_deps: bool = False,
 ) -> jax.Array:
-    """(num_rows, head_dim) u32 words at rows word_start + i * stride."""
+    """(num_rows, head_dim) u32 words at rows word_start + i * stride.
+
+    no_deps lets the loads reorder against every store and DMA into the
+    staging buffer (pltpu.annotate's no_hazard_no_deps); the caller orders
+    them with a basic block boundary where that matters."""
     num_word_rows, head_dim = words_ref.shape
     folds = head_dim // NUM_LANES
     if head_dim <= NUM_LANES:
+        if no_deps:
+            words_ref = pltpu.annotate(words_ref, no_hazard_no_deps=True)
         return words_ref[pl.ds(word_start, num_rows, stride)]
     else:
         # Note (david): a wide head loads each 128-lane half with its own
@@ -379,6 +386,8 @@ def load_staged_words(
         # heads of 256 that was 40K rotate/combine ops per 4096-token block,
         # 8.55 against 5.22 ms a step at 4 KV heads (flywheel-tpu PR #7).
         lanes_ref = words_ref.reshape(num_word_rows * folds, NUM_LANES)
+        if no_deps:
+            lanes_ref = pltpu.annotate(lanes_ref, no_hazard_no_deps=True)
         return jnp.concatenate(
             [
                 lanes_ref[
