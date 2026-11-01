@@ -904,10 +904,21 @@ def kvcache_kernel(
         # Note: through its (tokens * word_stride, head_dim) word view a slot
         # zeroes in whole 8-row stores; the 5-D view's one-word token rows took
         # one store per row. v7x, 32:8 heads, two 2048-token stages: 18450 ->
-        # 2322 bundles a call.
+        # 2322 bundles a call. A head_dim wider than the lanes zeroes through
+        # the 128-lane rows its K loads read; the head_dim-wide view stored
+        # each token row with 2 of 8 sublanes (v7x, 1 KV head of 256, two
+        # 768 x 8 stages: 12288 -> 3072 stores, 6438 -> 1828 bundles before
+        # the step loop).
         for zero_slot in range(num_slots):
             slot_words = staged_words(value_buffers, zero_slot)
-            slot_words[...] = jnp.zeros(slot_words.shape, jnp.uint32)
+            num_word_rows, word_lanes = slot_words.shape
+            if word_lanes > NUM_LANES:
+                zeroed_rows = slot_words.reshape(
+                    num_word_rows * word_lanes // NUM_LANES, NUM_LANES
+                )
+            else:
+                zeroed_rows = slot_words
+            zeroed_rows[...] = jnp.zeros(zeroed_rows.shape, jnp.uint32)
     else:
         value_words = (
             value_buffers.bitcast(jnp.uint32)
