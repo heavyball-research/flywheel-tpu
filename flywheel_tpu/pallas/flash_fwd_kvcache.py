@@ -47,7 +47,7 @@ from .fwd_pipeline import BF16_TILE_ROWS, fold_sink, overflow_guard_threshold
 
 SUPPORTED_HEAD_DIMS = (64, 128, 256)
 DEFAULT_NUM_KV_STAGES = 2
-NUM_IO_STAGES = 2
+NUM_IO_STAGES = 4
 SEM_K = 0
 SEM_V = 1
 SEM_K_WRITE = 2
@@ -655,8 +655,49 @@ def kvcache_kernel(
     # Note (deepolar): every sequence folds the same sinks, so they load once.
     sinks = sinks_ref[...] if has_sinks else None
 
+    # The KV block stream is every row's blocks in row order. Block j of it
+    # stages in slot j % num_kv_stages, and the cursor (row, block) names the
+    # next block to prefetch, kv_lookahead blocks past the one being consumed.
+    kv_lookahead = num_kv_stages - 1
+
+    def _row_blocks(row):
+        safe_row = jnp.minimum(row, jnp.maximum(num_active - 1, 0))
+        _, first, end = _block_range(cache_seqlens_ref[safe_row])
+        return first, end
+
+    def _first_live_cursor(row):
+        # The first block of the first row at or after row that has one.
+        def _cond(r):
+            first, end = _row_blocks(r)
+            return jnp.logical_and(r < num_active, first >= end)
+
+        r = lax.while_loop(_cond, lambda r: r + 1, row)
+        return r, _row_blocks(r)[0]
+
+    def _advance_cursor(cursor):
+        row, block = cursor
+        _, end = _row_blocks(row)
+        return lax.cond(
+            block + 1 < end,
+            lambda: (row, block + 1),
+            lambda: _first_live_cursor(row + 1),
+        )
+
+    def _prefetch_cursor(cursor, slot):
+        row, block = cursor
+
+        @pl.when(row < num_active)
+        def _start():
+            safe_row = jnp.minimum(row, num_active - 1)
+            _start_kv(
+                cache_batch_idx_ref[safe_row],
+                cache_seqlens_ref[safe_row],
+                block,
+                slot,
+            )
+
     def _process_sequence(local_batch_index, sequence_carry):
-        initial_slot, is_first_prefetched = sequence_carry
+        stream_index, cursor = sequence_carry
         cache_row = cache_batch_idx_ref[local_batch_index]
         cache_len = cache_seqlens_ref[local_batch_index]
         total_len = cache_len + int(has_new)
@@ -666,32 +707,17 @@ def kvcache_kernel(
         row_sum_ref[...] = jnp.zeros(row_sum_ref.shape, jnp.float32)
         accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, q_ref.dtype)
 
-        @pl.when(
-            jnp.logical_and(
-                first_block < end_block, jnp.logical_not(is_first_prefetched)
-            )
-        )
-        def _prefetch_first_block():
-            _start_kv(cache_row, cache_len, first_block, initial_slot)
-
-        next_local_batch_index = jnp.minimum(
-            local_batch_index + 1, num_active - 1
-        )
-        has_next_sequence = local_batch_index + 1 < num_active
-        next_cache_row = cache_batch_idx_ref[next_local_batch_index]
-        next_cache_len = cache_seqlens_ref[next_local_batch_index]
-        _, next_first_block, next_end_block = _block_range(next_cache_len)
-        next_has_blocks = jnp.logical_and(
-            has_next_sequence, next_first_block < next_end_block
-        )
         q_slot = lax.rem(local_batch_index, NUM_IO_STAGES)
         _q_copy(local_batch_index, q_slot).wait()
         queries = q_buffers[q_slot]
-        next_q_slot = lax.rem(q_slot + 1, NUM_IO_STAGES)
+        ahead_q_index = local_batch_index + NUM_IO_STAGES - 1
 
-        @pl.when(has_next_sequence)
-        def _prefetch_next_q():
-            _q_copy(next_local_batch_index, next_q_slot).start()
+        @pl.when(ahead_q_index < num_active)
+        def _prefetch_ahead_q():
+            _q_copy(
+                jnp.minimum(ahead_q_index, num_active - 1),
+                lax.rem(ahead_q_index, NUM_IO_STAGES),
+            ).start()
 
         def _score_and_softmax(
             slot,
@@ -851,26 +877,14 @@ def kvcache_kernel(
                 + weighted_values
             ).astype(q_ref.dtype)
 
-        def _attend_block(block_index, has_prefetched_next_sequence):
-            slot = lax.rem(
-                initial_slot + block_index - first_block, num_kv_stages
+        def _attend_block(block_index, block_carry):
+            block_stream_index, cursor = block_carry
+            slot = lax.rem(block_stream_index, num_kv_stages)
+            _prefetch_cursor(
+                cursor,
+                lax.rem(block_stream_index + kv_lookahead, num_kv_stages),
             )
-            next_block = block_index + 1
-            next_slot = lax.rem(slot + 1, num_kv_stages)
-
-            @pl.when(next_block < end_block)
-            def _prefetch_next_block():
-                _start_kv(cache_row, cache_len, next_block, next_slot)
-
-            should_prefetch_next_sequence = jnp.logical_and(
-                next_block == end_block, next_has_blocks
-            )
-
-            @pl.when(should_prefetch_next_sequence)
-            def _prefetch_next_sequence():
-                _start_kv(
-                    next_cache_row, next_cache_len, next_first_block, next_slot
-                )
+            cursor = _advance_cursor(cursor)
 
             _wait_kv(cache_len, block_index, slot)
 
@@ -1204,23 +1218,11 @@ def kvcache_kernel(
                 )
                 pl.when(is_block_full)(_attend_every_tile)
                 pl.when(jnp.logical_not(is_block_full))(_attend_live_tiles)
-            return jnp.logical_or(
-                has_prefetched_next_sequence, should_prefetch_next_sequence
-            )
+            return block_stream_index + 1, cursor
 
-        has_prefetched_next_sequence = lax.fori_loop(
-            first_block, end_block, _attend_block, False
+        stream_index, cursor = lax.fori_loop(
+            first_block, end_block, _attend_block, (stream_index, cursor)
         )
-        current_has_blocks = first_block < end_block
-        should_prefetch_after_empty = jnp.logical_and(
-            jnp.logical_not(current_has_blocks), next_has_blocks
-        )
-
-        @pl.when(should_prefetch_after_empty)
-        def _prefetch_after_empty_sequence():
-            _start_kv(
-                next_cache_row, next_cache_len, next_first_block, initial_slot
-            )
 
         output_slot = lax.rem(local_batch_index, NUM_IO_STAGES)
 
@@ -1255,22 +1257,19 @@ def kvcache_kernel(
             ).astype(jnp.float32)
             lse_ref[pl.ds(local_batch_index, 1), :, :] = lse[None, :, :]
         _output_copy(local_batch_index, output_slot).start()
-        num_blocks = end_block - first_block
-        next_initial_slot = lax.rem(
-            initial_slot + jnp.maximum(num_blocks, 0), num_kv_stages
-        )
-        return (
-            next_initial_slot,
-            jnp.logical_or(
-                has_prefetched_next_sequence, should_prefetch_after_empty
-            ),
-        )
+        return stream_index, cursor
 
-    @pl.when(num_active > 0)
-    def _prefetch_first_q():
-        _q_copy(0, 0).start()
+    for first_q_index in range(min(batch, NUM_IO_STAGES - 1)):
 
-    lax.fori_loop(0, num_active, _process_sequence, (0, False))
+        @pl.when(first_q_index < num_active)
+        def _prefetch_first_q():
+            _q_copy(first_q_index, first_q_index).start()  # pylint: disable=cell-var-from-loop
+
+    cursor = _first_live_cursor(jnp.int32(0))
+    for first_slot in range(kv_lookahead):
+        _prefetch_cursor(cursor, first_slot)
+        cursor = _advance_cursor(cursor)
+    lax.fori_loop(0, num_active, _process_sequence, (jnp.int32(0), cursor))
 
     # Note (david): the kernel must not exit with DMAs in flight, and the loop
     # leaves the last NUM_IO_STAGES output copies and the last num_kv_stages
@@ -1661,7 +1660,9 @@ def flash_attn_kvcache_pallas(
         pltpu.VMEM(state_shape, jnp.float32),
         pltpu.VMEM(state_shape, jnp.float32),
         pltpu.VMEM((num_query_heads, head_dim), q.dtype),
-        pltpu.SemaphoreType.DMA((NUM_SEMS, num_kv_stages, num_kv_heads)),
+        pltpu.SemaphoreType.DMA(
+            (NUM_SEMS, max(num_kv_stages, NUM_IO_STAGES), num_kv_heads)
+        ),
     )
     if num_active is None:
         num_active_array = jnp.full((1,), batch, jnp.int32)

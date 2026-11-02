@@ -3398,29 +3398,29 @@
       2
     ],
     "kvcache|float8_e4m3fn|h4|k1|b128|s16384|d256|a1|w-|l0": [
-      16384,
       4096,
-      2
+      4096,
+      4
     ],
     "kvcache|float8_e4m3fn|h4|k1|b16|s16384|d256|a1|w-|l0": [
       4096,
       4096,
-      2
+      4
     ],
     "kvcache|float8_e4m3fn|h4|k1|b32|s16384|d256|a1|w-|l0": [
       4096,
       4096,
-      2
+      4
     ],
     "kvcache|float8_e4m3fn|h4|k1|b64|s16384|d256|a1|w-|l0": [
-      8192,
       4096,
-      2
+      4096,
+      4
     ],
     "kvcache|float8_e4m3fn|h4|k1|b8|s16384|d256|a1|w-|l0": [
       4096,
-      2048,
-      2
+      4096,
+      3
     ],
     "kvcache|float8_e4m3fn|h8|k1|b128|s10240|d256|a1|w-|l0": [
       10240,
