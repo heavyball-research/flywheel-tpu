@@ -61,7 +61,9 @@ def prepare_chunk_indices(
     num_seqs = len(chunks_per_seq)
     num_chunks = max_T // chunk_size
     seq_ids = jnp.repeat(
-        jnp.arange(num_seqs, dtype=jnp.int32), chunks_per_seq, total_repeat_length=num_chunks
+        jnp.arange(num_seqs, dtype=jnp.int32),
+        chunks_per_seq,
+        total_repeat_length=num_chunks,
     )
     first_chunk_of_seq = jnp.concatenate(
         [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(chunks_per_seq)]
@@ -73,8 +75,12 @@ def prepare_chunk_indices(
     return jnp.stack([seq_ids, local_chunk_ids], axis=1)
 
 
-def assert_shape(x: jax.Array, expected_shape: tuple[int, ...], name: str = "tensor") -> None:
-    assert x.shape == expected_shape, f"[{name}] Expected shape {expected_shape}, got {x.shape}"
+def assert_shape(
+    x: jax.Array, expected_shape: tuple[int, ...], name: str = "tensor"
+) -> None:
+    assert (
+        x.shape == expected_shape
+    ), f"[{name}] Expected shape {expected_shape}, got {x.shape}"
 
 
 def assert_shape_or_none(
@@ -93,7 +99,10 @@ def exp2(x: jax.Array) -> jax.Array:
 
 
 def get_interpret() -> bool:
-    return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in ("1", "true")
+    return os.environ.get("PALLAS_INTERPRET", "").strip().lower() in (
+        "1",
+        "true",
+    )
 
 
 def chunk_cumsum_kernel(
@@ -108,7 +117,9 @@ def chunk_cumsum_kernel(
     for step in range(int(math.log2(chunk_size))):
         stride = 1 << step
         if is_reverse:
-            top_rows = cumsum[:, : chunk_size - stride, :] + cumsum[:, stride:, :]
+            top_rows = (
+                cumsum[:, : chunk_size - stride, :] + cumsum[:, stride:, :]
+            )
             bottom_rows = cumsum[:, chunk_size - stride :, :]
         else:
             top_rows = cumsum[:, :stride, :]
@@ -138,7 +149,9 @@ def chunk_local_cumsum_vector(
     layout. chunk_indices defaults to prepare_chunk_indices over cu_seqlens.
     """
     assert g.ndim == 4, f"g must be 4-D, got {g.ndim}-D"
-    assert chunk_size == 2 ** (chunk_size.bit_length() - 1), "chunk_size must be power of 2"
+    assert chunk_size == 2 ** (
+        chunk_size.bit_length() - 1
+    ), "chunk_size must be power of 2"
     assert cu_seqlens is not None, "This varlen-only module requires cu_seqlens"
 
     if head_first:
@@ -165,7 +178,9 @@ def chunk_local_cumsum_vector(
 
     cu_seqlens_i32 = cu_seqlens.astype(jnp.int32)
     if chunk_indices is None:
-        max_num_tokens = num_tokens + (cu_seqlens.shape[0] - 1) * (chunk_size - 1)
+        max_num_tokens = num_tokens + (cu_seqlens.shape[0] - 1) * (
+            chunk_size - 1
+        )
         chunk_indices_i32 = prepare_chunk_indices(
             cu_seqlens, chunk_size, max_T=max_num_tokens
         ).astype(jnp.int32)
@@ -185,10 +200,16 @@ def chunk_local_cumsum_vector(
     )
     seq_starts = cu_seqlens_i32[safe_seq_ids]
     seq_ends = cu_seqlens_i32[safe_seq_ids + 1]
-    chunk_starts = jnp.where(is_valid_chunk, seq_starts + local_chunk_ids * chunk_size, 0)
-    positions = chunk_starts[:, None] + jnp.arange(chunk_size, dtype=jnp.int32)[None, :]
+    chunk_starts = jnp.where(
+        is_valid_chunk, seq_starts + local_chunk_ids * chunk_size, 0
+    )
+    positions = (
+        chunk_starts[:, None] + jnp.arange(chunk_size, dtype=jnp.int32)[None, :]
+    )
     is_valid_token = (
-        is_valid_chunk[:, None] & (positions < seq_ends[:, None]) & (positions < num_tokens)
+        is_valid_chunk[:, None]
+        & (positions < seq_ends[:, None])
+        & (positions < num_tokens)
     )
 
     def _gather_chunk(start: jax.Array) -> jax.Array:
@@ -207,14 +228,20 @@ def chunk_local_cumsum_vector(
     row_block = NUM_SUBLANES
     while (
         row_block > 1
-        and NUM_PIPELINED_BLOCKS * row_block * chunk_size * NUM_LANES * F32_BYTES
+        and NUM_PIPELINED_BLOCKS
+        * row_block
+        * chunk_size
+        * NUM_LANES
+        * F32_BYTES
         > VMEM_HW_LIMIT_BYTES
     ):
         row_block //= 2
     block_shape = (row_block, 1, chunk_size, NUM_LANES)
 
     def _index_map(
-        feature_block_idx: jax.Array, row_block_idx: jax.Array, chunk_idx: jax.Array
+        feature_block_idx: jax.Array,
+        row_block_idx: jax.Array,
+        chunk_idx: jax.Array,
     ) -> tuple[jax.Array, jax.Array, int, jax.Array]:
         return (row_block_idx, chunk_idx, 0, feature_block_idx)
 
@@ -227,9 +254,17 @@ def chunk_local_cumsum_vector(
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=0,
-            grid=(padded_feature_dim // NUM_LANES, padded_num_rows // row_block, num_chunks),
-            in_specs=[pl.BlockSpec(block_shape=block_shape, index_map=_index_map)],
-            out_specs=pl.BlockSpec(block_shape=block_shape, index_map=_index_map),
+            grid=(
+                padded_feature_dim // NUM_LANES,
+                padded_num_rows // row_block,
+                num_chunks,
+            ),
+            in_specs=[
+                pl.BlockSpec(block_shape=block_shape, index_map=_index_map)
+            ],
+            out_specs=pl.BlockSpec(
+                block_shape=block_shape, index_map=_index_map
+            ),
         ),
         out_shape=jax.ShapeDtypeStruct(g_chunks.shape, out_dtype),
         interpret=get_interpret(),
@@ -240,12 +275,17 @@ def chunk_local_cumsum_vector(
 
     o_chunks = jnp.where(is_valid_token[None, :, :, None], o_chunks, 0)
     sentinel = jnp.minimum(cu_seqlens_i32[-1], num_tokens)
-    scatter_positions = jnp.where(is_valid_token, positions, sentinel).reshape(-1)
+    scatter_positions = jnp.where(is_valid_token, positions, sentinel).reshape(
+        -1
+    )
     o_rows = jnp.zeros(
-        (padded_num_rows, num_tokens + chunk_size, padded_feature_dim), dtype=o_chunks.dtype
+        (padded_num_rows, num_tokens + chunk_size, padded_feature_dim),
+        dtype=o_chunks.dtype,
     )
     o_rows = o_rows.at[:, scatter_positions, :].add(
-        o_chunks.reshape(padded_num_rows, num_chunks * chunk_size, padded_feature_dim)
+        o_chunks.reshape(
+            padded_num_rows, num_chunks * chunk_size, padded_feature_dim
+        )
     )
     o = o_rows[:num_rows, :num_tokens, :feature_dim].reshape(
         batch_size, num_heads, num_tokens, feature_dim
@@ -280,7 +320,8 @@ def chunk_slot_layout(
     slot_ids = jnp.arange(num_slots, dtype=jnp.int32)
     is_real_chunk = slot_ids < first_chunk_of_seq[-1]
     seq_ids = jnp.minimum(
-        jnp.searchsorted(first_chunk_of_seq[1:], slot_ids, side="right"), num_seqs - 1
+        jnp.searchsorted(first_chunk_of_seq[1:], slot_ids, side="right"),
+        num_seqs - 1,
     )
     local_chunk_ids = slot_ids - first_chunk_of_seq[seq_ids]
     # Note (david): every sequence is chunk-aligned, so every chunk is full and
@@ -296,26 +337,36 @@ def chunk_slot_layout(
     return chunk_starts, row_positions.reshape(-1)
 
 
-def gather_chunks(packed: jax.Array, chunk_starts: jax.Array, chunk_size: int) -> jax.Array:
+def gather_chunks(
+    packed: jax.Array, chunk_starts: jax.Array, chunk_size: int
+) -> jax.Array:
     """[1, T, H, D] packed tokens -> [H, num_slots, chunk_size, D] chunks."""
     _, _, num_heads, dim = packed.shape
     padded = jnp.pad(packed, ((0, 0), (0, chunk_size), (0, 0), (0, 0)))
 
     def _slice_chunk(start: jax.Array) -> jax.Array:
-        return jax.lax.dynamic_slice(padded, (0, start, 0, 0), (1, chunk_size, num_heads, dim))[0]
+        return jax.lax.dynamic_slice(
+            padded, (0, start, 0, 0), (1, chunk_size, num_heads, dim)
+        )[0]
 
     return jax.vmap(_slice_chunk)(chunk_starts).transpose(2, 0, 1, 3)
 
 
-def scatter_chunks(chunks: jax.Array, row_positions: jax.Array, num_tokens: int) -> jax.Array:
+def scatter_chunks(
+    chunks: jax.Array, row_positions: jax.Array, num_tokens: int
+) -> jax.Array:
     """[H, num_slots, chunk_size, D] chunks -> [1, T, H, D] packed tokens."""
     num_heads, _, chunk_size, dim = chunks.shape
     chunk_rows = chunks.transpose(1, 2, 0, 3).reshape(-1, num_heads, dim)
-    packed = jnp.zeros((num_tokens + chunk_size, num_heads, dim), dtype=chunks.dtype)
+    packed = jnp.zeros(
+        (num_tokens + chunk_size, num_heads, dim), dtype=chunks.dtype
+    )
     return packed.at[row_positions].add(chunk_rows)[:num_tokens][None]
 
 
-def solve_unit_lower_triangular(strict_lower: jax.Array, rhs: jax.Array) -> jax.Array:
+def solve_unit_lower_triangular(
+    strict_lower: jax.Array, rhs: jax.Array
+) -> jax.Array:
     """Solves (I + strict_lower) x = rhs in f32 by blocked forward substitution."""
     num_blocks = rhs.shape[0] // TRI_SOLVE_BLOCK_SIZE
     strict_lower_f32 = strict_lower.astype(jnp.float32)
@@ -385,19 +436,29 @@ def kda_fwd_intra_kernel(
     # normalization exp2(g - g_n), which overflows once per-step gate changes
     # exceed ~127. For causal i >= j the cumsum gives g[i] - g[j] <= 0, so the
     # decay stays in (0, 1].
-    causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.float32))
-    strict_causal_mask = jnp.tril(jnp.ones((chunk_size, chunk_size), dtype=jnp.float32), k=-1)
+    causal_mask = jnp.tril(
+        jnp.ones((chunk_size, chunk_size), dtype=jnp.float32)
+    )
+    strict_causal_mask = jnp.tril(
+        jnp.ones((chunk_size, chunk_size), dtype=jnp.float32), k=-1
+    )
     g_diff = g[:, None, :] - g[None, :, :]
     # Note (david): anti-causal entries would overflow exp2, so they are set to
     # the floor first; the causal masks zero them afterwards.
-    g_diff = jnp.where(causal_mask[:, :, None] > 0, g_diff, MIN_NORMAL_F32_EXPONENT)
+    g_diff = jnp.where(
+        causal_mask[:, :, None] > 0, g_diff, MIN_NORMAL_F32_EXPONENT
+    )
     decay = exp2(jnp.maximum(g_diff, MIN_NORMAL_F32_EXPONENT))
 
-    aqk = (scale * jnp.sum(q[:, None, :] * decay * k[None, :, :], axis=-1) * causal_mask).astype(
-        q_ref.dtype
-    )
+    aqk = (
+        scale
+        * jnp.sum(q[:, None, :] * decay * k[None, :, :], axis=-1)
+        * causal_mask
+    ).astype(q_ref.dtype)
     akk_strict_lower = (
-        jnp.sum(k[:, None, :] * decay * k[None, :, :], axis=-1) * beta * strict_causal_mask
+        jnp.sum(k[:, None, :] * decay * k[None, :, :], axis=-1)
+        * beta
+        * strict_causal_mask
     )
 
     rhs = jnp.concatenate(
@@ -448,7 +509,9 @@ def kda_fwd_intra(
     chunk_indices: jax.Array | None = None,
     safe_gate: bool = True,
     disable_recompute: bool = False,
-) -> tuple[jax.Array, jax.Array, jax.Array | None, jax.Array, jax.Array, jax.Array]:
+) -> tuple[
+    jax.Array, jax.Array, jax.Array | None, jax.Array, jax.Array, jax.Array
+]:
     """Intra-chunk KDA solve over chunk-aligned packed sequences.
 
     q, k, gk [1, T, H, K], v [1, T, H, V], beta [1, T, H]. Returns w, u, qg
@@ -458,8 +521,13 @@ def kda_fwd_intra(
     assert cu_seqlens is not None, "cu_seqlens must be provided for varlen"
     batch_size, num_tokens, num_heads, head_dim = q.shape
     value_dim = v.shape[-1]
-    assert batch_size == 1, f"varlen requires B=1 (packed layout), got B={batch_size}"
-    assert chunk_size >= TRI_SOLVE_BLOCK_SIZE and chunk_size % TRI_SOLVE_BLOCK_SIZE == 0
+    assert (
+        batch_size == 1
+    ), f"varlen requires B=1 (packed layout), got B={batch_size}"
+    assert (
+        chunk_size >= TRI_SOLVE_BLOCK_SIZE
+        and chunk_size % TRI_SOLVE_BLOCK_SIZE == 0
+    )
     assert_shape(k, (batch_size, num_tokens, num_heads, head_dim), "k")
     assert_shape(v, (batch_size, num_tokens, num_heads, value_dim), "v")
     assert_shape(gk, (batch_size, num_tokens, num_heads, head_dim), "gk")
@@ -471,39 +539,64 @@ def kda_fwd_intra(
     num_slots = chunk_starts.shape[0]
     q_chunks, k_chunks, g_chunks, beta_chunks, v_chunks = (
         gather_chunks(packed, chunk_starts, chunk_size)[None]
-        for packed in (q, k, gk, beta.reshape(batch_size, num_tokens, num_heads, 1), v)
+        for packed in (
+            q,
+            k,
+            gk,
+            beta.reshape(batch_size, num_tokens, num_heads, 1),
+            v,
+        )
     )
 
     def _block_spec(last_dim: int) -> pl.BlockSpec:
         return pl.BlockSpec(
-            index_map=lambda batch_idx, head_idx, slot_idx: (batch_idx, head_idx, slot_idx, 0, 0),
+            index_map=lambda batch_idx, head_idx, slot_idx: (
+                batch_idx,
+                head_idx,
+                slot_idx,
+                0,
+                0,
+            ),
             block_shape=(1, 1, 1, chunk_size, last_dim),
         )
 
-    out_last_dims = (value_dim, head_dim, head_dim, head_dim, chunk_size, chunk_size)
-    u_chunks, w_chunks, qg_chunks, kg_chunks, aqk_chunks, akk_inv_chunks = pl.pallas_call(
-        functools.partial(
-            kda_fwd_intra_kernel,
-            chunk_size=chunk_size,
-            head_dim=head_dim,
-            value_dim=value_dim,
-            scale=scale,
-            disable_recompute=disable_recompute,
-        ),
-        interpret=get_interpret(),
-        out_shape=[
-            jax.ShapeDtypeStruct((batch_size, num_heads, num_slots, chunk_size, last_dim), q.dtype)
-            for last_dim in out_last_dims
-        ],
-        in_specs=[
-            _block_spec(last_dim) for last_dim in (head_dim, head_dim, head_dim, 1, value_dim)
-        ],
-        out_specs=[_block_spec(last_dim) for last_dim in out_last_dims],
-        grid=(batch_size, num_heads, num_slots),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel", "parallel")
-        ),
-    )(q_chunks, k_chunks, g_chunks, beta_chunks, v_chunks)
+    out_last_dims = (
+        value_dim,
+        head_dim,
+        head_dim,
+        head_dim,
+        chunk_size,
+        chunk_size,
+    )
+    u_chunks, w_chunks, qg_chunks, kg_chunks, aqk_chunks, akk_inv_chunks = (
+        pl.pallas_call(
+            functools.partial(
+                kda_fwd_intra_kernel,
+                chunk_size=chunk_size,
+                head_dim=head_dim,
+                value_dim=value_dim,
+                scale=scale,
+                disable_recompute=disable_recompute,
+            ),
+            interpret=get_interpret(),
+            out_shape=[
+                jax.ShapeDtypeStruct(
+                    (batch_size, num_heads, num_slots, chunk_size, last_dim),
+                    q.dtype,
+                )
+                for last_dim in out_last_dims
+            ],
+            in_specs=[
+                _block_spec(last_dim)
+                for last_dim in (head_dim, head_dim, head_dim, 1, value_dim)
+            ],
+            out_specs=[_block_spec(last_dim) for last_dim in out_last_dims],
+            grid=(batch_size, num_heads, num_slots),
+            compiler_params=pltpu.CompilerParams(
+                dimension_semantics=("parallel", "parallel", "parallel")
+            ),
+        )(q_chunks, k_chunks, g_chunks, beta_chunks, v_chunks)
+    )
 
     if disable_recompute:
         qg = scatter_chunks(qg_chunks[0], row_positions, num_tokens)
@@ -619,10 +712,17 @@ def chunk_gated_delta_rule_fwd_h(
     assert_shape(w, (batch_size, num_tokens, num_heads, head_dim), "w")
     assert_shape(u, (batch_size, num_tokens, num_heads, value_dim), "u")
     assert_shape_or_none(g, (batch_size, num_tokens, num_heads), "g")
-    assert_shape_or_none(gk, (batch_size, num_tokens, num_heads, head_dim), "gk")
-    assert_shape_or_none(initial_state, (num_seqs, num_heads, head_dim, value_dim), "initial_state")
+    assert_shape_or_none(
+        gk, (batch_size, num_tokens, num_heads, head_dim), "gk"
+    )
+    assert_shape_or_none(
+        initial_state,
+        (num_seqs, num_heads, head_dim, value_dim),
+        "initial_state",
+    )
     assert head_dim <= MAX_HEAD_DIM, (
-        f"current kernel does not support head dimension larger than {MAX_HEAD_DIM}."
+        "current kernel does not support head dimension larger than"
+        f" {MAX_HEAD_DIM}."
     )
     assert chunk_indices is not None
 
@@ -633,40 +733,67 @@ def chunk_gated_delta_rule_fwd_h(
     def _to_head_major(packed: jax.Array, padded_dim: int) -> jax.Array:
         padded = jnp.pad(
             packed.astype(jnp.float32),
-            ((0, 0), (0, chunk_size), (0, 0), (0, padded_dim - packed.shape[-1])),
+            (
+                (0, 0),
+                (0, chunk_size),
+                (0, 0),
+                (0, padded_dim - packed.shape[-1]),
+            ),
         )
         return jnp.transpose(padded, (0, 2, 1, 3))
 
     def _token_index_map(
-        seq_idx: jax.Array, head_idx: jax.Array, chunk_idx: jax.Array, cu_seqlens_ref: jax.Array
+        seq_idx: jax.Array,
+        head_idx: jax.Array,
+        chunk_idx: jax.Array,
+        cu_seqlens_ref: jax.Array,
     ) -> tuple[int, jax.Array, jax.Array, int]:
         seq_start = pl.multiple_of(cu_seqlens_ref[seq_idx], chunk_size)
-        block_idx = jnp.minimum(seq_start // chunk_size + chunk_idx, num_tokens // chunk_size)
+        block_idx = jnp.minimum(
+            seq_start // chunk_size + chunk_idx, num_tokens // chunk_size
+        )
         return (0, head_idx, block_idx, 0)
 
     def _h_index_map(
-        seq_idx: jax.Array, head_idx: jax.Array, chunk_idx: jax.Array, cu_seqlens_ref: jax.Array
+        seq_idx: jax.Array,
+        head_idx: jax.Array,
+        chunk_idx: jax.Array,
+        cu_seqlens_ref: jax.Array,
     ) -> tuple[int, jax.Array, jax.Array, int, int]:
         seq_start = pl.multiple_of(cu_seqlens_ref[seq_idx], chunk_size)
-        h_chunk_idx = jnp.minimum(seq_start // chunk_size + chunk_idx, num_chunks - 1)
+        h_chunk_idx = jnp.minimum(
+            seq_start // chunk_size + chunk_idx, num_chunks - 1
+        )
         return (0, h_chunk_idx, head_idx, 0, 0)
 
     def _seq_state_index_map(
-        seq_idx: jax.Array, head_idx: jax.Array, chunk_idx: jax.Array, cu_seqlens_ref: jax.Array
+        seq_idx: jax.Array,
+        head_idx: jax.Array,
+        chunk_idx: jax.Array,
+        cu_seqlens_ref: jax.Array,
     ) -> tuple[jax.Array, jax.Array, int, int]:
         return (seq_idx, head_idx, 0, 0)
 
-    key_spec = pl.BlockSpec([1, 1, chunk_size, padded_head_dim], index_map=_token_index_map)
-    value_spec = pl.BlockSpec([1, 1, chunk_size, padded_value_dim], index_map=_token_index_map)
+    key_spec = pl.BlockSpec(
+        [1, 1, chunk_size, padded_head_dim], index_map=_token_index_map
+    )
+    value_spec = pl.BlockSpec(
+        [1, 1, chunk_size, padded_value_dim], index_map=_token_index_map
+    )
     seq_state_spec = pl.BlockSpec(
-        [1, 1, padded_head_dim, padded_value_dim], index_map=_seq_state_index_map
+        [1, 1, padded_head_dim, padded_value_dim],
+        index_map=_seq_state_index_map,
     )
 
     if g is None:
         g_head_major, g_spec = None, None
     else:
-        g_head_major = _to_head_major(g.reshape(batch_size, num_tokens, num_heads, 1), NUM_LANES)
-        g_spec = pl.BlockSpec([1, 1, chunk_size, NUM_LANES], index_map=_token_index_map)
+        g_head_major = _to_head_major(
+            g.reshape(batch_size, num_tokens, num_heads, 1), NUM_LANES
+        )
+        g_spec = pl.BlockSpec(
+            [1, 1, chunk_size, NUM_LANES], index_map=_token_index_map
+        )
     if gk is None:
         gk_head_major, gk_spec = None, None
     else:
@@ -676,45 +803,63 @@ def chunk_gated_delta_rule_fwd_h(
     else:
         h0 = jnp.pad(
             initial_state,
-            ((0, 0), (0, 0), (0, padded_head_dim - head_dim), (0, padded_value_dim - value_dim)),
+            (
+                (0, 0),
+                (0, 0),
+                (0, padded_head_dim - head_dim),
+                (0, padded_value_dim - value_dim),
+            ),
         )
         h0_spec = seq_state_spec
     if save_new_value:
         v_new_shape = jax.ShapeDtypeStruct(
-            [batch_size, num_heads, num_tokens + chunk_size, padded_value_dim], jnp.float32
+            [batch_size, num_heads, num_tokens + chunk_size, padded_value_dim],
+            jnp.float32,
         )
         v_new_spec = value_spec
     else:
         v_new_shape, v_new_spec = None, None
     if output_final_state:
         final_state_shape = jax.ShapeDtypeStruct(
-            [num_seqs, num_heads, padded_head_dim, padded_value_dim], jnp.float32
+            [num_seqs, num_heads, padded_head_dim, padded_value_dim],
+            jnp.float32,
         )
         final_state_spec = seq_state_spec
     else:
         final_state_shape, final_state_spec = None, None
 
     h_padded, v_new_padded, final_state_padded = pl.pallas_call(
-        functools.partial(chunk_gated_delta_rule_fwd_kernel, exp_fn=exp2 if use_exp2 else exp),
+        functools.partial(
+            chunk_gated_delta_rule_fwd_kernel, exp_fn=exp2 if use_exp2 else exp
+        ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
             grid=(num_seqs, num_heads, num_tokens // chunk_size),
             in_specs=[key_spec, value_spec, key_spec, g_spec, gk_spec, h0_spec],
             out_specs=[
                 pl.BlockSpec(
-                    [1, 1, 1, padded_head_dim, padded_value_dim], index_map=_h_index_map
+                    [1, 1, 1, padded_head_dim, padded_value_dim],
+                    index_map=_h_index_map,
                 ),
                 v_new_spec,
                 final_state_spec,
             ],
-            scratch_shapes=[pltpu.VMEM((padded_head_dim, padded_value_dim), jnp.float32)],
+            scratch_shapes=[
+                pltpu.VMEM((padded_head_dim, padded_value_dim), jnp.float32)
+            ],
         ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel", "arbitrary")
         ),
         out_shape=[
             jax.ShapeDtypeStruct(
-                [batch_size, num_chunks, num_heads, padded_head_dim, padded_value_dim],
+                [
+                    batch_size,
+                    num_chunks,
+                    num_heads,
+                    padded_head_dim,
+                    padded_value_dim,
+                ],
                 jnp.float32,
             ),
             v_new_shape,
@@ -733,7 +878,9 @@ def chunk_gated_delta_rule_fwd_h(
 
     h = h_padded[:, :, :, :head_dim, :value_dim]
     if save_new_value:
-        v_new = jnp.transpose(v_new_padded[:, :, :num_tokens, :value_dim], (0, 2, 1, 3))
+        v_new = jnp.transpose(
+            v_new_padded[:, :, :num_tokens, :value_dim], (0, 2, 1, 3)
+        )
     else:
         v_new = None
     if output_final_state:
@@ -773,11 +920,16 @@ def chunk_kda_fwd_o_gk_kernel(
         * exp_fn(jnp.maximum(g_first[0], MIN_NORMAL_F32_EXPONENT))[:, None]
     )
     o = jnp.dot(
-        qg, h_scaled, precision=jax.lax.Precision.HIGHEST, preferred_element_type=jnp.float32
+        qg,
+        h_scaled,
+        precision=jax.lax.Precision.HIGHEST,
+        preferred_element_type=jnp.float32,
     )
     o = o * scale
 
-    is_causal = jnp.arange(chunk_size)[:, None] >= jnp.arange(chunk_size)[None, :]
+    is_causal = (
+        jnp.arange(chunk_size)[:, None] >= jnp.arange(chunk_size)[None, :]
+    )
     aqk = jnp.where(is_causal, aqk_chunk, 0.0).astype(jnp.float32)
     o = o + jnp.dot(
         aqk,
@@ -819,13 +971,17 @@ def chunk_kda_fwd_o_gk(
     )
     num_slots = chunk_starts.shape[0]
     q_chunks, v_chunks, g_chunks, aqk_chunks = (
-        gather_chunks(packed, chunk_starts, chunk_size) for packed in (q, v, g, A)
+        gather_chunks(packed, chunk_starts, chunk_size)
+        for packed in (q, v, g, A)
     )
 
     num_h_chunks = h.shape[1]
     h_head_major = h[0].transpose(1, 0, 2, 3)
     if num_slots > num_h_chunks:
-        h_chunks = jnp.pad(h_head_major, ((0, 0), (0, num_slots - num_h_chunks), (0, 0), (0, 0)))
+        h_chunks = jnp.pad(
+            h_head_major,
+            ((0, 0), (0, num_slots - num_h_chunks), (0, 0), (0, 0)),
+        )
     elif num_slots < num_h_chunks:
         h_chunks = h_head_major[:, :num_slots]
     else:
@@ -836,8 +992,12 @@ def chunk_kda_fwd_o_gk(
     ) -> tuple[jax.Array, jax.Array, int, int]:
         return (head_idx, slot_idx, 0, 0)
 
-    key_spec = pl.BlockSpec([1, 1, chunk_size, head_dim], index_map=_chunk_index_map)
-    value_spec = pl.BlockSpec([1, 1, chunk_size, value_dim], index_map=_chunk_index_map)
+    key_spec = pl.BlockSpec(
+        [1, 1, chunk_size, head_dim], index_map=_chunk_index_map
+    )
+    value_spec = pl.BlockSpec(
+        [1, 1, chunk_size, value_dim], index_map=_chunk_index_map
+    )
     o_chunks = pl.pallas_call(
         functools.partial(
             chunk_kda_fwd_o_gk_kernel,
@@ -846,13 +1006,19 @@ def chunk_kda_fwd_o_gk(
             exp_fn=exp2 if use_exp2 else exp,
         ),
         grid=(num_heads, num_slots),
-        out_shape=jax.ShapeDtypeStruct([num_heads, num_slots, chunk_size, value_dim], v.dtype),
+        out_shape=jax.ShapeDtypeStruct(
+            [num_heads, num_slots, chunk_size, value_dim], v.dtype
+        ),
         in_specs=[
             key_spec,
             value_spec,
             key_spec,
-            pl.BlockSpec([1, 1, head_dim, value_dim], index_map=_chunk_index_map),
-            pl.BlockSpec([1, 1, chunk_size, chunk_size], index_map=_chunk_index_map),
+            pl.BlockSpec(
+                [1, 1, head_dim, value_dim], index_map=_chunk_index_map
+            ),
+            pl.BlockSpec(
+                [1, 1, chunk_size, chunk_size], index_map=_chunk_index_map
+            ),
         ],
         out_specs=value_spec,
         compiler_params=pltpu.CompilerParams(disable_bounds_checks=True),
@@ -880,12 +1046,16 @@ def kda_gate_chunk_cumsum(
     * (g + dt_bias)) when lower_bound is set.
     """
     _, _, num_heads, head_dim = g.shape
-    assert A_log.shape == (num_heads,), f"A_log shape {A_log.shape} != ({num_heads},)"
+    assert A_log.shape == (
+        num_heads,
+    ), f"A_log shape {A_log.shape} != ({num_heads},)"
 
     if dt_bias is None:
         gate = g.astype(jnp.float32)
     else:
-        gate = g.astype(jnp.float32) + dt_bias.astype(jnp.float32).reshape(num_heads, head_dim)
+        gate = g.astype(jnp.float32) + dt_bias.astype(jnp.float32).reshape(
+            num_heads, head_dim
+        )
     decay_rate = exp(A_log.astype(jnp.float32)).reshape(1, 1, num_heads, 1)
     if lower_bound is None:
         gate_activation = -decay_rate * jax.nn.softplus(gate)
@@ -915,9 +1085,9 @@ def pallas_kda_gate_cumsum(
 ) -> jax.Array:
     """chunk_local_cumsum_vector for T divisible by chunk_size, scaled by 1 / ln 2 by default."""
     num_tokens = g.shape[2 if head_first else 1]
-    assert num_tokens % chunk_size == 0, (
-        f"T={num_tokens} must be divisible by chunk_size={chunk_size}"
-    )
+    assert (
+        num_tokens % chunk_size == 0
+    ), f"T={num_tokens} must be divisible by chunk_size={chunk_size}"
 
     return chunk_local_cumsum_vector(
         g,
@@ -948,8 +1118,14 @@ def segment_gather_index(
     def _place_segment(seg_idx: jax.Array, gather_idx: jax.Array) -> jax.Array:
         positions = jnp.arange(num_positions)
         dst_start = dst_starts[seg_idx]
-        in_segment = (positions >= dst_start) & (positions < dst_start + seg_lens[seg_idx])
-        return jnp.where(in_segment, src_starts[seg_idx] + (positions - dst_start), gather_idx)
+        in_segment = (positions >= dst_start) & (
+            positions < dst_start + seg_lens[seg_idx]
+        )
+        return jnp.where(
+            in_segment,
+            src_starts[seg_idx] + (positions - dst_start),
+            gather_idx,
+        )
 
     return jax.lax.fori_loop(
         0,
@@ -1020,17 +1196,26 @@ def chunk_kda_fwd(
     assert_shape(k, (batch_size, num_tokens, num_heads, head_dim), "k")
     assert_shape(v, (batch_size, num_tokens, num_heads, value_dim), "v")
     assert cu_seqlens is not None, "cu_seqlens must not be None for varlen path"
-    assert batch_size == 1, f"varlen requires B=1 (packed layout), got B={batch_size}"
+    assert (
+        batch_size == 1
+    ), f"varlen requires B=1 (packed layout), got B={batch_size}"
 
     num_seqs = cu_seqlens.shape[-1] - 1
     assert_shape(beta, (batch_size, num_tokens, num_heads), "beta")
-    assert_shape_or_none(initial_state, (num_seqs, num_heads, head_dim, value_dim), "initial_state")
+    assert_shape_or_none(
+        initial_state,
+        (num_seqs, num_heads, head_dim, value_dim),
+        "initial_state",
+    )
 
     seq_lens = prepare_lens(cu_seqlens)
-    aligned_cu_seqlens = jnp.concatenate(
-        [jnp.zeros(1, dtype=jnp.int32), jnp.cumsum(align_up(seq_lens, chunk_size))]
+    aligned_cu_seqlens = jnp.concatenate([
+        jnp.zeros(1, dtype=jnp.int32),
+        jnp.cumsum(align_up(seq_lens, chunk_size)),
+    ])
+    num_aligned_tokens = align_up(
+        num_tokens + num_seqs * (chunk_size - 1), chunk_size
     )
-    num_aligned_tokens = align_up(num_tokens + num_seqs * (chunk_size - 1), chunk_size)
     align_gather_idx = segment_gather_index(
         dst_starts=aligned_cu_seqlens[:-1],
         src_starts=cu_seqlens[:-1],
@@ -1041,7 +1226,8 @@ def chunk_kda_fwd(
     q_aligned, k_aligned, v_aligned, g_aligned, beta_aligned = (
         jnp.pad(
             packed,
-            ((0, 0), (0, num_aligned_tokens - num_tokens)) + ((0, 0),) * (packed.ndim - 2),
+            ((0, 0), (0, num_aligned_tokens - num_tokens))
+            + ((0, 0),) * (packed.ndim - 2),
         )[:, align_gather_idx]
         for packed in (q, k, v, g, beta)
     )
@@ -1061,7 +1247,9 @@ def chunk_kda_fwd(
             & (positions[None, :] < (aligned_seq_starts + seq_lens)[:, None])
         ).any(axis=0)
         g_cumsum = kda_gate_chunk_cumsum(
-            g=jnp.where(is_real_token[None, :, None, None], g_aligned, PAD_GATE_LOGIT),
+            g=jnp.where(
+                is_real_token[None, :, None, None], g_aligned, PAD_GATE_LOGIT
+            ),
             A_log=A_log,
             chunk_size=chunk_size,
             scale=RCP_LN2,

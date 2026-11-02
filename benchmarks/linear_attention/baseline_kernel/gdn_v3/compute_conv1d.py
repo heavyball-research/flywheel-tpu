@@ -43,7 +43,7 @@ def causal_conv1d(
     for c_idx in range(cfg.chunk_size):
         tap_sum = jnp.zeros((cfg.seq_tile_size, 1, cfg.dim_size), jnp.float32)
         for tap in range(cfg.kernel_size):
-            tap_sum += conv_input[:, c_idx + tap] * conv_weight[tap:tap + 1]
+            tap_sum += conv_input[:, c_idx + tap] * conv_weight[tap : tap + 1]
         if conv_bias is None:
             conv_out_rows.append(tap_sum)
         else:
@@ -60,11 +60,11 @@ def causal_conv1d(
         # Note (david): the default serves sequences whose last real token is
         # at or past this window position. c_idx 0 would select the previous
         # conv state of an empty sequence, which writes no checkpoint.
-        conv_state = conv_input[:, last_row:last_row + cfg.prev_kernel_size]
+        conv_state = conv_input[:, last_row : last_row + cfg.prev_kernel_size]
         for c_idx in range(1, last_row):
             conv_state = jnp.where(
                 c_idx == real_sizes,
-                conv_input[:, c_idx:c_idx + cfg.prev_kernel_size],
+                conv_input[:, c_idx : c_idx + cfg.prev_kernel_size],
                 conv_state,
             )
         conv_states.append(conv_state)

@@ -46,6 +46,8 @@ if __name__ == "__main__":
         ModelManifest(
             model_id="vllm_generate_tpu",
             chat_class_path=(
-                "videomme_tpu.models.vllm_generate_tpu.VLLMGenerateTPU"),
-        ))
+                "videomme_tpu.models.vllm_generate_tpu.VLLMGenerateTPU"
+            ),
+        )
+    )
     cli_evaluate()

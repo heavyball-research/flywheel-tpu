@@ -1,0 +1,5 @@
+# Mechanical reformats that git blame should look through:
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# format: run pyink over the tree
+7be1e873a366182bd2d8ded722eace7e4a94dbbc

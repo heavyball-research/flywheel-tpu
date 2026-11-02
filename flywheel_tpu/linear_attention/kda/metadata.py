@@ -51,9 +51,14 @@ def compute_batched_seq_metadata(
     has_initial_state = (seq_lens - query_lens) > 0
 
     if cfg.is_replay:
-        replay_len, is_flush = plan_replay_step(replay_lens, query_lens,
-                                                has_initial_state, read_indices,
-                                                state_indices, cfg.replay_window)
+        replay_len, is_flush = plan_replay_step(
+            replay_lens,
+            query_lens,
+            has_initial_state,
+            read_indices,
+            state_indices,
+            cfg.replay_window,
+        )
         flush = is_flush.astype(jnp.int32)
     else:
         replay_len = None
@@ -92,9 +97,11 @@ def plan_replay_step(
     slot must receive the whole state).
     """
     replay_len = jnp.where(has_initial_state, replay_lens, 0).astype(jnp.int32)
-    is_flush = ((replay_len + query_lens > replay_window)
-                | jnp.logical_not(has_initial_state)
-                | (read_indices != state_indices))
+    is_flush = (
+        (replay_len + query_lens > replay_window)
+        | jnp.logical_not(has_initial_state)
+        | (read_indices != state_indices)
+    )
     return replay_len, is_flush
 
 
@@ -129,30 +136,36 @@ def compute_per_seq_metadata(
     is_valid_seq = all_seqs < end_seq - start_seq
     query_lens = jnp.where(is_valid_seq, query_lens, 0)
     seq_start = query_start_loc[:-1]
-    seq_delta = jnp.where(is_valid_seq,
-                          seq_start & (config.SUBLANE_ALIGN - 1), 0)
+    seq_delta = jnp.where(
+        is_valid_seq, seq_start & (config.SUBLANE_ALIGN - 1), 0
+    )
     seq_base = seq_start - seq_delta
 
     s_idx_to_num_tiles = pl.cdiv(query_lens + seq_delta, cfg.chunk_size)
-    s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles,
-                                             include_initial=True)
+    s_idx_to_start_p_id = jnp.cumulative_sum(
+        s_idx_to_num_tiles, include_initial=True
+    )
     # Note (david): total_repeat_length makes jnp.repeat jit compilable. It pads
     # p_id_to_s_idx past num_tiles with the last sequence index, which the
     # kernel never reads.
-    p_id_to_s_idx = jnp.repeat(all_seqs,
-                               s_idx_to_num_tiles,
-                               total_repeat_length=max_tiles)
+    p_id_to_s_idx = jnp.repeat(
+        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tiles
+    )
     p_id_to_t_id = all_p_ids - s_idx_to_start_p_id[p_id_to_s_idx]
     # Note (david): tiles follow the sequence's sublane-aligned grid: tile 0
     # starts at the sequence's first row, later tiles at their grid row, and
     # each ends at the next grid boundary or the sequence's end.
     p_id_to_r_base = jnp.maximum(
         seq_base[p_id_to_s_idx] + p_id_to_t_id * cfg.chunk_size,
-        seq_start[p_id_to_s_idx])
-    p_id_to_r_size = jnp.minimum(
-        query_start_loc[p_id_to_s_idx + 1],
-        seq_base[p_id_to_s_idx] + (p_id_to_t_id + 1) * cfg.chunk_size,
-    ) - p_id_to_r_base
+        seq_start[p_id_to_s_idx],
+    )
+    p_id_to_r_size = (
+        jnp.minimum(
+            query_start_loc[p_id_to_s_idx + 1],
+            seq_base[p_id_to_s_idx] + (p_id_to_t_id + 1) * cfg.chunk_size,
+        )
+        - p_id_to_r_base
+    )
     p_id_is_first_tile = p_id_to_t_id == 0
     p_id_is_last_tile = p_id_to_t_id == (s_idx_to_num_tiles[p_id_to_s_idx] - 1)
 

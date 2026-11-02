@@ -27,8 +27,10 @@ def main() -> None:
                 name = Path(info.filename)
                 if name.suffix == ".mp4" and name.stem in wanted:
                     target = out / name.name
-                    with archive.open(info) as source, open(target,
-                                                            "wb") as sink:
+                    with (
+                        archive.open(info) as source,
+                        open(target, "wb") as sink,
+                    ):
                         while block := source.read(1 << 24):
                             sink.write(block)
                     count += 1
@@ -38,8 +40,10 @@ def main() -> None:
     with ThreadPoolExecutor(len(chunks)) as pool:
         extracted = sum(pool.map(extract, chunks))
     missing = wanted - {path.stem for path in out.glob("*.mp4")}
-    print(f"long videos: {len(wanted)}, extracted {extracted}, "
-          f"missing {sorted(missing)}")
+    print(
+        f"long videos: {len(wanted)}, extracted {extracted}, "
+        f"missing {sorted(missing)}"
+    )
     if missing:
         raise SystemExit(1)
 

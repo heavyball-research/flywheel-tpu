@@ -7,7 +7,9 @@ from pathlib import Path
 
 import jax
 
-BASELINE_KERNEL_DIR = Path(__file__).resolve().parents[1] / "linear_attention" / "baseline_kernel"
+BASELINE_KERNEL_DIR = (
+    Path(__file__).resolve().parents[1] / "linear_attention" / "baseline_kernel"
+)
 PARAM_SCALE = 0.1
 KernelState = tuple[jax.Array, ...]
 Row = dict[str, int | float | str]
@@ -48,9 +50,12 @@ def report_throughput(
     """Prints one sweep point and returns its tokens_per_s and approx_tflops."""
     tokens_per_s = num_tokens / median_ms * 1e3
     approx_tflops = flops / median_ms / 1e9
-    print(f"  T={num_tokens:6d} nseqs={nseqs:3d}{label}  {median_ms:8.3f} ms  "
-          f"{tokens_per_s / 1e6:6.2f} Mtok/s  "
-          f"{approx_tflops:6.2f} TFLOP/s(approx)", flush=True)
+    print(
+        f"  T={num_tokens:6d} nseqs={nseqs:3d}{label}  {median_ms:8.3f} ms  "
+        f"{tokens_per_s / 1e6:6.2f} Mtok/s  "
+        f"{approx_tflops:6.2f} TFLOP/s(approx)",
+        flush=True,
+    )
     return {"tokens_per_s": tokens_per_s, "approx_tflops": approx_tflops}
 
 
@@ -59,16 +64,26 @@ def print_speedup_table(
 ) -> None:
     """Prints median ms per package and each package's speedup over pkgs[0]."""
     base_pkg = pkgs[0]
-    median_ms_by_run = {(row["T"], row["nseqs"], row["pkg"]): row["median_ms"] for row in rows}
+    median_ms_by_run = {
+        (row["T"], row["nseqs"], row["pkg"]): row["median_ms"] for row in rows
+    }
     print()
-    print(f"{'T':>7}{'nseqs':>7}"
-          + "".join(f"{pkg + ' ms':>20}" for pkg in pkgs)
-          + "".join(f"{pkg + ' x':>20}" for pkg in pkgs[1:]))
+    print(
+        f"{'T':>7}{'nseqs':>7}"
+        + "".join(f"{pkg + ' ms':>20}" for pkg in pkgs)
+        + "".join(f"{pkg + ' x':>20}" for pkg in pkgs[1:])
+    )
     for num_tokens, nseqs in itertools.product(seqlens, nseqs_list):
         if (num_tokens, nseqs, base_pkg) not in median_ms_by_run:
             continue
-        median_ms_by_pkg = {pkg: median_ms_by_run[(num_tokens, nseqs, pkg)] for pkg in pkgs}
-        print(f"{num_tokens:>7}{nseqs:>7}"
-              + "".join(f"{median_ms_by_pkg[pkg]:>20.3f}" for pkg in pkgs)
-              + "".join(f"{median_ms_by_pkg[base_pkg] / median_ms_by_pkg[pkg]:>19.3f}x"
-                        for pkg in pkgs[1:]))
+        median_ms_by_pkg = {
+            pkg: median_ms_by_run[(num_tokens, nseqs, pkg)] for pkg in pkgs
+        }
+        print(
+            f"{num_tokens:>7}{nseqs:>7}"
+            + "".join(f"{median_ms_by_pkg[pkg]:>20.3f}" for pkg in pkgs)
+            + "".join(
+                f"{median_ms_by_pkg[base_pkg] / median_ms_by_pkg[pkg]:>19.3f}x"
+                for pkg in pkgs[1:]
+            )
+        )

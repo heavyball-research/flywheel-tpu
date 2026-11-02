@@ -1,5 +1,5 @@
-"""Naive attention, the RoPE reference and the random padding masks the flash attn tests
-share."""
+"""Naive attention, the RoPE reference and the random padding masks the flash
+attn tests share."""
 
 import math
 
@@ -16,51 +16,65 @@ MASK_VALUE = -1e30
 
 
 def randn(rng, shape, dtype=jnp.bfloat16):
-    """Standard normal samples drawn in f32 from a numpy Generator, cast to dtype."""
-    return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(dtype)
+    """Standard normal samples drawn in f32 from a numpy Generator, cast to
+    dtype."""
+    return jnp.asarray(rng.standard_normal(shape, dtype=np.float32)).astype(
+        dtype
+    )
 
 
 def merge_kv_heads(k, v):
-    """The merged cache rows of K and V (..., nheads_k, d): per u32 word, its KV heads' K
-    then V; bf16 [k0, v0, k1, v1, ...], fp8 [k0, k1, v0, v1, ...] with an odd nheads_k
-    padded by one zero head."""
+    """The merged cache rows of K and V (..., nheads_k, d): per u32 word, its KV
+    heads' K then V; bf16 [k0, v0, k1, v1, ...], fp8 [k0, k1, v0, v1, ...] with
+    an odd nheads_k padded by one zero head."""
     *leading, nheads_k, d = k.shape
     heads_per_word = 2 // k.dtype.itemsize
-    head_pad = [(0, 0)] * len(leading) + [(0, -nheads_k % heads_per_word), (0, 0)]
+    head_pad = [(0, 0)] * len(leading) + [
+        (0, -nheads_k % heads_per_word),
+        (0, 0),
+    ]
     k_words, v_words = (
-        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d) for x in (k, v)
+        jnp.pad(x, head_pad).reshape(*leading, -1, heads_per_word, d)
+        for x in (k, v)
     )
     return jnp.stack([k_words, v_words], axis=-3).reshape(*leading, -1, d)
 
 
 def split_kv_heads(kv, nheads_k):
-    """merge_kv_heads' inverse: the (K, V) rows (..., nheads_k, d) of merged cache rows."""
+    """merge_kv_heads' inverse: the (K, V) rows (..., nheads_k, d) of merged
+    cache rows."""
     *leading, _, d = kv.shape
     heads_per_word = 2 // kv.dtype.itemsize
     words = kv.reshape(*leading, -1, 2, heads_per_word, d)
     return tuple(
-        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :] for part in range(2)
+        words[..., part, :, :].reshape(*leading, -1, d)[..., :nheads_k, :]
+        for part in range(2)
     )
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, rng):
     """(batch_size, max_seqlen) bool prefix masks whose lengths are drawn from
     [max(1, max_seqlen - 20), max_seqlen]."""
-    lengths = rng.integers(max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1))
+    lengths = rng.integers(
+        max(1, max_seqlen - 20), max_seqlen + 1, (batch_size, 1)
+    )
     return jnp.asarray(np.arange(max_seqlen)[None, :] < lengths)
 
 
 def generate_qkv(q, k, v, query_padding_mask, key_padding_mask):
     """Packs the valid tokens of padded q/k/v.
 
-    q: (batch_size, seqlen_q, nheads, d); k: (batch_size, seqlen_k, nheads_k, d);
-    v: (batch_size, seqlen_k, nheads_k, d_v); the masks are (batch_size, seqlen) bool.
-    Returns (q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
-    max_seqlen_k, output_pad_fn), where output_pad_fn scatters packed q-side rows
-    back to (batch_size, seqlen_q, ...).
+    q: (batch_size, seqlen_q, nheads, d); k: (batch_size, seqlen_k, nheads_k,
+    d); v: (batch_size, seqlen_k, nheads_k, d_v); the masks are (batch_size,
+    seqlen) bool. Returns (q_unpad, k_unpad, v_unpad, cu_seqlens_q,
+    cu_seqlens_k, max_seqlen_q, max_seqlen_k, output_pad_fn), where
+    output_pad_fn scatters packed q-side rows back to (batch_size, seqlen_q,
+    ...).
     """
     batch_size, seqlen_q = q.shape[:2]
-    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q, query_padding_mask)
+    q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(
+        q, query_padding_mask
+    )
     k_unpad, _, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k, key_padding_mask)
     v_unpad, *_ = unpad_input(v, key_padding_mask)
 
@@ -79,19 +93,24 @@ def generate_qkv(q, k, v, query_padding_mask, key_padding_mask):
     )
 
 
-def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlens=None):
-    """FlashAttention's apply_rotary_emb on (batch_size, seqlen, nheads, d), or on packed
-    (total, nheads, d) with cu_seqlens.
+def apply_rotary_emb(
+    x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlens=None
+):
+    """FlashAttention's apply_rotary_emb on (batch_size, seqlen, nheads, d), or
+    on packed (total, nheads, d) with cu_seqlens.
 
-    cos / sin: (seqlen_ro, rotary_dim / 2). Token t of sequence b sits at position
-    seqlen_offsets[b] + t (seqlen_offsets an int or (batch_size,)); a position past the
-    table, or a packed token past cu_seqlens[-1], stays unrotated. interleaved pairs
-    adjacent dims instead of the two halves of the first rotary_dim dims. The rotation
-    runs in f32 and rounds once to x's dtype, as the kernels do.
+    cos / sin: (seqlen_ro, rotary_dim / 2). Token t of sequence b sits at
+    position seqlen_offsets[b] + t (seqlen_offsets an int or (batch_size,)); a
+    position past the table, or a packed token past cu_seqlens[-1], stays
+    unrotated. interleaved pairs adjacent dims instead of the two halves of the
+    first rotary_dim dims. The rotation runs in f32 and rounds once to x's
+    dtype, as the kernels do.
     """
     seqlen_ro, rotary_dim = cos.shape[0], 2 * cos.shape[1]
     if cu_seqlens is None:
-        positions = jnp.reshape(jnp.asarray(seqlen_offsets), (-1, 1)) + jnp.arange(x.shape[1])
+        positions = jnp.reshape(
+            jnp.asarray(seqlen_offsets), (-1, 1)
+        ) + jnp.arange(x.shape[1])
     else:
         token_ids = jnp.arange(x.shape[0])
         num_seqs = cu_seqlens.shape[0] - 1
@@ -111,8 +130,12 @@ def apply_rotary_emb(x, cos, sin, interleaved=False, seqlen_offsets=0, cu_seqlen
         rotated = rotated.reshape(x_ro.shape)
     else:
         x1, x2 = jnp.split(x_ro, 2, axis=-1)
-        rotated = jnp.concatenate((x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1)
-    return jnp.concatenate((rotated.astype(x.dtype), x[..., rotary_dim:]), axis=-1)
+        rotated = jnp.concatenate(
+            (x1 * cos - x2 * sin, x1 * sin + x2 * cos), axis=-1
+        )
+    return jnp.concatenate(
+        (rotated.astype(x.dtype), x[..., rotary_dim:]), axis=-1
+    )
 
 
 def construct_local_mask(
@@ -122,9 +145,9 @@ def construct_local_mask(
     query_padding_mask=None,
     key_padding_mask=None,
 ):
-    """True where the bottom-right aligned window hides a key: (seqlen_q, seqlen_k),
-    or (batch, 1, seqlen_q, seqlen_k) with padding masks. Each bound is unbounded
-    when negative, so (left, -1) is a left-only window."""
+    """True where the bottom-right aligned window hides a key: (seqlen_q,
+    seqlen_k), or (batch, 1, seqlen_q, seqlen_k) with padding masks. Each bound
+    is unbounded when negative, so (left, -1) is a left-only window."""
     row_idx = jnp.arange(seqlen_q)[:, None]
     col_idx = jnp.arange(seqlen_k)[None, :]
     sk = (
@@ -138,7 +161,9 @@ def construct_local_mask(
         else query_padding_mask.sum(-1)[:, None, None, None]
     )
     diagonal = row_idx + sk - sq
-    mask = jnp.zeros(jnp.broadcast_shapes(jnp.shape(diagonal), col_idx.shape), bool)
+    mask = jnp.zeros(
+        jnp.broadcast_shapes(jnp.shape(diagonal), col_idx.shape), bool
+    )
     if window_size[1] >= 0:
         mask = mask | (col_idx > diagonal + window_size[1])
     if window_size[0] >= 0:
@@ -161,18 +186,20 @@ def attention_ref(
 ):
     """Naive softmax(q @ k^T / sqrt(d)) @ v on padded inputs.
 
-    q: (batch_size, seqlen_q, nheads, d); k: (batch_size, seqlen_k, nheads_k, d);
-    v: (batch_size, seqlen_k, nheads_k, d_v); the padding masks are (batch_size,
-    seqlen) bool. causal and window_size are bottom-right aligned on each sequence's
-    valid lengths, and causal forces the right bound to 0. upcast computes in f32;
-    without it the math runs in the input dtype, and reorder_ops scales k instead of
-    q, so the pair measures how far plain bf16 arithmetic drifts.
+    q: (batch_size, seqlen_q, nheads, d); k: (batch_size, seqlen_k, nheads_k,
+    d); v: (batch_size, seqlen_k, nheads_k, d_v); the padding masks are
+    (batch_size, seqlen) bool. causal and window_size are bottom-right aligned
+    on each sequence's valid lengths, and causal forces the right bound to 0.
+    upcast computes in f32; without it the math runs in the input dtype, and
+    reorder_ops scales k instead of q, so the pair measures how far plain bf16
+    arithmetic drifts.
 
-    sinks (nheads,) joins each head's softmax as one more logit with no value row.
+    sinks (nheads,) joins each head's softmax as one more logit with no value
+    row.
 
-    Returns (out, lse): out (batch_size, seqlen_q, nheads, d_v) in q's dtype, zero
-    on padded queries and on rows with no visible key; lse (batch_size, nheads,
-    seqlen_q) f32, -inf on rows with no visible key, or the row's sink.
+    Returns (out, lse): out (batch_size, seqlen_q, nheads, d_v) in q's dtype,
+    zero on padded queries and on rows with no visible key; lse (batch_size,
+    nheads, seqlen_q) f32, -inf on rows with no visible key, or the row's sink.
     """
     if causal:
         window_size = (window_size[0], 0)
@@ -183,15 +210,22 @@ def attention_ref(
     k = jnp.repeat(k, q.shape[2] // k.shape[2], axis=2)
     v = jnp.repeat(v, q.shape[2] // v.shape[2], axis=2)
     softmax_scale = 1.0 / math.sqrt(q.shape[-1])
-    # Note (david): the default TPU matmul precision truncates f32 operands to one
-    # bf16 pass, which would make the upcast reference as coarse as the kernel.
+    # Note (david): the default TPU matmul precision truncates f32 operands to
+    # one bf16 pass, which would make the upcast reference as coarse as the
+    # kernel.
     if not reorder_ops:
         scores = jnp.einsum(
-            "bthd,bshd->bhts", q * softmax_scale, k, precision=jax.lax.Precision.HIGHEST
+            "bthd,bshd->bhts",
+            q * softmax_scale,
+            k,
+            precision=jax.lax.Precision.HIGHEST,
         )
     else:
         scores = jnp.einsum(
-            "bthd,bshd->bhts", q, k * softmax_scale, precision=jax.lax.Precision.HIGHEST
+            "bthd,bshd->bhts",
+            q,
+            k * softmax_scale,
+            precision=jax.lax.Precision.HIGHEST,
         )
     if softcap > 0:
         scores = jnp.tanh(scores / softcap) * softcap
@@ -200,24 +234,33 @@ def attention_ref(
         masked = masked | ~key_padding_mask[:, None, None, :]
     if window_size[0] >= 0 or window_size[1] >= 0:
         masked = masked | construct_local_mask(
-            seqlen_q, seqlen_k, window_size, query_padding_mask, key_padding_mask
+            seqlen_q,
+            seqlen_k,
+            window_size,
+            query_padding_mask,
+            key_padding_mask,
         )
     scores = jnp.where(masked, MASK_VALUE, scores)
     empty_row = masked.all(axis=-1, keepdims=True)
-    # Note (david): the softmax accumulates in f32 even for bf16 scores, then rounds
-    # to v's dtype.
+    # Note (david): the softmax accumulates in f32 even for bf16 scores, then
+    # rounds to v's dtype.
     logits = scores.astype(jnp.float32)
     if sinks is not None:
         sink_logits = jnp.broadcast_to(
-            sinks.astype(jnp.float32)[None, :, None, None], (*logits.shape[:3], 1)
+            sinks.astype(jnp.float32)[None, :, None, None],
+            (*logits.shape[:3], 1),
         )
-        logits = jnp.concatenate([jnp.where(masked, -jnp.inf, logits), sink_logits], axis=-1)
+        logits = jnp.concatenate(
+            [jnp.where(masked, -jnp.inf, logits), sink_logits], axis=-1
+        )
     attention = jax.nn.softmax(logits, axis=-1)[..., :seqlen_k].astype(v.dtype)
     attention = jnp.where(empty_row, 0.0, attention)
     lse = jax.nn.logsumexp(logits, axis=-1)
     if sinks is None:
         lse = jnp.where(empty_row[..., 0], -jnp.inf, lse)
-    output = jnp.einsum("bhts,bshd->bthd", attention, v, precision=jax.lax.Precision.HIGHEST)
+    output = jnp.einsum(
+        "bhts,bshd->bthd", attention, v, precision=jax.lax.Precision.HIGHEST
+    )
     if query_padding_mask is not None:
         output = jnp.where(~query_padding_mask[:, :, None, None], 0.0, output)
     return output.astype(dtype_og), lse

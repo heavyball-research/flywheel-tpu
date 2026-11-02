@@ -41,14 +41,17 @@ def split_qkv_heads(
     for kq_head in range(cfg.num_kq_heads):
         q_start = kq_head * cfg.kq_head_dim
         k_start = k_offset + q_start
-        q_heads.append(qkv[..., q_start:q_start + cfg.kq_head_dim])
-        k_heads.append(qkv[..., k_start:k_start + cfg.kq_head_dim])
+        q_heads.append(qkv[..., q_start : q_start + cfg.kq_head_dim])
+        k_heads.append(qkv[..., k_start : k_start + cfg.kq_head_dim])
     for v_head in range(cfg.num_v_heads):
         v_start = v_offset + v_head * cfg.v_head_dim
-        v_heads.append(qkv[..., v_start:v_start + cfg.v_head_dim])
+        v_heads.append(qkv[..., v_start : v_start + cfg.v_head_dim])
 
-    return (jnp.stack(q_heads, axis=1), jnp.stack(k_heads, axis=1),
-            jnp.stack(v_heads, axis=1))
+    return (
+        jnp.stack(q_heads, axis=1),
+        jnp.stack(k_heads, axis=1),
+        jnp.stack(v_heads, axis=1),
+    )
 
 
 def load_qkv_realigned(
@@ -69,7 +72,8 @@ def load_qkv_realigned(
         # pltpu.roll only accepts non-negative shifts, so rotate them up by
         # block_rows - delta.
         seq_chunks.append(
-            pltpu.roll(block, block_rows - delta, 0)[:cfg.compute_chunk_size])
+            pltpu.roll(block, block_rows - delta, 0)[: cfg.compute_chunk_size]
+        )
     return jnp.stack(seq_chunks, axis=0)
 
 
@@ -134,43 +138,54 @@ def load_and_select_states(
         if carry_conv_scratch_ref is None:
             conv_state = initial_conv_state
         else:
-            conv_state = jnp.where(is_first_tile, initial_conv_state,
-                                   carry_conv_scratch_ref[idx])
+            conv_state = jnp.where(
+                is_first_tile, initial_conv_state, carry_conv_scratch_ref[idx]
+            )
 
         real_size_list.append(r_size)
         conv_state_list.append(conv_state)
         if cfg.is_replay:
-            plane_refs = (recurrent_slot_ref.at[idx, 0],
-                          recurrent_lo_slot_ref.at[idx, 0])
+            plane_refs = (
+                recurrent_slot_ref.at[idx, 0],
+                recurrent_lo_slot_ref.at[idx, 0],
+            )
 
             # Note (david): zero hi and lo planes are the f32 zero checkpoint.
             @pl.when(jnp.logical_not(has_initial_state))
             def _zero_checkpoint(plane_refs=plane_refs):
                 for ref in plane_refs:
                     ref[...] = jnp.zeros(ref.shape, ref.dtype)
+
         else:
             if cfg.split_checkpoint:
                 planes = recurrent_slot_ref[idx, 0]
                 hbm_recurrent_state = compute_gdn.merge_checkpoint_planes(
-                    planes[0], planes[1])
+                    planes[0], planes[1]
+                )
             else:
                 hbm_recurrent_state = recurrent_slot_ref[idx, 0]
-            initial_recurrent_state = jnp.where(has_initial_state,
-                                                hbm_recurrent_state, 0)
+            initial_recurrent_state = jnp.where(
+                has_initial_state, hbm_recurrent_state, 0
+            )
             if carry_recurrent_scratch_ref is None:
                 recurrent_state = initial_recurrent_state
             else:
-                recurrent_state = jnp.where(is_first_tile,
-                                            initial_recurrent_state,
-                                            carry_recurrent_scratch_ref[idx])
+                recurrent_state = jnp.where(
+                    is_first_tile,
+                    initial_recurrent_state,
+                    carry_recurrent_scratch_ref[idx],
+                )
             recurrent_state_list.append(recurrent_state)
 
     if cfg.is_replay:
         recurrent_states = None
     else:
         recurrent_states = jnp.stack(recurrent_state_list, axis=0)
-    return (jnp.stack(real_size_list, axis=0),
-            jnp.stack(conv_state_list, axis=0), recurrent_states)
+    return (
+        jnp.stack(real_size_list, axis=0),
+        jnp.stack(conv_state_list, axis=0),
+        recurrent_states,
+    )
 
 
 def load_activation_as_token(

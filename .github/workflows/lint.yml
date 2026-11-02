@@ -1,0 +1,31 @@
+# Run the pre-commit hooks (pyink, pylint, zizmor) over the whole tree.
+name: lint
+
+on:
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
+        with:
+          python-version: "3.12"
+      # --only-dev: the hooks need pre-commit, not jax.
+      - run: uv run --only-dev pre-commit run --all-files --show-diff-on-failure

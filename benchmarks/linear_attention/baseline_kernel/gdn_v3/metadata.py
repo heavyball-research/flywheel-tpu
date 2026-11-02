@@ -88,16 +88,18 @@ def compute_per_seq_metadata(
     query_lens = jnp.where(all_seqs < num_seqs, query_lens, 0)
 
     s_idx_to_num_tiles = pl.cdiv(query_lens, cfg.chunk_size)
-    s_idx_to_start_p_id = jnp.cumulative_sum(s_idx_to_num_tiles,
-                                             include_initial=True)
+    s_idx_to_start_p_id = jnp.cumulative_sum(
+        s_idx_to_num_tiles, include_initial=True
+    )
     # Note (david): total_repeat_length makes jnp.repeat jit compilable. It pads
     # p_id_to_s_idx past num_tiles, which the kernel never reads.
-    p_id_to_s_idx = jnp.repeat(all_seqs,
-                               s_idx_to_num_tiles,
-                               total_repeat_length=max_tiles)
+    p_id_to_s_idx = jnp.repeat(
+        all_seqs, s_idx_to_num_tiles, total_repeat_length=max_tiles
+    )
     p_id_to_t_id = all_p_ids - s_idx_to_start_p_id[p_id_to_s_idx]
-    p_id_to_r_base = (query_start_loc[p_id_to_s_idx] +
-                      p_id_to_t_id * cfg.chunk_size)
+    p_id_to_r_base = (
+        query_start_loc[p_id_to_s_idx] + p_id_to_t_id * cfg.chunk_size
+    )
     p_id_to_r_size = jnp.minimum(
         query_start_loc[p_id_to_s_idx + 1] - p_id_to_r_base,
         cfg.tile_size,

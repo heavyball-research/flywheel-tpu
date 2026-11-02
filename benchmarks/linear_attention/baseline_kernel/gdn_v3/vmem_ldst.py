@@ -22,8 +22,8 @@ WORD_BYTES = 4
 
 
 def load_as_qkv_large(
-        qkv_vmem_ref: jax.Ref,
-        cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    qkv_vmem_ref: jax.Ref, cfg: config.GDNConfig
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Splits one sequence's packed qkv into the large layout.
 
     qkv_vmem_ref is [chunk_size, 1, num_kq_heads * kq_head_dim * 2 +
@@ -69,8 +69,8 @@ def load_as_qkv_large(
 
 
 def load_as_qkv_compact(
-        qkv_vmem_ref: jax.Ref,
-        cfg: config.GDNConfig) -> tuple[jax.Array, jax.Array, jax.Array]:
+    qkv_vmem_ref: jax.Ref, cfg: config.GDNConfig
+) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Splits a tile's packed qkv into the compact layout, one load per head.
 
     qkv_vmem_ref is [seq_tile_size, chunk_size, 1, num_kq_heads * kq_head_dim
@@ -112,7 +112,7 @@ def load_compact_to_large(vmem_ref: jax.Ref) -> jax.Array:
     assert vmem_ref.dtype.itemsize == WORD_BYTES
     assert vmem_ref.shape[-2] == 1
     num_cols = vmem_ref.shape[-1]
-    large_shape = vmem_ref.shape[:-2] + (num_cols, )
+    large_shape = vmem_ref.shape[:-2] + (num_cols,)
     num_lanes = pltpu.get_tpu_info().num_lanes
 
     lane_tiles = []
@@ -161,18 +161,22 @@ def load_and_select_states(
         if carry_conv_scratch_ref is None:
             prev_conv_state = initial_conv_state
         else:
-            prev_conv_state = jnp.where(is_first_tile, initial_conv_state,
-                                        carry_conv_scratch_ref[idx])
+            prev_conv_state = jnp.where(
+                is_first_tile, initial_conv_state, carry_conv_scratch_ref[idx]
+            )
 
         hbm_recurrent_state = recurrent_slot_ref[idx, 0]
-        initial_recurrent_state = jnp.where(has_initial_state,
-                                            hbm_recurrent_state, 0)
+        initial_recurrent_state = jnp.where(
+            has_initial_state, hbm_recurrent_state, 0
+        )
         if carry_recurrent_scratch_ref is None:
             prev_recurrent_state = initial_recurrent_state
         else:
-            prev_recurrent_state = jnp.where(is_first_tile,
-                                             initial_recurrent_state,
-                                             carry_recurrent_scratch_ref[idx])
+            prev_recurrent_state = jnp.where(
+                is_first_tile,
+                initial_recurrent_state,
+                carry_recurrent_scratch_ref[idx],
+            )
 
         real_sizes_list.append(real_size)
         prev_conv_state_list.append(prev_conv_state)
@@ -201,8 +205,7 @@ def load_activation_as_large(
     k_large_list = []
     v_large_list = []
     for idx in range(cfg.seq_tile_size):
-        q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx],
-                                                      cfg)
+        q_large, k_large, v_large = load_as_qkv_large(qkv_vmem_ref.at[idx], cfg)
         q_large_list.append(q_large)
         k_large_list.append(k_large)
         v_large_list.append(v_large)

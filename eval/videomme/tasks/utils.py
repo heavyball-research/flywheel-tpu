@@ -19,9 +19,11 @@ prompt, the answer extraction and the scoring are lmms-eval's `videomme`.
 
 import os
 
-from lmms_eval.tasks.videomme.utils import (videomme_aggregate_results,
-                                            videomme_doc_to_text,
-                                            videomme_process_results)
+from lmms_eval.tasks.videomme.utils import (
+    videomme_aggregate_results,
+    videomme_doc_to_text,
+    videomme_process_results,
+)
 
 TASK_TYPES = frozenset({
     "Temporal Reasoning",
@@ -32,13 +34,15 @@ TASK_TYPES = frozenset({
 
 
 def process_docs(dataset):
-    return dataset.filter(lambda doc: doc["duration"] == "long" and doc[
-        "task_type"] in TASK_TYPES)
+    return dataset.filter(
+        lambda doc: doc["duration"] == "long" and doc["task_type"] in TASK_TYPES
+    )
 
 
 def doc_to_visual(doc):
-    path = os.path.join(os.environ["VIDEOMME_VIDEO_DIR"],
-                        doc["videoID"] + ".mp4")
+    path = os.path.join(
+        os.environ["VIDEOMME_VIDEO_DIR"], doc["videoID"] + ".mp4"
+    )
     if not os.path.isfile(path):
         raise FileNotFoundError(path)
     return [path]
