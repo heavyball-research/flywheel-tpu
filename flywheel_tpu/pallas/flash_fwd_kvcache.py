@@ -1612,10 +1612,16 @@ def kvcache_kernel(
         )
 
     def _staged_value_index(base, position, head_group, fragment, member):
-        return base + (
-            (position * num_kv_compute_fragments + fragment) * num_head_groups
-            + head_group
-        ) * kv_heads_per_group + member
+        return (
+            base
+            + (
+                (position * num_kv_compute_fragments + fragment)
+                * num_head_groups
+                + head_group
+            )
+            * kv_heads_per_group
+            + member
+        )
 
     def _fragments():
         return [
@@ -2414,13 +2420,11 @@ def flash_attn_kvcache_pallas(
         # Note (david): a packed step's unpacked V tiles, one per item,
         # fragment, head group and group member (see _attend_packed_step).
         pltpu.VMEM(staged_values_shape, k_cache.dtype),
-        pltpu.SemaphoreType.DMA(
-            (
-                NUM_SEMS,
-                max(num_slots, num_write_tiles, NUM_IO_STAGES),
-                num_kv_heads,
-            )
-        ),
+        pltpu.SemaphoreType.DMA((
+            NUM_SEMS,
+            max(num_slots, num_write_tiles, NUM_IO_STAGES),
+            num_kv_heads,
+        )),
     )
     if num_active is None:
         num_active_array = jnp.full((1,), batch, jnp.int32)

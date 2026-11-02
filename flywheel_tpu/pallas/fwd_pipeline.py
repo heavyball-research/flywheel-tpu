@@ -1529,8 +1529,7 @@ def fwd_body(
                                 kv_slot,
                                 tile_rows,
                                 0,
-                                2 * (staged_kv_head % heads_per_word)
-                                + kv_part,
+                                2 * (staged_kv_head % heads_per_word) + kv_part,
                                 :,
                             ]
                             for kv_part in range(2)
