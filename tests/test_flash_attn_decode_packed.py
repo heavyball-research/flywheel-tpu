@@ -254,7 +254,7 @@ def test_packed_verify_window(force_config, heads, kv_heads, seqlen_q, append):
 @pytest.mark.parametrize("items_per_step", [2, 8])
 def test_packed_decode_matches_one_item_kernel(force_config, items_per_step):
     case = decode_case(4, 1, 256, jnp.float8_e4m3fn)
-    force_config((BLOCK_KV, BLOCK_KV_COMPUTE, 2))
+    force_config((BLOCK_KV, BLOCK_KV_COMPUTE, 2, 1))
     one_item = run_decode(case, append=True)
     force_config((BLOCK_KV, BLOCK_KV_COMPUTE, 2, items_per_step))
     packed = run_decode(case, append=True)
@@ -270,6 +270,58 @@ def test_packed_decode_matches_one_item_kernel(force_config, items_per_step):
             np.asarray(packed_pages, np.float32),
             np.asarray(one_item_pages, np.float32),
         )
+
+
+def test_default_packed_config_stops_at_the_max_block():
+    config = flash_fwd_kvcache.default_packed_config(
+        num_query_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        capacity=16128,
+        kv_itemsize=1,
+        batch=64,
+        page_size=256,
+    )
+    max_block_kv = flash_fwd_kvcache.PACKED_MAX_BLOCK_KV
+    assert config == (
+        max_block_kv,
+        flash_fwd_kvcache.resolve_block_kv_compute(max_block_kv),
+        flash_fwd_kvcache.DEFAULT_NUM_KV_STAGES,
+        flash_fwd_kvcache.PACKED_ITEMS_PER_STEP,
+    )
+
+
+def test_default_packed_config_fills_the_vmem_budget():
+    # Note (david): 8 bf16 KV heads of 256 fill the budget below the max block.
+    shape = dict(
+        num_query_heads=32,
+        num_kv_heads=8,
+        head_dim=256,
+        kv_itemsize=2,
+        batch=64,
+    )
+    config = flash_fwd_kvcache.default_packed_config(
+        capacity=16128, page_size=256, **shape
+    )
+    block_kv, _, num_kv_stages, items_per_step = config
+    budget = (
+        flash_fwd_kvcache.PACKED_VMEM_FRACTION
+        * flash_fwd_kvcache.vmem_limit_bytes()
+    )
+
+    def vmem_bytes(block):
+        return flash_fwd_kvcache.kvcache_config_vmem_bytes(
+            block,
+            flash_fwd_kvcache.resolve_block_kv_compute(block),
+            num_kv_stages,
+            items_per_step,
+            **shape,
+        )
+
+    assert block_kv < flash_fwd_kvcache.PACKED_MAX_BLOCK_KV
+    assert block_kv % flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE == 0
+    next_block_kv = block_kv + flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE
+    assert vmem_bytes(block_kv) <= budget < vmem_bytes(next_block_kv)
 
 
 def test_packed_config_rejects_bad_items_per_step(force_config):

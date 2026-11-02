@@ -93,7 +93,9 @@ def test_tuned_block_kv_not_a_multiple_of_the_page_size_warns(
 ):
     warnings = run_on("TPU v7")
     monkeypatch.setattr(
-        flash_fwd_kvcache, "get_tuned_kvcache_config", lambda **_: (128, 128, 2)
+        flash_fwd_kvcache,
+        "get_tuned_kvcache_config",
+        lambda **_: (128, 128, 2, 1),
     )
     # The lookup runs while the kernel is traced.
     jax.clear_caches()
