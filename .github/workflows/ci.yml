@@ -41,8 +41,10 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
     steps:
-      - uses: actions/checkout@v7
-      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7  # v10.2.0
         with:
           python-version: "3.12"
           activate-environment: true
@@ -52,12 +54,15 @@ jobs:
           uv pip install -e . "$jax" "pytest>=8" pytest-xdist
       # tests/conftest.py keeps every N-th test from the i-th on.
       - name: Test
+        env:
+          SHARD: ${{ matrix.shard }}
+          SHARDS: ${{ strategy.job-total }}
         run: >
           python -m pytest -n auto -rfE --durations=20
-          --shard=${{ matrix.shard }}/${{ strategy.job-total }}
-          --junitxml=junit-cpu-${{ matrix.shard }}.xml
+          --shard="$SHARD/$SHARDS"
+          --junitxml="junit-cpu-$SHARD.xml"
       - if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: junit-cpu-${{ matrix.shard }}
           path: junit-cpu-${{ matrix.shard }}.xml
