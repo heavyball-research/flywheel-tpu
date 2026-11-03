@@ -1,5 +1,8 @@
 """A tuned-config lookup that misses on a TPU warns (warnings.warn), once per
-key, and the kernel then builds with its default config."""
+key, and the kernel then builds with its default config. Every tuned KV-cache
+decode entry fits its device's VMEM limit under the kernel's VMEM model."""
+
+import re
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +27,42 @@ TUNED_DECODE = dict(
     return_lse=False,
 )
 UNTUNED_DECODE = {**TUNED_DECODE, "batch": 48}
+# The VMEM limit a kernel is built against on each tuned device, as
+# vmem_limit_bytes() returns it there: v6e's 128 MiB cores are capped at
+# 100 MiB, and v7x's 64 MiB cores give all of it.
+DEVICE_VMEM_LIMIT_BYTES = {"TPU v6": 100 * 2**20, "TPU v7": 64 * 2**20}
+KVCACHE_KEY = re.compile(
+    r"kvcache\|(?P<dtype>\w+)\|h(?P<h>\d+)\|k(?P<k>\d+)\|b(?P<b>\d+)"
+    r"\|s\d+\|d(?P<d>\d+)\|"
+)
+
+
+def kvcache_entries():
+    for device_name, table in tuned_block_sizes.load_tuned_configs().items():
+        for key, config in table.items():
+            if key.startswith("kvcache|"):
+                yield pytest.param(device_name, key, config, id=key)
+
+
+@pytest.mark.parametrize("device_name, key, config", list(kvcache_entries()))
+def test_tuned_kvcache_entry_fits_its_device_vmem(device_name, key, config):
+    fields = KVCACHE_KEY.match(key)
+    assert fields is not None, key
+    block_kv, block_kv_compute, num_kv_stages, *packed = config
+    required = flash_fwd_kvcache.kvcache_config_vmem_bytes(
+        block_kv,
+        block_kv_compute,
+        num_kv_stages,
+        packed[0] if packed else 1,
+        num_query_heads=int(fields["h"]),
+        num_kv_heads=int(fields["k"]),
+        head_dim=int(fields["d"]),
+        kv_itemsize=jnp.dtype(fields["dtype"]).itemsize,
+        batch=int(fields["b"]),
+    )
+    assert (
+        required <= DEVICE_VMEM_LIMIT_BYTES[device_name]
+    ), f"{config} needs {required / 2**20:.1f} MiB"
 
 
 @pytest.fixture(name="run_on")
@@ -60,7 +99,7 @@ def test_untuned_key_warns_once_on_tpu(run_on):
 def test_tuned_key_does_not_warn(run_on):
     warnings = run_on("TPU v7")
     config = tuned_block_sizes.get_tuned_kvcache_config(**TUNED_DECODE)
-    assert config == (4096, 2048, 2)
+    assert config == (2048, 2048, 2)
     assert not warnings()
 
 
