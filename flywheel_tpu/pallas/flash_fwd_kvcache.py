@@ -97,14 +97,29 @@ PACKED_BLOCK_KV_GRANULE = 256
 PACKED_VMEM_FRACTION = 0.8
 
 
-def kv_staging_slots(num_kv_stages: int, items_per_step: int) -> int:
+def carries_last_pv(items_per_step: int, batch: int) -> bool:
+    """Whether the one-item loop leaves each item's last PV to the next item."""
+    # Note (david): a carried PV gives the MXU independent work while the
+    # next row's score, softmax and PV chain waits on its matmul. At one row
+    # there is no next row to overlap, and the carry's V reload, pending
+    # store and first item's trash PV only add to the row's chain, so a
+    # one-row call runs each item's last PV in place.
+    return items_per_step == 1 and batch > 1
+
+
+def kv_staging_slots(
+    num_kv_stages: int, items_per_step: int, batch: int
+) -> int:
     """Staging slots of the KV ring; a packed slot holds a whole step."""
-    # Note (david): the one-item ring holds one block more than the prefetch
-    # needs. A block's last PV runs in the next item, after that item's first
-    # softmax, and reads its V where the block was staged, so the prefetch the
-    # next item starts must land in another slot. A packed step finishes every
-    # PV it starts, so its ring is the prefetch alone.
-    return num_kv_stages + 1 if items_per_step == 1 else num_kv_stages
+    # Note (david): a carrying one-item ring holds one block more than the
+    # prefetch needs. A block's last PV runs in the next item, after that
+    # item's first softmax, and reads its V where the block was staged, so the
+    # prefetch the next item starts must land in another slot. A packed step,
+    # or an item that runs its last PV in place, finishes every PV it starts,
+    # so its ring is the prefetch alone.
+    if carries_last_pv(items_per_step, batch):
+        return num_kv_stages + 1
+    return num_kv_stages
 
 
 def cache_write_slots(num_kv_stages: int, items_per_step: int) -> int:
@@ -683,8 +698,9 @@ def kvcache_kernel(
     # stage puts tokens on a leading axis, where each token is whole tiles and
     # the 8-row granule is exact.
     cache_tile_rows = BF16_TILE_ROWS if is_cache_head_major else NUM_SUBLANES
-    num_slots = kv_staging_slots(num_kv_stages, items_per_step)
+    num_slots = kv_staging_slots(num_kv_stages, items_per_step, batch)
     num_write_slots = cache_write_slots(num_kv_stages, items_per_step)
+    is_carrying = carries_last_pv(items_per_step, batch)
     num_items = schedule_ref[layout.num_items_offset]
     num_steps = pl.cdiv(num_items, items_per_step)
 
@@ -916,13 +932,15 @@ def kvcache_kernel(
 
     # Note (david): staged V rows a block never loads keep whatever VMEM held;
     # start them finite so a zero probability times a stale row stays zero.
-    if is_merged_cache and is_bitcast_load:
-        # Note: through its (tokens * word_stride, head_dim) word view a slot
-        # zeroes in whole 8-row stores; the 5-D view's one-word token rows took
-        # one store per row. A head_dim wider than the lanes zeroes through
-        # the 128-lane rows its K loads read; the head_dim-wide view stored
-        # each token row with 2 of 8 sublanes.
-        for zero_slot in range(num_slots):
+    # After a slot's first block its rows hold an earlier block, which is
+    # finite, so only a slot's first use needs the zeros.
+    def _zero_staging_slot(zero_slot):
+        if is_merged_cache and is_bitcast_load:
+            # Note: through its (tokens * word_stride, head_dim) word view a
+            # slot zeroes in whole 8-row stores; the 5-D view's one-word token
+            # rows took one store per row. A head_dim wider than the lanes
+            # zeroes through the 128-lane rows its K loads read; the
+            # head_dim-wide view stored each token row with 2 of 8 sublanes.
             slot_words = staged_words(value_buffers, zero_slot)
             num_word_rows, word_lanes = slot_words.shape
             if word_lanes > NUM_LANES:
@@ -931,14 +949,14 @@ def kvcache_kernel(
                 )
             else:
                 zeroed_rows = slot_words
-            zeroed_rows[...] = jnp.zeros(zeroed_rows.shape, jnp.uint32)
-    else:
-        value_words = (
-            value_buffers.bitcast(jnp.uint32)
-            if is_bitcast_load
-            else value_buffers
-        )
-        value_words[...] = jnp.zeros(value_words.shape, value_words.dtype)
+        else:
+            value_words = (
+                value_buffers.bitcast(jnp.uint32)
+                if is_bitcast_load
+                else value_buffers
+            )
+            zeroed_rows = value_words.at[zero_slot]
+        zeroed_rows[...] = jnp.zeros(zeroed_rows.shape, zeroed_rows.dtype)
 
     # Note (deepolar): every sequence folds the same sinks, so they load once.
     sinks = sinks_ref[...] if has_sinks else None
@@ -1290,13 +1308,14 @@ def kvcache_kernel(
             lse_ref[pl.ds(row, 1), :, :] = lse[None, :, :]
         _output_copy(row, output_slot).start()
 
-    # Note (david): the mask-free and live-tile copies leave their last
-    # fragment's PV pending, and the next copy issues it after its own first
-    # score and softmax, as the varlen kernels do across blocks and rows: a
-    # 4:1-head row's score, softmax and PV are one dependent chain, and the
-    # pending PV gives the MXU independent work while the next chain waits on
-    # its matmul. The PV lands in its row's parity, and the row's output
-    # finish follows it when it was the row's last.
+    # Note (david): in a carrying call (carries_last_pv), the mask-free and
+    # live-tile copies leave their last fragment's PV pending, and the next
+    # copy issues it after its own first score and softmax, as the varlen
+    # kernels do across blocks and rows: a 4:1-head row's score, softmax and
+    # PV are one dependent chain, and the pending PV gives the MXU independent
+    # work while the next chain waits on its matmul. The PV lands in its row's
+    # parity, and the row's output finish follows it when it was the row's
+    # last. A one-row call runs that PV and the finish in place.
     last_head_group = num_head_groups - 1
 
     def _take_pending():
@@ -1327,8 +1346,13 @@ def kvcache_kernel(
             parity,
         )
 
+        _finish_if_last(finish_row, parity)
+
+    def _finish_if_last(finish_row, parity):
+        """Finish row finish_row (-1: none) from its parity's state."""
+
         @pl.when(finish_row >= 0)
-        def _finish_pending_row():
+        def _finish_last():
             _finish_row(finish_row, parity)
 
     def _carry_out(
@@ -1409,7 +1433,7 @@ def kvcache_kernel(
                         row_sum,
                     )
                 )
-                if fragment_index == 0:
+                if fragment_index == 0 and is_carrying:
                     _take_pending()
                 if kv_compute_index == num_kv_compute_fragments - 1:
                     row_max_ref[parity, group_slice, :] = row_max
@@ -1423,17 +1447,21 @@ def kvcache_kernel(
                     rescale,
                     values,
                 )
-            _, last_kv_compute_index, probabilities, rescale, _ = (
-                pending_fragment
-            )
-            _carry_out(
-                slot,
-                last_kv_compute_index,
-                probabilities,
-                rescale,
-                parity,
-                finish_row,
-            )
+            if is_carrying:
+                _, last_kv_compute_index, probabilities, rescale, _ = (
+                    pending_fragment
+                )
+                _carry_out(
+                    slot,
+                    last_kv_compute_index,
+                    probabilities,
+                    rescale,
+                    parity,
+                    finish_row,
+                )
+            else:
+                _pv(slot, *pending_fragment, parity)
+                _finish_if_last(finish_row, parity)
 
         def _attend_live_tiles():
             first_fragment = (
@@ -1474,7 +1502,7 @@ def kvcache_kernel(
                             row_sum_prev,
                         )
                     )
-                    if head_group == 0:
+                    if head_group == 0 and is_carrying:
                         _take_pending()
                     if pending_fragment is not None:
                         _pv(slot, *pending_fragment, parity)
@@ -1486,17 +1514,22 @@ def kvcache_kernel(
                         values,
                     )
                     next_row_states.append((row_max, row_sum))
-                _, _, probabilities, rescale, _ = pending_fragment
-                _carry_out(
-                    slot,
-                    kv_compute_index,
-                    probabilities,
-                    rescale,
-                    parity,
-                    jnp.where(
-                        kv_compute_index == end_fragment - 1, finish_row, -1
-                    ),
-                )
+                if is_carrying:
+                    _, _, probabilities, rescale, _ = pending_fragment
+                    _carry_out(
+                        slot,
+                        kv_compute_index,
+                        probabilities,
+                        rescale,
+                        parity,
+                        jnp.where(
+                            kv_compute_index == end_fragment - 1,
+                            finish_row,
+                            -1,
+                        ),
+                    )
+                else:
+                    _pv(slot, *pending_fragment, parity)
                 return tuple(next_row_states)
 
             row_states = lax.fori_loop(
@@ -1516,6 +1549,8 @@ def kvcache_kernel(
             ):
                 row_max_ref[parity, group_slice, :] = row_max
                 row_sum_ref[parity, group_slice, :] = row_sum
+            if not is_carrying:
+                _finish_if_last(finish_row, parity)
 
         if num_kv_compute_fragments == 1:
             _attend_every_tile()
@@ -1567,9 +1602,10 @@ def kvcache_kernel(
         # output (zeros, or its sinks' fold), after the previous row's.
         @pl.when(is_empty_row)
         def _finish_empty_row():
-            _take_pending()
-            pending_ref[PENDING_PARITY] = TRASH_PARITY
-            pending_ref[PENDING_FINISH_ROW] = -1
+            if is_carrying:
+                _take_pending()
+                pending_ref[PENDING_PARITY] = TRASH_PARITY
+                pending_ref[PENDING_FINISH_ROW] = -1
             _finish_row(row, parity)
 
         @pl.when(jnp.logical_not(is_empty_row))
@@ -1882,6 +1918,13 @@ def kvcache_kernel(
                     sems.at[SEM_K_WRITE, 0, 0],
                 ).start()
 
+        # Note (david): the prologue's copies fill every slot at once, so all
+        # are zeroed first; the new tokens' writes land in HBM meanwhile.
+        for zero_slot in range(num_slots):
+            _zero_staging_slot(zero_slot)
+
+        if has_new:
+
             # Note (david): a DMA semaphore counts bytes, so one wait sized to
             # every row's token covers all the writes (src == dst: only the
             # size matters).
@@ -1898,18 +1941,11 @@ def kvcache_kernel(
             )
         lax.fori_loop(0, num_steps, _process_step, 0)
     else:
-        # Note (david): the first item takes a pending PV aimed at the trash
-        # accumulator, so no copy branches on whether one is pending.
-        pending_ref[PENDING_SLOT] = 0
-        pending_ref[PENDING_KV_COMPUTE] = 0
-        pending_ref[PENDING_PARITY] = TRASH_PARITY
-        pending_ref[PENDING_FINISH_ROW] = -1
-        pending_probabilities_ref[...] = jnp.zeros(
-            pending_probabilities_ref.shape, pending_probabilities_ref.dtype
-        )
-        pending_rescale_ref[...] = jnp.zeros(
-            pending_rescale_ref.shape, jnp.float32
-        )
+        # Note (david): item i stages into slot i % num_slots, so the first
+        # item's slot is zeroed before its copy starts, and slot k only when
+        # an item k exists, behind that copy. At one short row the prologue
+        # then zeroes one slot, not the whole ring.
+        _zero_staging_slot(0)
 
         @pl.when(num_active > 0)
         def _prefetch_first_q():
@@ -1919,9 +1955,30 @@ def kvcache_kernel(
         def _prefetch_first_item():
             _start_item_kv(0, 0)
 
+        if is_carrying:
+            # Note (david): the first item takes a pending PV aimed at the
+            # trash accumulator, so no copy branches on whether one is
+            # pending.
+            pending_ref[PENDING_SLOT] = 0
+            pending_ref[PENDING_KV_COMPUTE] = 0
+            pending_ref[PENDING_PARITY] = TRASH_PARITY
+            pending_ref[PENDING_FINISH_ROW] = -1
+            pending_probabilities_ref[...] = jnp.zeros(
+                pending_probabilities_ref.shape,
+                pending_probabilities_ref.dtype,
+            )
+            pending_rescale_ref[...] = jnp.zeros(
+                pending_rescale_ref.shape, jnp.float32
+            )
+        for zero_slot in range(1, num_slots):
+            pl.when(num_items > zero_slot)(
+                functools.partial(_zero_staging_slot, zero_slot)
+            )
+
         lax.fori_loop(0, num_items, _process_item, 0)
-        # Note (david): the last block's PV and its row's finish run here.
-        _take_pending()
+        if is_carrying:
+            # Note (david): the last block's PV and its row's finish run here.
+            _take_pending()
 
     # Note (david): the kernel must not exit with DMAs in flight, and the
     # one-item loop leaves its last NUM_IO_STAGES output copies and last
@@ -1978,20 +2035,19 @@ def kvcache_config_vmem_bytes(
     """VMEM bytes of the kernel's scratch at a config."""
     # Note (david): this must mirror the scratch shapes below; the extra
     # BF16_TILE_ROWS rows per stage bound the cache write tiles, and the two
-    # extra heads per token bound a staged block's bank pad word row. The
-    # one-item staging ring holds one block more than num_kv_stages, the
-    # pending PV's, whose probabilities are at most one 8-row query tile of a
-    # head pair's keys. A packed slot holds a step's blocks, and the packed
-    # kernel keeps the whole q and out in VMEM.
+    # extra heads per token bound a staged block's bank pad word row. A
+    # carrying one-item staging ring holds one block more than num_kv_stages,
+    # the pending PV's, whose probabilities are at most one 8-row query tile
+    # of a head pair's keys. A packed slot holds a step's blocks, and the
+    # packed kernel keeps the whole q and out in VMEM.
+    num_slots = kv_staging_slots(num_kv_stages, items_per_step, batch)
     if items_per_step == 1:
-        staged_tokens = (num_kv_stages + 1) * (block_kv + BF16_TILE_ROWS)
+        staged_tokens = num_slots * (block_kv + BF16_TILE_ROWS)
         q_o_rows = 2
         accumulator_itemsize = BF16_BYTES
     else:
         staged_tokens = (
-            kv_staging_slots(num_kv_stages, items_per_step)
-            * items_per_step
-            * block_kv
+            num_slots * items_per_step * block_kv
             + (cache_write_slots(num_kv_stages, items_per_step) + 1)
             * BF16_TILE_ROWS
         )
@@ -2474,7 +2530,7 @@ def flash_attn_kvcache_pallas(
     is_bitcast_load = not interpret and not is_cache_head_major
     staged_kv_heads = cache_shape[2] if merged_cache else num_kv_heads
     word_rows = kv_word_rows(k_cache.dtype)
-    num_slots = kv_staging_slots(num_kv_stages, items_per_step)
+    num_slots = kv_staging_slots(num_kv_stages, items_per_step, batch)
     num_write_slots = cache_write_slots(num_kv_stages, items_per_step)
 
     def _staging_shape(num_stages, num_tokens, word_stride):
