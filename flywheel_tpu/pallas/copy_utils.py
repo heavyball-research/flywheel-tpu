@@ -26,9 +26,8 @@ MERGED_KV_DTYPES = (
 # both. An odd fp8 head count pads one zero head. An fp8 head's (K, V) bytes
 # share one 16-bit half (batched RPA's order), so its unpack is one u32 -> u16
 # pack and a u16-level shift for V. The head pair's (K, K, V, V) order this
-# replaced kept V in the other half, a u32 shift of every staged word: 1.5x the
-# VALU work of a 4:1-head fp8 decode step at one KV head (v7x, 192 against 128
-# VALU bundles per 1K keys).
+# replaced kept V in the other half, a u32 shift of every staged word, which
+# added VALU work to every fp8 decode step at one KV head.
 
 
 def check_merged_kv_dtype(dtype: jnp.dtype) -> None:

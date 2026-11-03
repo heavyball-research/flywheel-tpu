@@ -302,9 +302,8 @@ def fragment_geometry(
     # query rows, and the head keeps its own rows of the result. The group then
     # runs one softmax over a full f32 tile instead of one per head over a
     # mostly empty one, and its running max, sum and accumulator are whole
-    # tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block loop went
-    # from 7149 to 5223 bundles (RPA v3: 7165), losing the per-head cross-lane
-    # broadcasts, sublane rotates and single-row state stores.
+    # tiles, which drops the per-head cross-lane broadcasts, sublane rotates
+    # and single-row state stores.
     if (
         is_merged_cache
         and not is_pair_word_fragment
@@ -429,8 +428,8 @@ def build_decode_schedule(
 
     # Note (david): items find their row through a (max_items, batch)
     # membership mask and its row reductions, all vector work; gathering and
-    # scattering over a compacted page list instead cost ~300 us a step on v6e
-    # (batch 64, 4096 pages).
+    # scattering over a compacted page list instead is scalar work that grows
+    # with the page count.
     items = jnp.arange(layout.max_items, dtype=jnp.int32)
     is_in_row = (items[:, None] >= row_item_start[None, :]) & (
         items[:, None] < row_item_end[None, :]
@@ -471,8 +470,8 @@ def build_decode_schedule(
     if layout.pages_per_item:
         # Note (david): a copy then issues with one block_table read, not a
         # ~18-op cache_batch_idx / block_table / clip chain. Gathering every
-        # item's pages here instead cost 20 us a call at capacity 16128 (v6e).
-        # A padding item's base is clipped into the table, and its copies are
+        # item's pages here instead is a gather per page of every item. A
+        # padding item's base is clipped into the table, and its copies are
         # empty.
         table_base = jnp.clip(
             _at_row(cache_row) * pages_per_seq
@@ -761,8 +760,7 @@ def kvcache_kernel(
             # its straight-line body, where their scalar address work rides
             # the vector bundles, as batched RPA's copy_in does. Guarded by
             # load_size and looped over the block's live pages, they ran as
-            # their own basic blocks: 10.1k of 64.1k bundles a call held no
-            # vector op (v7x, 64 rows of 1300-2300 tokens, 768 x 8).
+            # their own basic blocks, bundles that held no vector op.
             if page_size is None:
                 _issue(
                     cache_batch_idx_ref[_item_field("row", item)],
@@ -802,9 +800,9 @@ def kvcache_kernel(
                 )
             else:
                 # Note (david): a block copies only the pages that hold its
-                # tokens, each a full page but the clipped last; issuing every
-                # page of a large block, most empty at short context, cost
-                # about 1 us a row at 8192-token blocks (v6e, batch 8).
+                # tokens, each a full page but the clipped last; a large block
+                # at short context is mostly empty pages, and issuing them all
+                # costs a copy each.
                 row = _item_field("row", item)
                 table_base = cache_batch_idx_ref[
                     row
@@ -917,12 +915,9 @@ def kvcache_kernel(
     if is_merged_cache and is_bitcast_load:
         # Note: through its (tokens * word_stride, head_dim) word view a slot
         # zeroes in whole 8-row stores; the 5-D view's one-word token rows took
-        # one store per row. v7x, 32:8 heads, two 2048-token stages: 18450 ->
-        # 2322 bundles a call. A head_dim wider than the lanes zeroes through
+        # one store per row. A head_dim wider than the lanes zeroes through
         # the 128-lane rows its K loads read; the head_dim-wide view stored
-        # each token row with 2 of 8 sublanes (v7x, 1 KV head of 256, two
-        # 768 x 8 stages: 12288 -> 3072 stores, 6438 -> 1828 bundles before
-        # the step loop).
+        # each token row with 2 of 8 sublanes.
         for zero_slot in range(num_slots):
             slot_words = staged_words(value_buffers, zero_slot)
             num_word_rows, word_lanes = slot_words.shape
@@ -1040,7 +1035,7 @@ def kvcache_kernel(
         """(is_valid, fragment_has_valid_key) of the fragment at key_start."""
         # Note (david): build the mask at full fragment shape; a (1, N) mask
         # needs a sublane-broadcast relayout inside every fragment's select,
-        # which measured ~40% of MQA decode time.
+        # which dominated MQA decode.
         key_position = (
             key_start
             + lax.broadcasted_iota(
@@ -1097,10 +1092,9 @@ def kvcache_kernel(
         if is_merged_cache:
             # Note (david): a head's K and V share their u32 words, so the
             # score's word load also yields the values, held until this
-            # fragment's pv. Loading the words again for pv cost 1.30x the
-            # blocked layout's MHA decode (32 KV heads of 256, batch 32,
-            # v6e), whose 32-row word stride takes the costly strided load;
-            # one load is at parity.
+            # fragment's pv. Loading the words again for pv made MHA decode
+            # slower than the blocked layout's, since its 32-row word stride
+            # takes the costly strided load; one load is at parity.
             scores = None
             values = []
             for group_member in range(kv_heads_per_group):
@@ -1526,14 +1520,10 @@ def kvcache_kernel(
             # one pipeline over all its fragments, as before; only a partial
             # block (a row's last, or a window's first) loops over the tiles
             # holding its keys, as RPA v3 runs cdiv(kv_len, bkv_csz) tiles.
-            # Running every tile of a partial block made a row cost the
-            # whole block: at Qwen3-4B's 16:4 heads, batch 128 and kv_len
-            # 256 on v6e, the 8192-token blocks of 2048-token tiles of #14's
-            # v7x entries took 4.33 us a row against 1.67 us looping over
-            # the first tile alone (RPA v3: 3.32 us). The loop drains the
-            # pipeline at every tile, so full blocks keep the single
-            # pipeline: looping over them took 1.21x as long at 2048-token
-            # blocks of 256-token tiles and kv_len 4608.
+            # Running every tile of a partial block made a short row cost the
+            # whole block, as with the 8192-token blocks of #14's v7x
+            # entries. The loop drains the pipeline at every tile, so full
+            # blocks keep the single pipeline; looping over them was slower.
             is_block_full = jnp.logical_and(
                 block_start + block_kv <= total_len,
                 first_key <= block_start,
@@ -1661,10 +1651,9 @@ def kvcache_kernel(
         # matmul plus the softmax, and the in-order MXU pushes at most one V
         # tile ahead of it, so only the K pushes ahead of it in program order
         # fill that wait. Two halves put the second half's K ahead of the
-        # first half's PV and every K push ahead of every V push (v7x,
-        # 768 x 8: 1491 cycles a step, 1 spill). Groups of 1 or 2 items left
-        # the MXU waiting at each PV while the K unpack ran ahead into spills
-        # (2328 and 1881 cycles, 190 and 254 spills).
+        # first half's PV and every K push ahead of every V push. Groups of 1
+        # or 2 items left the MXU waiting at each PV while the K unpack ran
+        # ahead into spills.
         half_size = -(-len(items) // 2)
         running = [(row_max, row_sum) for row_max, row_sum, _ in states]
         accumulators = [accumulator for _, _, accumulator in states]
@@ -1737,8 +1726,7 @@ def kvcache_kernel(
                     # Note (david): the V words the QK loaded are unpacked
                     # there and kept in VMEM for the PV. Left as values, the
                     # scheduler loaded every staged word twice, for the QK and
-                    # for the PV (v7x, 768 x 8: 3064 word loads a step for
-                    # 1536 word vregs).
+                    # for the PV.
                     for member, value in enumerate(values):
                         staged_values_ref[
                             _staged_value_index(
@@ -1792,9 +1780,8 @@ def kvcache_kernel(
     # its compute, into the slot it just read, so they overlap a whole step of
     # compute even at two stages. Issued before the compute, num_kv_stages - 1
     # steps ahead into the slot the step before freed, they still sank to the
-    # step's end, where the next step waited on them at once (v6e, 768 x 8,
-    # 1300-2300 tokens: 117.1 us at two stages and 84.8 at three, against
-    # 83.2 at two issued after the compute).
+    # step's end, where the next step waited on them at once, and two stages
+    # needed a third to hide them.
     prefetch_distance = num_kv_stages
 
     def _process_step(step, carry):
@@ -1805,8 +1792,8 @@ def kvcache_kernel(
         slot = lax.rem(step, num_kv_stages)
 
         # Note (david): the wait comes first, so the items' scalar header below
-        # rides the vector work after it; behind the header it held 57
-        # scalar-only bundles of every step (v7x, 768 x 8). The K loads follow
+        # rides the vector work after it; behind the header every step held
+        # scalar-only bundles. The K loads follow
         # the wait, which no vector op crosses (the region, if-converted, is no
         # block boundary).
         @pl.when(step >= 0)
@@ -1872,10 +1859,10 @@ def kvcache_kernel(
         if has_new:
             # Note (david): every staged block then already holds its row's
             # new token, so a step stitches no append into its staging.
-            # Stitched per step, the 8 items' tile read-modify-writes and
-            # write-backs were a 317-bundle basic block of every 1865-bundle
-            # step, and the step's spills fell 55 -> 1 without them (v7x,
-            # 768 x 8). A row past num_active writes 0 tokens, with no branch.
+            # Stitched per step, the items' tile read-modify-writes and
+            # write-backs were a basic block of their own in every step, and
+            # most of the step's spills. A row past num_active writes 0
+            # tokens, with no branch.
             num_writes = jnp.minimum(num_active, batch)
             for row in range(batch):
                 num_tokens = jnp.where(row < num_writes, 1, 0)
