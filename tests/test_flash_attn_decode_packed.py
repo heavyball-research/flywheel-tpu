@@ -272,23 +272,44 @@ def test_packed_decode_matches_one_item_kernel(force_config, items_per_step):
         )
 
 
-def test_default_packed_config_stops_at_the_max_block():
+QWEN35_DECODE = dict(
+    num_query_heads=4,
+    num_kv_heads=1,
+    head_dim=256,
+    capacity=16128,
+    kv_itemsize=1,
+    page_size=256,
+)
+
+
+@pytest.mark.parametrize("device_name", ["TPU v6", "TPU v7", "cpu"])
+def test_default_packed_config_stops_at_the_max_block(device_name):
     config = flash_fwd_kvcache.default_packed_config(
-        num_query_heads=4,
-        num_kv_heads=1,
-        head_dim=256,
-        capacity=16128,
-        kv_itemsize=1,
-        batch=64,
-        page_size=256,
+        batch=64, device_name=device_name, **QWEN35_DECODE
     )
-    max_block_kv = flash_fwd_kvcache.PACKED_MAX_BLOCK_KV
+    items_per_step, max_block_kv = flash_fwd_kvcache.PACKED_STEP_LIMITS.get(
+        device_name, flash_fwd_kvcache.DEFAULT_PACKED_STEP_LIMITS
+    )
     assert config == (
         max_block_kv,
-        flash_fwd_kvcache.resolve_block_kv_compute(max_block_kv),
+        max_block_kv,
         flash_fwd_kvcache.DEFAULT_NUM_KV_STAGES,
-        flash_fwd_kvcache.PACKED_ITEMS_PER_STEP,
+        items_per_step,
     )
+
+
+@pytest.mark.parametrize("device_name", ["TPU v6", "TPU v7"])
+@pytest.mark.parametrize("batch", [1, 2, 3])
+def test_default_packed_config_steps_no_wider_than_the_batch(
+    device_name, batch
+):
+    config = flash_fwd_kvcache.default_packed_config(
+        batch=batch, device_name=device_name, **QWEN35_DECODE
+    )
+    if batch == 1:
+        assert config is None
+    else:
+        assert config[3] == batch
 
 
 def test_default_packed_config_fills_the_vmem_budget():
@@ -301,9 +322,9 @@ def test_default_packed_config_fills_the_vmem_budget():
         batch=64,
     )
     config = flash_fwd_kvcache.default_packed_config(
-        capacity=16128, page_size=256, **shape
+        capacity=16128, page_size=256, device_name="TPU v6", **shape
     )
-    block_kv, _, num_kv_stages, items_per_step = config
+    block_kv, block_kv_compute, num_kv_stages, items_per_step = config
     budget = (
         flash_fwd_kvcache.PACKED_VMEM_FRACTION
         * flash_fwd_kvcache.vmem_limit_bytes()
@@ -311,17 +332,42 @@ def test_default_packed_config_fills_the_vmem_budget():
 
     def vmem_bytes(block):
         return flash_fwd_kvcache.kvcache_config_vmem_bytes(
-            block,
-            flash_fwd_kvcache.resolve_block_kv_compute(block),
-            num_kv_stages,
-            items_per_step,
-            **shape,
+            block, block, num_kv_stages, items_per_step, **shape
         )
 
-    assert block_kv < flash_fwd_kvcache.PACKED_MAX_BLOCK_KV
+    _, max_block_kv = flash_fwd_kvcache.DEFAULT_PACKED_STEP_LIMITS
+    assert block_kv_compute == block_kv < max_block_kv
     assert block_kv % flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE == 0
     next_block_kv = block_kv + flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE
     assert vmem_bytes(block_kv) <= budget < vmem_bytes(next_block_kv)
+
+
+def test_validate_takes_a_paged_block_that_does_not_divide_capacity():
+    # Note (david): 768 tokens are whole 256-token pages but not a divisor of
+    # 64 pages; a paged table is padded to whole blocks.
+    shape = dict(
+        num_query_heads=4,
+        num_kv_heads=1,
+        head_dim=256,
+        capacity=16384,
+        kv_itemsize=1,
+        batch=64,
+    )
+    config = (768, 768, 2, 8)
+    assert (
+        flash_fwd_kvcache.validate_kvcache_config(
+            config, page_size=256, **shape
+        )
+        == config
+    )
+    with pytest.raises(ValueError, match="multiple of page_size"):
+        flash_fwd_kvcache.validate_kvcache_config(
+            (640, 640, 2, 8), page_size=256, **shape
+        )
+    with pytest.raises(ValueError, match="divisor of capacity"):
+        flash_fwd_kvcache.validate_kvcache_config(
+            config, page_size=None, **shape
+        )
 
 
 def test_packed_config_rejects_bad_items_per_step(force_config):
