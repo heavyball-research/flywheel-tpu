@@ -1558,12 +1558,11 @@ def flash_attn_with_kvcache(
       per query row, identity by default.
     - block_table given, paged merged: k_cache is one (num_pages, page_size,
       cache_heads, head_dim) pool whose token rows interleave the KV heads' K
-      and V rows, page_size a multiple of 128, and v_cache is None. A bf16 pool
+      and V rows, page_size a multiple of 128, and v_cache is None. A pool
       holds each KV head's K then its V, [k0, v0, k1, v1, ...] (RPA v3's head
-      order), cache_heads = 2 * nheads_k. A float8_e4m3fn or float8_e5m2 pool
-      holds each head pair's two K rows then its two V rows, [k0, k1, v0, v1,
-      ...], an odd nheads_k padded with one zero head (cache_heads = 2 *
-      nheads_k rounded up to a multiple of 4). block_table: (batch,
+      order): cache_heads = 2 * nheads_k for bf16; a float8_e4m3fn or
+      float8_e5m2 pool pads an odd nheads_k with one zero head (cache_heads =
+      2 * nheads_k rounded up to a multiple of 4). block_table: (batch,
       max_pages_per_seq) int mapping each row's positions to pages;
       cache_batch_idx must be None. Pages an append writes must be private to
       the request.

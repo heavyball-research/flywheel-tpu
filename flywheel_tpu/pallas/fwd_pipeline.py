@@ -529,7 +529,7 @@ def fwd_body(
     # Note (david): a paged group is the gqa_fold q heads of one kv head, which
     # read its (K, V) rows; those of one page are the u32 word window of the
     # interleaved cache's head axis that holds them, one DMA: a bf16 head's
-    # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
+    # [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows [k, v, k', v'].
     assert not is_paged or head_fold == 1, head_fold
     if is_paged:
         word_rows = kv_word_rows(kv_pair_buf.dtype)
@@ -1529,8 +1529,7 @@ def fwd_body(
                                 kv_slot,
                                 tile_rows,
                                 0,
-                                kv_part * heads_per_word
-                                + staged_kv_head % heads_per_word,
+                                2 * (staged_kv_head % heads_per_word) + kv_part,
                                 :,
                             ]
                             for kv_part in range(2)

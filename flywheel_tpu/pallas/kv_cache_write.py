@@ -1,9 +1,9 @@
 """Write new K/V rows into the merged interleaved paged KV cache.
 
 The cache is (num_pages, page_size, cache_heads, head_dim) whose token rows
-interleave the kv heads' K and V rows: bf16 [k0, v0, k1, v1, ...] with
-cache_heads = 2 * nheads_k, fp8 [k0, k1, v0, v1, ...] with nheads_k padded to
-even (copy_utils.merged_cache_heads). K and V rows share one u32 word per
+interleave the kv heads' K and V rows, [k0, v0, k1, v1, ...], with
+cache_heads = 2 * nheads_k (fp8: nheads_k padded to even,
+copy_utils.merged_cache_heads). K and V rows share one u32 word per
 lane, so they cannot be written into their rows separately (a size-1 window
 of the tiled head axis does not compile, and a strided one is not
 expressible); the writer stages both in VMEM, interleaves them there and
