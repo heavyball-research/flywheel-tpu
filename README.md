@@ -63,7 +63,7 @@ and training on TPU v6e and v7x.
 
 Latest: [![GitHub Release](https://img.shields.io/github/v/release/heavyball-research/flywheel-tpu)](https://github.com/heavyball-research/flywheel-tpu/releases/latest)
 
-- [2026/11] [v0.4.1](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.4.1): a decode kernel that pipelines several rows' KV blocks per step, GDN conv pools read in place in vllm-torchtpu's slot-major layout, and v7x entries for Qwen3.5-35B's head_dim 256
+- [2026/11] [v0.4.1](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.4.1): optimized decode kernel and GDN conv pools
 - [2026/11] Paper on arXiv: [FlyWheel: Attention Kernels Built for the TPU](https://arxiv.org/abs/2611.01426)
 - [2026/10] [v0.4.0](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.4.0): fp8 paged KV cache, speculative verify windows on the decode kernel, and attention sinks
 - [2026/10] [tpu-inference](https://github.com/vllm-project/tpu-inference) adds FlyWheel as `--attention-backend flywheel` ([#3837](https://github.com/vllm-project/tpu-inference/pull/3837))
