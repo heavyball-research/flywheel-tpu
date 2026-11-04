@@ -1564,7 +1564,7 @@ def kvcache_kernel(
 
     def _attend_packed_step(slot, items, states, value_base):
         """Run the step's items through the prefill kernels' fragment pipeline
-        (fwd_pipeline) in two halves: a half scores its items and continues
+        (fwd_blocks) in two halves: a half scores its items and continues
         the online softmax through them, then issues the PV the previous half
         left pending; the last half's PV runs at the step's end. states are
         per head group (row_max, row_sum, accumulator).
