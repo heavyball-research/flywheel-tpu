@@ -456,7 +456,7 @@ def wait_kv_block(
 # Note (david): a paged group is the gqa_fold q heads of one kv head, which
 # read its (K, V) rows; those of one page are the u32 word window of the
 # interleaved cache's head axis that holds them, one DMA: a bf16 head's
-# [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows.
+# [2 * kv_head, 2 * kv_head + 2), an fp8 head pair's 4 rows [k, v, k', v'].
 @dataclasses.dataclass(frozen=True, eq=False)
 class PagedKVRefs:
     """The paged K and V stream: the merged interleaved cache (num_pages,

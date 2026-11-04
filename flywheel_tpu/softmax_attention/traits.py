@@ -398,7 +398,9 @@ class DecodeTraits:
 
     num_q_heads counts every query row of a cache row: query_tokens > 1
     folds a verify window's tokens into the query heads. kv_config is
-    dispatch's (block_kv, block_kv_compute, num_kv_stages). is_merged_cache
+    dispatch's (block_kv, block_kv_compute, num_kv_stages, items_per_step);
+    items_per_step > 1 packs that many (row, block) items into one loop step,
+    on a merged cache only. is_merged_cache
     reads one cache whose token rows interleave the KV heads' K and V rows,
     else a K / V pair of cache_dtype. is_cache_head_major stages tokens on the
     sublane axis, and is_bitcast_load reads staged head pairs as u32 words,
@@ -425,6 +427,16 @@ class DecodeTraits:
 
     def __post_init__(self) -> None:
         num_kv_heads = self.num_kv_heads
+        if len(self.kv_config) != 4:
+            raise ValueError(
+                "kv_config is dispatch's (block_kv, block_kv_compute,"
+                f" num_kv_stages, items_per_step); got {self.kv_config}."
+            )
+        if self.is_packed and not self.is_merged_cache:
+            raise NotImplementedError(
+                "items_per_step > 1 packs merged-cache decode only; got a K/V"
+                " cache pair."
+            )
         if not self.is_merged_cache:
             if self.cache_dtype != jnp.bfloat16:
                 raise NotImplementedError(
@@ -466,6 +478,14 @@ class DecodeTraits:
         return self.kv_config[2]
 
     @property
+    def items_per_step(self) -> int:
+        return self.kv_config[3]
+
+    @property
+    def is_packed(self) -> bool:
+        return self.items_per_step > 1
+
+    @property
     def guard_threshold(self) -> float:
         # Note (david): a row's keys stay within the caller's capacity, which
         # the padded table does not raise, so the guard is sized on it.
@@ -499,8 +519,8 @@ class DecodeTraits:
     # groups unpack one head per fragment. A merged row's u32 word pairs a
     # head's K with its V instead, so a merged build always unpacks one head per
     # fragment.
-    # Note: an fp8 merged word holds a head pair's K bytes in its low half and
-    # V bytes in its high half, so the pair rides one fragment like the bf16
+    # Note: an fp8 merged word holds a head pair, each head's K byte then its
+    # V byte in one 16-bit half, so the pair rides one fragment like the bf16
     # head-pair bitcast.
     @property
     def is_pair_word_fragment(self) -> bool:
@@ -532,10 +552,8 @@ class DecodeTraits:
         # group's query rows, and the head keeps its own rows of the result. The
         # group then runs one softmax over a full f32 tile instead of one per
         # head over a mostly empty one, and its running max, sum and accumulator
-        # are whole tiles. At 32 KV heads of 256 (MHA) the v7x 512-token block
-        # loop went from 7149 to 5223 bundles (RPA v3: 7165), losing the
-        # per-head cross-lane broadcasts, sublane rotates and single-row state
-        # stores.
+        # are whole tiles, which drops the per-head cross-lane broadcasts,
+        # sublane rotates and single-row state stores.
         query_heads_per_kv_head = self.query_heads_per_kv_head
         if (
             self.is_merged_cache

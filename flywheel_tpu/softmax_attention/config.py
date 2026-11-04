@@ -84,9 +84,10 @@ MIN_Q_TILES_PER_BLOCK = 2
 # vmul jnp.exp lowers to on TPU. Gradient matmuls keep the true scale.
 LOG2E = math.log2(math.e)
 
-# The KV-cache decode kernel's (block_kv, block_kv_compute, num_kv_stages),
-# as dispatch picks it.
-KVCacheConfig = tuple[int, int, int]
+# The KV-cache decode kernel's (block_kv, block_kv_compute, num_kv_stages[,
+# items_per_step]). Note (david): a tuned entry without items_per_step runs
+# one (row, block) item per loop step; dispatch always resolves all four.
+KVCacheConfig = tuple[int, int, int] | tuple[int, int, int, int]
 
 
 def next_pow2(value: int) -> int:

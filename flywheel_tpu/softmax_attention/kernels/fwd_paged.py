@@ -296,7 +296,7 @@ def unpack_paged_block(
                     kv_slot,
                     tile_rows,
                     0,
-                    kv_part * heads_per_word + kv_head % heads_per_word,
+                    2 * (kv_head % heads_per_word) + kv_part,
                     :,
                 ]
                 for kv_part in range(2)

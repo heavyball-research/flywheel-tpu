@@ -31,12 +31,13 @@ head_fold the real num_heads, so a rounded-up entry could hand back a config
 the shape cannot build. A missing key returns None and the build takes its
 analytic default config; on a TPU that issues a UserWarning, once per key. A
 kvcache| key holds the contiguous KV-cache decode kernel's (block_kv,
-block_kv_compute, num_kv_stages); every other key holds a dense fwd / bwd
-CONFIG_FIELDS tuple.
+block_kv_compute, num_kv_stages[, items_per_step]); every other key holds a
+dense fwd / bwd CONFIG_FIELDS tuple.
 """
 
 import functools
 import json
+import math
 import pathlib
 import re
 import warnings
@@ -64,7 +65,7 @@ from .config import (
     pick_tile,
     vmem_limit_bytes,
 )
-from .kernels.decode import validate_kvcache_config
+from .kernels.decode import kvcache_config_vmem_bytes, validate_kvcache_config
 from .kernels.fwd_dense import (
     flash_attn_forward,
     flash_attn_forward_runtime_offset,
@@ -169,6 +170,23 @@ STAGED_KV_ELEMENT_BUDGET = 8 * 1024 * 1024
 # (1.82 ms when every tile of the block ran), while a 16K context took 15.53
 # against 15.33 ms.
 KVCACHE_MAX_BLOCK_KV = 1024
+# Note (david): a merged-cache decode's default packed config sizes like
+# batched RPA's decode: the device's items a step, never more than the batch's
+# rows, and fewer only when the smallest block does not fit; the block grows by
+# the MXU's 256 columns (v6e, v7x) while the kernel's VMEM stays within 80% of
+# the limit, up to the device's max block. Unlike the one-item loop, a packed
+# step runs every compute tile of its blocks, padding items included, so a row
+# pays for the empty keys of its last block, and a step wider than the batch
+# pays for whole blocks of nothing. The limits are heuristics, measured at one
+# shape, 4:1 heads of 256 with an fp8 cache: on v6e 768-token blocks had the
+# smallest worst case against the best block at each row length, and RPA's
+# larger blocks lost most on 256-token rows; on v7x 16 items of 512 tokens beat
+# 8 of 768 in all but one case. Other shapes take the same limits untuned.
+# Values are (items a step, max block_kv).
+DEFAULT_PACKED_STEP_LIMITS = (8, 768)
+PACKED_STEP_LIMITS = {"TPU v7": (16, 512)}
+PACKED_BLOCK_KV_GRANULE = 256
+PACKED_VMEM_FRACTION = 0.8
 # Note (david): the dq accumulator and stage buffers cap the useful backward
 # block at 1024, one rung below the forward's ladder.
 BWD_BLOCKS = (1024, 512, 256, 128)
@@ -365,23 +383,30 @@ def get_tuned_kvcache_config(
 
 
 def resolve_tuned_kvcache_config(
-    *, page_size: int | None, **key_fields: DTypeLike | int | bool | None
+    *,
+    page_size: int | None,
+    has_packed_default: bool,
+    **key_fields: DTypeLike | int | bool | None,
 ) -> KVCacheConfig | None:
     """The tuned config of one KV-cache decode build, or None for the
     kernel's default config.
 
     key_fields are kvcache_config_key's; page_size is the paged cache's, None
-    for the contiguous pair. A paged build rejects an entry whose block_kv is
-    not whole pages, with a warning.
+    for the contiguous pair. has_packed_default skips a one-item (3-field)
+    entry. A paged build rejects an entry whose block_kv is not whole pages,
+    with a warning.
     """
     tuned_config = get_tuned_kvcache_config(**key_fields)
+    # TODO (david): the tuned table holds one-item configs, tuned before the
+    # packed kernel existed, and needs re-tuning with packed (4-field)
+    # entries. Until then a merged-cache decode with a packed default skips a
+    # 3-field entry and takes that default; a 4-field config still applies,
+    # items_per_step 1 for the one-item kernel.
+    if tuned_config is None or (has_packed_default and len(tuned_config) == 3):
+        return None
     # Note (david): a paged block is whole pages, so a tuned block_kv that does
     # not tile the page cannot be used as-is.
-    if (
-        tuned_config is not None
-        and page_size is not None
-        and tuned_config[0] % page_size
-    ):
+    if page_size is not None and tuned_config[0] % page_size:
         warn_untuned(
             TUNED_CONFIGS_PATH,
             kvcache_config_key(**key_fields),
@@ -389,8 +414,77 @@ def resolve_tuned_kvcache_config(
             f" page size {page_size}, and a paged block must be whole pages",
         )
         return None
+    return tuned_config
+
+
+def default_packed_config(
+    *,
+    num_query_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    capacity: int,
+    kv_itemsize: int,
+    batch: int,
+    page_size: int | None,
+    device_name: str,
+) -> KVCacheConfig | None:
+    """The merged-cache decode's default (block_kv, block_kv, num_kv_stages,
+    items_per_step), or None when the batch has one row or not even two
+    items a step fit the VMEM budget.
+
+    A packed step runs every compute tile of its blocks, so its compute tile
+    is the whole block.
+    """
+    max_items_per_step, max_block_kv = PACKED_STEP_LIMITS.get(
+        device_name, DEFAULT_PACKED_STEP_LIMITS
+    )
+    if page_size is None:
+        granule = PACKED_BLOCK_KV_GRANULE
     else:
-        return tuned_config
+        granule = math.lcm(PACKED_BLOCK_KV_GRANULE, page_size)
+    vmem_budget = PACKED_VMEM_FRACTION * vmem_limit_bytes()
+
+    def _fits(block_kv, items_per_step):
+        return (
+            kvcache_config_vmem_bytes(
+                block_kv,
+                block_kv,
+                DEFAULT_NUM_KV_STAGES,
+                items_per_step,
+                num_query_heads=num_query_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                kv_itemsize=kv_itemsize,
+                batch=batch,
+            )
+            <= vmem_budget
+        )
+
+    # Note (david): every active row holds at least one item, so with every
+    # row active a step no wider than the batch is at most half padding. At
+    # one row the one-item loop runs only the compute tiles that hold the
+    # row's keys.
+    items_per_step = min(max_items_per_step, batch)
+    while items_per_step > 1 and not _fits(granule, items_per_step):
+        items_per_step -= 1
+    if items_per_step == 1:
+        return None
+    # Note (david): a block is whole pages, so a page past the max block
+    # still makes a block of one granule.
+    block_kv = granule
+    while block_kv + granule <= min(capacity, max_block_kv) and _fits(
+        block_kv + granule, items_per_step
+    ):
+        block_kv += granule
+    # Note (david): a paged table is padded to whole blocks, but a cache
+    # without pages is split into them, so its block divides the capacity.
+    if page_size is None:
+        block_kv = next(
+            block
+            for block in range(block_kv, 0, -MIN_BLOCK_KV)
+            if capacity % block == 0
+        )
+    return block_kv, block_kv, DEFAULT_NUM_KV_STAGES, items_per_step
 
 
 def default_kvcache_config(
@@ -449,18 +543,39 @@ def resolve_kvcache_config(
     batch: int,
     append: bool,
     variant: Variant,
+    merged_cache: bool,
+    query_tokens: int,
 ) -> KVCacheConfig:
-    """The (block_kv, block_kv_compute, num_kv_stages) of one KV-cache decode
-    build: its tuned entry, validated against the build, or else
-    default_kvcache_config.
+    """The (block_kv, block_kv_compute, num_kv_stages, items_per_step) of one
+    KV-cache decode build: its tuned entry, else default_packed_config for a
+    merged-cache decode, else default_kvcache_config, validated against the
+    build.
 
     The arguments are resolve_tuned_kvcache_config's, with the key's
     sliding_window (the left window bound) and return_lse read from variant;
-    num_query_heads counts a folded window's tokens as query heads, as the
-    kernel does.
+    num_query_heads counts a folded window's query_tokens as query heads, as
+    the kernel does. merged_cache is the kernel's one merged cache operand.
     """
+    # Note (david): only a merged-cache decode, one query token a row, takes
+    # the packed default. A window folds its tokens into the query rows, and
+    # the packed step's score tiles, which the VMEM model leaves out, grow
+    # with them: 46 MiB past the model at 64 tokens of a 3-head GQA.
+    if merged_cache and query_tokens == 1:
+        packed_default = default_packed_config(
+            num_query_heads=num_query_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            capacity=capacity,
+            kv_itemsize=jnp.dtype(dtype).itemsize,
+            batch=batch,
+            page_size=page_size,
+            device_name=get_device_name(),
+        )
+    else:
+        packed_default = None
     tuned_config = resolve_tuned_kvcache_config(
         page_size=page_size,
+        has_packed_default=packed_default is not None,
         dtype=dtype,
         num_query_heads=num_query_heads,
         num_kv_heads=num_kv_heads,
@@ -471,22 +586,27 @@ def resolve_kvcache_config(
         sliding_window=variant.window[0],
         return_lse=variant.return_lse,
     )
-    if tuned_config is None:
-        return default_kvcache_config(
+    if tuned_config is not None:
+        config = tuned_config
+    elif packed_default is not None:
+        config = packed_default
+    else:
+        config = default_kvcache_config(
             capacity=capacity,
             page_size=page_size,
             head_dim=head_dim,
             num_kv_heads=num_kv_heads,
         )
-    else:
-        return validate_kvcache_config(
-            tuned_config,
-            num_query_heads=num_query_heads,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            capacity=capacity,
-            kv_itemsize=jnp.dtype(dtype).itemsize,
-        )
+    return validate_kvcache_config(
+        config,
+        num_query_heads=num_query_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        capacity=capacity,
+        kv_itemsize=jnp.dtype(dtype).itemsize,
+        batch=batch,
+        page_size=page_size,
+    )
 
 
 def resolve_bwd_config(

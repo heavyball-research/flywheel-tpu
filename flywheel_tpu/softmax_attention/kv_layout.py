@@ -22,12 +22,14 @@ MERGED_KV_DTYPES = (
 # operand.
 INTERLEAVE_STEP_ELEMENTS = 8192
 
-# Note (david): a merged-cache token keeps each KV head's K and V in one u32
-# word per lane, so one load yields both. A bf16 word is one head's (K, V),
-# rows [k0, v0, k1, v1, ...]; an fp8 word is a head pair's (K, K, V, V), rows
-# [k0, k1, v0, v1, ...], the bf16 interleave at 16-bit granularity, so the
-# fp8 pack needs no cross-sublane shuffle. An odd fp8 head count pads one zero
-# head.
+# Note (david): a merged-cache token's rows are each KV head's K row then its
+# V row, [k0, v0, k1, v1, ...], for every dtype, so one u32 word per lane holds
+# a bf16 head's (K, V) or an fp8 head pair's (K, V, K, V), and one load yields
+# both. An odd fp8 head count pads one zero head. An fp8 head's (K, V) bytes
+# share one 16-bit half (batched RPA's order), so its unpack is one u32 -> u16
+# pack and a u16-level shift for V. The head pair's (K, K, V, V) order this
+# replaced kept V in the other half, a u32 shift of every staged word, which
+# added VALU work to every fp8 decode step at one KV head.
 
 
 def check_merged_kv_dtype(dtype: jnp.dtype) -> None:
@@ -81,28 +83,45 @@ def resolve_merged_kv_heads(
 
 def interleave_kv_rows(k_rows: jax.Array, v_rows: jax.Array) -> jax.Array:
     """(..., heads, head_dim) K and V rows -> (..., 2 * heads, head_dim) merged
-    cache rows; an fp8 operand needs an even head count."""
-    # Note (david): the halves move as integers, so every bit pattern (NaN
-    # payloads, subnormals) survives; an fp8 pair packs into the 16-bit half.
-    k_bits = pltpu.bitcast(k_rows, jnp.uint16).astype(jnp.uint32)
-    v_bits = pltpu.bitcast(v_rows, jnp.uint16).astype(jnp.uint32)
-    return pltpu.bitcast(k_bits | (v_bits << BF16_BITS), k_rows.dtype)
+    cache rows, each head's K row then its V row."""
+    # Note (david): the rows move as integers, so every bit pattern (NaN
+    # payloads, subnormals) survives; a head's (K, V) pair is one integer of
+    # twice the dtype's width, which the bitcast back splits into its 2 rows.
+    bits = jnp.dtype(k_rows.dtype).itemsize * 8
+    element = jnp.dtype(f"uint{bits}")
+    pair = jnp.dtype(f"uint{2 * bits}")
+    k_bits = pltpu.bitcast(k_rows, element).astype(jnp.uint32)
+    v_bits = pltpu.bitcast(v_rows, element).astype(jnp.uint32)
+    return pltpu.bitcast(
+        (k_bits | (v_bits << jnp.uint32(bits))).astype(pair), k_rows.dtype
+    )
 
 
 def kv_word_halves(
     words: jax.Array, kv_head: jax.Array | int, dtype: jnp.dtype
 ) -> tuple[jax.Array, jax.Array]:
-    """(keys, values) of kv_head from its (rows, head_dim) u32 merged words."""
+    """(keys, values) of kv_head from its (rows, head_dim) u32 merged words;
+    rows is even for an fp8 cache."""
     if jnp.dtype(dtype) == jnp.bfloat16:
         keys, values = bf16_half(words, 0), bf16_half(words, 1)
     else:
-        head_in_word = jnp.asarray(
-            kv_head % kv_heads_per_word(dtype), jnp.uint32
+        # Note (david): the head's (K, V) bytes are the word's low (even head)
+        # or high (odd head) 16-bit half; pairs of those halves, viewed as u32,
+        # shift V into the low byte of each.
+        if isinstance(kv_head, int) and kv_head % 2 == 0:
+            head_bits = words
+        else:
+            head_bits = words >> (
+                jnp.asarray(kv_head % kv_heads_per_word(dtype), jnp.uint32)
+                * jnp.uint32(BF16_BITS)
+            )
+        halves = head_bits.astype(jnp.uint16)
+        keys = pltpu.bitcast(halves.astype(jnp.uint8), dtype)
+        value_bits = pltpu.bitcast(
+            pltpu.bitcast(halves, jnp.uint32) >> jnp.uint32(FP8_BITS),
+            jnp.uint16,
         )
-        key_shift = head_in_word * jnp.uint32(FP8_BITS)
-        key_bits = words >> key_shift
-        keys = pltpu.bitcast(key_bits.astype(jnp.uint8), dtype)
-        values = pltpu.bitcast((key_bits >> BF16_BITS).astype(jnp.uint8), dtype)
+        values = pltpu.bitcast(value_bits.astype(jnp.uint8), dtype)
     return keys, values
 
 

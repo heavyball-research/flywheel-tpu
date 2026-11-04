@@ -1,6 +1,6 @@
 .claude/
 .ruff_cache/
-docs/
+notes/
 __pycache__/
 *.pyc
 .venv/

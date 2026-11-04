@@ -1,6 +1,6 @@
 [project]
 name = "flywheel-tpu"
-version = "0.4.0"
+version = "0.4.1"
 description = "FlyWheel: attention kernels for TPU, implemented in JAX Pallas"
 dynamic = ["readme"]
 requires-python = ">=3.12"
@@ -65,14 +65,18 @@ path = "README.md"
 
 # Images -> raw URLs.
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
-pattern = '(src|srcset)="(assert/[^"]+)"'
+pattern = '(src|srcset)="(assets/[^"]+)"'
 replacement = '\1="https://raw.githubusercontent.com/heavyball-research/flywheel-tpu/main/\2"'
 
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
-pattern = '\]\((assert/[^)]+)\)'
+pattern = '\]\((assets/[^)]+)\)'
 replacement = '](https://raw.githubusercontent.com/heavyball-research/flywheel-tpu/main/\1)'
 
 # Remaining relative links -> GitHub blob pages.
 [[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
 pattern = '\]\((?!https?://|#)([^)]+)\)'
 replacement = '](https://github.com/heavyball-research/flywheel-tpu/blob/main/\1)'
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = 'href="(?!https?://|#)([^"]+)"'
+replacement = 'href="https://github.com/heavyball-research/flywheel-tpu/blob/main/\1"'
