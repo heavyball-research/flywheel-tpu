@@ -31,7 +31,8 @@ INTERNAL_EXPORTS = {
 }
 
 
-def __getattr__(name: str):
+# PEP 562 names the module hook __getattr__.
+def __getattr__(name: str):  # pylint: disable=invalid-name
     module_name = INTERNAL_EXPORTS.get(name)
     if module_name is None:
         raise AttributeError(f"module 'flywheel_tpu' has no attribute {name!r}")
