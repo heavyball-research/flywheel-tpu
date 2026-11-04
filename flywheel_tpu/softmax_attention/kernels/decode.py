@@ -11,22 +11,22 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import round_up
-from ...core.tpu import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import (
     BF16_BYTES,
     BF16_TILE_ROWS,
     F32_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
 )
-from ..config import (
+from flywheel_tpu.softmax_attention.config import (
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     STAGES,
     KVCacheConfig,
     vmem_limit_bytes,
 )
-from ..kv_layout import (
+from flywheel_tpu.softmax_attention.kv_layout import (
     FP8_BITS,
     MIN_BLOCK_KV,
     bank_safe_word_stride,
@@ -37,8 +37,8 @@ from ..kv_layout import (
     resolve_merged_kv_heads,
     staged_words,
 )
-from ..traits import DecodeTraits
-from ..variant import Variant
+from flywheel_tpu.softmax_attention.traits import DecodeTraits
+from flywheel_tpu.softmax_attention.variant import Variant
 
 NUM_IO_STAGES = 2
 SEM_K = 0
