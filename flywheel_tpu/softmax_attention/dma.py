@@ -7,8 +7,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from ..core.tpu import NUM_LANES
-from .config import QKVLayout, TokenMajorInfo
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import QKVLayout, TokenMajorInfo
 
 
 def advance(

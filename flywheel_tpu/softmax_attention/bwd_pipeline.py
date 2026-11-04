@@ -8,19 +8,25 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tpu import NUM_LANES
-from .config import (
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     QKVLayout,
     vmem_limit_bytes,
 )
-from .dma import advance, drain, fold_row, hbm_head_slice, hbm_window
-from .mask import apply_causal_kv_major
-from .schedule import BwdSchedule
-from .traits import BwdTraits
-from .variant import Variant
+from flywheel_tpu.softmax_attention.dma import (
+    advance,
+    drain,
+    fold_row,
+    hbm_head_slice,
+    hbm_window,
+)
+from flywheel_tpu.softmax_attention.mask import apply_causal_kv_major
+from flywheel_tpu.softmax_attention.schedule import BwdSchedule
+from flywheel_tpu.softmax_attention.traits import BwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant
 
 # Note (david): contracting axis 0 of both ds and k gives dq = ds^T @ k without
 # materializing the transpose.

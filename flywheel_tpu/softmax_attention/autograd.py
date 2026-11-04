@@ -5,9 +5,9 @@ from collections.abc import Callable
 
 import jax
 
-from .dispatch import resolve_bwd_config
-from .kernels.bwd import flash_attn_bwd
-from .variant import Variant
+from flywheel_tpu.softmax_attention.dispatch import resolve_bwd_config
+from flywheel_tpu.softmax_attention.kernels.bwd import flash_attn_bwd
+from flywheel_tpu.softmax_attention.variant import Variant
 
 
 def attn_with_vjp(

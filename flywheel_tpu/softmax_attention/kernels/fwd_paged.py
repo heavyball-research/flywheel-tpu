@@ -18,9 +18,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import round_up
-from ...core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
-from ..config import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.softmax_attention.config import (
     MIN_Q_TILES_PER_BLOCK,
     PAGE_SIZE_MULTIPLE,
     BlockSizes,
@@ -29,8 +29,8 @@ from ..config import (
     next_pow2,
     vmem_limit_bytes,
 )
-from ..dma import advance, drain
-from ..fwd_blocks import (
+from flywheel_tpu.softmax_attention.dma import advance, drain
+from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
     NUM_PENDING_FIELDS,
@@ -66,23 +66,26 @@ from ..fwd_blocks import (
     start_q_row,
     wait_q_row,
 )
-from ..fwd_call import check_rotary_operands, rotary_fields
-from ..kv_layout import (
+from flywheel_tpu.softmax_attention.fwd_call import (
+    check_rotary_operands,
+    rotary_fields,
+)
+from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_halves,
     kv_word_rows,
     load_staged_words,
     resolve_merged_kv_heads,
     staged_words,
 )
-from ..schedule import (
+from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
     ScheduleTableLayout,
     make_paged_fwd_schedule,
     paged_schedule_table,
 )
-from ..softmax import overflow_guard_threshold
-from ..traits import PagedFwdTraits
-from ..variant import Variant, VariantOperands
+from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
+from flywheel_tpu.softmax_attention.traits import PagedFwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 
 # Note (david): the distance-1 fragment pipeline keeps five score-shaped f32
 # temporaries live, plus a one-byte bounds mask per score.

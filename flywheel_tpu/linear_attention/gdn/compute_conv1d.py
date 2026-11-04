@@ -18,8 +18,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import BF16_TILE_ROWS, NUM_LANES
-from . import config
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES
+from flywheel_tpu.linear_attention.gdn import config
 
 MXU_LANES = 256
 # Note (david): one bf16 sublane tile, whose last prev_kernel_size rows are the

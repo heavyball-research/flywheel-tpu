@@ -11,17 +11,20 @@ import math
 import jax
 import jax.numpy as jnp
 
-from ..core.tiling import round_up
-from ..core.tpu import NUM_LANES
-from .autograd import attn_with_vjp, forward_only_attn
-from .config import BlockSizes, next_pow2
-from .dispatch import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.autograd import (
+    attn_with_vjp,
+    forward_only_attn,
+)
+from flywheel_tpu.softmax_attention.config import BlockSizes, next_pow2
+from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
     get_kernel,
     make_flash_attn_mha,
     resolve_paged_block_sizes,
 )
-from .inputs import (
+from flywheel_tpu.softmax_attention.inputs import (
     HEAD_MAJOR_PACKED_AXIS,
     HEAD_MAJOR_SEQ_AXIS,
     ROTARY_TOKEN_AXIS,
@@ -35,8 +38,11 @@ from .inputs import (
     pad_seqlen,
     parse_qkv,
 )
-from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
-from .rotary import prepare_rotary
+from flywheel_tpu.softmax_attention.kernels.fwd_paged import (
+    check_paged_inputs,
+    flash_attn_varlen_paged,
+)
+from flywheel_tpu.softmax_attention.rotary import prepare_rotary
 
 
 def flash_attn_func(

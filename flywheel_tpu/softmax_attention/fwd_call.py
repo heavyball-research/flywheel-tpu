@@ -10,8 +10,8 @@ k, v or out scratch buffer.
 import jax
 import jax.numpy as jnp
 
-from .config import QKVLayout, from_head_minor
-from .traits import FwdTraits
+from flywheel_tpu.softmax_attention.config import QKVLayout, from_head_minor
+from flywheel_tpu.softmax_attention.traits import FwdTraits
 
 
 def rotary_fields(

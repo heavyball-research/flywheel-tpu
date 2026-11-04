@@ -8,9 +8,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import round_up
-from ...core.tpu import NUM_LANES
-from ..bwd_pipeline import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.bwd_pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
     SEM_DI,
@@ -26,7 +26,7 @@ from ..bwd_pipeline import (
     bwd_out_shape,
     call_bwd,
 )
-from ..config import (
+from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     LOG2E,
     NN_DIM_NUMBERS,
@@ -37,15 +37,15 @@ from ..config import (
     TokenMajorInfo,
     vmem_limit_bytes,
 )
-from ..dma import advance, drain, hbm_tm_slice
-from ..mask import apply_causal_kv_major
-from ..schedule import (
+from flywheel_tpu.softmax_attention.dma import advance, drain, hbm_tm_slice
+from flywheel_tpu.softmax_attention.mask import apply_causal_kv_major
+from flywheel_tpu.softmax_attention.schedule import (
     DenseBwdParams,
     dense_bwd_params,
     make_dense_bwd_schedule,
 )
-from ..traits import BwdTraits
-from ..variant import Variant
+from flywheel_tpu.softmax_attention.traits import BwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant
 
 # Note (david): dq_acc is the only scratch that grows with q_seq_len; capping it
 # at half the VMEM budget leaves the other half to the block-sized stage

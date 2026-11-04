@@ -56,8 +56,8 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from .config import DEFAULT_MASK_VALUE, LOG2E
-from .softmax import fold_sink
+from flywheel_tpu.softmax_attention.config import DEFAULT_MASK_VALUE, LOG2E
+from flywheel_tpu.softmax_attention.softmax import fold_sink
 
 # The Variant fields a tuned block entry may vary in (matches_tuned_table).
 TUNED_TABLE_FIELDS = ("softmax_scale", "causal", "has_sinks", "return_lse")

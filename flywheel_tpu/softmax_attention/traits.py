@@ -16,22 +16,22 @@ import math
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
-from .config import (
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.softmax_attention.config import (
     BlockSizes,
     KVCacheConfig,
     PagedKVInfo,
     QKVLayout,
     TokenMajorInfo,
 )
-from .kv_layout import (
+from flywheel_tpu.softmax_attention.kv_layout import (
     MIN_BLOCK_KV,
     kv_heads_per_word,
     kv_word_rows,
     merged_cache_heads,
 )
-from .rotary import ROTARY_DIM_MULTIPLE
-from .softmax import overflow_guard_threshold
+from flywheel_tpu.softmax_attention.rotary import ROTARY_DIM_MULTIPLE
+from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 
 DECODE_HEAD_DIMS = (64, 128, 256)
 

@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tpu import NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.core.tpu import NUM_LANES, NUM_SUBLANES
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 # Note (david): d64 is the one sub-tile head_dim token-major supports; a

@@ -23,8 +23,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import BF16_TILE_ROWS, NUM_LANES
-from . import config
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES
+from flywheel_tpu.linear_attention.gdn import config
 
 L2_NORM_EPS = 1e-6
 BASE_BLOCK_SIZE = 4

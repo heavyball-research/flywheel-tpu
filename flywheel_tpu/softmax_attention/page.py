@@ -6,8 +6,13 @@ import functools
 
 import jax
 
-from .kernels.kv_cache_write import kv_cache_write_pallas
-from .kv_layout import check_merged_kv_dtype, merged_cache_heads
+from flywheel_tpu.softmax_attention.kernels.kv_cache_write import (
+    kv_cache_write_pallas,
+)
+from flywheel_tpu.softmax_attention.kv_layout import (
+    check_merged_kv_dtype,
+    merged_cache_heads,
+)
 
 
 @functools.partial(

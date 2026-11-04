@@ -4,10 +4,10 @@ the Variant."""
 import jax
 import jax.numpy as jnp
 
-from ..core.tiling import round_up
-from ..core.tpu import NUM_LANES
-from .config import PAIRED_HEAD_DIM
-from .variant import Variant
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import PAIRED_HEAD_DIM
+from flywheel_tpu.softmax_attention.variant import Variant
 
 # Note (david): seq is axis 1 of the token-major dense layout (batch, seq,
 # heads * head_dim) and axis 2 of both head-major ones, (batch, heads, seq,

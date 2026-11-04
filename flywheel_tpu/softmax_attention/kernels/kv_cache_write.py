@@ -18,7 +18,10 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..kv_layout import INTERLEAVE_STEP_ELEMENTS, interleave_kv_rows
+from flywheel_tpu.softmax_attention.kv_layout import (
+    INTERLEAVE_STEP_ELEMENTS,
+    interleave_kv_rows,
+)
 
 # Note (david): the scoped VMEM the staging is sized against; the compiler
 # gets KV_WRITE_VMEM_HEADROOM_BYTES more for the interleave temporaries.

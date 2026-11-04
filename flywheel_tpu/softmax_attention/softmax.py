@@ -6,7 +6,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from .config import DEFAULT_MASK_VALUE
+from flywheel_tpu.softmax_attention.config import DEFAULT_MASK_VALUE
 
 # Note (david): the guard keeps score <= e^T, row_sum <= kv_seq_len * e^T and
 # |o| <= row_sum * max|v| under the f32 max (e^88.7), assuming |v| <= 2^12 and

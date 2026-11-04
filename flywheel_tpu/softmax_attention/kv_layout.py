@@ -6,8 +6,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tiling import round_up
-from ..core.tpu import NUM_LANES
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import NUM_LANES
 
 MIN_BLOCK_KV = 128
 BF16_BITS = 16

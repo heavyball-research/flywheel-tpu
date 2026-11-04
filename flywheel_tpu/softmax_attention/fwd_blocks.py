@@ -37,26 +37,33 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
-from .config import (
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
     QKVLayout,
     hbm_bf16_tile_rows,
 )
-from .dma import fold_row, hbm_window
-from .kv_layout import kv_heads_per_word, kv_word_rows
-from .mask import apply_packed_bounds_mask
-from .rotary import rotate_tile
-from .schedule import FwdSchedule, ScheduleRow, WindowFragment
-from .softmax import (
+from flywheel_tpu.softmax_attention.dma import fold_row, hbm_window
+from flywheel_tpu.softmax_attention.kv_layout import (
+    kv_heads_per_word,
+    kv_word_rows,
+)
+from flywheel_tpu.softmax_attention.mask import apply_packed_bounds_mask
+from flywheel_tpu.softmax_attention.rotary import rotate_tile
+from flywheel_tpu.softmax_attention.schedule import (
+    FwdSchedule,
+    ScheduleRow,
+    WindowFragment,
+)
+from flywheel_tpu.softmax_attention.softmax import (
     MASKED_ROW_BOUND,
     UNANCHORED_ROW_BOUND,
     UNANCHORED_ROW_MAX,
 )
-from .traits import FwdTraits
-from .variant import Variant, VariantOperands
+from flywheel_tpu.softmax_attention.traits import FwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 
 SEM_Q = 0
 SEM_K = 1

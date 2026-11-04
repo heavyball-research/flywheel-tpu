@@ -21,8 +21,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import round_up
-from ...core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
 
 # Note (david): Mosaic requires every DMA offset and size along a tiled
 # dimension to be provably a multiple of the sublane tile height, and the token

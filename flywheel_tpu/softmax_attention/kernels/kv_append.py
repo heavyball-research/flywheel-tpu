@@ -8,8 +8,11 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..config import vmem_limit_bytes
-from ..kv_layout import INTERLEAVE_STEP_ELEMENTS, interleave_kv_rows
+from flywheel_tpu.softmax_attention.config import vmem_limit_bytes
+from flywheel_tpu.softmax_attention.kv_layout import (
+    INTERLEAVE_STEP_ELEMENTS,
+    interleave_kv_rows,
+)
 
 
 def append_kernel(

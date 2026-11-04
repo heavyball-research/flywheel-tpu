@@ -10,19 +10,27 @@ import math
 import jax
 import jax.numpy as jnp
 
-from .config import PAGE_SIZE_MULTIPLE
-from .dispatch import resolve_kvcache_config, resolve_paged_block_sizes
-from .inputs import (
+from flywheel_tpu.softmax_attention.config import PAGE_SIZE_MULTIPLE
+from flywheel_tpu.softmax_attention.dispatch import (
+    resolve_kvcache_config,
+    resolve_paged_block_sizes,
+)
+from flywheel_tpu.softmax_attention.inputs import (
     check_common_kwargs,
     check_sinks,
     descale_scalar,
     make_variant,
 )
-from .kernels.decode import flash_attn_kvcache_pallas
-from .kernels.fwd_paged import check_paged_inputs, flash_attn_varlen_paged
-from .kernels.kv_append import append_ragged
-from .kv_layout import resolve_merged_kv_heads
-from .variant import Variant, fused_q_scale
+from flywheel_tpu.softmax_attention.kernels.decode import (
+    flash_attn_kvcache_pallas,
+)
+from flywheel_tpu.softmax_attention.kernels.fwd_paged import (
+    check_paged_inputs,
+    flash_attn_varlen_paged,
+)
+from flywheel_tpu.softmax_attention.kernels.kv_append import append_ragged
+from flywheel_tpu.softmax_attention.kv_layout import resolve_merged_kv_heads
+from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 
 # Note (david): the paged varlen kernel pads every request to a 128-token q
 # block, so a short window folded into the decode kernel's query heads reads

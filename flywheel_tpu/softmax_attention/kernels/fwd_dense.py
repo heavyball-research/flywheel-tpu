@@ -11,15 +11,15 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import NUM_LANES
-from ..config import (
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import (
     QKVLayout,
     TokenMajorInfo,
     from_head_minor,
     vmem_limit_bytes,
 )
-from ..dma import advance, drain
-from ..fwd_blocks import (
+from flywheel_tpu.softmax_attention.dma import advance, drain
+from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
     NUM_PENDING_FIELDS,
@@ -54,21 +54,21 @@ from ..fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from ..fwd_call import (
+from flywheel_tpu.softmax_attention.fwd_call import (
     check_qkv_operands,
     check_rotary_operands,
     rotary_fields,
     staged_shape,
 )
-from ..schedule import (
+from flywheel_tpu.softmax_attention.schedule import (
     DenseFwdParams,
     FwdSchedule,
     make_dense_fwd_schedule,
     make_runtime_offset_dense_fwd_schedule,
     window_fragment_plans,
 )
-from ..traits import FwdTraits
-from ..variant import Variant, VariantOperands
+from flywheel_tpu.softmax_attention.traits import FwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 
 
 def flash_fwd_kernel(

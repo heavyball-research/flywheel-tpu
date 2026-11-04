@@ -47,9 +47,9 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
-from ..core.tiling import round_up
-from ..core.tpu import BF16_TILE_ROWS, NUM_LANES
-from .config import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES
+from flywheel_tpu.softmax_attention.config import (
     FWD_BLOCKS,
     FWD_KV_COMPUTE_BLOCKS,
     FWD_Q_COMPUTE_BLOCKS,
@@ -65,18 +65,26 @@ from .config import (
     pick_tile,
     vmem_limit_bytes,
 )
-from .kernels.decode import kvcache_config_vmem_bytes, validate_kvcache_config
-from .kernels.fwd_dense import (
+from flywheel_tpu.softmax_attention.kernels.decode import (
+    kvcache_config_vmem_bytes,
+    validate_kvcache_config,
+)
+from flywheel_tpu.softmax_attention.kernels.fwd_dense import (
     flash_attn_forward,
     flash_attn_forward_runtime_offset,
 )
-from .kernels.fwd_paged import estimate_vmem_bytes
-from .kernels.fwd_varlen import flash_attn_forward_varlen
-from .kv_layout import MIN_BLOCK_KV
-from .schedule import VarlenSchedule, dense_fwd_params
-from .softmax import overflow_guard_threshold
-from .traits import FwdTraits
-from .variant import Variant
+from flywheel_tpu.softmax_attention.kernels.fwd_paged import estimate_vmem_bytes
+from flywheel_tpu.softmax_attention.kernels.fwd_varlen import (
+    flash_attn_forward_varlen,
+)
+from flywheel_tpu.softmax_attention.kv_layout import MIN_BLOCK_KV
+from flywheel_tpu.softmax_attention.schedule import (
+    VarlenSchedule,
+    dense_fwd_params,
+)
+from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
+from flywheel_tpu.softmax_attention.traits import FwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant
 
 TUNED_CONFIGS_PATH = pathlib.Path(__file__).with_name("tuned_configs.json")
 

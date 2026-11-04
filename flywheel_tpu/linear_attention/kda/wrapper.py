@@ -24,9 +24,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tiling import round_up
-from ...core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
-from . import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
+from flywheel_tpu.linear_attention.kda import (
     compute_conv1d,
     compute_kda,
     config,

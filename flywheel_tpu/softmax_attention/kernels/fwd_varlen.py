@@ -15,10 +15,14 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import NUM_LANES
-from ..config import QKVLayout, hbm_bf16_tile_rows, vmem_limit_bytes
-from ..dma import advance, drain
-from ..fwd_blocks import (
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import (
+    QKVLayout,
+    hbm_bf16_tile_rows,
+    vmem_limit_bytes,
+)
+from flywheel_tpu.softmax_attention.dma import advance, drain
+from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
     NUM_PENDING_FIELDS,
@@ -56,22 +60,22 @@ from ..fwd_blocks import (
     wait_kv_block,
     wait_q_row,
 )
-from ..fwd_call import (
+from flywheel_tpu.softmax_attention.fwd_call import (
     check_qkv_operands,
     check_rotary_operands,
     rotary_fields,
     staged_shape,
 )
-from ..schedule import (
+from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
     ScheduleTableLayout,
     VarlenSchedule,
     make_per_seq_fwd_schedule,
     varlen_schedule_table,
 )
-from ..seqlen import check_cu_seqlens_pair
-from ..traits import FwdTraits
-from ..variant import Variant, VariantOperands
+from flywheel_tpu.softmax_attention.seqlen import check_cu_seqlens_pair
+from flywheel_tpu.softmax_attention.traits import FwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 
 
 def flash_fwd_varlen_kernel(
