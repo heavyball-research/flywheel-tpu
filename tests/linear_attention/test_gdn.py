@@ -20,6 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from flywheel_tpu.linear_attention.gdn import wrapper as gdn_wrapper
 from tests.linear_attention.harness import (
     DECODE,
     GDN,
@@ -513,3 +514,171 @@ def test_chunk_gate_in_kernel_varlen(
     ref, ref_ht = fused.chunk(g_ref, beta)
     assert_close("o", ref, tri, 0.005)
     assert_close("ht", ref_ht, tri_ht, 0.005)
+
+
+def _slot_major_runs(run):
+    """run(slot_major_conv) twice on the same draws: the [N, K - 1, dim]
+    cache, then the slot-major [N, K - 1, 1, dim] pool."""
+    return [run(slot_major) for slot_major in (False, True)]
+
+
+def _assert_bitwise(name, cache_result, pool_result):
+    for i, (x, y) in enumerate(zip(cache_result, pool_result)):
+        np.testing.assert_array_equal(
+            np.asarray(x, np.float32), np.asarray(y, np.float32), f"{name}[{i}]"
+        )
+
+
+def test_chunk_slot_major_conv_pool() -> None:
+    """A prefill on the slot-major conv pool gives the [N, K - 1, dim] cache's
+    output, states and conv pool bit for bit, across mixed tiles."""
+
+    def run(slot_major):
+        rng = np.random.default_rng(7)
+        cu_seqlens = [0, 15, 100, 300, 600]
+        q = randn(rng, (1, 600, 2, 128))
+        k = randn(rng, (1, 600, 2, 128))
+        v = randn(rng, (1, 600, 4, 128))
+        beta = rand(rng, (1, 600, 4))
+        g = logsigmoid(rand(rng, (1, 600, 4)))
+        h0 = randn(rng, (4, 4, 128, 128))
+        fused = Fused(
+            GDN,
+            rng,
+            q,
+            k,
+            v,
+            cu_seqlens=cu_seqlens,
+            initial_state=h0,
+            slot_major_conv=slot_major,
+        )
+        raw_g, _ = encode_gate(GDN, g)
+        out, final = fused.chunk(raw_g, beta)
+        return out, final, fused.final_conv_pool, fused.final_state_pool
+
+    _assert_bitwise("chunk", *_slot_major_runs(run))
+
+
+@DECODE
+def test_fused_recurrent_slot_major_conv_pool(
+    record_dtype: jnp.dtype | None,
+) -> None:
+    """Decode steps on the slot-major conv pool give the [N, K - 1, dim]
+    cache's outputs, states and conv pool bit for bit."""
+
+    def run(slot_major):
+        rng = np.random.default_rng(11)
+        q = randn(rng, (5, 6, 2, 128))
+        k = randn(rng, (5, 6, 2, 128))
+        v = randn(rng, (5, 6, 4, 128))
+        beta = rand(rng, (5, 6, 4))
+        g = logsigmoid(rand(rng, (5, 6, 4)))
+        h0 = randn(rng, (5, 4, 128, 128))
+        fused = Fused(
+            GDN, rng, q, k, v, initial_state=h0, slot_major_conv=slot_major
+        )
+        raw_g, _ = encode_gate(GDN, g)
+        out, final = fused.recurrent(raw_g, beta, record_dtype)
+        return out, final, fused.final_conv_pool, fused.final_state_pool
+
+    _assert_bitwise("recurrent", *_slot_major_runs(run))
+
+
+@pytest.mark.parametrize(
+    ("query_lens", "num_spec_tokens", "num_decode"),
+    [
+        ((4, 4, 4), 3, 3),
+        ((1, 1, 37, 300), 0, 2),
+    ],
+    ids=["verify_windows", "decode_then_prefill"],
+)
+def test_slot_major_conv_pool_windows(
+    query_lens: tuple[int, ...], num_spec_tokens: int, num_decode: int
+) -> None:
+    """fused_conv1d_gdn on the slot-major conv pool against the [N, K - 1,
+    dim] cache, bit for bit, where each verify window writes one conv
+    checkpoint per position and decode rows precede prefill rows."""
+    n_kq, n_v, d = 2, 4, 128
+    dim = (2 * n_kq + n_v) * d
+    kernel_size = 4
+    window = num_spec_tokens + 1
+    num_seqs = len(query_lens)
+    num_slots = 1 + num_seqs * window
+    rng = np.random.default_rng(3)
+    num_tokens = sum(query_lens)
+    qkv = randn(rng, (num_tokens, dim)).astype(jnp.bfloat16)
+    b = randn(rng, (num_tokens, n_v)).astype(jnp.bfloat16)
+    a = randn(rng, (num_tokens, n_v)).astype(jnp.bfloat16)
+    conv_cache = randn(rng, (num_slots, kernel_size - 1, dim))
+    recurrent = randn(rng, (num_slots, n_v, d, d)) * 0.1
+    bound = kernel_size**-0.5
+    conv_weight = uniform(rng, (dim, 1, kernel_size), -bound, bound)
+    a_log = randn(rng, (n_v,)) * 0.1
+    dt_bias = randn(rng, (n_v,)) * 0.1
+    state_indices = jnp.asarray(1 + np.arange(num_seqs) * window, jnp.int32)
+    query_start_loc = jnp.asarray(
+        np.concatenate([[0], np.cumsum(query_lens)]), jnp.int32
+    )
+    seq_lens = jnp.asarray(np.asarray(query_lens) + 50, jnp.int32)
+    distribution = jnp.asarray([num_decode, num_decode, num_seqs], jnp.int32)
+    read_offsets = (
+        jnp.asarray(rng.integers(0, window, num_seqs), jnp.int32)
+        if num_spec_tokens
+        else None
+    )
+
+    def run(slot_major):
+        conv = conv_cache[:, :, None] if slot_major else conv_cache
+        (conv, rec), out = gdn_wrapper.fused_conv1d_gdn(
+            qkv,
+            b,
+            a,
+            jnp.array(conv),
+            jnp.array(recurrent),
+            conv_weight,
+            None,
+            a_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            state_indices,
+            read_offsets,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d,
+            d_v=d,
+            kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
+        )
+        return out, conv[:, :, 0] if slot_major else conv, rec
+
+    _assert_bitwise("windows", *_slot_major_runs(run))
+
+
+def test_slot_major_conv_pool_shape_is_checked() -> None:
+    rng = np.random.default_rng(0)
+    dim, n_v, d = 1024, 4, 128
+    with pytest.raises(ValueError, match="slot-major conv state"):
+        gdn_wrapper.fused_conv1d_gdn(
+            randn(rng, (8, dim)).astype(jnp.bfloat16),
+            randn(rng, (8, n_v)).astype(jnp.bfloat16),
+            randn(rng, (8, n_v)).astype(jnp.bfloat16),
+            jnp.zeros((9, 3, 2, dim), jnp.float32),
+            jnp.zeros((9, n_v, d, d), jnp.float32),
+            jnp.zeros((dim, 1, 4), jnp.float32),
+            None,
+            jnp.zeros((n_v,), jnp.float32),
+            jnp.zeros((n_v,), jnp.float32),
+            jnp.arange(9, dtype=jnp.int32),
+            jnp.arange(1, 9, dtype=jnp.int32),
+            jnp.asarray([8, 8, 8], jnp.int32),
+            jnp.full((8,), 5, jnp.int32),
+            jnp.arange(1, 9, dtype=jnp.int32),
+            n_kq=2,
+            n_v=n_v,
+            d_k=d,
+            d_v=d,
+            kernel_size=4,
+        )

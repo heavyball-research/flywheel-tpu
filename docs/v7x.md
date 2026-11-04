@@ -1,6 +1,7 @@
 # FlyWheel on TPU v7x
 
-The benchmarks in the [README](README.md) were measured on v6e. This page has
+The [benchmarks](benchmarks.md) and the [end-to-end evaluation](e2e_evaluation.md)
+were measured on v6e. This page has
 the softmax and linear attention benchmarks and the end-to-end evaluation on
 v7x, measured the same way and on the same stack, `jax[tpu]==0.11.0` and
 `libtpu==0.0.44`.
@@ -11,12 +12,12 @@ Causal prefill on one v7x core, head_dim 256, B = 1, for 32:32 (MHA)
 and 32:4 (GQA) heads. The rows under each sequence length are our speedup
 over [RPA v3](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/ragged_paged_attention/v3) and [Splash Attention](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/tpu/splash_attention).
 
-![Attention kernel throughput on v7x](assert/softmax_attn_benchmark_v7x.png)
+![Attention kernel throughput on v7x](../assets/softmax_attn_benchmark_v7x.png)
 
 Every number comes from
-[`benchmarks/softmax_attention/`](benchmarks/softmax_attention/), with the
+[`benchmarks/softmax_attention/`](../benchmarks/softmax_attention/), with the
 block, the timing and the trace split described in the
-[README](README.md#softmax-attention). Three things differ on v7x:
+[benchmarks page](benchmarks.md#softmax-attention). Three things differ on v7x:
 
 - **One device is one core.** A v7x chip has two TensorCores and JAX lists
   each as a device, so the `jax.devices()[0]` the benchmark runs on is half a
@@ -25,10 +26,10 @@ block, the timing and the trace split described in the
 - **The block configs are tuned on v7x.** A v7x core has 64 MiB of VMEM, less
   than the configs searched on v6e need: RPA v3's v6e entries run out of VMEM
   on 15 of the 16 cells, and Splash Attention's at 64K and 128K. So
-  [`tune_blocks.py`](benchmarks/softmax_attention/tune_blocks.py) searched all
+  [`tune_blocks.py`](../benchmarks/softmax_attention/tune_blocks.py) searched all
   three kernels per cell on v7x, into `rpa_tuned_v7x.json`,
   `splash_tuned_v7x.json` and the `"TPU v7"` section of
-  [`tuned_configs.json`](flywheel_tpu/tuned_configs.json), and
+  [`tuned_configs.json`](../flywheel_tpu/tuned_configs.json), and
   `attention_block.py` reads the tables of the chip it runs on. At 32:32 RPA
   v3's own v7 default formula runs out of VMEM as well, on every cell; what
   fits is `[128, 256, 128, 256]`, which is its tuned config from 1K to 128K.
@@ -146,7 +147,7 @@ run out of VMEM, so it runs `[128, 256, 128, 256]`, the one config that fit its
 sweep; a decode call compiles RPA's mixed kernel as well, so that config is set
 there too. flywheel runs its defaults for chunked prefill, sized to the core's
 VMEM by `vmem_limit_bytes()`, and for decode the configs tuned on v7x in the
-`"TPU v7"` section of [`tuned_configs.json`](flywheel_tpu/tuned_configs.json).
+`"TPU v7"` section of [`tuned_configs.json`](../flywheel_tpu/tuned_configs.json).
 
 Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count),
 and our speedup over RPA v3:
@@ -186,7 +187,7 @@ GDN prefill on one v7x core, n_kq = 16 and d_k = d_v = 128, with T tokens
 packed into 1 or 8 sequences. The row under each sequence length is our
 speedup over the vendored `gdn_v3` baseline (gray).
 
-![GDN prefill kernel throughput on v7x](assert/gdn_benchmark_v7x.png)
+![GDN prefill kernel throughput on v7x](../assets/gdn_benchmark_v7x.png)
 
 A v7x core has 64 MiB of VMEM, half of v6e's, and n_v = 48 is where that
 shows:
@@ -253,7 +254,7 @@ PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench
 
 ## End-to-end evaluation
 
-The [README](README.md#end-to-end-evaluation)'s vLLM backend with its RULER
+The [end-to-end evaluation](e2e_evaluation.md)'s vLLM backend with its RULER
 and BABILong sweeps, on one v7x host. The host has four chips, so eight
 TensorCores, and `--tp-size 8` gives each tensor-parallel rank one core. The
 model is Qwen3.8-27B in bf16: 64 layers, 48 of them GDN linear attention and
@@ -263,13 +264,13 @@ sequence at a time, with chunked prefill and prefix caching off.
 `flywheel` sets `USE_FLYWHEEL_TPU_KERNEL=1` and
 `USE_FLYWHEEL_TPU_LINEAR_KERNEL=1`. `baseline` is the same backend with both
 off: RPA v3 with the mixed block sizes of
-[`eval/configs`](eval/configs/qwen38_27b_tp8_rpa_mixed_blocks.json), and
+[`eval/configs`](../eval/configs/qwen38_27b_tp8_rpa_mixed_blocks.json), and
 `gdn_v3`. Those block sizes were tuned on v6e; they compile on a v7x core at
 every length here and were not tuned again.
 
 Tokens/s is prompt tokens over the time of the generation calls, so it
 includes the answer's decode steps: up to 128 tokens on RULER and 20 on
-BABILong. Every point ran 20 samples per task; the README's sweeps run 500 on
+BABILong. Every point ran 20 samples per task; the v6e sweeps run 500 on
 RULER and 100 on BABILong.
 
 RULER, 13 tasks and 260 prompts per point; the score is the mean over the
@@ -291,11 +292,11 @@ BABILong, qa1 to qa5 and 100 prompts per point; accuracy in %:
 | 256k | 22,872 | 27,788 | 1.21x | 56.0 | 56.0 |
 | 512k | 17,815 | 24,140 | 1.35x | 47.0 | 46.0 |
 
-NOTE: The RULER 524K and BABILong 512k rows are not the README's 512k
-points. The README runs 512k on several hosts (due to the smaller HBM size on
+NOTE: The RULER 524K and BABILong 512k rows are not the v6e 512k
+points. The v6e evaluation runs 512k on several hosts (due to the smaller HBM size on
 v6e), at TP 8 with prefill context parallelism 2, so each rank prefills half
 of a prompt. These rows are TP 8 on a single host (see below for the exact
-commands), and every rank prefills the whole prompt. As in the README's 512k
+commands), and every rank prefills the whole prompt. As in the v6e 512k
 commands, `--enable-sp` is on, and `--yarn-factor 2` stretches the model's
 RoPE from its 262,144 positions to 524,288, because the prompts run to 524K
 tokens on RULER and 508K on BABILong. RULER 262K runs with `--yarn-factor 2`
@@ -327,7 +328,7 @@ pass: in the first, the vision encoder's time varied between 5 and 11 s per
 request, and flywheel's time to the first token came out at 18.66 s against
 17.95 s with the same prefill times.
 
-To reproduce, on a v7x host with the venv of the README's vLLM backend
+To reproduce, on a v7x host with the venv of the [vLLM backend](e2e_evaluation.md#vllm-backend-tpu-inference)
 section:
 
 ```bash
