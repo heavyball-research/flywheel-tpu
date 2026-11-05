@@ -1,4 +1,4 @@
-"""Regression tests for kernel paths the random grids of test_flash_attn.py do
+"""Regression tests for kernel paths the random grids of test_prefill.py do
 not reach: dense and packed flash_attn_func / flash_attn_varlen_func, and
 single-token decode through flash_attn_with_kvcache."""
 
@@ -11,14 +11,14 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.flash_attn_interface import (
+from flywheel_tpu.softmax_attention.config import next_pow2
+from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
-    fused_q_scale,
-    pad_seqlen,
+    make_flash_attn_mha,
 )
-from flywheel_tpu.pallas.block_sizes import next_pow2
-from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
-from tests.test_util import attention_ref, randn
+from flywheel_tpu.softmax_attention.inputs import pad_seqlen
+from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
+from tests.softmax_attention.util import attention_ref, randn
 
 INTERPRET = jax.default_backend() != "tpu"
 
@@ -34,7 +34,7 @@ def max_abs(x):
 
 
 def assert_output_close(out, q, k, v, rows=slice(None), **mask_kwargs):
-    """test_flash_attn.py's rule: at most twice the error of the bf16 reference
+    """test_prefill.py's rule: at most twice the error of the bf16 reference
     with reordered ops, plus the rounding of arithmetic on the f32 reference."""
     out_ref, _ = attention_ref(q, k, v, **mask_kwargs)
     out_bf16, _ = attention_ref(
@@ -160,6 +160,40 @@ def test_flash_attn_varlen_func_feeds_the_program(seqlens):
 
     expected = attend(q, k, v, cu)
     assert jnp.array_equal(layer(q, k, v, cu).reshape(expected.shape), expected)
+
+
+@pytest.mark.parametrize("entry", ["dense", "varlen"])
+@pytest.mark.parametrize("array_type", ["jax", "numpy"])
+def test_flash_attn_array_softmax_scale(entry, array_type):
+    # A concrete 0-d array scale, such as 1 / jnp.sqrt(d), keys the kernel
+    # cache as the Python float it holds.
+    d = 128
+    array_scale = 1.0 / jnp.sqrt(jnp.float32(d))
+    if array_type == "numpy":
+        array_scale = np.asarray(array_scale)
+    seqlens = [100, 156]
+    q, k, v, _ = packed_qkv(seqlens, 2, 2, d)
+    if entry == "dense":
+        q, k, v = (operand[None] for operand in (q, k, v))
+
+    def attend(softmax_scale):
+        if entry == "dense":
+            return dense_attn(q, k, v, causal=True, softmax_scale=softmax_scale)
+        cu = cu_seqlens_of(seqlens)
+        return varlen_attn(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=True,
+            softmax_scale=softmax_scale,
+        )
+
+    expected = attend(float(array_scale))
+    assert jnp.array_equal(attend(array_scale), expected)
 
 
 @pytest.mark.parametrize(
@@ -293,7 +327,7 @@ def random_sinks(nheads):
 
 def assert_lse_close(lse, q, k, v, **mask_kwargs):
     """lse (batch, nheads, seqlen_q) against the f32 reference, by the out rule
-    plus test_flash_attn.py's fixed 1e-2."""
+    plus test_prefill.py's fixed 1e-2."""
     _, lse_ref = attention_ref(q, k, v, **mask_kwargs)
     _, lse_bf16 = attention_ref(
         q, k, v, upcast=False, reorder_ops=True, **mask_kwargs
@@ -591,13 +625,15 @@ def test_kernel_rejects_misshaped_sinks(entry):
     # SMEM past its end.
     batch, nheads, seqlen = 2, 4, 128
     blocks = default_block_sizes(seqlen, seqlen, head_dim=128)
+    variant = Variant(softmax_scale=1.0, causal=True, has_sinks=True)
     if entry == "dense":
         kernel = make_flash_attn_mha(
             batch * nheads,
             seqlen,
             seqlen,
-            causal=True,
+            variant=variant,
             block_sizes=blocks,
+            head_dim=128,
             interpret=INTERPRET,
         )
         q = jnp.zeros((batch * nheads, seqlen, 128), jnp.bfloat16)
@@ -607,8 +643,9 @@ def test_kernel_rejects_misshaped_sinks(entry):
             nheads,
             seqlen,
             seqlen,
-            causal=True,
+            variant=variant,
             block_sizes=blocks,
+            head_dim=128,
             interpret=INTERPRET,
             varlen_max_seqlen_kv=seqlen,
         )

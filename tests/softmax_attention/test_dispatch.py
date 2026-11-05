@@ -9,10 +9,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu import flash_attn_with_kvcache, tuned_block_sizes
-from flywheel_tpu.pallas import flash_fwd_kvcache
-from tests.test_flash_attn import INTERPRET, generate_block_kvcache
-from tests.test_util import merge_kv_heads, randn
+from flywheel_tpu import flash_attn_with_kvcache
+from flywheel_tpu.softmax_attention import dispatch
+from flywheel_tpu.softmax_attention.kernels import decode as decode_kernel
+from tests.softmax_attention.test_prefill import INTERPRET, generate_block_kvcache
+from tests.softmax_attention.util import merge_kv_heads, randn
 
 # A TPU v7 decode entry, and the same shape at a batch with no entry.
 TUNED_DECODE = dict(
@@ -38,7 +39,9 @@ KVCACHE_KEY = re.compile(
 
 
 def kvcache_entries():
-    for device_name, table in tuned_block_sizes.load_tuned_configs().items():
+    for device_name, table in dispatch.load_table(
+        dispatch.TUNED_CONFIGS_PATH
+    ).items():
         for key, config in table.items():
             if key.startswith("kvcache|"):
                 yield pytest.param(device_name, key, config, id=key)
@@ -49,7 +52,7 @@ def test_tuned_kvcache_entry_fits_its_device_vmem(device_name, key, config):
     fields = KVCACHE_KEY.match(key)
     assert fields is not None, key
     block_kv, block_kv_compute, num_kv_stages, *packed = config
-    required = flash_fwd_kvcache.kvcache_config_vmem_bytes(
+    required = decode_kernel.kvcache_config_vmem_bytes(
         block_kv,
         block_kv_compute,
         num_kv_stages,
@@ -71,10 +74,8 @@ def fixture_run_on(monkeypatch, recwarn):
     callable listing the fallback warnings raised since."""
 
     def pretend(device_name):
-        monkeypatch.setattr(
-            tuned_block_sizes, "get_device_name", lambda: device_name
-        )
-        tuned_block_sizes._warn_untuned_once.cache_clear()  # pylint: disable=protected-access
+        monkeypatch.setattr(dispatch, "get_device_name", lambda: device_name)
+        dispatch._warn_untuned_once.cache_clear()  # pylint: disable=protected-access
         recwarn.clear()
         return lambda: [
             str(warning.message)
@@ -88,24 +89,22 @@ def fixture_run_on(monkeypatch, recwarn):
 def test_untuned_key_warns_once_on_tpu(run_on):
     warnings = run_on("TPU v7")
     for _ in range(2):
-        assert (
-            tuned_block_sizes.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
-        )
-    key = tuned_block_sizes.kvcache_config_key(**UNTUNED_DECODE)
+        assert dispatch.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
+    key = dispatch.kvcache_config_key(**UNTUNED_DECODE)
     assert len(warnings()) == 1
     assert key in warnings()[0] and "TPU v7" in warnings()[0]
 
 
 def test_tuned_key_does_not_warn(run_on):
     warnings = run_on("TPU v7")
-    config = tuned_block_sizes.get_tuned_kvcache_config(**TUNED_DECODE)
+    config = dispatch.get_tuned_kvcache_config(**TUNED_DECODE)
     assert config == (2048, 2048, 2)
     assert not warnings()
 
 
 def test_untuned_dense_key_warns_on_tpu(run_on):
     warnings = run_on("TPU v7")
-    config = tuned_block_sizes.get_tuned_config(
+    config = dispatch.get_tuned_config(
         "fwd",
         token_major=False,
         num_heads=3,
@@ -123,7 +122,7 @@ def test_untuned_dense_key_warns_on_tpu(run_on):
 
 def test_untuned_key_off_tpu_does_not_warn(run_on):
     warnings = run_on("cpu")
-    assert tuned_block_sizes.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
+    assert dispatch.get_tuned_kvcache_config(**UNTUNED_DECODE) is None
     assert not warnings()
 
 
@@ -132,9 +131,7 @@ def test_tuned_block_kv_not_a_multiple_of_the_page_size_warns(
 ):
     warnings = run_on("TPU v7")
     monkeypatch.setattr(
-        flash_fwd_kvcache,
-        "get_tuned_kvcache_config",
-        lambda **_: (128, 128, 2, 1),
+        dispatch, "get_tuned_kvcache_config", lambda **_: (128, 128, 2, 1)
     )
     # The lookup runs while the kernel is traced.
     jax.clear_caches()

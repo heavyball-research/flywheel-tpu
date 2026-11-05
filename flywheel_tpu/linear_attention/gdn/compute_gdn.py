@@ -23,10 +23,9 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from . import config
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES
+from flywheel_tpu.linear_attention.gdn import config
 
-NUM_LANES = 128
-BF16_SUBLANE_ROWS = 16
 L2_NORM_EPS = 1e-6
 BASE_BLOCK_SIZE = 4
 BLOCKS_PER_LEVEL = 4
@@ -79,7 +78,7 @@ def pack_width(chunk: int, num_v_heads: int) -> int:
     # Note (david): a lone [chunk, chunk] f32 block is lane-padded to 128
     # lanes, so packing 128 // chunk heads halves the vregs at chunk 64 while
     # each dot stays one vreg column wide.
-    if chunk % BF16_SUBLANE_ROWS or NUM_LANES % chunk:
+    if chunk % BF16_TILE_ROWS or NUM_LANES % chunk:
         return 1
     elif num_v_heads % (NUM_LANES // chunk):
         return 1
@@ -147,7 +146,7 @@ def stacked_dots(
     # Note (david): the MXU instruction stream is the critical path and Mosaic
     # shares a weight push only between adjacent dots, so parts sharing rhs are
     # stacked into one dot; the sublane concat needs 16-row bf16 tiles.
-    if all(part.shape[1] % BF16_SUBLANE_ROWS == 0 for part in lhs_parts):
+    if all(part.shape[1] % BF16_TILE_ROWS == 0 for part in lhs_parts):
         part_rows = [part.shape[1] for part in lhs_parts]
         stacked = dot(jnp.concatenate(lhs_parts, axis=1), rhs)
         return jnp.split(
@@ -219,7 +218,7 @@ def invert_triangular_matrix(
     # T^-1 = D^-1 (I - N)(I + N^2) with N = E D^-1 and N^4 == 0. Every operand
     # stays bounded like the inverse, so plain bf16 dots reach 9e-3 max abs
     # error against f64 on repeated keys.
-    if chunk % BF16_SUBLANE_ROWS == 0:
+    if chunk % BF16_TILE_ROWS == 0:
         level_sizes = [BASE_BLOCK_SIZE]
         while level_sizes[-1] < chunk:
             level_sizes.append(min(level_sizes[-1] * BLOCKS_PER_LEVEL, chunk))
@@ -227,7 +226,7 @@ def invert_triangular_matrix(
     else:
         # Note (david): a chunk below 16 rows cannot fill a bf16 sublane tile,
         # so it runs one level with input-dtype operands at HIGHEST precision.
-        assert chunk < BF16_SUBLANE_ROWS, chunk
+        assert chunk < BF16_TILE_ROWS, chunk
         level_sizes = [chunk]
         operand_dtype, precision = dtype, jax.lax.Precision.HIGHEST
 
@@ -302,7 +301,7 @@ def invert_triangular_matrix(
     # one [groups, 16, cols] slab, a bf16 sublane tile, and masks out the
     # slab's off-diagonal base blocks.
     block_size = level_sizes[0]
-    slab_rows = min(chunk, BF16_SUBLANE_ROWS)
+    slab_rows = min(chunk, BF16_TILE_ROWS)
     lane = _lane_iota(slab_rows)
     lane_in_slab = lane & (slab_rows - 1) if slab_rows < chunk else lane
     row = _row_iota(slab_rows)

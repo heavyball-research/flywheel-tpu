@@ -267,16 +267,11 @@ def lens_label(lens) -> str:
     return f"lognormal, median {a[0]}"
 
 
-def kv_rows(kernel: str, hk: int, dtype: str) -> tuple[list[int], list[int]]:
-    """(K rows, V rows) of each KV head among one token's head rows. Batched
-    RPA: [k0, v0, k1, v1, ...]. flywheel's merged cache: the same in bf16; in
-    fp8, a head pair's [k0, k1, v0, v1] in one u32 word."""
-    if kernel == "rpa" or dtype == "bf16":
-        return [2 * h for h in range(hk)], [2 * h + 1 for h in range(hk)]
-    return (
-        [4 * (h // 2) + h % 2 for h in range(hk)],
-        [4 * (h // 2) + 2 + h % 2 for h in range(hk)],
-    )
+def kv_rows(hk: int) -> tuple[list[int], list[int]]:
+    """(K rows, V rows) of each KV head among one token's head rows: each
+    head's K row then its V row, [k0, v0, k1, v1, ...], in batched RPA's cache
+    and in flywheel's merged cache, bf16 and fp8 alike."""
+    return [2 * h for h in range(hk)], [2 * h + 1 for h in range(hk)]
 
 
 class Step:
@@ -285,7 +280,7 @@ class Step:
     def __init__(self, rpa, case: Case, num_layers: int, iters: int):
         import jax
         import jax.numpy as jnp
-        from flywheel_tpu.pallas.copy_utils import merged_cache_heads
+        from flywheel_tpu.softmax_attention.kv_layout import merged_cache_heads
 
         self.rpa, self.case, self.iters = rpa, case, iters
         self.dtype = jnp.float8_e4m3fn if case.dtype == "fp8" else jnp.bfloat16
@@ -429,7 +424,7 @@ class Step:
             jnp.copy(self.caches[0])
         )
 
-    def append_ok(self, kernel, cache) -> bool:
+    def append_ok(self, cache) -> bool:
         """Only the step's token slots changed, holding the step's K and V."""
         import jax.numpy as jnp
 
@@ -444,23 +439,21 @@ class Step:
         expect = np.zeros((self.num_pages, PAGE), bool)
         expect[pages, slots] = True
         new = cache[jnp.asarray(pages), jnp.asarray(slots)]
-        k_rows, v_rows = kv_rows(kernel, self.case.hk, self.case.dtype)
+        k_rows, v_rows = kv_rows(self.case.hk)
         return (
             bool(jnp.array_equal(changed, jnp.asarray(expect)))
             and bool(jnp.array_equal(bits(new[:, k_rows]), bits(self.k)))
             and bool(jnp.array_equal(bits(new[:, v_rows]), bits(self.v)))
         )
 
-    def reference(self, kernel, cache):
+    def reference(self, cache):
         """f32 attention of the first sequences over a kernel's cache."""
         import jax
         import jax.numpy as jnp
 
         c = self.case
         rows = cache.reshape(self.num_pages * PAGE, self.rows, c.d)
-        k_rows, v_rows = (
-            jnp.asarray(r) for r in kv_rows(kernel, c.hk, c.dtype)
-        )
+        k_rows, v_rows = (jnp.asarray(r) for r in kv_rows(c.hk))
         outs = []
         for i in range(min(NUM_REFERENCE_SEQS, c.b)):
             n = int(self.lens[i]) + 1
@@ -520,9 +513,9 @@ def device_times(trace_dir: str):
 def table_entry(case: Case, dtype) -> list | None:
     """flywheel's tuned-table entry for the case's decode call (None: its
     default config), from the same key fields the kernel looks up."""
-    from flywheel_tpu import tuned_block_sizes
+    from flywheel_tpu.softmax_attention import dispatch
 
-    config = tuned_block_sizes.get_tuned_kvcache_config(
+    config = dispatch.get_tuned_kvcache_config(
         dtype=dtype,
         num_query_heads=case.hq,
         num_kv_heads=case.hk,
@@ -559,19 +552,18 @@ def run_case(rpa, case: Case, args, trace_root: str) -> dict:
         "fw_table_entry": table_entry(case, step.dtype),
     }
 
-    # Checks on layer 0. The two fp8 layouts order K and V rows differently
-    # (same bytes per token), so each kernel is checked over its own cache.
+    # Checks on layer 0, each kernel over its own cache.
     for kernel in args.kernels:
         try:
             out, cache = step.once(kernel)
         except Exception as e:  # pylint: disable=broad-exception-caught
             res[f"{kernel}_error"] = repr(e)[:400]
             continue
-        ref = np.asarray(step.reference(kernel, cache))
+        ref = np.asarray(step.reference(cache))
         out = np.asarray(out.astype(jnp.float32))[: len(ref)]
         scale = float(np.max(np.abs(ref))) or 1.0
         res[f"{kernel}_rel_err"] = float(np.max(np.abs(out - ref))) / scale
-        res[f"{kernel}_append_ok"] = step.append_ok(kernel, cache)
+        res[f"{kernel}_append_ok"] = step.append_ok(cache)
         del out, cache
 
     loops = {k: step.loop(k) for k in args.kernels if f"{k}_error" not in res}

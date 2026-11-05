@@ -1,4 +1,6 @@
-"""Shared tile-size and layout types and lane constants for Pallas kernels."""
+"""Softmax-attention family constants, the VMEM limit and HBM tiling its
+kernels are built against, and the tile-size and layout types they are built
+with."""
 
 import dataclasses
 import enum
@@ -11,16 +13,18 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental.pallas import tpu as pltpu
 
+from flywheel_tpu.core.tpu import NUM_LANES, NUM_SUBLANES
+
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
-NUM_LANES = 128
-NUM_SUBLANES = 8
 # Note (david): d64 is the one sub-tile head_dim token-major supports; a
 # 64-wide head fills half a lane tile, so heads are DMA'd and folded in pairs.
 PAIRED_HEAD_DIM = NUM_LANES // 2
 NN_DIM_NUMBERS = (((1,), (0,)), ((), ()))
 NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
-BF16_BYTES = 2
-F32_BYTES = 4
+
+# The page-size unit of a paged KV cache.
+PAGE_SIZE_MULTIPLE = 128
+
 # Kernels on v6e's 128 MiB cores are built against 100 MiB of VMEM; a core with
 # less is built against all of it (64 MiB on v7x).
 MAX_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -71,20 +75,23 @@ DEFAULT_BLOCK_Q_COMPUTE = 256
 FWD_BLOCKS = (2048, 1024, 512, 256, 128)
 FWD_KV_COMPUTE_BLOCKS = (512, 384, 256, 128)
 FWD_Q_COMPUTE_BLOCKS = (256, 128)
+# Note (david): the static-anchor softmax runs a distance-1 fragment pipeline,
+# which must not revisit a q slice while its rescale is still pending.
+MIN_Q_TILES_PER_BLOCK = 2
 
 # Note (david): exp(x) == exp2(x * log2(e)). Folding log2(e) into the score
 # scale and the loaded lse lets the softmax use exp2, dropping the per-element
 # vmul jnp.exp lowers to on TPU. Gradient matmuls keep the true scale.
 LOG2E = math.log2(math.e)
 
+# The KV-cache decode kernel's (block_kv, block_kv_compute, num_kv_stages[,
+# items_per_step]). Note (david): a tuned entry without items_per_step runs
+# one (row, block) item per loop step; dispatch always resolves all four.
+KVCacheConfig = tuple[int, int, int] | tuple[int, int, int, int]
+
 
 def next_pow2(value: int) -> int:
     return 1 << max(0, int(value) - 1).bit_length()
-
-
-def round_up(value: int, alignment: int) -> int:
-    """Smallest multiple of alignment that is >= value."""
-    return -(-value // alignment) * alignment
 
 
 def pick_tile(candidates: Sequence[int], block: int) -> int:

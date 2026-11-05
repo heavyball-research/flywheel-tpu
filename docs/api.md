@@ -238,7 +238,8 @@ Return:
 ```
 
 To see the implementation of these functions, check
-[flash_attn_interface.py](../flywheel_tpu/flash_attn_interface.py).
+[prefill.py](../flywheel_tpu/softmax_attention/prefill.py) and
+[decode.py](../flywheel_tpu/softmax_attention/decode.py).
 
 ## Linear attention
 

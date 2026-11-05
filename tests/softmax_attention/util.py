@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from tests.padding import pad_input, unpad_input
+from tests.softmax_attention.padding import pad_input, unpad_input
 
 # Note (david): masking with a finite value instead of -inf keeps a fully masked
 # row finite, so jax.vjp through it does not leak NaN into every input; such

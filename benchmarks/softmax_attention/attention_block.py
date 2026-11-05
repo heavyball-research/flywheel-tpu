@@ -109,7 +109,7 @@ class Cell:
 
 def tuned_table(impl, device_kind):
     """The path of impl's tuned table for the chip JAX calls device_kind."""
-    from flywheel_tpu.tuned_block_sizes import get_device_variant_name
+    from flywheel_tpu.softmax_attention.dispatch import get_device_variant_name
 
     chip = get_device_variant_name(device_kind)
     if chip not in TABLE_TAGS:

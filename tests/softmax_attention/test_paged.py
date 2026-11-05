@@ -15,7 +15,7 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
-from tests.test_util import apply_rotary_emb
+from tests.softmax_attention.util import apply_rotary_emb
 
 INTERPRET = jax.default_backend() != "tpu"
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)

@@ -25,8 +25,9 @@ after the second time.
 
 --collect turns a directory of finished searches into the tables the block
 benchmark reads: rpa_tuned_<chip>.json and splash_tuned_<chip>.json next to
-this file, and one section of flywheel_tpu/tuned_configs.json. Which tables and
-which section come from the device the searches recorded, not from the machine
+this file, and one section of
+flywheel_tpu/softmax_attention/tuned_configs.json. Which tables and which
+section come from the device the searches recorded, not from the machine
 --collect runs on, which needs no TPU. It refuses to write an RPA or Splash
 table for a device attention_block.py has no table suffix for, or over a table
 that holds cells the directory has no search for, which would drop them.
@@ -146,7 +147,7 @@ class Flywheel:
         }
 
     def seeds(self):
-        from flywheel_tpu.flash_attn_interface import default_block_sizes
+        from flywheel_tpu.softmax_attention.dispatch import default_block_sizes
 
         default = default_block_sizes(self.cell.seq, self.cell.seq)
         return [{
@@ -190,16 +191,18 @@ class Flywheel:
     def build(self, config, qkv):
         import jax
 
-        from flywheel_tpu.flash_attn_interface import fused_q_scale
-        from flywheel_tpu.pallas.block_sizes import BlockSizes, QKVLayout
-        from flywheel_tpu.pallas.flash_fwd import make_flash_attn_mha
+        from flywheel_tpu.softmax_attention.config import BlockSizes, QKVLayout
+        from flywheel_tpu.softmax_attention.dispatch import make_flash_attn_mha
+        from flywheel_tpu.softmax_attention.variant import Variant
 
         cell = self.cell
         kernel = make_flash_attn_mha(
             cell.batch * cell.heads,
             cell.seq,
             cell.seq,
-            causal=True,
+            variant=Variant(
+                softmax_scale=1.0 / math.sqrt(cell.head_dim), causal=True
+            ),
             block_sizes=BlockSizes(
                 block_q=config["q_block"],
                 block_kv=config["kv_block"],
@@ -208,10 +211,10 @@ class Flywheel:
                 num_stages=config["stages"],
                 qkv_layout=QKVLayout[config["qkv_layout"].upper()],
             ),
+            head_dim=cell.head_dim,
             num_kv_heads=cell.batch * cell.heads_k,
             head_fold=config["head_fold"],
             transposed_pv=config["transposed_pv"],
-            q_scale=float(fused_q_scale(1.0 / math.sqrt(cell.head_dim), 0.0)),
         )
         call = jax.jit(kernel)
         return (lambda state: (call(*qkv), state)), (lambda: None)
@@ -789,7 +792,7 @@ def table_cells(configs):
 
 def collect(directory):
     """Write the tables of the device the searches in directory ran on."""
-    from flywheel_tpu import tuned_block_sizes
+    from flywheel_tpu.softmax_attention import dispatch
 
     best = []
     for path in sorted(directory.glob("*.jsonl")):
@@ -806,7 +809,7 @@ def collect(directory):
     if len(devices) != 1:
         raise ValueError(f"expected searches from one device, got {devices}.")
     device = devices.pop()
-    section_name = tuned_block_sizes.get_device_name(device)
+    section_name = dispatch.get_device_name(device)
 
     def head_tables(records):
         configs = {}
@@ -863,12 +866,12 @@ def collect(directory):
         written.append((path, count))
 
     if by_impl["flywheel"]:
-        path = tuned_block_sizes.TUNED_CONFIGS_PATH
+        path = dispatch.TUNED_CONFIGS_PATH
         table = json.loads(path.read_text(encoding="utf-8"))
         section = table.setdefault(section_name, {})
         for record in by_impl["flywheel"]:
             cell = record["cell"]
-            key = tuned_block_sizes.tuned_config_key(
+            key = dispatch.tuned_config_key(
                 "fwd",
                 token_major=False,
                 num_heads=cell["batch"] * cell["heads"],

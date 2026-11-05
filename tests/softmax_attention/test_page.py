@@ -7,9 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu.pallas.copy_utils import merged_cache_heads
-from flywheel_tpu.pallas.kv_cache_write import write_kv_cache_pages
-from tests.test_util import merge_kv_heads, randn
+from flywheel_tpu.softmax_attention.kv_layout import merged_cache_heads
+from flywheel_tpu.softmax_attention.page import write_kv_cache_pages
+from tests.softmax_attention.util import merge_kv_heads, randn
 
 INTERPRET = jax.default_backend() != "tpu"
 KV_DTYPES = [jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2]

@@ -29,7 +29,7 @@ block, the timing and the trace split described in the
   [`tune_blocks.py`](../benchmarks/softmax_attention/tune_blocks.py) searched all
   three kernels per cell on v7x, into `rpa_tuned_v7x.json`,
   `splash_tuned_v7x.json` and the `"TPU v7"` section of
-  [`tuned_configs.json`](../flywheel_tpu/tuned_configs.json), and
+  [`tuned_configs.json`](../flywheel_tpu/softmax_attention/tuned_configs.json), and
   `attention_block.py` reads the tables of the chip it runs on. At 32:32 RPA
   v3's own v7 default formula runs out of VMEM as well, on every cell; what
   fits is `[128, 256, 128, 256]`, which is its tuned config from 1K to 128K.
@@ -147,7 +147,7 @@ run out of VMEM, so it runs `[128, 256, 128, 256]`, the one config that fit its
 sweep; a decode call compiles RPA's mixed kernel as well, so that config is set
 there too. flywheel runs its defaults for chunked prefill, sized to the core's
 VMEM by `vmem_limit_bytes()`, and for decode the configs tuned on v7x in the
-`"TPU v7"` section of [`tuned_configs.json`](../flywheel_tpu/tuned_configs.json).
+`"TPU v7"` section of [`tuned_configs.json`](../flywheel_tpu/softmax_attention/tuned_configs.json).
 
 Chunked prefill, 16K tokens in 1K chunks, ms (TFLOP/s by the causal count),
 and our speedup over RPA v3:

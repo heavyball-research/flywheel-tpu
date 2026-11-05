@@ -18,7 +18,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import compute_kda, config, memory_ref
+from flywheel_tpu.linear_attention.kda import compute_kda, config, memory_ref
 
 
 def split_qkv_heads(

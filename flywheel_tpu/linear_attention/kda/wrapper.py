@@ -24,7 +24,9 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import (
+from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
+from flywheel_tpu.linear_attention.kda import (
     compute_conv1d,
     compute_kda,
     config,
@@ -33,8 +35,6 @@ from . import (
     vmem_ldst,
 )
 
-F32_BYTES = 4
-BF16_BYTES = 2
 # Note (david): a verify window keeps one state checkpoint per position in
 # VMEM, so large-head models (e.g. Qwen3.5-397B: 64 local v-heads, 21M per
 # buffered window even at tile_size 1) do not fit the default budget; windowed
@@ -1399,7 +1399,7 @@ def launch_fused_conv1d_kda(
         raise ValueError("qkv must be a nonempty [tokens, dim] array")
     # Note (david): the chunked math and the conv halo work on whole bf16
     # sublane tiles.
-    sublane_rows = compute_kda.BF16_SUBLANE_ROWS
+    sublane_rows = BF16_TILE_ROWS
     if compute_chunk_size <= 0 or compute_chunk_size % sublane_rows:
         raise ValueError(
             f"compute_chunk_size must be a positive multiple of {sublane_rows}"
@@ -1534,9 +1534,9 @@ def launch_fused_conv1d_kda(
     num_lanes = tpu_info.num_lanes
     mixed_tile_size = min(
         mixed_tile_size,
-        pl.cdiv(batch_size, compute_chunk_size) * compute_chunk_size,
+        round_up(batch_size, compute_chunk_size),
     )
-    aligned_num_v_heads = pl.cdiv(n_v, num_lanes) * num_lanes
+    aligned_num_v_heads = round_up(n_v, num_lanes)
 
     if replay_window:
         # Note (david): a replay tile reads a checkpoint's hi plane, and its

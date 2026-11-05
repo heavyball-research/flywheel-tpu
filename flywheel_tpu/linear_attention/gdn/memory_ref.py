@@ -21,7 +21,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from . import config
+from flywheel_tpu.linear_attention.gdn import config
 
 
 @jax.tree_util.register_dataclass

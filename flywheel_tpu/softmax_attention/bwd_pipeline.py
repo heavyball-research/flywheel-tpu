@@ -1,6 +1,5 @@
 """Kv-outer backward kernel body and its launcher."""
 
-import functools
 from collections.abc import Callable
 
 import jax
@@ -9,20 +8,25 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from .block_sizes import (
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
-    LOG2E,
     NN_DIM_NUMBERS,
     NT_DIM_NUMBERS,
-    NUM_LANES,
     QKVLayout,
-    TokenMajorInfo,
-    default_block,
     vmem_limit_bytes,
 )
-from .copy_utils import advance, drain, fold_row, hbm_head_slice, hbm_window
-from .loop_schedule import BwdSchedule
-from .mask import apply_causal_kv_major
+from flywheel_tpu.softmax_attention.dma import (
+    advance,
+    drain,
+    fold_row,
+    hbm_head_slice,
+    hbm_window,
+)
+from flywheel_tpu.softmax_attention.mask import apply_causal_kv_major
+from flywheel_tpu.softmax_attention.schedule import BwdSchedule
+from flywheel_tpu.softmax_attention.traits import BwdTraits
+from flywheel_tpu.softmax_attention.variant import Variant
 
 # Note (david): contracting axis 0 of both ds and k gives dq = ds^T @ k without
 # materializing the transpose.
@@ -39,36 +43,35 @@ SEM_ODK = 7
 SEM_ODV = 8
 NUM_SEMS_BWD = 9
 
-# Note (david): the dq accumulator and stage buffers cap the useful backward
-# block at 1024, one rung below the forward's ladder.
-BWD_BLOCKS = (1024, 512, 256, 128)
-
-default_bwd_block = functools.partial(default_block, candidates=BWD_BLOCKS)
-
 
 def bwd_body(
+    traits: BwdTraits,
+    variant: Variant,
     schedule: BwdSchedule,
     refs: tuple[jax.Array, ...],
-    *,
-    bq: int,
-    bkv: int,
-    bq_compute: int,
-    bkv_compute: int,
-    num_stages: int,
-    scale: float,
-    causal: bool,
-    causal_offset: int,
-    out_dtype: jnp.dtype,
-    head_fold: int,
-    kv_fold: int,
-    token_major: TokenMajorInfo | None,
 ) -> None:
     """Kv-outer backward over schedule.
 
-    refs are q, k, v, do, lse, di, dq, dk, dv, then call_bwd's scratch in order.
-    dk/dv accumulate per kv block and dq over the whole group; each streams out
-    as soon as it is complete.
+    traits is the build's static configuration, and variant gives the softmax
+    scale and the causal mask with its causal offset. refs are q, k, v, do,
+    lse, di, dq, dk, dv, then call_bwd's scratch in order. dk/dv accumulate per
+    kv block and dq over the whole group; each streams out as soon as it is
+    complete.
     """
+    bq, bkv = traits.bq, traits.bkv
+    bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
+    num_stages = traits.num_stages
+    out_dtype = traits.dtype
+    head_fold, kv_fold = traits.head_fold, traits.kv_fold
+    token_major = traits.token_major
+    num_q_tiles, num_kv_tiles = traits.num_q_tiles, traits.num_kv_tiles
+    lane_width_qk, lane_width_v = traits.width_qk, traits.width_v
+    q_heads_per_row = traits.q_heads_per_row
+    kv_heads_per_row = traits.kv_heads_per_row
+    is_lane_paired = traits.is_lane_paired
+    heads_per_lane_tile = traits.heads_per_lane_tile
+    scale = variant.softmax_scale
+    causal, causal_offset = variant.causal, variant.causal_offset
     # Note (david): the exact unpack pins this ref list against call_bwd's
     # operand and scratch order; a mismatch fails here instead of shifting every
     # later ref.
@@ -98,39 +101,12 @@ def bwd_body(
     ) = refs
 
     f32 = jnp.float32
-    num_q_tiles = bq // bq_compute
-    num_kv_tiles = bkv // bkv_compute
     # Note (david): scores stay in log2 units so the softmax recompute can use
     # exp2; lse arrives pre-scaled by LOG2E to match.
-    score_scale = scale * LOG2E
+    score_scale = variant.q_scale
     # Note (david): fully masked q rows (causal_offset < 0) carry lse == -inf,
     # so exp2(qk - lse) overflows to inf and 0 * inf = NaN would reach dk/dv.
     should_guard_lse = causal and causal_offset < 0
-
-    if token_major is None:
-        lane_width_qk = None
-        lane_width_v = None
-        q_heads_per_row = None
-        kv_heads_per_row = None
-    else:
-        lane_width_qk = token_major.head_dim_qk
-        lane_width_v = token_major.head_dim_v
-        q_heads_per_row = token_major.num_q_heads
-        kv_heads_per_row = token_major.num_kv_heads
-
-    # Note (david): Mosaic takes a lane window of a scratch ref only at
-    # whole-tile offset and size once another axis is sliced too, so 64-wide
-    # heads are addressed a lane tile (a head pair) at a time: loads take the
-    # head's half out of the value and stores go through a tile-wide
-    # read-modify-write. The head loop is sequential Python, so the partner half
-    # is never stale.
-    is_lane_paired = (
-        token_major is not None and token_major.head_dim_qk % NUM_LANES != 0
-    )
-    if is_lane_paired:
-        heads_per_lane_tile = NUM_LANES // token_major.head_dim_qk
-    else:
-        heads_per_lane_tile = 1
 
     def _fold_head(ref, head_idx, lane_width=None, fold=head_fold):
         # Note (david): fold == 1 passes the ref through, which under GQA makes
@@ -677,17 +653,12 @@ def bwd_body(
     )
 
 
-def bwd_out_shape(
-    token_major: TokenMajorInfo | None,
-    dtype: jnp.dtype,
-    num_heads: int,
-    num_kv_heads: int,
-    q_seq_len: int,
-    kv_seq_len: int,
-    head_dim_qk: int,
-    head_dim_v: int,
-) -> list[jax.ShapeDtypeStruct]:
+def bwd_out_shape(traits: BwdTraits) -> list[jax.ShapeDtypeStruct]:
     """(dq, dk, dv) output structs, laid out like q, k and v."""
+    token_major, dtype = traits.token_major, traits.dtype
+    num_heads, num_kv_heads = traits.num_q_heads, traits.num_kv_heads
+    q_seq_len, kv_seq_len = traits.q_seq_len, traits.kv_seq_len
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
     if token_major is None:
         return [
             jax.ShapeDtypeStruct((num_heads, q_seq_len, head_dim_qk), dtype),
@@ -731,23 +702,18 @@ def call_bwd(
     lse_log2: jax.Array,
     delta: jax.Array,
     *,
-    bq: int,
-    bkv: int,
-    head_fold: int,
-    kv_fold: int,
-    num_stages: int,
-    num_heads: int,
-    num_kv_heads: int,
-    q_seq_len: int,
-    kv_seq_len: int,
-    head_dim_qk: int,
-    head_dim_v: int,
+    traits: BwdTraits,
     interpret: bool,
     kernel_name: str,
-    token_major: TokenMajorInfo | None,
 ) -> list[jax.Array]:
-    """Allocate a bwd_body kernel's stage buffers and accumulators and run
-    it."""
+    """Allocate a bwd_body kernel's stage buffers and accumulators for traits
+    and run it."""
+    bq, bkv = traits.bq, traits.bkv
+    head_fold, kv_fold = traits.head_fold, traits.kv_fold
+    num_stages = traits.num_stages
+    q_seq_len = traits.q_seq_len
+    head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
+    token_major = traits.token_major
     vmem = pltpu.VMEM
     any_spec = pl.BlockSpec(memory_space=pl.ANY)
 
@@ -789,16 +755,7 @@ def call_bwd(
             kernel,
             in_specs=[any_spec] * len(hbm_operands),
             out_specs=[any_spec, any_spec, any_spec],
-            out_shape=bwd_out_shape(
-                token_major,
-                q.dtype,
-                num_heads,
-                num_kv_heads,
-                q_seq_len,
-                kv_seq_len,
-                head_dim_qk,
-                head_dim_v,
-            ),
+            out_shape=bwd_out_shape(traits),
             scratch_shapes=scratch_shapes,
             name=kernel_name,
             compiler_params=pltpu.CompilerParams(

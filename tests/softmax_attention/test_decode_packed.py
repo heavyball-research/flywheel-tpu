@@ -1,6 +1,6 @@
 """Packed decode: several (row, block) items per straight-line kernel step
 (a 4-element KV-cache config, items_per_step > 1), checked against the NumPy
-reference of test_flash_attn_paged and against the one-item kernel.
+reference of test_paged and against the one-item kernel.
 
 The rows span one to four 256-token blocks, so steps hold several rows, a row
 spans several steps, and the last step is padded whenever the item count is
@@ -13,8 +13,9 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_with_kvcache
-from flywheel_tpu.pallas import flash_fwd_kvcache
-from tests.test_flash_attn_paged import (
+from flywheel_tpu.softmax_attention import dispatch
+from flywheel_tpu.softmax_attention.kernels import decode as decode_kernel
+from tests.softmax_attention.test_paged import (
     INTERPRET,
     assert_extend_matches,
     ragged_reference,
@@ -56,7 +57,7 @@ def fixture_force_config(monkeypatch):
     def _force(config):
         jax.clear_caches()
         monkeypatch.setattr(
-            flash_fwd_kvcache, "get_tuned_kvcache_config", lambda **_: config
+            dispatch, "get_tuned_kvcache_config", lambda **_: config
         )
 
     yield _force
@@ -79,7 +80,7 @@ def decode_case(heads, kv_heads, head_dim, dtype, prefixes=PREFIXES):
 
 def run_decode(case, *, append, **kwargs):
     """flash_attn_with_kvcache's decode on the merged pool; (out, lse,
-    updated_k, updated_v) in test_flash_attn_paged's layout."""
+    updated_k, updated_v) in test_paged's layout."""
     q, kc, vc, k, v, _, lengths, table = case
     kv_heads = kc.shape[2]
     out, lse, cache = flash_attn_with_kvcache(
@@ -284,16 +285,16 @@ QWEN35_DECODE = dict(
 
 @pytest.mark.parametrize("device_name", ["TPU v6", "TPU v7", "cpu"])
 def test_default_packed_config_stops_at_the_max_block(device_name):
-    config = flash_fwd_kvcache.default_packed_config(
+    config = dispatch.default_packed_config(
         batch=64, device_name=device_name, **QWEN35_DECODE
     )
-    items_per_step, max_block_kv = flash_fwd_kvcache.PACKED_STEP_LIMITS.get(
-        device_name, flash_fwd_kvcache.DEFAULT_PACKED_STEP_LIMITS
+    items_per_step, max_block_kv = dispatch.PACKED_STEP_LIMITS.get(
+        device_name, dispatch.DEFAULT_PACKED_STEP_LIMITS
     )
     assert config == (
         max_block_kv,
         max_block_kv,
-        flash_fwd_kvcache.DEFAULT_NUM_KV_STAGES,
+        dispatch.DEFAULT_NUM_KV_STAGES,
         items_per_step,
     )
 
@@ -303,7 +304,7 @@ def test_default_packed_config_stops_at_the_max_block(device_name):
 def test_default_packed_config_steps_no_wider_than_the_batch(
     device_name, batch
 ):
-    config = flash_fwd_kvcache.default_packed_config(
+    config = dispatch.default_packed_config(
         batch=batch, device_name=device_name, **QWEN35_DECODE
     )
     if batch == 1:
@@ -321,24 +322,21 @@ def test_default_packed_config_fills_the_vmem_budget():
         kv_itemsize=2,
         batch=64,
     )
-    config = flash_fwd_kvcache.default_packed_config(
+    config = dispatch.default_packed_config(
         capacity=16128, page_size=256, device_name="TPU v6", **shape
     )
     block_kv, block_kv_compute, num_kv_stages, items_per_step = config
-    budget = (
-        flash_fwd_kvcache.PACKED_VMEM_FRACTION
-        * flash_fwd_kvcache.vmem_limit_bytes()
-    )
+    budget = dispatch.PACKED_VMEM_FRACTION * dispatch.vmem_limit_bytes()
 
     def vmem_bytes(block):
-        return flash_fwd_kvcache.kvcache_config_vmem_bytes(
+        return decode_kernel.kvcache_config_vmem_bytes(
             block, block, num_kv_stages, items_per_step, **shape
         )
 
-    _, max_block_kv = flash_fwd_kvcache.DEFAULT_PACKED_STEP_LIMITS
+    _, max_block_kv = dispatch.DEFAULT_PACKED_STEP_LIMITS
     assert block_kv_compute == block_kv < max_block_kv
-    assert block_kv % flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE == 0
-    next_block_kv = block_kv + flash_fwd_kvcache.PACKED_BLOCK_KV_GRANULE
+    assert block_kv % dispatch.PACKED_BLOCK_KV_GRANULE == 0
+    next_block_kv = block_kv + dispatch.PACKED_BLOCK_KV_GRANULE
     assert vmem_bytes(block_kv) <= budget < vmem_bytes(next_block_kv)
 
 
@@ -355,19 +353,15 @@ def test_validate_takes_a_paged_block_that_does_not_divide_capacity():
     )
     config = (768, 768, 2, 8)
     assert (
-        flash_fwd_kvcache.validate_kvcache_config(
-            config, page_size=256, **shape
-        )
+        decode_kernel.validate_kvcache_config(config, page_size=256, **shape)
         == config
     )
     with pytest.raises(ValueError, match="multiple of page_size"):
-        flash_fwd_kvcache.validate_kvcache_config(
+        decode_kernel.validate_kvcache_config(
             (640, 640, 2, 8), page_size=256, **shape
         )
     with pytest.raises(ValueError, match="divisor of capacity"):
-        flash_fwd_kvcache.validate_kvcache_config(
-            config, page_size=None, **shape
-        )
+        decode_kernel.validate_kvcache_config(config, page_size=None, **shape)
 
 
 def test_packed_config_rejects_bad_items_per_step(force_config):

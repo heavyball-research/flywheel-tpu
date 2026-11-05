@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from . import config, memory_ref
+from flywheel_tpu.linear_attention.gdn import config, memory_ref
 
 
 def compute_batched_seq_metadata(
