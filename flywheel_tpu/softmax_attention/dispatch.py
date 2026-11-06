@@ -31,8 +31,11 @@ head_fold the real num_heads, so a rounded-up entry could hand back a config
 the shape cannot build. A missing key returns None and the build takes its
 analytic default config; on a TPU that issues a UserWarning, once per key. A
 kvcache| key holds the contiguous KV-cache decode kernel's (block_kv,
-block_kv_compute, num_kv_stages[, items_per_step]); every other key holds a
-dense fwd / bwd CONFIG_FIELDS tuple.
+block_kv_compute, num_kv_stages[, items_per_step]); an mla| key the MLA decode
+kernel's (target block_kv, max_items_per_step); every other key holds a dense
+fwd / bwd CONFIG_FIELDS tuple. mla| keys alone are bucketed (batch and
+max_seqlen_k to powers of two), as their target block is only a target: the
+kernel fits it to the call's pages and VMEM.
 """
 
 import functools
@@ -381,6 +384,28 @@ def kvcache_config_key(
         f"|w{'-' if sliding_window is None else sliding_window}"
         f"|l{int(bool(return_lse))}"
     )
+
+
+def get_tuned_mla_config(
+    *,
+    cache_dtype: DTypeLike,
+    num_query_rows: int,
+    batch: int,
+    max_seqlen_k: int,
+) -> tuple[int, int] | None:
+    """The tuned (target block_kv, max_items_per_step) of an MLA decode build,
+    keyed on its cache dtype, its s_q * H query rows, and its batch and
+    max_seqlen_k rounded up to powers of two; None when untuned."""
+    key = (
+        f"mla|{jnp.dtype(cache_dtype).name}|r{num_query_rows}"
+        f"|b{next_pow2(batch)}|kv{max(512, next_pow2(max_seqlen_k))}"
+    )
+    config = lookup(TUNED_CONFIGS_PATH, key)
+    if config is None:
+        return None
+    else:
+        block_kv, max_items_per_step = config
+        return block_kv, max_items_per_step
 
 
 def get_tuned_kvcache_config(
