@@ -1949,6 +1949,1338 @@
       2048,
       1024,
       2
+    ],
+    "mla|bfloat16|r128|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv4096": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv131072": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv32768": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv8192": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv32768": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv4096": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv1024": [
+      1024,
+      2
+    ],
+    "mla|bfloat16|r256|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv16384": [
+      4096,
+      2
+    ],
+    "mla|bfloat16|r256|b16|kv2048": [
+      512,
+      4
+    ],
+    "mla|bfloat16|r256|b16|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv32768": [
+      2048,
+      2
+    ],
+    "mla|bfloat16|r256|b16|kv4096": [
+      4096,
+      2
+    ],
+    "mla|bfloat16|r256|b16|kv65536": [
+      8192,
+      1
+    ],
+    "mla|bfloat16|r256|b16|kv8192": [
+      512,
+      4
+    ],
+    "mla|bfloat16|r256|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv131072": [
+      8192,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv32768": [
+      1024,
+      2
+    ],
+    "mla|bfloat16|r256|b1|kv4096": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv65536": [
+      2048,
+      2
+    ],
+    "mla|bfloat16|r256|b1|kv8192": [
+      512,
+      2
+    ],
+    "mla|bfloat16|r256|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv16384": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv262144": [
+      4096,
+      2
+    ],
+    "mla|bfloat16|r256|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv8192": [
+      2048,
+      2
+    ],
+    "mla|bfloat16|r32|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv4096": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv131072": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv32768": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv131072": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv1024": [
+      1024,
+      4
+    ],
+    "mla|bfloat16|r512|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv1024": [
+      1024,
+      2
+    ],
+    "mla|bfloat16|r512|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b16|kv2048": [
+      512,
+      4
+    ],
+    "mla|bfloat16|r512|b16|kv32768": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b16|kv4096": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv8192": [
+      512,
+      4
+    ],
+    "mla|bfloat16|r512|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv32768": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv4096": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv65536": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv8192": [
+      1024,
+      1
+    ],
+    "mla|bfloat16|r512|b64|kv1024": [
+      1024,
+      4
+    ],
+    "mla|bfloat16|r512|b64|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r512|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv4096": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv131072": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv32768": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv8192": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv2048": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b256|kv2048": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b32|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv2048": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b8|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv32768": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv1024": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv131072": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv16384": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv2048": [
+      512,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv262144": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv32768": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv4096": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv131072": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv16384": [
+      4096,
+      1
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv32768": [
+      1024,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv4096": [
+      2048,
+      1
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv65536": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv32768": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv131072": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv1024": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv1024": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv131072": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv16384": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv2048": [
+      512,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv32768": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv4096": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv65536": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv8192": [
+      512,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv131072": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv16384": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv32768": [
+      1024,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv4096": [
+      1024,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv65536": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv1024": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv262144": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv65536": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv8192": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv2048": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv8192": [
+      2048,
+      8
     ]
   },
   "TPU v7": {
@@ -3596,6 +4928,1338 @@
       8192,
       2048,
       2
+    ],
+    "mla|bfloat16|r128|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv16384": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv32768": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r128|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r16|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r16|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv1024": [
+      1024,
+      4
+    ],
+    "mla|bfloat16|r256|b16|kv131072": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b16|kv2048": [
+      512,
+      4
+    ],
+    "mla|bfloat16|r256|b16|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv4096": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r256|b16|kv8192": [
+      2048,
+      2
+    ],
+    "mla|bfloat16|r256|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv131072": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv16384": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv32768": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv4096": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r256|b1|kv65536": [
+      4096,
+      1
+    ],
+    "mla|bfloat16|r256|b1|kv8192": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r256|b64|kv1024": [
+      1024,
+      4
+    ],
+    "mla|bfloat16|r256|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv262144": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r256|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv4096": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r32|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv1024": [
+      1024,
+      2
+    ],
+    "mla|bfloat16|r512|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv16384": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv32768": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv4096": [
+      2048,
+      1
+    ],
+    "mla|bfloat16|r512|b1|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b1|kv8192": [
+      1024,
+      1
+    ],
+    "mla|bfloat16|r512|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r512|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv1024": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv32768": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv16384": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv2048": [
+      512,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|bfloat16|r64|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv2048": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv32768": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b16|kv8192": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv16384": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv2048": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b256|kv2048": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b32|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv16384": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b64|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r128|b8|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv32768": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv16384": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r16|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv1024": [
+      1024,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv131072": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv16384": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv2048": [
+      512,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv32768": [
+      2048,
+      4
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv4096": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b16|kv8192": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv131072": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv16384": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv32768": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv65536": [
+      4096,
+      2
+    ],
+    "mla|float8_e4m3fn|r256|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r256|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv32768": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv16384": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv2048": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r32|b64|kv8192": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv262144": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b128|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv1024": [
+      1024,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv131072": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv16384": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv32768": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv4096": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv65536": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b16|kv8192": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv131072": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv16384": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv32768": [
+      1024,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv4096": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv65536": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv16384": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv262144": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r512|b64|kv65536": [
+      2048,
+      2
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv16384": [
+      2048,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b128|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv131072": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv262144": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv32768": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b16|kv8192": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv131072": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv16384": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv2048": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv32768": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv4096": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv512": [
+      512,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv65536": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b1|kv8192": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv1024": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv16384": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv2048": [
+      8192,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv262144": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv4096": [
+      1024,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv65536": [
+      4096,
+      8
+    ],
+    "mla|float8_e4m3fn|r64|b64|kv8192": [
+      2048,
+      8
     ]
   }
 }
