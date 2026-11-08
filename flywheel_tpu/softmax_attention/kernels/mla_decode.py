@@ -1,5 +1,6 @@
 """Absorbed MLA decode: append new latent tokens, then attend as MQA."""
 
+import enum
 import functools
 import math
 from typing import NamedTuple
@@ -55,6 +56,10 @@ NUM_GROUPS = 2
 # fraction of block_kv up to REPLAY_CHUNK_TILES lane tiles, so its code is one
 # chunk's.
 REPLAY_CHUNK_TILES = 4
+# Note (david): the append runs in chunks through NUM_APPEND_BUFFERS buffers,
+# so its VMEM does not grow with the batch.
+APPEND_CHUNK_REQUESTS = 64
+NUM_APPEND_BUFFERS = 3
 # Note (david): the rest of the VMEM limit is Mosaic's room for a step's score
 # temporaries.
 VMEM_BUDGET_FRACTION = 0.75
@@ -78,6 +83,18 @@ class MlaDecodeConfig(NamedTuple):
 
     block_kv: int
     items_per_step: int
+
+
+class KvSource(enum.Enum):
+    """Where a step's copies take an item's tokens from."""
+
+    # Note (david): the tokens before the appended tiles, which do not wait
+    # for the append.
+    CACHE_BEFORE_APPEND = enum.auto()
+    # Note (david): the appended tiles, from the append buffers.
+    APPEND_BUFFER = enum.auto()
+    # Note (david): every token, after the append's write-back.
+    CACHE = enum.auto()
 
 
 class ScheduleItem(NamedTuple):
@@ -118,6 +135,25 @@ def mla_block_kv(
         )
 
 
+def mla_append_chunk(batch: int, items_per_step: int) -> int:
+    """Requests in one chunk of the append, so that the buffers hold every
+    request of the first NUM_STAGES steps, which read them."""
+    return min(
+        batch,
+        max(
+            APPEND_CHUNK_REQUESTS,
+            pl.cdiv(NUM_STAGES * items_per_step, NUM_APPEND_BUFFERS),
+        ),
+    )
+
+
+def max_append_tokens(query_tokens: int, cache_dtype: jnp.dtype) -> int:
+    """Tokens of the cache tiles that hold a request's new tokens, at most."""
+    tile_rows = cache_tile_rows(cache_dtype)
+    # Note (david): the first new token may sit anywhere in its tile.
+    return (pl.cdiv(query_tokens - 1, tile_rows) + 1) * tile_rows
+
+
 def mla_vmem_bytes(
     config: MlaDecodeConfig,
     *,
@@ -135,7 +171,7 @@ def mla_vmem_bytes(
     tile_rows = cache_tile_rows(cache_dtype)
     padded_rows = pl.cdiv(num_query_rows, BF16_TILE_ROWS) * BF16_TILE_ROWS
     padded_tokens = pl.cdiv(query_tokens, tile_rows) * tile_rows
-    append_tokens = (pl.cdiv(query_tokens - 1, tile_rows) + 1) * tile_rows
+    append_rows = NUM_APPEND_BUFFERS * mla_append_chunk(batch, items_per_step)
     kv_ring_bytes = (
         NUM_STAGES * items_per_step * block_kv * CACHE_ROW_DIM * itemsize
     )
@@ -147,9 +183,14 @@ def mla_vmem_bytes(
         * BF16_BYTES
     )
     new_token_bytes = (
-        (batch + 1) * padded_tokens * (LATENT_DIM + NUM_LANES) * itemsize
+        (append_rows + 1) * padded_tokens * (LATENT_DIM + NUM_LANES) * itemsize
     )
-    append_tile_bytes = 2 * batch * append_tokens * CACHE_ROW_DIM * itemsize
+    append_tile_bytes = (
+        append_rows
+        * max_append_tokens(query_tokens, cache_dtype)
+        * CACHE_ROW_DIM
+        * itemsize
+    )
     output_ring_bytes = (
         2 * items_per_step * padded_rows * LATENT_DIM * BF16_BYTES
     )
@@ -255,8 +296,10 @@ def default_mla_config(
             config = MlaDecodeConfig(block_kv, config.items_per_step // 2)
         if mla_vmem_bytes(config, **shape) <= vmem_budget:
             return config
+        # Note (david): a block is whole lane tiles.
         elif (
-            mla_block_kv(page_size, bound_pages, target_block_kv // 2)
+            target_block_kv // 2 < NUM_LANES
+            or mla_block_kv(page_size, bound_pages, target_block_kv // 2)
             >= block_kv
         ):
             raise ValueError(
@@ -319,6 +362,7 @@ def mla_decode_kernel(
     page_size: int,
     pages_per_seq: int,
     config: MlaDecodeConfig,
+    append_chunk: int,
     num_heads: int,
     sm_scale_log2: float,
     s_dtype: jnp.dtype,
@@ -334,6 +378,9 @@ def mla_decode_kernel(
     Query, new-token and output rows are token-major (row t * H + h). With
     is_quantized, refs start with the SMEM (1,) f32 kv_scale; with
     return_lse, the lse block holds request b at [b // 128, :, b % 128].
+    The append runs in chunks of append_chunk requests, and request b's new
+    tokens and tiles sit at row b % (NUM_APPEND_BUFFERS * append_chunk) of
+    the append buffers.
     """
     # Note (david): K and V share the fp8 cache's one kv_scale, so it folds
     # into the score scale and the output normalization instead of scaling
@@ -357,8 +404,7 @@ def mla_decode_kernel(
         new_latent,
         new_rope,
         new_token_rows,
-        cache_append_tiles,
-        attention_append_tiles,
+        append_tiles,
         output_ring,
         row_max_ref,
         row_sum_ref,
@@ -380,6 +426,8 @@ def mla_decode_kernel(
     max_items = schedule_ref.shape[0] - 1
     num_items = schedule_ref[max_items]
     num_steps = pl.cdiv(num_items, items_per_step)
+    num_append_rows = append_tiles.shape[0]
+    num_chunks = pl.cdiv(batch, append_chunk)
     # Note (david): the word layout is a row-major reshape of the token rows,
     # and a copy into the staging's own tiles converts the tiling at full
     # bandwidth, so every copy addresses token rows. The Pallas interpreter
@@ -431,27 +479,26 @@ def mla_decode_kernel(
         )
         return jnp.where(num_tokens > 0, block_table_ref[table_index], 0)
 
+    def _append_row(request):
+        """Row of the request's new tokens and tiles in the append buffers."""
+        return lax.rem(request, num_append_rows)
+
     def _start_item_copies(
-        item,
-        slot,
-        is_live_step,
-        *,
-        copy_cached_tokens,
-        copy_append_tiles,
-        copy_queries,
+        item, slot, is_live_step, *, kv_source, copy_queries
     ):
-        """Start the item's copies into its place in the ring slot: cached
-        tokens from HBM, appended tiles from attention_append_tiles, and its
-        request's query rows when the item starts the request."""
+        """Start the item's copies into its place in the ring slot: its
+        tokens from kv_source, and its request's query rows when the item
+        starts the request."""
         append_start, append_end = _append_tile_range(item.kv_len)
         item_start = item.kv_block * block_kv
         item_end = item_start + block_kv
         slot_offset = item.step_position * block_kv
         kv_sem = dma_sems.at[SEM_KV, slot]
-        # Note (david): the cached tokens stop at the appended tiles, which
-        # the prologue's write-back is still rewriting in HBM.
-        if copy_cached_tokens:
-            cached_end = jnp.minimum(append_start, item_end)
+        if kv_source in (KvSource.CACHE_BEFORE_APPEND, KvSource.CACHE):
+            if kv_source == KvSource.CACHE_BEFORE_APPEND:
+                cached_end = jnp.minimum(append_start, item_end)
+            else:
+                cached_end = jnp.minimum(append_end, item_end)
             if block_kv >= page_size:
                 pages_per_item = block_kv // page_size
                 for page in range(pages_per_item):
@@ -500,7 +547,7 @@ def mla_decode_kernel(
                     kv_ring.at[slot, pl.ds(slot_offset, num_tokens)],
                     kv_sem,
                 ).start()
-        if copy_append_tiles:
+        elif kv_source == KvSource.APPEND_BUFFER:
             copy_start = jnp.maximum(append_start, item_start)
             num_tokens = _tile_aligned(
                 jnp.where(
@@ -520,8 +567,8 @@ def mla_decode_kernel(
             @pl.when(num_tokens > 0)
             def _start_append_tile_copy():
                 pltpu.make_async_copy(
-                    attention_append_tiles.at[
-                        item.request,
+                    append_tiles.at[
+                        _append_row(item.request),
                         pl.ds(
                             _tile_aligned(copy_start - append_start),
                             num_tokens,
@@ -558,18 +605,51 @@ def mla_decode_kernel(
                     query_sem,
                 ).start()
 
-    def _start_step_copies(
-        step, slot, *, copy_cached_tokens, copy_append_tiles, copy_queries
-    ):
+    def _start_step_copies(step, slot, *, kv_source, copy_queries):
         is_live_step = step < num_steps
         for step_position in range(items_per_step):
             _start_item_copies(
                 _schedule_item(step, step_position),
                 slot,
                 is_live_step,
-                copy_cached_tokens=copy_cached_tokens,
-                copy_append_tiles=copy_append_tiles,
+                kv_source=kv_source,
                 copy_queries=copy_queries,
+            )
+
+    def _zero_rows_past_kv_len(slot, items):
+        """Zero the staged rows past each request's kv_len in its last tile.
+
+        These rows hold whatever the cache holds there, possibly NaN, and
+        P @ V multiplies them by 0. The other staged rows hold keys or the
+        zeros and keys of earlier steps, so they stay finite.
+        """
+        # Note (david): branch-free: an item with no row to zero rewrites its
+        # first tile unchanged.
+        for item in items:
+            item_start = item.kv_block * block_kv
+            needs_zeroing = jnp.logical_and(
+                item.is_last_block, lax.rem(item.kv_len, tile_rows) != 0
+            )
+            last_tile_start = (item.kv_len - 1) // tile_rows * tile_rows
+            tile_offset = jnp.where(
+                needs_zeroing, last_tile_start - item_start, 0
+            )
+            kept_rows = jnp.where(
+                needs_zeroing,
+                item.kv_len - item_start - tile_offset,
+                tile_rows,
+            )
+            rows = kv_ring.at[
+                slot,
+                pl.ds(
+                    _tile_aligned(item.step_position * block_kv + tile_offset),
+                    tile_rows,
+                ),
+            ]
+            rows[...] = jnp.where(
+                lax.broadcasted_iota(jnp.int32, rows.shape, 0) < kept_rows,
+                rows[...],
+                jnp.zeros(rows.shape, rows.dtype),
             )
 
     def _anchored_softmax(item, scores, visible, row_max, row_sum):
@@ -827,6 +907,7 @@ def mla_decode_kernel(
             for step_position in range(items_per_step)
         ]
         _wait_step_copies(slot, items)
+        _zero_rows_past_kv_len(slot, items)
         # Note (david): q_pe is narrower than a lane tile, which no DMA window
         # can address, so it reaches its lanes of the query rows through
         # vector stores.
@@ -848,11 +929,7 @@ def mla_decode_kernel(
         # Note (david): the copies overwrite the slot the items have just
         # read, so they start after its last load.
         _start_step_copies(
-            step + NUM_STAGES,
-            slot,
-            copy_cached_tokens=True,
-            copy_append_tiles=True,
-            copy_queries=True,
+            step + NUM_STAGES, slot, kv_source=KvSource.CACHE, copy_queries=True
         )
         for item in items:
             pl.when(item.is_last_block)(
@@ -943,22 +1020,17 @@ def mla_decode_kernel(
     def _run_replay_step(step, carry):
         """One step of the online-softmax replay."""
         slot = lax.rem(step, NUM_STAGES)
-        _wait_step_copies(
-            slot,
-            [
-                _schedule_item(step, step_position)
-                for step_position in range(items_per_step)
-            ],
-        )
+        items = [
+            _schedule_item(step, step_position)
+            for step_position in range(items_per_step)
+        ]
+        _wait_step_copies(slot, items)
+        _zero_rows_past_kv_len(slot, items)
         lax.fori_loop(
             0, items_per_step, functools.partial(_replay_item, step, slot), 0
         )
         _start_step_copies(
-            step + NUM_STAGES,
-            slot,
-            copy_cached_tokens=True,
-            copy_append_tiles=True,
-            copy_queries=True,
+            step + NUM_STAGES, slot, kv_source=KvSource.CACHE, copy_queries=True
         )
         return carry
 
@@ -989,44 +1061,73 @@ def mla_decode_kernel(
             ),
         )
 
-    def _wait_append_copies(sem_row, request, carry):
+    def _chunk_requests(chunk):
+        """(first request, request count) of the append chunk."""
+        first_request = chunk * append_chunk
+        return first_request, jnp.minimum(append_chunk, batch - first_request)
+
+    def _new_token_copies(chunk):
+        first_request, num_requests = _chunk_requests(chunk)
+        buffer = chunk % NUM_APPEND_BUFFERS
+        return tuple(
+            pltpu.make_async_copy(
+                source.at[pl.ds(first_request, num_requests)],
+                destination.at[pl.ds(buffer * append_chunk, num_requests)],
+                dma_sems.at[SEM_NEW_TOKENS, buffer],
+            )
+            for source, destination in (
+                (new_kv_c_hbm, new_latent),
+                (new_k_pe_hbm, new_rope),
+            )
+        )
+
+    def _wait_append_copies(sem_row, buffer, request, carry):
         num_tokens, _ = _append_windows(request)
 
         @pl.when(num_tokens > 0)
         def _wait_tiles():
-            tiles = cache_append_tiles.at[
-                request, pl.ds(0, _tile_aligned(num_tokens))
+            tiles = append_tiles.at[
+                _append_row(request), pl.ds(0, _tile_aligned(num_tokens))
             ]
-            pltpu.make_async_copy(tiles, tiles, dma_sems.at[sem_row, 0]).wait()
+            pltpu.make_async_copy(
+                tiles, tiles, dma_sems.at[sem_row, buffer]
+            ).wait()
 
         return carry
 
-    def _start_append_reads(request, carry):
+    def _for_chunk_requests(chunk, body):
+        """Run body(buffer, request, carry) over the chunk's requests."""
+        first_request, num_requests = _chunk_requests(chunk)
+        lax.fori_loop(
+            first_request,
+            first_request + num_requests,
+            functools.partial(body, chunk % NUM_APPEND_BUFFERS),
+            0,
+        )
+
+    def _start_append_reads(buffer, request, carry):
         _, windows = _append_windows(request)
         for page_id, page_offset, buffer_offset, num_tokens in windows:
             pltpu.make_async_copy(
                 cache_token_rows.at[page_id, pl.ds(page_offset, num_tokens)],
-                cache_append_tiles.at[
-                    request, pl.ds(buffer_offset, num_tokens)
+                append_tiles.at[
+                    _append_row(request), pl.ds(buffer_offset, num_tokens)
                 ],
-                dma_sems.at[SEM_APPEND_READ, 0],
+                dma_sems.at[SEM_APPEND_READ, buffer],
             ).start()
         return carry
 
-    def _merge_new_tokens(request, carry):
-        """Patch the request's new tokens into its tiles: cache_append_tiles
-        keeps every other row's bits and goes back to the cache, and
-        attention_append_tiles zeroes the rows past kv_len (the cache's,
-        possibly NaN) for the attention."""
+    def _merge_new_tokens(buffer, request, carry):
+        """Patch the request's new tokens into its tiles, keeping every other
+        row's bits, and start their write-back to the cache."""
         _, windows = _append_windows(request)
+        row = _append_row(request)
         kv_len = kv_lens_ref[request]
         append_start, _ = _append_tile_range(kv_len)
         new_token_start = kv_len - query_tokens
-        new_token_rows[:, :latent_dim] = new_latent[request]
-        new_token_rows[:, latent_dim : latent_dim + rope_dim] = new_rope[
-            request
-        ]
-        old_tiles = cache_append_tiles[request]
+        new_token_rows[:, :latent_dim] = new_latent[row]
+        new_token_rows[:, latent_dim : latent_dim + rope_dim] = new_rope[row]
+        old_tiles = append_tiles[row]
         token_position = append_start + lax.broadcasted_iota(
             jnp.int32, old_tiles.shape, 0
         )
@@ -1039,19 +1140,55 @@ def mla_decode_kernel(
                 ),
                 merged_tiles,
             )
-        cache_append_tiles[request] = merged_tiles
-        attention_append_tiles[request] = jnp.where(
-            token_position < kv_len, merged_tiles, jnp.zeros_like(merged_tiles)
-        )
+        append_tiles[row] = merged_tiles
         for page_id, page_offset, buffer_offset, num_tokens in windows:
             pltpu.make_async_copy(
-                cache_append_tiles.at[
-                    request, pl.ds(buffer_offset, num_tokens)
-                ],
+                append_tiles.at[row, pl.ds(buffer_offset, num_tokens)],
                 cache_token_rows.at[page_id, pl.ds(page_offset, num_tokens)],
-                dma_sems.at[SEM_APPEND_WRITE, 0],
+                dma_sems.at[SEM_APPEND_WRITE, buffer],
             ).start()
         return carry
+
+    def _start_chunk_reads(chunk):
+        for copy in _new_token_copies(chunk):
+            copy.start()
+        _for_chunk_requests(chunk, _start_append_reads)
+
+    def _wait_chunk_writes(chunk):
+        _for_chunk_requests(
+            chunk, functools.partial(_wait_append_copies, SEM_APPEND_WRITE)
+        )
+
+    def _append_chunk(index, carry):
+        """Merge one chunk, last chunk first, and start the reads of the
+        chunk before it. Each buffer signals its own semaphores."""
+        chunk = num_chunks - 1 - index
+
+        @pl.when(chunk > 0)
+        def _start_previous_chunk_reads():
+            # Note (david): the chunk before reuses the buffer of the chunk
+            # NUM_APPEND_BUFFERS - 1 after it.
+            reused_chunk = chunk - 1 + NUM_APPEND_BUFFERS
+
+            @pl.when(reused_chunk < num_chunks)
+            def _wait_reused_buffer():
+                _wait_chunk_writes(reused_chunk)
+
+            _start_chunk_reads(chunk - 1)
+
+        for copy in _new_token_copies(chunk):
+            copy.wait()
+        _for_chunk_requests(
+            chunk, functools.partial(_wait_append_copies, SEM_APPEND_READ)
+        )
+        _for_chunk_requests(chunk, _merge_new_tokens)
+        return carry
+
+    def _wait_last_append_writes():
+        # Note (david): the chunks run last first, so the first ones may still
+        # write back.
+        for chunk in range(min(num_chunks, NUM_APPEND_BUFFERS)):
+            _wait_chunk_writes(chunk)
 
     query_ring[:, :, pl.ds(latent_dim, row_dim - latent_dim)] = jnp.zeros(
         (num_query_slots, num_query_rows, row_dim - latent_dim),
@@ -1062,46 +1199,26 @@ def mla_decode_kernel(
     row_sum_ref[...] = jnp.zeros(row_sum_ref.shape, jnp.float32)
     accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
     max_row_sum_ref[...] = jnp.zeros(max_row_sum_ref.shape, jnp.float32)
-    new_token_copies = (
-        pltpu.make_async_copy(
-            new_kv_c_hbm, new_latent, dma_sems.at[SEM_NEW_TOKENS, 0]
-        ),
-        pltpu.make_async_copy(
-            new_k_pe_hbm, new_rope, dma_sems.at[SEM_NEW_TOKENS, 0]
-        ),
-    )
-    for copy in new_token_copies:
-        copy.start()
-    lax.fori_loop(0, batch, _start_append_reads, 0)
+    _start_chunk_reads(num_chunks - 1)
     # Note (david): the first steps' cached tokens and queries do not depend
-    # on the append, so they start before the merge and overlap it.
+    # on the append, so they start before it and overlap it.
     for step in range(NUM_STAGES):
         kv_ring[step] = jnp.zeros(kv_ring.shape[1:], kv_ring.dtype)
         _start_step_copies(
             step,
             step,
-            copy_cached_tokens=True,
-            copy_append_tiles=False,
+            kv_source=KvSource.CACHE_BEFORE_APPEND,
             copy_queries=True,
         )
-    for copy in new_token_copies:
-        copy.wait()
-    # Note (david): every request's tile reads signal one semaphore, which
-    # counts bytes, so a wait sized to one request's tiles may return on
-    # another's; the merges start once every read has landed.
-    lax.fori_loop(
-        0, batch, functools.partial(_wait_append_copies, SEM_APPEND_READ), 0
-    )
-    lax.fori_loop(0, batch, _merge_new_tokens, 0)
+    lax.fori_loop(0, num_chunks, _append_chunk, 0)
+    # Note (david): the first steps take their appended tiles from the
+    # buffers, as the write-back may still run.
     for step in range(NUM_STAGES):
         _start_step_copies(
-            step,
-            step,
-            copy_cached_tokens=False,
-            copy_append_tiles=True,
-            copy_queries=False,
+            step, step, kv_source=KvSource.APPEND_BUFFER, copy_queries=False
         )
-
+    # Note (david): the later steps take their appended tiles from the cache.
+    _wait_last_append_writes()
     lax.fori_loop(0, num_steps, _run_step, 0)
     # Note (david): only the last num_output_slots output copies still run;
     # each earlier one was waited for by the finish that reused its slot.
@@ -1110,8 +1227,8 @@ def mla_decode_kernel(
 
     # Note (david): the steps copy into the slot they have just read, so no
     # step can replay in place; the replay reruns the whole schedule once with
-    # the online softmax, rewriting every output. No appended tile is written
-    # again, so attention_append_tiles still holds the prologue's.
+    # the online softmax, rewriting every output. Every write-back has landed,
+    # so the replay stages every token from the cache.
     should_replay_ref[0] = jnp.any(
         jnp.logical_not(max_row_sum_ref[...] <= 2.0**guard_threshold)
     ).astype(jnp.int32)
@@ -1125,21 +1242,11 @@ def mla_decode_kernel(
         accumulator_ref[...] = jnp.zeros(accumulator_ref.shape, jnp.float32)
         for step in range(NUM_STAGES):
             _start_step_copies(
-                step,
-                step,
-                copy_cached_tokens=True,
-                copy_append_tiles=True,
-                copy_queries=True,
+                step, step, kv_source=KvSource.CACHE, copy_queries=True
             )
         lax.fori_loop(0, num_steps, _run_replay_step, 0)
         for request in range(max(0, batch - num_output_slots), batch):
             _output_copy(request, request % num_output_slots).wait()
-
-    # Note (david): the kernel must not exit with DMAs in flight, and the
-    # append write-backs still run.
-    lax.fori_loop(
-        0, batch, functools.partial(_wait_append_copies, SEM_APPEND_WRITE), 0
-    )
 
 
 def mla_decode_pallas(
@@ -1176,6 +1283,19 @@ def mla_decode_pallas(
     # MXU's M dimension.
     num_query_rows = query_tokens * num_heads
     block_kv, items_per_step = config
+    # Note (david): an item is whole lane tiles, and whole pages or a whole
+    # fraction of one.
+    if (
+        block_kv <= 0
+        or block_kv % NUM_LANES
+        or (block_kv % page_size and page_size % block_kv)
+        or items_per_step < 1
+    ):
+        raise ValueError(
+            f"{config} needs block_kv a multiple of {NUM_LANES} and either a"
+            f" multiple or a divisor of page_size {page_size}, and"
+            " items_per_step >= 1."
+        )
     blocks_per_request = pl.cdiv(pages_per_seq * page_size, block_kv)
     if blocks_per_request >= KV_BLOCK_MASK or batch >= 1 << (
         31 - REQUEST_SHIFT
@@ -1210,9 +1330,9 @@ def mla_decode_pallas(
         out_specs.append(pl.BlockSpec(lse_shape, lambda *_: (0, 0, 0)))
     num_query_slots = NUM_STAGES * items_per_step
     num_output_slots = 2 * items_per_step
-    tile_rows = cache_tile_rows(cache_dtype)
-    # Note (david): the first new token may sit anywhere in its tile.
-    max_append_tokens = (pl.cdiv(query_tokens - 1, tile_rows) + 1) * tile_rows
+    append_chunk = mla_append_chunk(batch, items_per_step)
+    num_append_rows = NUM_APPEND_BUFFERS * append_chunk
+    append_tokens = max_append_tokens(query_tokens, cache_dtype)
     scratch_shapes = (
         # kv_ring
         pltpu.VMEM(
@@ -1223,15 +1343,13 @@ def mla_decode_pallas(
         # q_pe_ring
         pltpu.VMEM((num_query_slots, num_query_rows, rope_dim), q_pe.dtype),
         # new_latent
-        pltpu.VMEM((batch, query_tokens, latent_dim), cache_dtype),
+        pltpu.VMEM((num_append_rows, query_tokens, latent_dim), cache_dtype),
         # new_rope
-        pltpu.VMEM((batch, query_tokens, rope_dim), cache_dtype),
+        pltpu.VMEM((num_append_rows, query_tokens, rope_dim), cache_dtype),
         # new_token_rows
         pltpu.VMEM((query_tokens, row_dim), cache_dtype),
-        # cache_append_tiles
-        pltpu.VMEM((batch, max_append_tokens, row_dim), cache_dtype),
-        # attention_append_tiles
-        pltpu.VMEM((batch, max_append_tokens, row_dim), cache_dtype),
+        # append_tiles
+        pltpu.VMEM((num_append_rows, append_tokens, row_dim), cache_dtype),
         # output_ring
         pltpu.VMEM(
             (num_output_slots, num_query_rows, latent_dim), q_nope.dtype
@@ -1247,9 +1365,10 @@ def mla_decode_pallas(
         # should_replay_ref
         pltpu.SMEM((1,), jnp.int32),
         # dma_sems
-        pltpu.SemaphoreType.DMA(
-            (NUM_SEM_ROWS, max(NUM_STAGES, num_output_slots))
-        ),
+        pltpu.SemaphoreType.DMA((
+            NUM_SEM_ROWS,
+            max(NUM_STAGES, num_output_slots, NUM_APPEND_BUFFERS),
+        )),
     )
     kernel = functools.partial(
         mla_decode_kernel,
@@ -1257,6 +1376,7 @@ def mla_decode_pallas(
         page_size=page_size,
         pages_per_seq=pages_per_seq,
         config=config,
+        append_chunk=append_chunk,
         num_heads=num_heads,
         sm_scale_log2=sm_scale * LOG2E,
         s_dtype=s_dtype,

@@ -16,11 +16,16 @@ import dataclasses
 import jax
 import jax.numpy as jnp
 import pytest
+from jax.experimental import pallas as pl
 
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.softmax_attention.config import vmem_limit_bytes
 from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+    VMEM_BUDGET_FRACTION,
     MlaDecodeConfig,
     default_mla_config,
     mla_decode_pallas,
+    mla_vmem_bytes,
 )
 from flywheel_tpu.softmax_attention.mla_decode import (
     FP8_CACHE_DTYPE,
@@ -192,6 +197,13 @@ GEOMETRY_PARAMS = [
             for page_size in (one_tile, three_tiles)
         ),
     )
+]
+
+# Note (david): batches past the point where a VMEM copy of every request's
+# new tokens and tiles stopped fitting.
+LARGE_BATCH_PARAMS = [
+    MlaParam(768, 4, 20, is_varlen=True, is_causal=True, is_fp8=is_fp8)
+    for is_fp8 in (False, True)
 ]
 
 # Note (david): a straddle at KV_BLOCK sits on a KV block boundary of the
@@ -384,6 +396,7 @@ def run_decode(case, param, s_dtype):
         + GEOMETRY_PARAMS
         + STRADDLE_PARAMS
         + FRESH_PARAMS
+        + LARGE_BATCH_PARAMS
     ),
 )
 def test_flash_mla_decode(param, s_dtype):
@@ -479,3 +492,70 @@ def test_flash_mla_decode_replay_chunks(is_fp8, block_kv):
         config=MlaDecodeConfig(block_kv, 2),
     )
     check_decode(case, param, LSE_TOL, out, lse, kv_cache)
+
+
+LARGE_BATCH_MAX_SEQLEN_K = 4096
+
+
+@pytest.mark.parametrize("page_size", [16, 256, 1024])
+@pytest.mark.parametrize("batch", [725, 4096])
+@pytest.mark.parametrize("s_q, h_q", [(1, 8), (4, 128)])
+def test_default_mla_config_at_large_batch(page_size, batch, s_q, h_q):
+    """A large batch gets a block of whole lane tiles, a step no wider than
+    its items, and a config inside the VMEM budget."""
+    shape = {
+        "batch": batch,
+        "num_query_rows": s_q * h_q,
+        "query_tokens": s_q,
+        "cache_dtype": BF16,
+        "return_lse": True,
+    }
+    config = default_mla_config(
+        page_size=page_size,
+        pages_per_seq=LARGE_BATCH_MAX_SEQLEN_K // page_size,
+        max_seqlen_k=LARGE_BATCH_MAX_SEQLEN_K,
+        **shape,
+    )
+    assert config.block_kv % NUM_LANES == 0, config
+    max_items = batch * pl.cdiv(LARGE_BATCH_MAX_SEQLEN_K, config.block_kv)
+    assert 1 <= config.items_per_step <= max_items, config
+    vmem_budget = VMEM_BUDGET_FRACTION * vmem_limit_bytes()
+    assert mla_vmem_bytes(config, **shape) <= vmem_budget, config
+
+
+@pytest.mark.parametrize("page_size", [16, 1024])
+def test_default_mla_config_rejects_vmem_overflow(page_size):
+    """A shape that fits no block raises the VMEM error."""
+    with pytest.raises(ValueError, match="VMEM limit at one 128-token item"):
+        default_mla_config(
+            batch=16384,
+            page_size=page_size,
+            pages_per_seq=LARGE_BATCH_MAX_SEQLEN_K // page_size,
+            num_query_rows=MAX_QUERY_TOKENS * 128,
+            query_tokens=MAX_QUERY_TOKENS,
+            cache_dtype=BF16,
+            return_lse=True,
+            max_seqlen_k=LARGE_BATCH_MAX_SEQLEN_K,
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [MlaDecodeConfig(64, 2), MlaDecodeConfig(384, 2), MlaDecodeConfig(512, 0)],
+    ids=["under-a-lane-tile", "not-page-aligned", "no-items"],
+)
+def test_mla_decode_pallas_rejects_config(config):
+    """An explicit config whose block is no whole lane tiles, neither a
+    multiple nor a divisor of the page, or whose step has no item."""
+    case = make_case(MlaParam(2, 1, 20, False, True, page_size=256))
+    with pytest.raises(ValueError, match="needs block_kv"):
+        mla_decode_pallas(
+            *case.operands(),
+            kv_scale=case.kv_scale,
+            sm_scale=SM_SCALE,
+            s_dtype=jnp.dtype(jnp.float32),
+            causal=True,
+            return_lse=False,
+            interpret=INTERPRET,
+            config=config,
+        )
