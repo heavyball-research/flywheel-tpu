@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Time attention over a paged KV cache in serving scenarios, chunked prefill,
 # decode and speculative verify, for flywheel, RPA v3 and vllm-torchtpu's
-# batched RPA, with a profiler trace per cell.
+# batched RPA, and MLA chunked prefill for flywheel_mla and MLA v2, with a
+# profiler trace per cell.
 #
 # Every cell appends to one JSONL. A cell that fails (out of VMEM, or a cache
 # larger than HBM) is recorded as an error and the sweep goes on.
@@ -12,7 +13,7 @@
 #
 # Environment:
 #     PYTHON          interpreter (default: .venv/bin/python)
-#     IMPLS           default "flywheel rpa"; batched_rpa needs
+#     IMPLS           default "flywheel rpa", empty for none; batched_rpa needs
 #                     TORCHTPU_SOURCE
 #     TORCHTPU_SOURCE a vllm-torchtpu checkout for batched_rpa
 #     HEADS_K         default "4 32"
@@ -27,6 +28,11 @@
 #     VERIFY_TOKENS   query tokens per sequence per step (default "1 4 8 16");
 #                     1 runs each impl's decode path
 #     VERIFY_STEPS    verify steps per timed call (default 8)
+#     MLA_IMPLS       MLA chunked prefill impls, e.g. "flywheel_mla mla_v2"
+#                     (default: none)
+#     MLA_HEADS       default "16 128"
+#     MLA_KV_DTYPES   default "bfloat16 float8_e4m3fn"
+#     MLA_SEQS        default "16384 65536"
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -34,7 +40,7 @@ export PYTHONPATH=.
 
 PYTHON=${PYTHON:-.venv/bin/python}
 OUT=${1:-results/benchmark/kvcache_scenarios/$(date +%Y%m%d_%H%M%S)}
-IMPLS=${IMPLS:-"flywheel rpa"}
+IMPLS=${IMPLS-"flywheel rpa"}
 TORCHTPU_SOURCE=${TORCHTPU_SOURCE:-}
 if [[ " $IMPLS " == *" batched_rpa "* && -z $TORCHTPU_SOURCE ]]; then
   echo "IMPLS has batched_rpa: set TORCHTPU_SOURCE to a vllm-torchtpu" \
@@ -53,6 +59,10 @@ VERIFY_BATCHES=${VERIFY_BATCHES:-"32 128"}
 VERIFY_SEQS=${VERIFY_SEQS:-"2048 8192"}
 VERIFY_TOKENS=${VERIFY_TOKENS:-"1 4 8 16"}
 VERIFY_STEPS=${VERIFY_STEPS:-8}
+MLA_IMPLS=${MLA_IMPLS:-}
+MLA_HEADS=${MLA_HEADS:-"16 128"}
+MLA_KV_DTYPES=${MLA_KV_DTYPES:-"bfloat16 float8_e4m3fn"}
+MLA_SEQS=${MLA_SEQS:-"16384 65536"}
 mkdir -p "$OUT"
 
 has_scenario() { [[ " $SCENARIOS " == *" $1 "* ]]; }
@@ -79,6 +89,10 @@ if has_scenario verify; then
   note "            verify heads [$VERIFY_HEADS]"
   note "            verify batches [$VERIFY_BATCHES] seqs [$VERIFY_SEQS]"
   note "            verify tokens [$VERIFY_TOKENS] steps $VERIFY_STEPS"
+fi
+if [[ -n $MLA_IMPLS ]]; then
+  note "            mla impls [$MLA_IMPLS] heads [$MLA_HEADS]"
+  note "            mla kv dtypes [$MLA_KV_DTYPES] seqs [$MLA_SEQS]"
 fi
 note "start $(date -u +%FT%TZ)"
 
@@ -117,6 +131,19 @@ if has_scenario verify; then
               --heads-k "$verify_heads_k" --head-dim "$verify_head_dim" \
               --seq "$seq" --batch "$batch" --verify-tokens "$tokens" \
               --decode-tokens "$VERIFY_STEPS"
+        done
+      done
+    done
+  done
+fi
+
+if has_scenario chunked_prefill; then
+  for seq in $MLA_SEQS; do
+    for heads in $MLA_HEADS; do
+      for kv_dtype in $MLA_KV_DTYPES; do
+        for impl in $MLA_IMPLS; do
+          run --impl "$impl" --scenario chunked_prefill --heads "$heads" \
+              --kv-dtype "$kv_dtype" --seq "$seq"
         done
       done
     done

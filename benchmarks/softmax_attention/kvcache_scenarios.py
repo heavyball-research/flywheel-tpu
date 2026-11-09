@@ -41,6 +41,10 @@ window in its decode case and decode_query_size = --verify-tokens, as that
 backend serves K + 1 verify tokens; its cache is RPA v3's, its blocks its own
 default. With --verify-tokens 1 every impl runs its decode path.
 
+flywheel_mla and mla_v2 run DeepSeek's absorbed MLA chunked prefill
+(benchmarks/common/mla.py) on MLA v2's cache in its serving pages; an MLA
+cell whose last output fails COS_DIFF_BOUND is recorded as check_failed.
+
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
 under jax.profiler, and every device op of one scenario is summed by name.
@@ -61,6 +65,17 @@ import sys
 
 import numpy as np
 
+from benchmarks.common.mla import (
+    COS_DIFF_BOUND,
+    DEFAULT_MLA_V2_SOURCE,
+    LATENT_DIM,
+    MLA_PREFILL_IMPLS,
+    ROPE_DIM,
+    SERVING_PAGE,
+    build_mla_prefill,
+    draw_normal,
+    mla_cos_diff,
+)
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
@@ -72,9 +87,11 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "rpa", "batched_rpa")
+IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS)
 SCENARIOS = ("chunked_prefill", "decode", "verify")
-KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged")
+# Note (david): MLA v2's kernel is named MLA-<case>-..., flywheel's MLA
+# kernels flash_mla_*.
+KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "MLA-", "flash_mla")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -101,16 +118,23 @@ class Cell:
     kv_dtype: str = "bfloat16"
 
     @property
+    def is_mla(self):
+        return self.impl in MLA_PREFILL_IMPLS
+
+    @property
     def key(self):
         if self.sliding_window is None:
             window_tag = ""
         else:
             window_tag = f"-w{self.sliding_window}"
         kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
+        if self.is_mla:
+            heads_tag = f"h{self.heads}"
+        else:
+            heads_tag = f"h{self.heads}-k{self.heads_k}-d{self.head_dim}"
         shape = (
-            f"{self.impl}-{self.scenario}-h{self.heads}-k{self.heads_k}"
-            f"-d{self.head_dim}-s{self.seq}-p{self.page_size}{window_tag}"
-            f"{kv_tag}"
+            f"{self.impl}-{self.scenario}-{heads_tag}-s{self.seq}"
+            f"-p{self.page_size}{window_tag}{kv_tag}"
         )
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
@@ -157,8 +181,16 @@ class Cell:
 
     @property
     def kv_token_bytes(self):
-        """Cache bytes of one token: K and V of every KV head."""
-        return 2 * self.heads_k * self.head_dim * self.itemsize
+        """Cache bytes of one token: K and V of every KV head, or MLA's one
+        cache row."""
+        if self.is_mla:
+            from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+                CACHE_ROW_DIM,
+            )
+
+            return CACHE_ROW_DIM * self.itemsize
+        else:
+            return 2 * self.heads_k * self.head_dim * self.itemsize
 
     @property
     def cache_bytes(self):
@@ -276,6 +308,76 @@ def fill_cache(shape, dtype, generator):
         )
     )
     return jax.block_until_ready(tile(base))
+
+
+def build_mla(cell, args):
+    """(step, fresh_state, info, check) running an MLA prefill path on the
+    chunked prefill; check(out) is the last call's cos_diff."""
+    import jax
+    import jax.numpy as jnp
+
+    from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
+
+    keys = jax.random.split(jax.random.key(cell.heads * 1000 + cell.seq), 4)
+    q_latent = draw_normal(
+        keys[0], (cell.chunk, cell.heads, LATENT_DIM), jnp.bfloat16
+    )
+    q_pe = draw_normal(
+        keys[1], (cell.chunk, cell.heads, ROPE_DIM), jnp.bfloat16
+    )
+    new_kv_c = draw_normal(keys[2], (cell.seq, LATENT_DIM), cell.kv_dtype)
+    new_k_pe = draw_normal(keys[3], (cell.seq, ROPE_DIM), cell.kv_dtype)
+    pages_per_seq = -(-cell.seq // cell.page_size)
+    table = np.random.default_rng(cell.heads).permutation(pages_per_seq)
+    table = table.astype(np.int32).reshape(1, pages_per_seq)
+    cache_shape = mla_cache_shape(
+        pages_per_seq, cell.page_size, jnp.dtype(cell.kv_dtype)
+    )
+    path = build_mla_prefill(
+        cell.impl,
+        heads=cell.heads,
+        kv_dtype=cell.kv_dtype,
+        cache_shape=cache_shape,
+        num_tokens=cell.chunk,
+        batch=1,
+        pages_per_seq=pages_per_seq,
+        max_seqlen_q=cell.chunk,
+        max_seqlen_k=cell.seq,
+        mla_v2_source=args.mla_v2_source,
+    )
+    queries = path.queries(q_latent, q_pe)
+    chunks = [
+        slice(i * cell.chunk, (i + 1) * cell.chunk)
+        for i in range(cell.num_calls)
+    ]
+    tokens = [path.tokens(new_kv_c[chunk], new_k_pe[chunk]) for chunk in chunks]
+    cu_q_lens = np.array([0, cell.chunk], np.int32)
+    metas = [
+        path.meta(cu_q_lens, np.array([chunk.stop], np.int32), table)
+        for chunk in chunks
+    ]
+    jax.block_until_ready((queries, tokens, metas))
+    kernel = jax.jit(path.attend, donate_argnums=(0,))
+
+    def _step(cache):
+        out = None
+        for call_tokens, meta in zip(tokens, metas):
+            out, cache = kernel(cache, *queries, *call_tokens, *meta)
+        return out, cache
+
+    return (
+        _step,
+        (lambda: jnp.zeros(cache_shape, cell.kv_dtype)),
+        path.info,
+        lambda out: mla_cos_diff(
+            path.token_major(out),
+            q_latent,
+            q_pe,
+            new_kv_c,
+            new_k_pe,
+            cell.kv_dtype,
+        ),
+    )
 
 
 def build_flywheel(cell, inputs, args):
@@ -534,7 +636,11 @@ def run(cell, args):
     import jax
 
     pairs = attention_pairs(cell)
-    attn_flops = 4 * pairs * cell.heads * cell.head_dim
+    if cell.is_mla:
+        # Note (david): QK over the latent and the rope, P @ V over the latent.
+        attn_flops = 2 * pairs * cell.heads * (2 * LATENT_DIM + ROPE_DIM)
+    else:
+        attn_flops = 4 * pairs * cell.heads * cell.head_dim
     # Every call reads each sequence's whole visible cache once.
     if cell.scenario == "decode":
         kv_tokens_read = pairs
@@ -573,10 +679,22 @@ def run(cell, args):
         )
         return record
     try:
-        inputs = make_inputs(cell)
-        step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
+        if cell.is_mla:
+            step, fresh, info, check = build_mla(cell, args)
+        else:
+            inputs = make_inputs(cell)
+            step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
+            check = None
         record.update(info)
-        timing, _ = time_call(step, fresh())
+        timing, out = time_call(step, fresh())
+        if check is None:
+            status = "ok"
+        else:
+            record["cos_diff"] = check(out)
+            if record["cos_diff"] <= COS_DIFF_BOUND:
+                status = "ok"
+            else:
+                status = "check_failed"
     except Exception as error:  # pylint: disable=broad-exception-caught
         record.update(
             status="error", error=f"{type(error).__name__}: {str(error)[:400]}"
@@ -585,7 +703,7 @@ def run(cell, args):
 
     ms = timing["median_ms"]
     record.update(
-        status="ok",
+        status=status,
         **timing,
         ms_per_call=ms / cell.num_calls,
         tflops=attn_flops / (ms * 1e9),
@@ -618,17 +736,25 @@ def run(cell, args):
 
 def main(argv=None):
     args = parse_args(argv)
+    is_mla = args.impl in MLA_PREFILL_IMPLS
+    if args.page_size is not None:
+        page_size = args.page_size
+    elif is_mla:
+        page_size = SERVING_PAGE[args.kv_dtype]
+    else:
+        page_size = 128
     cell = Cell(
         args.impl,
         args.scenario,
         args.heads,
-        args.heads_k,
-        args.head_dim,
+        # Note (david): MLA's queries attend one latent head.
+        1 if is_mla else args.heads_k,
+        LATENT_DIM if is_mla else args.head_dim,
         args.seq,
         args.chunk,
         args.batch,
         args.decode_tokens,
-        args.page_size,
+        page_size,
         args.sliding_window,
         args.verify_tokens,
         kv_dtype=args.kv_dtype,
@@ -679,7 +805,13 @@ def parse_args(argv=None):
         default=1,
         help="verify: query tokens per sequence per step",
     )
-    parser.add_argument("--page-size", type=int, default=128)
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        help=(
+            "default: 128; for an MLA impl, MLA v2's serving page of the dtype"
+        ),
+    )
     parser.add_argument(
         "--kv-dtype",
         default="bfloat16",
@@ -717,13 +849,28 @@ def parse_args(argv=None):
         type=pathlib.Path,
         help="batched_rpa: a vllm-torchtpu checkout",
     )
+    parser.add_argument(
+        "--mla-v2-source",
+        type=pathlib.Path,
+        default=DEFAULT_MLA_V2_SOURCE,
+        help="mla_v2: a tpu-inference checkout at the pinned commit",
+    )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
         "--trace",
         type=pathlib.Path,
         help="also trace one scenario into this directory",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    is_mla = args.impl in MLA_PREFILL_IMPLS
+    if is_mla and args.scenario != "chunked_prefill":
+        parser.error(f"--impl {args.impl} runs chunked_prefill only")
+    elif is_mla and args.sliding_window is not None:
+        parser.error(f"--impl {args.impl} takes no --sliding-window")
+    elif is_mla and args.kv_dtype not in SERVING_PAGE:
+        parser.error(f"--impl {args.impl} takes --kv-dtype {set(SERVING_PAGE)}")
+    else:
+        return args
 
 
 if __name__ == "__main__":
