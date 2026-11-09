@@ -41,6 +41,8 @@ and training on TPU v6e and v7x.
   paged KV cache
 - **Decode**: paged or contiguous KV cache, with the K/V append fused into the
   kernel; speculative verify windows run on the decode kernel
+- **MLA decode**: DeepSeek-V2/V3/R1 and Kimi-K2, with fused cache append
+  and bf16/fp8 paged latent caches
 - **KV cache formats**: bf16, or an fp8 (e4m3, e5m2) paged cache with
   per-tensor descales
 - **Attention variants**: causal, sliding window that skips fully masked
