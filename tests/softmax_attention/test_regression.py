@@ -360,6 +360,9 @@ def test_flash_attn_varlen_clamped_window_first_pass(
         q, k, v, cu, cu, max(seqlens), max(seqlens), causal=causal
     )
     jax.clear_caches()
+    # max_abs alone misses the NaN on CPU, whose vectorized max reduction
+    # drops NaN in large arrays.
+    assert np.isfinite(np.asarray(out, np.float32)).all()
     for index, segment in enumerate(segments):
         rows = slice(int(cu[index]), int(cu[index + 1]))
         assert_output_close(out[rows][None], *segment, causal=causal)
