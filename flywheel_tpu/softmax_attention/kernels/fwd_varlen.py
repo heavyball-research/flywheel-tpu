@@ -566,12 +566,16 @@ def varlen_fwd_body(
                     _block_pv(_resolve_g(prev), prev_pv)
                     return current_pv, current
 
+                # The replay stays rolled: unrolled, its copies make up most
+                # of the kernel's code, and a kernel that large splits its
+                # hot loop over several instruction overlays once libtpu
+                # compiles the program as HLO functions.
                 last_pv, last = lax.fori_loop(
                     1,
                     num_fragments,
                     _pipeline_step,
                     (first_pv, first),
-                    unroll=True,
+                    unroll=not guard_recovery,
                 )
                 if carries_out:
                     # Note (david): this copy runs every fragment, so its last
