@@ -260,7 +260,7 @@ def poisoned_split_cache(case) -> tuple[np.ndarray, np.ndarray]:
         flat = cache.reshape(-1, words).copy()
         flat[~is_cached] = poison[~is_cached, None]
         rows.append(flat.reshape(cache.shape))
-    return tuple(rows)
+    return rows[0], rows[1]
 
 
 def poison_sparse_core_vmem() -> jax.Array:
