@@ -312,6 +312,105 @@ For example, allocate a bf16 cache with
 
 Implementation: [mla_decode.py](../flywheel_tpu/softmax_attention/mla_decode.py).
 
+### mla_cache_write
+
+MLA prefill uses a separate cache write, unlike decode's fused append. Write
+the new latent tokens first, then call `flash_mla_prefill` with the updated
+cache and the same chunk offsets, lengths and page table:
+
+```python
+from flywheel_tpu.softmax_attention.mla_cache_write import mla_cache_write
+from flywheel_tpu.softmax_attention.mla_prefill import flash_mla_prefill
+
+kv_cache = mla_cache_write(
+    new_kv_c, new_k_pe, kv_cache, cu_q_lens, kv_lens, block_table,
+)
+out = flash_mla_prefill(
+    q_nope, q_pe, kv_cache, cu_q_lens, kv_lens, block_table,
+    sm_scale=sm_scale, max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+)  # bf16 cache; pass kv_scale for an fp8 cache.
+```
+
+```python
+mla_cache_write(new_kv_c, new_k_pe, kv_cache, cu_q_lens, kv_lens,
+                 block_table, *, interpret=False):
+"""Write each request's packed chunk into its paged latent cache.
+The cache is donated and updated in place: rebind the returned kv_cache and do not
+reuse the old one. Under an outer jax.jit, donate the cache on that jit instead.
+
+Arguments:
+    new_kv_c: (T, 512). New latent tokens in the cache's dtype, packed token-major.
+    new_k_pe: (T, 64). New keys with RoPE already applied, in the cache's dtype.
+    kv_cache: same layout, dtypes and page-size constraints as flash_mla_decode.
+    cu_q_lens: (B + 1,), int32, nondecreasing from 0 to at most T. Request r's
+        chunk is rows [cu_q_lens[r], cu_q_lens[r + 1]); an empty chunk writes
+        nothing, and rows past cu_q_lens[B] are padding.
+    kv_lens: (B,), int32. Tokens per request after the write. A chunk of q_len
+        tokens goes to [kv_lens - q_len, kv_lens); requires kv_lens >= q_len.
+    block_table: (B, pages_per_seq), int32. Must cover kv_lens. Pages written
+        must be private to the request; entries past the used pages may hold anything.
+    interpret: bool, static. Run the Pallas TPU interpreter, e.g. on CPU.
+Return:
+    kv_cache: the updated cache, in its input dtype and layout. Written rows hold
+        the latent, RoPE key and zero padding; every other cache bit is unchanged.
+"""
+```
+
+For fp8, quantize both new tensors with the cache's per-tensor scale before
+the write. `mla_cache_write` copies the quantized values without a scale
+argument; pass `kv_scale` to the subsequent attention call.
+
+Implementation: [mla_cache_write.py](../flywheel_tpu/softmax_attention/mla_cache_write.py).
+
+### flash_mla_prefill
+
+Attends packed query chunks to the paged latent cache. As in
+`flash_mla_decode`, the caller absorbs W_UK into `q_nope`, applies RoPE to
+the RoPE queries and keys, and applies W_UV to the latent output. Both
+prefill APIs are forward-only and imported from their modules, not the
+package's top level.
+
+```python
+flash_mla_prefill(q_nope, q_pe, kv_cache, cu_q_lens, kv_lens, block_table,
+                  *, sm_scale, kv_scale=None, causal=True, return_lse=False,
+                  max_seqlen_q, max_seqlen_k, interpret=False):
+"""Attend each request's chunk to its cached prefix and the chunk itself.
+The chunk's latent tokens must already be in the cache, e.g. via mla_cache_write.
+The cache is read-only: it is neither donated nor returned.
+
+Arguments:
+    q_nope: (T, H, 512), bfloat16. Packed token-major queries with W_UK absorbed;
+        H must be 8, 16, 32, 64 or 128.
+    q_pe: (T, H, 64), bfloat16. Queries with RoPE already applied.
+    kv_cache: same layout, dtypes and page-size constraints as flash_mla_decode.
+    cu_q_lens: (B + 1,), int32. Nondecreasing chunk offsets from 0 to at most T,
+        as in mla_cache_write. Empty chunks are inactive; outputs for padding rows
+        past cu_q_lens[B] are unspecified.
+    kv_lens: (B,), int32. Cached tokens per request, including its query chunk
+        as the last q_len tokens; requires kv_lens >= q_len.
+    block_table: (B, pages_per_seq), int32. Maps logical pages to cache pages;
+        must cover kv_lens. Entries past the used pages may hold anything.
+    sm_scale: float, required. The model's scale for q_nope @ latent + q_pe @ rope.
+    kv_scale: float32 scalar, required for fp8 and None for bf16. Real cache
+        values are fp8 * kv_scale. May be traced without recompiling for a new scale.
+    causal: bool. Chunk token i sees positions < kv_lens - q_len + i + 1.
+        If False, each query token sees all kv_lens tokens.
+    return_lse: bool. Also return the natural-log logsumexp of the attention scores.
+    max_seqlen_q: int, required. Static upper bound on the per-request chunk
+        lengths, in [1, T]; sizes the query blocks and schedule.
+    max_seqlen_k: int, required. Static upper bound on kv_lens, in
+        [1, pages_per_seq * page_size]; sizes the KV blocks.
+    interpret: bool. Run the Pallas TPU interpreter, e.g. on CPU.
+    sm_scale, causal, return_lse and interpret must also be static.
+Return:
+    out, or (out, lse) with return_lse=True.
+    out: (T, H, 512), bfloat16. Apply the model's W_UV to this latent output.
+    lse: (H, T), float32; +inf for a non-padding row with no visible key.
+"""
+```
+
+Implementation: [mla_prefill.py](../flywheel_tpu/softmax_attention/mla_prefill.py).
+
 ## Linear attention
 
 The linear-attention layers of hybrid models, Gated DeltaNet (GDN, e.g.

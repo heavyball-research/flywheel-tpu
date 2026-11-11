@@ -12,6 +12,10 @@ tokens, latent and rope alike, to float8_e4m3fn under one per-tensor
 kv_scale, where FlashMLA's fp8 cache scales each lane tile of the latent and
 keeps the rope bf16; its reference attends the dequantized values, as
 FlashMLA's does.
+
+The prefill cases and reference carry the same draws, traps and attention
+over to a ragged chunk: each request's new tokens, packed token-major, follow
+its own cached prefix, and causal is bottom-right.
 """
 
 import dataclasses
@@ -39,6 +43,9 @@ INVALID_PAGE = 2147480000
 # FlashMLA rounds the longest request up to a multiple of SEQLEN_ALIGN tokens
 # before it sizes every request's pages.
 SEQLEN_ALIGN = 256
+# Note (david): the reference attends a block of query rows at a time, which
+# bounds its scores' memory on long chunks.
+REFERENCE_ROWS = 256
 # The largest finite fp8 cache value, onto which an fp8 case's kv_scale maps
 # the data's max abs.
 FP8_MAX = float(jnp.finfo(FP8_CACHE_DTYPE).max)
@@ -111,6 +118,38 @@ class MlaCase:
         )
 
 
+@dataclasses.dataclass(frozen=True)
+class MlaPrefillParam:
+    """A ragged prefill chunk: request r appends q_lens[r] tokens after its
+    prefix_lens[r] cached ones, and padded_tokens rows follow the chunk."""
+
+    q_lens: tuple[int, ...]
+    prefix_lens: tuple[int, ...]
+    h_q: int = 16
+    page_size: int = 64
+    is_fp8: bool = False
+    seed: int = 0
+    padded_tokens: int = 0
+
+
+@dataclasses.dataclass(frozen=True)
+class MlaPrefillCase:
+    """A prefill chunk's operands as host arrays, T tokens packed token-major:
+    request r's are rows [cu_q_lens[r], cu_q_lens[r + 1]), the rest padding."""
+
+    q_nope: np.ndarray  # (T, h_q, LATENT_DIM) bf16
+    q_pe: np.ndarray  # (T, h_q, ROPE_DIM) bf16
+    new_kv_c: np.ndarray  # (T, LATENT_DIM) in the cache's dtype
+    new_k_pe: np.ndarray  # (T, ROPE_DIM) in the cache's dtype
+    # (num_pages, page_size, CACHE_ROW_DIM) bf16 or fp8, the logical cache
+    # before the chunk is written.
+    kv_cache: np.ndarray
+    cu_q_lens: np.ndarray  # (b + 1,) i32
+    kv_lens: np.ndarray  # (b,) i32, the prefix and the chunk
+    block_table: np.ndarray  # (b, pages_per_seq) i32
+    kv_scale: np.float32 | None = None  # an fp8 cache's f32 scale
+
+
 def logical_cache(kv_cache) -> np.ndarray:
     """A word-layout cache (mla_cache_shape) as the logical (num_pages,
     page_size, CACHE_ROW_DIM) host array."""
@@ -146,36 +185,11 @@ def make_case(param: MlaParam) -> MlaCase:
     """
     bf16 = jnp.bfloat16
     rng = np.random.default_rng(param.seed)
-    kv_lens = np.full(param.b, param.s_k, np.int32)
-    if param.kv_lens is not None:
-        kv_lens[:] = param.kv_lens
-    if param.is_varlen:
-        lengths = random.Random(param.seed)
-        for i in range(param.b):
-            kv_lens[i] = int(
-                max(lengths.normalvariate(param.s_k, param.s_k / 2), param.s_q)
-            )
-    if param.have_zero_seqlen_k:
-        kv_lens[rng.standard_normal(param.b) > 0] = 0
-
-    page_size = param.page_size
-    num_pages = param.b * pages_per_seq(int(kv_lens.max()), page_size)
-
+    kv_lens = draw_kv_lens(param, rng)
     q = clamped_randn(rng, (param.b, param.s_q, param.h_q, QK_DIM), 1.0)
-    block_table = (
-        rng.permutation(num_pages).astype(np.int32).reshape(param.b, -1)
+    kv_cache, block_table = paged_cache(
+        rng, kv_lens, kv_lens - param.s_q, param.page_size
     )
-    kv_cache = np.full((num_pages, page_size, CACHE_ROW_DIM), np.nan, bf16)
-    for i, kv_len in enumerate(kv_lens.tolist()):
-        num_owned = cdiv(kv_len, page_size)
-        pages = block_table[i, :num_owned]
-        rows = np.zeros((num_owned, page_size, CACHE_ROW_DIM), bf16)
-        rows[..., :QK_DIM] = clamped_randn(
-            rng, (num_owned, page_size, QK_DIM), 0.1
-        )
-        rows.reshape(-1, CACHE_ROW_DIM)[kv_len - param.s_q :] = np.nan
-        kv_cache[pages] = rows
-        block_table[i, num_owned:] = INVALID_PAGE
     new_kv = clamped_randn(rng, (param.b, param.s_q, QK_DIM), 0.1).astype(bf16)
     q = q.astype(bf16)
     case = MlaCase(
@@ -193,6 +207,92 @@ def make_case(param: MlaParam) -> MlaCase:
         return case
 
 
+def draw_kv_lens(param: MlaParam, rng: np.random.Generator) -> np.ndarray:
+    """make_case's kv lengths for param, (b,) i32; have_zero_seqlen_k draws
+    from rng."""
+    kv_lens = np.full(param.b, param.s_k, np.int32)
+    if param.kv_lens is not None:
+        kv_lens[:] = param.kv_lens
+    if param.is_varlen:
+        lengths = random.Random(param.seed)
+        for i in range(param.b):
+            kv_lens[i] = int(
+                max(lengths.normalvariate(param.s_k, param.s_k / 2), param.s_q)
+            )
+    if param.have_zero_seqlen_k:
+        kv_lens[rng.standard_normal(param.b) > 0] = 0
+    return kv_lens
+
+
+def make_prefill_case(param: MlaPrefillParam) -> MlaPrefillCase:
+    """make_case's draws for a ragged chunk, in packed order: request r's
+    cache holds prefix_lens[r] valid rows, then NaN where its chunk goes, and
+    the padded_tokens rows after the chunk are NaN in q and the new tokens."""
+    assert len(param.q_lens) == len(param.prefix_lens), param
+    bf16 = jnp.bfloat16
+    rng = np.random.default_rng(param.seed)
+    q_lens = np.array(param.q_lens, np.int32)
+    prefix_lens = np.array(param.prefix_lens, np.int32)
+    cu_q_lens = np.zeros(len(q_lens) + 1, np.int32)
+    cu_q_lens[1:] = np.cumsum(q_lens)
+    chunk_tokens = int(cu_q_lens[-1])
+    num_tokens = chunk_tokens + param.padded_tokens
+
+    q = np.full((num_tokens, param.h_q, QK_DIM), np.nan, bf16)
+    q[:chunk_tokens] = clamped_randn(
+        rng, (chunk_tokens, param.h_q, QK_DIM), 1.0
+    )
+    kv_lens = prefix_lens + q_lens
+    kv_cache, block_table = paged_cache(
+        rng, kv_lens, prefix_lens, param.page_size
+    )
+    new_kv = np.full((num_tokens, QK_DIM), np.nan, bf16)
+    new_kv[:chunk_tokens] = clamped_randn(rng, (chunk_tokens, QK_DIM), 0.1)
+    case = MlaPrefillCase(
+        q_nope=q[..., :LATENT_DIM],
+        q_pe=q[..., LATENT_DIM:],
+        new_kv_c=new_kv[..., :LATENT_DIM],
+        new_k_pe=new_kv[..., LATENT_DIM:],
+        kv_cache=kv_cache,
+        cu_q_lens=cu_q_lens,
+        kv_lens=kv_lens,
+        block_table=block_table,
+    )
+    if param.is_fp8:
+        return quantize_case(case)
+    else:
+        return case
+
+
+def paged_cache(
+    rng: np.random.Generator,
+    kv_lens: np.ndarray,
+    prefix_lens: np.ndarray,
+    page_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """make_case's bf16 cache and block_table for requests of kv_lens tokens,
+    each with prefix_lens valid rows and NaN past them."""
+    bf16 = jnp.bfloat16
+    num_requests = len(kv_lens)
+    num_pages = num_requests * pages_per_seq(int(kv_lens.max()), page_size)
+    block_table = (
+        rng.permutation(num_pages).astype(np.int32).reshape(num_requests, -1)
+    )
+    kv_cache = np.full((num_pages, page_size, CACHE_ROW_DIM), np.nan, bf16)
+    for i, (kv_len, prefix_len) in enumerate(
+        zip(kv_lens.tolist(), prefix_lens.tolist())
+    ):
+        num_owned = cdiv(kv_len, page_size)
+        rows = np.zeros((num_owned, page_size, CACHE_ROW_DIM), bf16)
+        rows[..., :QK_DIM] = clamped_randn(
+            rng, (num_owned, page_size, QK_DIM), 0.1
+        )
+        rows.reshape(-1, CACHE_ROW_DIM)[prefix_len:] = np.nan
+        kv_cache[block_table[i, :num_owned]] = rows
+        block_table[i, num_owned:] = INVALID_PAGE
+    return kv_cache, block_table
+
+
 def pages_per_seq(max_kv_len: int, page_size: int) -> int:
     """The pages make_case gives every request when the longest holds
     max_kv_len tokens."""
@@ -203,29 +303,28 @@ def pages_per_seq(max_kv_len: int, page_size: int) -> int:
     return max(cdiv(max_kv_len, align), 1) * align // page_size
 
 
-def quantize_case(case: MlaCase) -> MlaCase:
+def quantize_case[CaseT: (MlaCase, MlaPrefillCase)](case: CaseT) -> CaseT:
     """case, a bf16 one, with its cache and new tokens quantized to
     FP8_CACHE_DTYPE under one per-tensor kv_scale.
 
     kv_scale is amax / FP8_MAX, amax the max abs over the cache's valid rows
-    (each request's first kv_lens - s_q) and all new tokens, so the largest
-    value quantizes to FP8_MAX and none overflows; a value quantizes to
-    round(value / kv_scale), and NaN rows stay NaN.
+    and the real new tokens, so the largest value quantizes to FP8_MAX and
+    none overflows; a value quantizes to round(value / kv_scale), and NaN rows
+    stay NaN.
     """
-    s_q = case.new_kv_c.shape[1]
     page_size = case.kv_cache.shape[1]
     owned_pages = [
         case.block_table[i, : cdiv(kv_len, page_size)]
         for i, kv_len in enumerate(case.kv_lens.tolist())
     ]
     amax = max(
-        float(np.abs(new.astype(np.float32)).max())
-        for new in (case.new_kv_c, case.new_k_pe)
+        float(np.nanmax(np.abs(values.astype(np.float32)), initial=0.0))
+        for values in (
+            case.new_kv_c,
+            case.new_k_pe,
+            *(case.kv_cache[pages] for pages in owned_pages),
+        )
     )
-    for pages, kv_len in zip(owned_pages, case.kv_lens.tolist()):
-        rows = case.kv_cache[pages].reshape(-1, CACHE_ROW_DIM)
-        valid = rows[: max(kv_len - s_q, 0), :QK_DIM].astype(np.float32)
-        amax = max(amax, float(np.abs(valid).max(initial=0.0)))
     kv_scale = np.float32(amax / FP8_MAX)
 
     def quantize(x):
@@ -243,6 +342,73 @@ def quantize_case(case: MlaCase) -> MlaCase:
     )
 
 
+def attend_request(
+    q: np.ndarray,
+    kv_cache: np.ndarray,
+    page_row: np.ndarray,
+    kv_len: int,
+    kv_scale: np.float32 | None,
+    *,
+    causal: bool,
+    sm_scale: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """FlashMLA's reference_torch for one request: its queries q, (n, h_q,
+    QK_DIM) f32 at its last n positions, attend its first kv_len rows of
+    kv_cache on the pages page_row lists.
+
+    The rows attend in f32 with NaN zeroed: scores sm_scale * q . (latent,
+    rope), with causal a tril(diagonal = kv_len - n) mask, V the latent. An
+    fp8 cache's rows are dequantized first, to their f32 value times
+    kv_scale, so that quantization error is not mistaken for a kernel bug. A
+    query that sees no key gets out 0 and lse +inf.
+
+    Returns out (n, h_q, LATENT_DIM) f32 and lse (h_q, n) f32 natural log.
+    """
+    num_queries, h_q, _ = q.shape
+    pages = page_row[: cdiv(kv_len, kv_cache.shape[1])]
+    rows = kv_cache[pages].reshape(-1, CACHE_ROW_DIM)[:kv_len, :QK_DIM]
+    # Note (david): dequantized rows stay f32, so the reference adds no
+    # rounding of its own.
+    if kv_scale is None:
+        kv = rows.astype(np.float32)
+    else:
+        kv = rows.astype(np.float32) * kv_scale
+    kv[np.isnan(kv)] = 0.0
+    out = np.zeros((num_queries, h_q, LATENT_DIM), np.float32)
+    lse = np.zeros((h_q, num_queries), np.float32)
+    for first in range(0, num_queries, REFERENCE_ROWS):
+        block = slice(first, min(first + REFERENCE_ROWS, num_queries))
+        num_rows = block.stop - first
+        scores = (q[block].reshape(-1, QK_DIM) @ kv.T).reshape(
+            num_rows, h_q, kv_len
+        )
+        if causal:
+            visible = (
+                np.arange(kv_len)[None, :]
+                <= (kv_len - num_queries + np.arange(first, block.stop))[
+                    :, None
+                ]
+            )
+        else:
+            visible = np.ones((num_rows, kv_len), bool)
+        scores = np.where(visible[:, None], scores, -np.inf)
+        scores *= np.float32(sm_scale)
+        peak = scores.max(axis=-1, keepdims=True, initial=-np.inf)
+        peak = np.where(np.isfinite(peak), peak, 0.0)
+        with np.errstate(divide="ignore"):
+            row_lse = peak + np.log(
+                np.exp(scores - peak).sum(axis=-1, keepdims=True)
+            )
+        lonely = row_lse == -np.inf
+        probs = np.exp(scores - np.where(lonely, 0.0, row_lse))
+        row_out = probs.reshape(num_rows * h_q, kv_len) @ kv[:, :LATENT_DIM]
+        out[block] = np.where(
+            lonely, 0.0, row_out.reshape(num_rows, h_q, LATENT_DIM)
+        )
+        lse[:, block] = np.where(lonely, np.inf, row_lse)[..., 0].T
+    return out, lse
+
+
 def reference(
     case: MlaCase, *, causal: bool, sm_scale: float = SM_SCALE
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -250,11 +416,7 @@ def reference(
 
     Writes each active request's new tokens as (latent, rope, zero padding)
     rows at [kv_lens - s_q, kv_lens), then attends each request's kv_lens rows
-    in f32 with NaN zeroed: scores sm_scale * q . (latent, rope), with causal
-    a tril(diagonal = kv_len - s_q) mask, V the latent. An fp8 cache's rows
-    are dequantized first, to their f32 value times kv_scale, so that
-    quantization error is not mistaken for a kernel bug. A query that sees no
-    key, as every query of an inactive request, gets out 0 and lse +inf.
+    as attend_request does; every query of an inactive request sees no key.
 
     Returns (out, lse, kv_cache): out (b, s_q, h_q, LATENT_DIM) bf16, lse (b,
     h_q, s_q) f32 natural log, kv_cache the cache flash_mla_decode must
@@ -272,36 +434,78 @@ def reference(
             pages = case.block_table[i, positions // page_size]
             kv_cache[pages, positions % page_size] = new_rows[i]
     q = np.concatenate([case.q_nope, case.q_pe], axis=-1).astype(np.float32)
-    q = q.reshape((b, s_q * h_q, QK_DIM))
     out = np.zeros((b, s_q, h_q, LATENT_DIM), np.float32)
     lse = np.zeros((b, h_q, s_q), np.float32)
     for i, kv_len in enumerate(case.kv_lens.tolist()):
-        pages = case.block_table[i, : cdiv(kv_len, page_size)]
-        kv = kv_cache[pages].reshape(-1, CACHE_ROW_DIM)[:kv_len, :QK_DIM]
-        kv = kv.astype(np.float32)
-        # Note (david): the dequantized rows stay f32, the values that
-        # flash_mla_decode's kv_scale stands for, so the reference adds no
-        # rounding of its own to them.
-        if case.kv_scale is not None:
-            kv *= case.kv_scale
-        kv[np.isnan(kv)] = 0.0
-        scores = (q[i] @ kv.T).reshape(s_q, h_q, kv_len)
-        if causal and s_q > 1:
-            visible = np.tri(s_q, kv_len, kv_len - s_q, dtype=bool)
-            scores = np.where(visible[:, None], scores, -np.inf)
-        scores *= np.float32(sm_scale)
-        peak = scores.max(axis=-1, keepdims=True, initial=-np.inf)
-        peak = np.where(np.isfinite(peak), peak, 0.0)
-        with np.errstate(divide="ignore"):
-            row_lse = peak + np.log(
-                np.exp(scores - peak).sum(axis=-1, keepdims=True)
-            )
-        lonely = row_lse == -np.inf  # (s_q, h_q, 1)
-        probs = np.exp(scores - np.where(lonely, 0.0, row_lse))
-        row_out = probs.reshape(s_q * h_q, kv_len) @ kv[:, :LATENT_DIM]
-        out[i] = np.where(lonely, 0.0, row_out.reshape(s_q, h_q, LATENT_DIM))
-        lse[i] = np.where(lonely, np.inf, row_lse)[..., 0].T
+        out[i], lse[i] = attend_request(
+            q[i],
+            kv_cache,
+            case.block_table[i],
+            kv_len,
+            case.kv_scale,
+            causal=causal,
+            sm_scale=sm_scale,
+        )
     return out.astype(jnp.bfloat16), lse, kv_cache
+
+
+def write_chunks(case: MlaPrefillCase) -> np.ndarray:
+    """The logical cache with each request's chunk tokens written as (latent,
+    rope, zero padding) rows at [kv_lens - q_len, kv_lens)."""
+    kv_cache = case.kv_cache.copy()
+    num_tokens = case.q_nope.shape[0]
+    page_size = kv_cache.shape[1]
+    new_rows = np.zeros((num_tokens, CACHE_ROW_DIM), kv_cache.dtype)
+    new_rows[:, :LATENT_DIM] = case.new_kv_c
+    new_rows[:, LATENT_DIM:QK_DIM] = case.new_k_pe
+    for i, (start, end, kv_len) in enumerate(
+        zip(
+            case.cu_q_lens[:-1].tolist(),
+            case.cu_q_lens[1:].tolist(),
+            case.kv_lens.tolist(),
+        )
+    ):
+        positions = np.arange(kv_len - (end - start), kv_len)
+        pages = case.block_table[i, positions // page_size]
+        kv_cache[pages, positions % page_size] = new_rows[start:end]
+    return kv_cache
+
+
+def prefill_reference(
+    case: MlaPrefillCase, *, causal: bool, sm_scale: float = SM_SCALE
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """reference() for a ragged chunk.
+
+    Attends each request's kv_lens rows of the cache write_chunks leaves as
+    attend_request does, so that with causal chunk token i sees positions
+    [0, kv_lens - q_len + i]. Padding rows get out 0 and lse +inf.
+
+    Returns (out, lse, kv_cache): out (T, h_q, LATENT_DIM) f32; lse (h_q, T)
+    f32 natural log; kv_cache the logical cache after the write.
+    """
+    kv_cache = write_chunks(case)
+    num_tokens, h_q, _ = case.q_nope.shape
+    chunks = list(
+        zip(
+            case.cu_q_lens[:-1].tolist(),
+            case.cu_q_lens[1:].tolist(),
+            case.kv_lens.tolist(),
+        )
+    )
+    q = np.concatenate([case.q_nope, case.q_pe], axis=-1).astype(np.float32)
+    out = np.zeros((num_tokens, h_q, LATENT_DIM), np.float32)
+    lse = np.full((h_q, num_tokens), np.inf, np.float32)
+    for i, (start, end, kv_len) in enumerate(chunks):
+        out[start:end], lse[:, start:end] = attend_request(
+            q[start:end],
+            kv_cache,
+            case.block_table[i],
+            kv_len,
+            case.kv_scale,
+            causal=causal,
+            sm_scale=sm_scale,
+        )
+    return out, lse, kv_cache
 
 
 def check_is_allclose(

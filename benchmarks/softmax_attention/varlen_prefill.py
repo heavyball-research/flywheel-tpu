@@ -36,6 +36,11 @@ batched_rpa runs vllm-torchtpu's batched RPA (--torchtpu-source) with its
 defaults. Both RPAs also write the new K/V into their own cache layout inside
 the call, which flywheel's time does not include.
 
+flywheel_mla and mla_v2 run DeepSeek's absorbed MLA prefill
+(benchmarks/common/mla.py), writing the batch into an empty MLA v2 cache in
+its serving pages; an MLA cell whose last sequence fails COS_DIFF_BOUND is
+recorded as check_failed.
+
 Attention work is the causal (query, key) pairs, sum(s (s + 1) / 2), which
 the patterns do not hold constant, so only TFLOP/s compares across patterns.
 Only the call is inside the clock: q, k, v and the metadata are made once.
@@ -58,6 +63,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from benchmarks.common.mla import (
+    COS_DIFF_BOUND,
+    DEFAULT_MLA_V2_SOURCE,
+    LATENT_DIM,
+    MLA_PREFILL_IMPLS,
+    ROPE_DIM,
+    SERVING_PAGE,
+    build_mla_prefill,
+    draw_normal,
+    mla_cos_diff,
+)
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
     DEFAULT_RPA_SOURCE,
@@ -76,8 +92,9 @@ from benchmarks.softmax_attention.kvcache_scenarios import (
 )
 from flywheel_tpu import flash_attn_varlen_func
 from flywheel_tpu.softmax_attention.config import next_pow2
+from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
 
-IMPLS = ("flywheel", "rpa", "batched_rpa")
+IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS)
 PATTERNS = ("uniform", "spiky", "longtail")
 
 Step = Callable[[jax.Array], tuple[jax.Array, jax.Array]]
@@ -137,14 +154,39 @@ class Cell:
     batch: int
     budget: int
     page_size: int
+    kv_dtype: str = "bfloat16"
+
+    @property
+    def is_mla(self) -> bool:
+        return self.impl in MLA_PREFILL_IMPLS
 
     @property
     def key(self) -> str:
+        if self.is_mla:
+            heads_tag = f"h{self.heads}"
+        else:
+            heads_tag = f"h{self.heads}-k{self.heads_k}-d{self.head_dim}"
+        kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
         return (
-            f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
-            f"-{self.pattern}-b{self.batch}-t{self.budget}"
-            f"-p{self.page_size}"
+            f"{self.impl}-{heads_tag}-{self.pattern}-b{self.batch}"
+            f"-t{self.budget}-p{self.page_size}{kv_tag}"
         )
+
+    @property
+    def seed(self) -> int:
+        """The seed of the cell's draws; it leaves the impl out, so every impl
+        sees the same numbers."""
+        seed = 0
+        for part in (
+            self.heads,
+            self.heads_k,
+            self.head_dim,
+            self.batch,
+            self.budget,
+            PATTERNS.index(self.pattern),
+        ):
+            seed = (seed * 1000003 + part) % (2**31)
+        return seed
 
     @property
     def lengths(self) -> list[int]:
@@ -166,34 +208,14 @@ class Inputs:
 
 def make_inputs(cell: Cell) -> Inputs:
     """Packed q, k, v, the ragged metadata and the page table, shared by every
-    impl: the seed leaves the impl out, so each sees the same numbers."""
+    impl."""
     lengths = cell.lengths
-    seed = 0
-    for part in (
-        cell.heads,
-        cell.heads_k,
-        cell.head_dim,
-        cell.batch,
-        cell.budget,
-        PATTERNS.index(cell.pattern),
-    ):
-        seed = (seed * 1000003 + part) % (2**31)
-    generator = np.random.default_rng(seed)
+    generator = np.random.default_rng(cell.seed)
     total = cell.budget
     q = draw(generator, "bfloat16", total, cell.heads, cell.head_dim)
     k = draw(generator, "bfloat16", total, cell.heads_k, cell.head_dim)
     v = draw(generator, "bfloat16", total, cell.heads_k, cell.head_dim)
-
-    own_pages = [-(-length // cell.page_size) for length in lengths]
-    num_pages = sum(own_pages)
-    pages_per_seq = -(-next_pow2(max(lengths)) // cell.page_size)
-    pool = generator.permutation(num_pages).astype(np.int32)
-    table = np.empty((cell.batch, pages_per_seq), np.int32)
-    start = 0
-    for index, count in enumerate(own_pages):
-        table[index, :count] = pool[start : start + count]
-        table[index, count:] = pool[start + count - 1]
-        start += count
+    table, num_pages = page_table(generator, lengths, cell.page_size)
     cu_q_lens = np.zeros(cell.batch + 1, np.int32)
     cu_q_lens[1:] = np.cumsum(lengths)
     return jax.block_until_ready(
@@ -206,6 +228,89 @@ def make_inputs(cell: Cell) -> Inputs:
             jnp.asarray(table),
             num_pages,
         )
+    )
+
+
+def page_table(
+    generator: np.random.Generator, lengths: list[int], page_size: int
+) -> tuple[np.ndarray, int]:
+    """(table, num_pages): every sequence's next_pow2(max_seqlen) / page_size
+    slots over a shuffled pool of the pages the lengths need, a sequence's
+    slots past its own pages repeating its last page."""
+    own_pages = [-(-length // page_size) for length in lengths]
+    num_pages = sum(own_pages)
+    pages_per_seq = -(-next_pow2(max(lengths)) // page_size)
+    pool = generator.permutation(num_pages).astype(np.int32)
+    table = np.empty((len(lengths), pages_per_seq), np.int32)
+    start = 0
+    for index, count in enumerate(own_pages):
+        table[index, :count] = pool[start : start + count]
+        table[index, count:] = pool[start + count - 1]
+        start += count
+    return table, num_pages
+
+
+def build_mla(
+    cell: Cell, args: argparse.Namespace
+) -> tuple[
+    Step, Callable[[], jax.Array], BuildInfo, Callable[[jax.Array], float]
+]:
+    """(step, fresh_state, info, check) running an MLA prefill path that
+    writes the batch's latents into an empty cache and attends; check(out) is
+    the last sequence's cos_diff."""
+    lengths = cell.lengths
+    keys = jax.random.split(jax.random.key(cell.seed), 4)
+    q_latent = draw_normal(
+        keys[0], (cell.budget, cell.heads, LATENT_DIM), jnp.bfloat16
+    )
+    q_pe = draw_normal(
+        keys[1], (cell.budget, cell.heads, ROPE_DIM), jnp.bfloat16
+    )
+    new_kv_c = draw_normal(keys[2], (cell.budget, LATENT_DIM), cell.kv_dtype)
+    new_k_pe = draw_normal(keys[3], (cell.budget, ROPE_DIM), cell.kv_dtype)
+    table, num_pages = page_table(
+        np.random.default_rng(cell.seed), lengths, cell.page_size
+    )
+    cu_q_lens = np.zeros(cell.batch + 1, np.int32)
+    cu_q_lens[1:] = np.cumsum(lengths)
+    cache_shape = mla_cache_shape(
+        num_pages, cell.page_size, jnp.dtype(cell.kv_dtype)
+    )
+    path = build_mla_prefill(
+        cell.impl,
+        heads=cell.heads,
+        kv_dtype=cell.kv_dtype,
+        cache_shape=cache_shape,
+        num_tokens=cell.budget,
+        batch=cell.batch,
+        pages_per_seq=table.shape[1],
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        mla_v2_source=args.mla_v2_source,
+    )
+    operands = jax.block_until_ready((
+        *path.queries(q_latent, q_pe),
+        *path.tokens(new_kv_c, new_k_pe),
+        *path.meta(cu_q_lens, np.asarray(lengths, np.int32), table),
+    ))
+    kernel = jax.jit(path.attend, donate_argnums=(0,))
+    last = slice(int(cu_q_lens[-2]), int(cu_q_lens[-1]))
+    return (
+        (lambda cache: kernel(cache, *operands)),
+        (lambda: jnp.zeros(cache_shape, cell.kv_dtype)),
+        {
+            **path.info,
+            "pages_per_seq": int(table.shape[1]),
+            "cache_pages": num_pages,
+        },
+        lambda out: mla_cos_diff(
+            path.token_major(out)[last],
+            q_latent[last],
+            q_pe[last],
+            new_kv_c[last],
+            new_k_pe[last],
+            cell.kv_dtype,
+        ),
     )
 
 
@@ -431,7 +536,11 @@ BUILDERS = {
 def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
     lengths = cell.lengths
     pairs = sum(length * (length + 1) // 2 for length in lengths)
-    attn_flops = 4 * pairs * cell.heads * cell.head_dim
+    if cell.is_mla:
+        # Note (david): QK over the latent and the rope, P @ V over the latent.
+        attn_flops = 2 * pairs * cell.heads * (2 * LATENT_DIM + ROPE_DIM)
+    else:
+        attn_flops = 4 * pairs * cell.heads * cell.head_dim
     record = {
         "key": cell.key,
         "cell": dataclasses.asdict(cell),
@@ -441,14 +550,26 @@ def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
         "attn_flops": attn_flops,
     }
     try:
-        inputs = make_inputs(cell)
-        record.update(
-            pages_per_seq=int(inputs.block_table.shape[1]),
-            cache_pages=inputs.num_pages,
-        )
-        step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
+        if cell.is_mla:
+            step, fresh, info, check = build_mla(cell, args)
+        else:
+            inputs = make_inputs(cell)
+            record.update(
+                pages_per_seq=int(inputs.block_table.shape[1]),
+                cache_pages=inputs.num_pages,
+            )
+            step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
+            check = None
         record.update(info)
-        timing, _ = time_call(step, fresh())
+        timing, out = time_call(step, fresh())
+        if check is None:
+            status = "ok"
+        else:
+            record["cos_diff"] = check(out)
+            if record["cos_diff"] <= COS_DIFF_BOUND:
+                status = "ok"
+            else:
+                status = "check_failed"
     except Exception as error:  # pylint: disable=broad-exception-caught
         record.update(
             status="error", error=f"{type(error).__name__}: {str(error)[:400]}"
@@ -456,7 +577,7 @@ def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
         return record
 
     ms = timing["median_ms"]
-    record.update(status="ok", **timing, tflops=attn_flops / (ms * 1e9))
+    record.update(status=status, **timing, tflops=attn_flops / (ms * 1e9))
     if args.trace:
         per_op = trace_scenario(cell, step, fresh(), args.trace)
         if per_op is None:
@@ -482,15 +603,24 @@ def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    is_mla = args.impl in MLA_PREFILL_IMPLS
+    if args.page_size is not None:
+        page_size = args.page_size
+    elif is_mla:
+        page_size = SERVING_PAGE[args.kv_dtype]
+    else:
+        page_size = 128
     cell = Cell(
         args.impl,
         args.heads,
-        args.heads_k,
-        args.head_dim,
+        # Note (david): MLA's queries attend one latent head.
+        1 if is_mla else args.heads_k,
+        LATENT_DIM if is_mla else args.head_dim,
         args.pattern,
         args.batch,
         args.budget,
-        args.page_size,
+        page_size,
+        args.kv_dtype,
     )
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
@@ -526,7 +656,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="total packed tokens, split by the pattern",
     )
-    parser.add_argument("--page-size", type=int, default=128)
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        help=(
+            "default: 128; for an MLA impl, MLA v2's serving page of the dtype"
+        ),
+    )
+    parser.add_argument(
+        "--kv-dtype",
+        default="bfloat16",
+        choices=tuple(SERVING_PAGE),
+        help="cache dtype; fp8 for an MLA impl only",
+    )
     parser.add_argument(
         "--rpa-table",
         type=pathlib.Path,
@@ -543,13 +685,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=pathlib.Path,
         help="batched_rpa: a vllm-torchtpu checkout",
     )
+    parser.add_argument(
+        "--mla-v2-source",
+        type=pathlib.Path,
+        default=DEFAULT_MLA_V2_SOURCE,
+        help="mla_v2: a tpu-inference checkout at the pinned commit",
+    )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
         "--trace",
         type=pathlib.Path,
         help="also trace the cell into this directory",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.impl not in MLA_PREFILL_IMPLS and args.kv_dtype != "bfloat16":
+        parser.error(f"--impl {args.impl} takes a bfloat16 cache only")
+    else:
+        return args
 
 
 if __name__ == "__main__":
