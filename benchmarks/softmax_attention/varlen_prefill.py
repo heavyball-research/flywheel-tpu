@@ -41,6 +41,12 @@ flywheel_mla and mla_v2 run DeepSeek's absorbed MLA prefill
 its serving pages; an MLA cell whose last sequence fails COS_DIFF_BOUND is
 recorded as check_failed.
 
+flywheel_dsa, torchtpu_dsa and torchtpu_dsa_masked_dense run one DeepSeek
+sparse attention layer step (benchmarks/common/dsa.py): each impl writes the
+batch's index keys and latents into empty fp8 caches of DSA_PAGE pages, then
+scores, selects and attends. A DSA cell whose last sequence fails
+COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as check_failed.
+
 Attention work is the causal (query, key) pairs, sum(s (s + 1) / 2), which
 the patterns do not hold constant, so only TFLOP/s compares across patterns.
 Only the call is inside the clock: q, k, v and the metadata are made once.
@@ -53,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import pathlib
@@ -63,6 +70,21 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from benchmarks.common.dsa import (
+    DSA_GEOMETRIES,
+    DSA_IMPLS,
+    DSA_KV_DTYPE,
+    DSA_PAGE,
+    TORCHTPU_DSA_IMPLS,
+    DsaRequests,
+    DsaScenario,
+    build_dsa_layer,
+    draw_dsa_keys,
+    draw_dsa_queries,
+    dsa_args_error,
+    edge_rows,
+    prepare_torchtpu_process,
+)
 from benchmarks.common.mla import (
     COS_DIFF_BOUND,
     DEFAULT_MLA_V2_SOURCE,
@@ -88,13 +110,14 @@ from benchmarks.softmax_attention.attention_block import tuned_table
 from benchmarks.softmax_attention.kvcache_scenarios import (
     KERNEL_MARKERS,
     draw,
+    dsa_cell_record,
     trace_scenario,
 )
 from flywheel_tpu import flash_attn_varlen_func
 from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
 
-IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS)
+IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS, *DSA_IMPLS)
 PATTERNS = ("uniform", "spiky", "longtail")
 
 Step = Callable[[jax.Array], tuple[jax.Array, jax.Array]]
@@ -155,14 +178,22 @@ class Cell:
     budget: int
     page_size: int
     kv_dtype: str = "bfloat16"
+    # A DSA cell's DSA_GEOMETRIES entry.
+    dsa_geometry: str | None = None
 
     @property
     def is_mla(self) -> bool:
         return self.impl in MLA_PREFILL_IMPLS
 
     @property
+    def is_dsa(self) -> bool:
+        return self.impl in DSA_IMPLS
+
+    @property
     def key(self) -> str:
-        if self.is_mla:
+        if self.is_dsa:
+            heads_tag = self.dsa_geometry
+        elif self.is_mla:
             heads_tag = f"h{self.heads}"
         else:
             heads_tag = f"h{self.heads}-k{self.heads_k}-d{self.head_dim}"
@@ -312,6 +343,58 @@ def build_mla(
             cell.kv_dtype,
         ),
     )
+
+
+def build_dsa(cell: Cell, args: argparse.Namespace) -> DsaScenario:
+    """One DSA layer step that writes the batch into empty caches; the check
+    takes the last sequence's rows."""
+    geometry = DSA_GEOMETRIES[cell.dsa_geometry]
+    lengths = cell.lengths
+    keys = jax.random.split(jax.random.key(cell.seed), 2)
+    queries = draw_dsa_queries(keys[0], geometry, cell.budget)
+    tokens = draw_dsa_keys(keys[1], geometry, cell.budget)
+    table, num_pages = page_table(
+        np.random.default_rng(cell.seed), lengths, cell.page_size
+    )
+    cu_q_lens = np.zeros(cell.batch + 1, np.int32)
+    cu_q_lens[1:] = np.cumsum(lengths)
+    requests = DsaRequests(cu_q_lens, np.asarray(lengths, np.int32), table, 0)
+    layer = build_dsa_layer(
+        cell.impl,
+        geometry,
+        num_tokens=cell.budget,
+        batch=cell.batch,
+        max_seqlen_k=max(lengths),
+        torchtpu_source=args.torchtpu_source,
+    )
+    return DsaScenario(
+        layer=layer,
+        geometry=geometry,
+        fresh=lambda: layer.empty_caches(num_pages),
+        queries=queries,
+        layer_queries=layer.queries(queries),
+        calls=[(layer.keys(tokens), layer.meta(requests))],
+        requests=[requests],
+        rows=edge_rows(int(cu_q_lens[-2]), int(cu_q_lens[-1])),
+        logical=lambda request: tokens.rows(
+            slice(int(cu_q_lens[request]), int(cu_q_lens[request + 1]))
+        ),
+    )
+
+
+def run_dsa(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
+    record = {
+        "key": cell.key,
+        "cell": dataclasses.asdict(cell),
+        "lengths": cell.lengths,
+        "max_seqlen": max(cell.lengths),
+    }
+    record.update(
+        dsa_cell_record(
+            cell, functools.partial(build_dsa, cell, args), args.trace
+        )
+    )
+    return record
 
 
 def build_flywheel(
@@ -601,33 +684,47 @@ def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
     return record
 
 
-def main(argv: list[str] | None = None) -> int:
-    args = parse_args(argv)
+def make_cell(args: argparse.Namespace) -> Cell:
     is_mla = args.impl in MLA_PREFILL_IMPLS
+    is_dsa = args.impl in DSA_IMPLS
     if args.page_size is not None:
         page_size = args.page_size
+    elif is_dsa:
+        page_size = DSA_PAGE
     elif is_mla:
         page_size = SERVING_PAGE[args.kv_dtype]
     else:
         page_size = 128
-    cell = Cell(
+    if is_dsa:
+        heads = DSA_GEOMETRIES[args.dsa_geometry].heads
+    else:
+        heads = args.heads
+    return Cell(
         args.impl,
-        args.heads,
+        heads,
         # Note (david): MLA's queries attend one latent head.
-        1 if is_mla else args.heads_k,
-        LATENT_DIM if is_mla else args.head_dim,
+        1 if is_mla or is_dsa else args.heads_k,
+        LATENT_DIM if is_mla or is_dsa else args.head_dim,
         args.pattern,
         args.batch,
         args.budget,
         page_size,
-        args.kv_dtype,
+        DSA_KV_DTYPE if is_dsa else args.kv_dtype,
+        args.dsa_geometry,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    cell = make_cell(args)
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
+    if cell.impl in TORCHTPU_DSA_IMPLS:
+        prepare_torchtpu_process()
     if cell.impl == "rpa" and args.rpa_table is None:
         args.rpa_table = tuned_table("rpa", jax.devices()[0].device_kind)
-    record = run(cell, args)
+    record = run_dsa(cell, args) if cell.is_dsa else run(cell, args)
     if args.output:
         write_record(args.output, record)
     print(json.dumps(record))
@@ -660,14 +757,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--page-size",
         type=int,
         help=(
-            "default: 128; for an MLA impl, MLA v2's serving page of the dtype"
+            "default: 128; for an MLA impl, MLA v2's serving page of the"
+            f" dtype; for a DSA impl, {DSA_PAGE}"
         ),
     )
     parser.add_argument(
         "--kv-dtype",
         default="bfloat16",
         choices=tuple(SERVING_PAGE),
-        help="cache dtype; fp8 for an MLA impl only",
+        help="cache dtype; fp8 for an MLA impl only (a DSA impl's is fp8)",
     )
     parser.add_argument(
         "--rpa-table",
@@ -683,13 +781,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--torchtpu-source",
         type=pathlib.Path,
-        help="batched_rpa: a vllm-torchtpu checkout",
+        help="batched_rpa and the torchtpu DSA impls: a vllm-torchtpu checkout",
     )
     parser.add_argument(
         "--mla-v2-source",
         type=pathlib.Path,
         default=DEFAULT_MLA_V2_SOURCE,
         help="mla_v2: a tpu-inference checkout at the pinned commit",
+    )
+    parser.add_argument(
+        "--dsa-geometry",
+        choices=tuple(DSA_GEOMETRIES),
+        help="a DSA impl's model geometry",
     )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
@@ -698,7 +801,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="also trace the cell into this directory",
     )
     args = parser.parse_args(argv)
-    if args.impl not in MLA_PREFILL_IMPLS and args.kv_dtype != "bfloat16":
+    dsa_error = dsa_args_error(args.impl, args.dsa_geometry, args.page_size)
+    if dsa_error is not None:
+        parser.error(dsa_error)
+    elif args.impl not in MLA_PREFILL_IMPLS and args.kv_dtype != "bfloat16":
         parser.error(f"--impl {args.impl} takes a bfloat16 cache only")
     else:
         return args

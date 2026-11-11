@@ -45,6 +45,11 @@ flywheel_mla and mla_v2 run DeepSeek's absorbed MLA chunked prefill
 (benchmarks/common/mla.py) on MLA v2's cache in its serving pages; an MLA
 cell whose last output fails COS_DIFF_BOUND is recorded as check_failed.
 
+flywheel_dsa, torchtpu_dsa and torchtpu_dsa_masked_dense run one DeepSeek
+sparse attention layer step per call (benchmarks/common/dsa.py) on fp8 caches
+of DSA_PAGE pages, on decode and chunked prefill. A DSA cell whose last call
+fails COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as check_failed.
+
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
 under jax.profiler, and every device op of one scenario is summed by name.
@@ -58,6 +63,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import functools
 import json
 import math
 import pathlib
@@ -65,6 +71,29 @@ import sys
 
 import numpy as np
 
+from benchmarks.common.dsa import (
+    DSA_BASE_PAGES,
+    DSA_CACHE_TOKEN_BYTES,
+    DSA_GEOMETRIES,
+    DSA_IMPLS,
+    DSA_KV_DTYPE,
+    DSA_PAGE,
+    FLYWHEEL_DSA,
+    TORCHTPU_DSA_IMPLS,
+    DsaKeys,
+    DsaRequests,
+    DsaScenario,
+    build_dsa_layer,
+    draw_dsa_keys,
+    draw_dsa_queries,
+    dsa_args_error,
+    dsa_work,
+    edge_rows,
+    filled_caches,
+    measure_dsa,
+    page_index_keys,
+    prepare_torchtpu_process,
+)
 from benchmarks.common.mla import (
     COS_DIFF_BOUND,
     DEFAULT_MLA_V2_SOURCE,
@@ -87,8 +116,9 @@ from benchmarks.common.rpa import (
 from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
-IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS)
+IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS, *DSA_IMPLS)
 SCENARIOS = ("chunked_prefill", "decode", "verify")
+DSA_SCENARIOS = ("chunked_prefill", "decode")
 # Note (david): MLA v2's kernel is named MLA-<case>-..., flywheel's MLA
 # kernels flash_mla_*.
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "MLA-", "flash_mla")
@@ -116,10 +146,18 @@ class Cell:
     # k, v and cache dtype. An fp8 cell keeps the descales at 1: they only
     # scale the scores and the output, not the work timed.
     kv_dtype: str = "bfloat16"
+    # A DSA cell's DSA_GEOMETRIES entry.
+    dsa_geometry: str | None = None
+    # flywheel_dsa's pinned route; None picks it on device.
+    dsa_route: str | None = None
 
     @property
     def is_mla(self):
         return self.impl in MLA_PREFILL_IMPLS
+
+    @property
+    def is_dsa(self):
+        return self.impl in DSA_IMPLS
 
     @property
     def key(self):
@@ -128,7 +166,11 @@ class Cell:
         else:
             window_tag = f"-w{self.sliding_window}"
         kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
-        if self.is_mla:
+        if self.is_dsa and self.dsa_route is not None:
+            heads_tag = f"{self.dsa_geometry}-{self.dsa_route}"
+        elif self.is_dsa:
+            heads_tag = self.dsa_geometry
+        elif self.is_mla:
             heads_tag = f"h{self.heads}"
         else:
             heads_tag = f"h{self.heads}-k{self.heads_k}-d{self.head_dim}"
@@ -181,9 +223,11 @@ class Cell:
 
     @property
     def kv_token_bytes(self):
-        """Cache bytes of one token: K and V of every KV head, or MLA's one
-        cache row."""
-        if self.is_mla:
+        """Cache bytes of one token: K and V of every KV head, MLA's one
+        cache row, or DSA's latent and index key."""
+        if self.is_dsa:
+            return DSA_CACHE_TOKEN_BYTES
+        elif self.is_mla:
             from flywheel_tpu.softmax_attention.kernels.mla_decode import (
                 CACHE_ROW_DIM,
             )
@@ -377,6 +421,133 @@ def build_mla(cell, args):
             new_k_pe,
             cell.kv_dtype,
         ),
+    )
+
+
+def dsa_block_table(cell, pages_per_seq):
+    """Every sequence's pages, shuffled across sequences."""
+    generator = np.random.default_rng(cell.heads * 1000 + cell.batch)
+    pages = generator.permutation(cell.num_seqs * pages_per_seq)
+    return pages.astype(np.int32).reshape(cell.num_seqs, pages_per_seq)
+
+
+def dsa_decode_logical(cell, table, base_keys, index_key, step_keys, request):
+    """A decode request's keys after the steps: its pages' own index keys
+    and their base pages' latents, then the steps' tokens."""
+    import jax.numpy as jnp
+
+    page = cell.page_size
+    base_pages = base_keys.index_keys.shape[0] // page
+    positions = np.arange(cell.context)
+    rows = (table[request, positions // page] % base_pages) * page
+    cached = base_keys.rows(jnp.asarray(rows + positions % page))
+    index_keys = page_index_keys(
+        index_key, jnp.asarray(table[request]), base_keys.index_keys.shape[1]
+    )
+    cached = cached._replace(index_keys=index_keys[: cell.context])
+    return DsaKeys(*(
+        jnp.concatenate([
+            values,
+            jnp.broadcast_to(new[request], (cell.num_calls, *new.shape[1:])),
+        ])
+        for values, new in zip(cached, step_keys)
+    ))
+
+
+def build_dsa_decode(cell, args):
+    """The decode steps on a filled cache (filled_caches); every step's
+    tokens are the same, at the next position."""
+    import jax
+
+    geometry = DSA_GEOMETRIES[cell.dsa_geometry]
+    pages_per_seq = -(-cell.seq // cell.page_size)
+    num_pages = cell.batch * pages_per_seq
+    table = dsa_block_table(cell, pages_per_seq)
+    base_pages = math.gcd(num_pages, DSA_BASE_PAGES)
+    keys = jax.random.split(jax.random.key(cell.heads * 1000 + cell.seq), 4)
+    queries = draw_dsa_queries(keys[0], geometry, cell.batch)
+    step_keys = draw_dsa_keys(keys[1], geometry, cell.batch)
+    base_keys = draw_dsa_keys(keys[2], geometry, base_pages * cell.page_size)
+    layer = build_dsa_layer(
+        cell.impl,
+        geometry,
+        num_tokens=cell.batch,
+        batch=cell.batch,
+        max_seqlen_k=cell.seq,
+        torchtpu_source=args.torchtpu_source,
+        route=cell.dsa_route,
+    )
+    requests = [
+        DsaRequests(
+            np.arange(cell.batch + 1),
+            np.full(cell.batch, cell.context + i + 1),
+            table,
+            cell.batch,
+        )
+        for i in range(cell.num_calls)
+    ]
+    layer_keys = layer.keys(step_keys)
+    return DsaScenario(
+        layer=layer,
+        geometry=geometry,
+        fresh=lambda: filled_caches(layer, base_keys, num_pages, keys[3]),
+        queries=queries,
+        layer_queries=layer.queries(queries),
+        calls=[(layer_keys, layer.meta(step)) for step in requests],
+        requests=requests,
+        rows=edge_rows(0, cell.batch),
+        logical=functools.partial(
+            dsa_decode_logical, cell, table, base_keys, keys[3], step_keys
+        ),
+    )
+
+
+def build_dsa_chunked_prefill(cell, args):
+    """The chunked prefill from an empty cache; every chunk reuses one
+    chunk's queries and writes its own keys."""
+    import jax
+
+    geometry = DSA_GEOMETRIES[cell.dsa_geometry]
+    pages_per_seq = -(-cell.seq // cell.page_size)
+    table = dsa_block_table(cell, pages_per_seq)
+    keys = jax.random.split(jax.random.key(cell.heads * 1000 + cell.seq), 2)
+    queries = draw_dsa_queries(keys[0], geometry, cell.chunk)
+    sequence = draw_dsa_keys(keys[1], geometry, cell.seq)
+    layer = build_dsa_layer(
+        cell.impl,
+        geometry,
+        num_tokens=cell.chunk,
+        batch=1,
+        max_seqlen_k=cell.seq,
+        torchtpu_source=args.torchtpu_source,
+        route=cell.dsa_route,
+    )
+    requests = [
+        DsaRequests(
+            np.array([0, cell.chunk]),
+            np.array([(i + 1) * cell.chunk]),
+            table,
+            0,
+        )
+        for i in range(cell.num_calls)
+    ]
+    chunks = [
+        sequence.rows(slice(i * cell.chunk, (i + 1) * cell.chunk))
+        for i in range(cell.num_calls)
+    ]
+    return DsaScenario(
+        layer=layer,
+        geometry=geometry,
+        fresh=lambda: layer.empty_caches(pages_per_seq),
+        queries=queries,
+        layer_queries=layer.queries(queries),
+        calls=[
+            (layer.keys(chunk), layer.meta(call))
+            for chunk, call in zip(chunks, requests)
+        ],
+        requests=requests,
+        rows=edge_rows(0, cell.chunk),
+        logical=lambda request: sequence,
     )
 
 
@@ -632,9 +803,69 @@ def trace_scenario(cell, step, state, directory):
     return {name: ms for name, ms in per_op.items() if ms >= 1e-3}
 
 
-def run(cell, args):
+def cache_hbm_error(cell):
+    """Why the cell's KV cache cannot fit in HBM, or None."""
     import jax
 
+    hbm = jax.devices()[0].memory_stats().get("bytes_limit")
+    if hbm and cell.cache_bytes > 0.9 * hbm:
+        return (
+            f"the KV cache needs {cell.cache_bytes / 2**30:.1f} GiB, more "
+            f"than 90% of the device's {hbm / 2**30:.1f} GiB of HBM"
+        )
+    return None
+
+
+def dsa_cell_record(cell, build_scenario, trace_directory):
+    """A DSA cell's work, timing and check, plus per-op trace times when a
+    trace directory is given; or its error."""
+    try:
+        scenario = build_scenario()
+        record = {
+            **dsa_work(scenario.geometry, scenario.requests),
+            **measure_dsa(scenario),
+        }
+    except Exception as error:  # pylint: disable=broad-exception-caught
+        return {
+            "status": "error",
+            "error": f"{type(error).__name__}: {str(error)[:400]}",
+        }
+    if trace_directory is None:
+        return record
+    per_op = trace_scenario(
+        cell, scenario.step, scenario.fresh(), trace_directory
+    )
+    if per_op is None:
+        record["trace_error"] = "no device events in the trace"
+    else:
+        record["trace_ops_ms"] = dict(
+            sorted(per_op.items(), key=lambda op: -op[1])
+        )
+    return record
+
+
+def run_dsa(cell, args):
+    record = {
+        "key": cell.key,
+        "cell": dataclasses.asdict(cell),
+        "num_calls": cell.num_calls,
+        "cache_bytes": cell.cache_bytes,
+    }
+    hbm_error = cache_hbm_error(cell)
+    if hbm_error is not None:
+        record.update(status="error", error=hbm_error)
+        return record
+    if cell.scenario == "decode":
+        build = build_dsa_decode
+    else:
+        build = build_dsa_chunked_prefill
+    record.update(
+        dsa_cell_record(cell, functools.partial(build, cell, args), args.trace)
+    )
+    return record
+
+
+def run(cell, args):
     pairs = attention_pairs(cell)
     if cell.is_mla:
         # Note (david): QK over the latent and the rope, P @ V over the latent.
@@ -668,15 +899,9 @@ def run(cell, args):
         "kv_bytes_read": kv_bytes_read,
         "cache_bytes": cell.cache_bytes,
     }
-    hbm = jax.devices()[0].memory_stats().get("bytes_limit")
-    if hbm and cell.cache_bytes > 0.9 * hbm:
-        record.update(
-            status="error",
-            error=(
-                f"the KV cache needs {cell.cache_bytes / 2**30:.1f} GiB, more "
-                f"than 90% of the device's {hbm / 2**30:.1f} GiB of HBM"
-            ),
-        )
+    hbm_error = cache_hbm_error(cell)
+    if hbm_error is not None:
+        record.update(status="error", error=hbm_error)
         return record
     try:
         if cell.is_mla:
@@ -734,22 +959,28 @@ def run(cell, args):
     return record
 
 
-def main(argv=None):
-    args = parse_args(argv)
+def make_cell(args):
     is_mla = args.impl in MLA_PREFILL_IMPLS
+    is_dsa = args.impl in DSA_IMPLS
     if args.page_size is not None:
         page_size = args.page_size
+    elif is_dsa:
+        page_size = DSA_PAGE
     elif is_mla:
         page_size = SERVING_PAGE[args.kv_dtype]
     else:
         page_size = 128
-    cell = Cell(
+    if is_dsa:
+        heads = DSA_GEOMETRIES[args.dsa_geometry].heads
+    else:
+        heads = args.heads
+    return Cell(
         args.impl,
         args.scenario,
-        args.heads,
+        heads,
         # Note (david): MLA's queries attend one latent head.
-        1 if is_mla else args.heads_k,
-        LATENT_DIM if is_mla else args.head_dim,
+        1 if is_mla or is_dsa else args.heads_k,
+        LATENT_DIM if is_mla or is_dsa else args.head_dim,
         args.seq,
         args.chunk,
         args.batch,
@@ -757,18 +988,38 @@ def main(argv=None):
         page_size,
         args.sliding_window,
         args.verify_tokens,
-        kv_dtype=args.kv_dtype,
+        kv_dtype=DSA_KV_DTYPE if is_dsa else args.kv_dtype,
+        dsa_geometry=args.dsa_geometry,
+        dsa_route=args.dsa_route,
     )
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    cell = make_cell(args)
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
-    record = run(cell, args)
+    if cell.impl in TORCHTPU_DSA_IMPLS:
+        prepare_torchtpu_process()
+    record = run_dsa(cell, args) if cell.is_dsa else run(cell, args)
     if args.output:
         write_record(args.output, record)
     print(json.dumps(record))
     return 0 if record["status"] == "ok" else 1
+
+
+def scenario_dsa_args_error(args):
+    """Why the DSA arguments do not fit together, or None."""
+    if args.impl in DSA_IMPLS and args.scenario not in DSA_SCENARIOS:
+        return f"--impl {args.impl} runs {' and '.join(DSA_SCENARIOS)} only"
+    elif args.impl in DSA_IMPLS and args.sliding_window is not None:
+        return f"--impl {args.impl} takes no --sliding-window"
+    elif args.dsa_route is not None and args.impl != FLYWHEEL_DSA:
+        return f"--impl {args.impl} takes no --dsa-route"
+    return dsa_args_error(args.impl, args.dsa_geometry, args.page_size)
 
 
 def parse_args(argv=None):
@@ -809,7 +1060,8 @@ def parse_args(argv=None):
         "--page-size",
         type=int,
         help=(
-            "default: 128; for an MLA impl, MLA v2's serving page of the dtype"
+            "default: 128; for an MLA impl, MLA v2's serving page of the"
+            f" dtype; for a DSA impl, {DSA_PAGE}"
         ),
     )
     parser.add_argument(
@@ -847,13 +1099,25 @@ def parse_args(argv=None):
     parser.add_argument(
         "--torchtpu-source",
         type=pathlib.Path,
-        help="batched_rpa: a vllm-torchtpu checkout",
+        help="batched_rpa and the torchtpu DSA impls: a vllm-torchtpu checkout",
     )
     parser.add_argument(
         "--mla-v2-source",
         type=pathlib.Path,
         default=DEFAULT_MLA_V2_SOURCE,
         help="mla_v2: a tpu-inference checkout at the pinned commit",
+    )
+    parser.add_argument(
+        "--dsa-geometry",
+        choices=tuple(DSA_GEOMETRIES),
+        help="a DSA impl's model geometry",
+    )
+    parser.add_argument(
+        "--dsa-route",
+        help=(
+            "flywheel_dsa: pin dsa_attention's route (mixed or sparse);"
+            " default: picked on device"
+        ),
     )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
@@ -863,7 +1127,10 @@ def parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     is_mla = args.impl in MLA_PREFILL_IMPLS
-    if is_mla and args.scenario != "chunked_prefill":
+    dsa_error = scenario_dsa_args_error(args)
+    if dsa_error is not None:
+        parser.error(dsa_error)
+    elif is_mla and args.scenario != "chunked_prefill":
         parser.error(f"--impl {args.impl} runs chunked_prefill only")
     elif is_mla and args.sliding_window is not None:
         parser.error(f"--impl {args.impl} takes no --sliding-window")
