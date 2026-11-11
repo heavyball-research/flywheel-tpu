@@ -19,11 +19,12 @@ from flywheel_tpu.sparse_attention.dsa.indexer import (
 )
 from tests.sparse_attention import dsa_reference as ref
 
-# Note (david): these kernels run under the Pallas interpreter, but one case
-# there takes longer than a whole CPU CI shard.
+# Note (david): the Pallas interpreter cannot read through the indexer's
+# bitcast key ref, and the repeated cache write is far too slow there.
 if jax.default_backend() != "tpu":
     pytest.skip(
-        "too slow under the Pallas interpreter", allow_module_level=True
+        "the Pallas interpreter cannot run these kernels",
+        allow_module_level=True,
     )
 
 # block_table's entry for the pages past a request's last one.
