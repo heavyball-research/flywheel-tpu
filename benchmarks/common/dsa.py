@@ -249,7 +249,9 @@ class DsaKeys(NamedTuple):
     rope: jax.Array
 
     def rows(self, rows) -> DsaKeys:
-        return DsaKeys(*(values[rows] for values in self))
+        return DsaKeys(
+            self.index_keys[rows], self.latent[rows], self.rope[rows]
+        )
 
 
 class DsaRequests(NamedTuple):
@@ -612,7 +614,9 @@ def patch_pallas_fori_lowering() -> None:
     from jax._src.pallas.mosaic import lowering
 
     source = textwrap.dedent(
-        inspect.getsource(lowering._lower_jaxpr_to_for_loop)
+        inspect.getsource(
+            lowering._lower_jaxpr_to_for_loop  # pylint: disable=protected-access
+        )
     )
     if FORI_REMAINDER_NEEDLE not in source:
         raise RuntimeError(
@@ -629,6 +633,7 @@ def patch_pallas_fori_lowering() -> None:
         lowering.__dict__,
         namespace,
     )
+    # pylint: disable-next=protected-access
     lowering._lower_jaxpr_to_for_loop = namespace["_lower_jaxpr_to_for_loop"]
 
 

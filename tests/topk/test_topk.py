@@ -248,7 +248,9 @@ def run_flat_case(row_lengths, row_stride, kind, tail, seed):
     values = row_scores(rng, len(row_lengths), row_stride, kind)
     columns = np.arange(row_stride)[None, :]
     stored = np.where(columns < row_lengths[:, None], values, tail)
-    flat = stored.astype(np.float32).reshape(len(row_lengths), -1, TILE_COLUMNS)
+    flat = stored.astype(np.float32).reshape(
+        (len(row_lengths), -1, TILE_COLUMNS)
+    )
     positions = top_k(
         jnp.asarray(flat), FLAT_K, row_lengths=jnp.asarray(row_lengths)
     )

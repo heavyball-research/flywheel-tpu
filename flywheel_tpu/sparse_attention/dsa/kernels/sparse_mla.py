@@ -331,8 +331,8 @@ def _attend_step(
     list scheduler sees all of the step's matmuls before any softmax waits on
     them.
     """
-    tokens_per_step = q_nope_ref.shape[0]
-    top_k = nope_ref.shape[0] // tokens_per_step
+    step_tokens = q_nope_ref.shape[0]
+    top_k = nope_ref.shape[0] // step_tokens
     score_scale = kv_scale * sm_scale_log2
     staged = [
         _token_scores(
@@ -345,7 +345,7 @@ def _attend_step(
             token * top_k,
             top_k,
         )
-        for token in range(tokens_per_step)
+        for token in range(step_tokens)
     ]
     for token, (keys, scores) in enumerate(staged):
         row_max, row_sum, accumulator = _softmax_pv(scores, keys, score_scale)
@@ -383,10 +383,10 @@ def _attend_blocks(
     BLOCK_SLOTS gathered rows, a block of every token per basic block: each
     block rescales the running sum and P @ V of the blocks before it to the
     running max. The tokens from request_tokens on are padding."""
-    tokens_per_step = q_nope_ref.shape[0]
-    top_k = nope_ref.shape[0] // tokens_per_step
+    step_tokens = q_nope_ref.shape[0]
+    top_k = nope_ref.shape[0] // step_tokens
     score_scale = kv_scale * sm_scale_log2
-    for token in range(tokens_per_step):
+    for token in range(step_tokens):
         for half, query in enumerate(_rope_queries(q_pe_ref[token])):
             rope_query_ref[token, half] = query
     max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, max_ref.dtype)
@@ -411,7 +411,7 @@ def _attend_blocks(
                 token * top_k + first_slot,
                 BLOCK_SLOTS,
             )
-            for token in range(tokens_per_step)
+            for token in range(step_tokens)
         ]
         for token, (keys, scores) in enumerate(staged):
             running_max = max_ref[token]
@@ -433,7 +433,7 @@ def _attend_blocks(
             )
             accumulator_ref[token] = accumulator_ref[token] * rescale + pv
 
-    for token in range(tokens_per_step):
+    for token in range(step_tokens):
         _write_token(
             out_ref,
             lse_ref,
