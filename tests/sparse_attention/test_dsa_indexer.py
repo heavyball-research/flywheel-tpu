@@ -4,6 +4,7 @@ row's causal prefix."""
 
 import dataclasses
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -17,6 +18,13 @@ from flywheel_tpu.sparse_attention.dsa.indexer import (
     index_cache_shape,
 )
 from tests.sparse_attention import dsa_reference as ref
+
+# Note (david): these kernels run under the Pallas interpreter, but one case
+# there takes longer than a whole CPU CI shard.
+if jax.default_backend() != "tpu":
+    pytest.skip(
+        "too slow under the Pallas interpreter", allow_module_level=True
+    )
 
 # block_table's entry for the pages past a request's last one.
 INVALID_PAGE = 2147480000
