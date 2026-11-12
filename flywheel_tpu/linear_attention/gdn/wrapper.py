@@ -92,11 +92,22 @@ def store_out_rows(
             row_offset = pl.multiple_of(
                 chunk_idx * compute_chunk, compute_chunk
             )
-        out_slot_ref[pl.ds(row_offset, compute_chunk)] = out[0].astype(
-            out_dtype
-        )
+        # Note: splitting out heads is a sublane transpose of the f32
+        # chunk: 180.2 -> 184.9 us for an 8192-token call on v7x.
+        rows = out[0].reshape(compute_chunk, *cfg.out_row_shape)
+        out_slot_ref[pl.ds(row_offset, compute_chunk)] = rows.astype(out_dtype)
     else:
-        stage = out_slot_ref[...]
+        # Note: every stage row a tile's DMA writes is a token row, a
+        # head row the blend overwrites or a tail row the fixup zeroes, so a
+        # split-heads stage is built lane-packed from zeros and split once
+        # (28.7 -> 29.0 us for 64 decodes on v7x; one store per token row took
+        # 31.0).
+        if cfg.split_out_heads:
+            stage = jnp.zeros(
+                (out_slot_ref.shape[0], cfg.v_dim_size), out_dtype
+            )
+        else:
+            stage = out_slot_ref[...]
         stage_rows = lax.broadcasted_iota(jnp.int32, stage.shape, 0)
         seq_row_start = delta
         for seq_idx in range(cfg.seq_tile_size):
@@ -111,6 +122,12 @@ def store_out_rows(
                 )
                 stage = jnp.where(is_token_row, token_out, stage)
             seq_row_start += num_seq_rows
+        if cfg.split_out_heads:
+            stage = (
+                stage.astype(jnp.float32)
+                .reshape(stage.shape[0], *cfg.out_row_shape)
+                .astype(out_dtype)
+            )
         out_slot_ref[...] = stage
 
 
@@ -876,7 +893,7 @@ def outer_kernel(
                 used_rows - (used_rows & (stage_tile - 1)), stage_tile
             )
             tail_slab_rows = tail_slab_start + lax.broadcasted_iota(
-                jnp.int32, (stage_tile, cfg.v_dim_size), 0
+                jnp.int32, (stage_tile, *cfg.out_row_shape), 0
             )
             stage_ref[pl.ds(tail_slab_start, stage_tile)] = jnp.where(
                 tail_slab_rows < used_rows,
@@ -904,7 +921,7 @@ def outer_kernel(
                 ].astype(jnp.float32)
                 own_slab = stage_ref[pl.ds(0, stage_tile)].astype(jnp.float32)
                 head_rows = lax.broadcasted_iota(
-                    jnp.int32, (align, cfg.v_dim_size), 0
+                    jnp.int32, (align, *cfg.out_row_shape), 0
                 )
                 prev_head = jnp.where(
                     head_rows + (prev_stage_row - prev_slab_start) < align,
@@ -1064,7 +1081,7 @@ def merge_checkpoint(checkpoint: jax.Array) -> jax.Array:
 
 @jax.jit(
     donate_argnames=("conv_state", "recurrent_state"),
-    static_argnames=STATIC_ARGNAMES,
+    static_argnames=STATIC_ARGNAMES + ("split_out_heads",),
 )
 def fused_conv1d_gdn(
     qkv: jax.Array,
@@ -1097,6 +1114,7 @@ def fused_conv1d_gdn(
     # ones, whose tail tile runs its chunks without cross-chunk overlap.
     mixed_tile_size: int = 128,
     compute_chunk_size: int = 64,
+    split_out_heads: bool = False,
 ) -> tuple[tuple[jax.Array, jax.Array], jax.Array]:
     """Conv1D + silu + gated delta rule in one fused kernel.
 
@@ -1152,10 +1170,12 @@ def fused_conv1d_gdn(
             of compute_chunk_size.
         compute_chunk_size: Tokens per chunked-GDN math step; a mixed tile
             unrolls mixed_tile_size // compute_chunk_size of them.
+        split_out_heads: Return out as [batch_size, n_v, d_v].
 
     Returns:
         (new_conv_state, new_recurrent_state): The updated state caches.
-        out: The output [batch_size, n_v * d_v].
+        out: The output [batch_size, n_v * d_v], or [batch_size, n_v, d_v]
+            with split_out_heads.
     """
     (conv_state, recurrent_state, _, _), out = launch_fused_conv1d_gdn(
         qkv,
@@ -1188,6 +1208,7 @@ def fused_conv1d_gdn(
         mixed_tile_size=mixed_tile_size,
         compute_chunk_size=compute_chunk_size,
         replay_window=0,
+        split_out_heads=split_out_heads,
     )
     return (conv_state, recurrent_state), out
 
@@ -1374,6 +1395,7 @@ def launch_fused_conv1d_gdn(
     mixed_tile_size: int,
     compute_chunk_size: int,
     replay_window: int,
+    split_out_heads: bool = False,
 ) -> tuple[
     tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None], jax.Array
 ]:
@@ -1666,6 +1688,7 @@ def launch_fused_conv1d_gdn(
             replay_window=kernel_replay_window,
             split_checkpoint=replay_window > 0,
             conv_slot_major=conv_slot_major,
+            split_out_heads=split_out_heads,
             dim_size=dim,
             num_kq_heads=n_kq,
             num_v_heads=n_v,
@@ -1717,7 +1740,7 @@ def launch_fused_conv1d_gdn(
         }
         if aliased_out is None:
             out_shape = jax.ShapeDtypeStruct(
-                (cfg.batch_size, cfg.v_dim_size), cfg.dtypes.act_out
+                (cfg.batch_size, *cfg.out_row_shape), cfg.dtypes.act_out
             )
             aliased_out_spec = None
             input_output_aliases = state_aliases
