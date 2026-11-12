@@ -20,7 +20,16 @@ verify           --batch sequences each hold seq - verify_tokens tokens of KV
                  --verify-tokens query tokens per sequence that append their
                  K/V and attend causally (bottom-right) to the whole cache.
                  Every step rewrites the same slots, as a step whose drafts
-                 are all rejected does, so each attends seq keys.
+                 are all rejected does, so each attends its whole length.
+
+decode and verify cache batch * (seq - new tokens) tokens before the first
+call, split across the sequences by --pattern (benchmarks/common/lengths.py):
+uniform gives each sequence seq - new tokens, spiky and longtail hold the
+same total in other shapes, so a pattern's cost over uniform is the cost of
+the uneven lengths alone. Every sequence then appends the same new tokens.
+The pool holds only the pages each sequence's length needs, shuffled across
+sequences; a sequence's block table row runs to the longest sequence's page
+count and repeats its own last page past its pages.
 
 Both kernels read and write a paged cache of --page-size token pages (128,
 the page flywheel's vLLM backend allocates), with pages shuffled across
@@ -45,6 +54,33 @@ flywheel_mla and mla_v2 run DeepSeek's absorbed MLA chunked prefill
 (benchmarks/common/mla.py) on MLA v2's cache in its serving pages; an MLA
 cell whose last output fails COS_DIFF_BOUND is recorded as check_failed.
 
+On decode and verify they run the absorbed MLA decode: MQA over one cache row
+per token, LATENT_DIM values plus ROPE_DIM of RoPE key, shared by all --heads
+query heads. These cells run on MLA_DECODE_PAGE token pages for every cache
+dtype, the page tpu-inference's MLA backend serves. Each impl keeps its cache
+in its own layout and is given q in its own layout, both outside the clock.
+
+mla_v2 runs mla_ragged_paged_attention as tpu-inference's mla_attention layer
+calls it: on the cache layout its cache manager allocates by the
+MLA_KV_PACKING_SIZE and MLA_TRANSPOSE_KV_CACHE environment variables (32
+tokens per packed row and not transposed by default, read here with
+tpu_inference/envs.py's defaults), with q in the cache's dtype, as
+tpu-inference quantizes q for an fp8 cache unless
+DISABLE_MLA_Q_ACTIVATION_QUANTIZATION is set, with q, the new rows and the
+metadata padded to the next power of two of tokens and of requests, as its
+model runner pads a step, with decode in its
+batched_decode case and a verify window in its mixed case, and with the tuned
+blocks of those cases, or its defaults when the tuned table has no entry for
+the shape (block_source says which). Its wall clock includes the transposes
+of q into and the output out of its kernel's token-major layout (xpose_* ops),
+which kernel_ms leaves out.
+
+flywheel_mla runs flash_mla_decode on its cache, MLA v2's word layout at the
+dtype's packing, with q in bfloat16 (the only q dtype it takes), causal over
+a verify window, and max_seqlen_k the longest sequence's final length, as
+serving passes its bound. Its block comes from the mla| entries of
+tuned_configs.json, else its heuristic (block_source says which).
+
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
 under jax.profiler, and every device op of one scenario is summed by name.
@@ -60,21 +96,30 @@ import argparse
 import dataclasses
 import json
 import math
+import os
 import pathlib
 import sys
 
 import numpy as np
 
+from benchmarks.common.lengths import PATTERNS, pattern_weights, split_budget
 from benchmarks.common.mla import (
     COS_DIFF_BOUND,
     DEFAULT_MLA_V2_SOURCE,
+    KV_PACKING_SIZE_DEFAULT,
     LATENT_DIM,
     MLA_PREFILL_IMPLS,
     ROPE_DIM,
     SERVING_PAGE,
+    SM_SCALE,
     build_mla_prefill,
     draw_normal,
+    load_mla_v2,
     mla_cos_diff,
+    mla_v2_blocks,
+    mla_v2_padded_sizes,
+    pad_mla_v2_meta,
+    pad_mla_v2_tokens,
 )
 from benchmarks.common.records import recorded, write_record
 from benchmarks.common.rpa import (
@@ -92,6 +137,9 @@ SCENARIOS = ("chunked_prefill", "decode", "verify")
 # Note (david): MLA v2's kernel is named MLA-<case>-..., flywheel's MLA
 # kernels flash_mla_*.
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "MLA-", "flash_mla")
+# tpu-inference's PallasMLAttentionBackend.get_page_size, the page of MLA
+# decode and verify cells for every cache dtype.
+MLA_DECODE_PAGE = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -111,11 +159,15 @@ class Cell:
     sliding_window: int | None = None
     # verify: query tokens per sequence per step (num_spec_tokens + 1).
     verify_tokens: int = 1
-    # q dtype. Every byte count below follows the cache's itemsize.
+    # q dtype; an MLA decode or verify cell draws q in kv_dtype, which mla_v2
+    # takes as drawn and flywheel_mla as bfloat16. Every byte count below
+    # follows the cache's itemsize.
     dtype: str = "bfloat16"
     # k, v and cache dtype. An fp8 cell keeps the descales at 1: they only
     # scale the scores and the output, not the work timed.
     kv_dtype: str = "bfloat16"
+    # decode, verify: how the cached tokens split across the sequences.
+    pattern: str = "uniform"
 
     @property
     def is_mla(self):
@@ -138,21 +190,44 @@ class Cell:
         )
         if self.scenario == "chunked_prefill":
             return f"{shape}-c{self.chunk}"
-        elif self.scenario == "verify":
+        pattern_tag = "" if self.pattern == "uniform" else f"-{self.pattern}"
+        batch_tag = f"-b{self.batch}{pattern_tag}"
+        if self.scenario == "verify":
             return (
-                f"{shape}-b{self.batch}-t{self.verify_tokens}"
+                f"{shape}{batch_tag}-t{self.verify_tokens}"
                 f"-n{self.decode_tokens}"
             )
-        return f"{shape}-b{self.batch}-n{self.decode_tokens}"
+        return f"{shape}{batch_tag}-n{self.decode_tokens}"
 
     @property
-    def context(self):
-        """Cached tokens per sequence before the first call."""
+    def new_tokens(self):
+        """Tokens each sequence appends over the scenario."""
         if self.scenario == "chunked_prefill":
-            return 0
+            return self.seq
         elif self.scenario == "verify":
-            return self.seq - self.verify_tokens
-        return self.seq - self.decode_tokens
+            return self.verify_tokens
+        return self.decode_tokens
+
+    @property
+    def contexts(self):
+        """Cached tokens of each sequence before the first call, (num_seqs,):
+        the pattern's split of num_seqs * (seq - new_tokens)."""
+        context = self.seq - self.new_tokens
+        if self.pattern == "uniform":
+            return np.full(self.num_seqs, context, np.int64)
+        weights = pattern_weights(self.pattern, self.num_seqs)
+        return np.asarray(split_budget(weights, self.num_seqs * context))
+
+    @property
+    def seq_lens(self):
+        """Each sequence's tokens after the last call; they sum to
+        num_seqs * seq whatever the pattern."""
+        return self.contexts + self.new_tokens
+
+    @property
+    def num_pages(self):
+        """Pages in the pool: each sequence's own, and no more."""
+        return int((-(-self.seq_lens // self.page_size)).sum())
 
     @property
     def num_calls(self):
@@ -199,23 +274,21 @@ class Cell:
 
 def attention_pairs(cell):
     """(query, key) pairs the whole scenario attends."""
+    contexts = cell.contexts
     if cell.scenario == "verify":
         # Note (david): window token t sees the context and t + 1 new tokens.
         tokens = cell.verify_tokens
-        per_step = tokens * cell.context + tokens * (tokens + 1) // 2
-        return cell.num_calls * cell.batch * per_step
-    if cell.scenario == "chunked_prefill":
-        first_query, num_queries = 0, cell.seq
-    else:
-        first_query, num_queries = cell.context, cell.decode_tokens
-    causal_keys = np.arange(
-        first_query + 1, first_query + num_queries + 1, dtype=np.int64
+        per_step = tokens * contexts + tokens * (tokens + 1) // 2
+        return cell.num_calls * int(per_step.sum())
+    # (num_seqs, new_tokens): the keys each query token sees.
+    causal_keys = contexts[:, None] + np.arange(
+        1, cell.new_tokens + 1, dtype=np.int64
     )
     if cell.sliding_window is None:
         visible_keys = causal_keys
     else:
         visible_keys = np.minimum(causal_keys, cell.sliding_window)
-    return cell.num_seqs * int(visible_keys.sum())
+    return int(visible_keys.sum())
 
 
 def draw(generator, dtype, *shape):
@@ -227,7 +300,8 @@ def draw(generator, dtype, *shape):
 
 
 def make_inputs(cell):
-    """Per-call q, k, v and the block table, shared by both impls."""
+    """Per-call q, k, v (MLA decode and verify: q and the new cache rows, in
+    two parts each) and the block table, shared by every impl."""
     import jax
     import jax.numpy as jnp
 
@@ -248,6 +322,19 @@ def make_inputs(cell):
             )
             for i in range(cell.num_calls)
         ]
+    elif cell.is_mla:
+        # Note: (ql_nope, q_pe, kv_c, k_pe), as tpu-inference's MLA layer
+        # feeds its kernel: ql_nope, the absorbed q, head-major as the q_nope
+        # projection emits it, q_pe token-major, and the new cache rows split
+        # at LATENT_DIM.
+        tokens = cell.query_tokens
+        step = (
+            draw(generator, cell.dtype, cell.heads, tokens, LATENT_DIM),
+            draw(generator, cell.dtype, tokens, cell.heads, ROPE_DIM),
+            draw(generator, cell.kv_dtype, tokens, LATENT_DIM),
+            draw(generator, cell.kv_dtype, tokens, ROPE_DIM),
+        )
+        calls = [step] * cell.num_calls
     elif cell.scenario == "verify":
 
         def window_tokens(heads, dtype):
@@ -272,11 +359,17 @@ def make_inputs(cell):
             one_token(cell.heads_k, cell.kv_dtype),
         )
         calls = [step] * cell.num_calls
-    pages_per_seq = -(-cell.seq // cell.page_size)
-    table = generator.permutation(cell.num_seqs * pages_per_seq)
-    block_table = jnp.asarray(
-        table.reshape(cell.num_seqs, pages_per_seq).astype(np.int32)
-    )
+    # Note: with uniform lengths this is a shuffled pool reshaped to
+    # (num_seqs, pages_per_seq), the same table as before patterns existed.
+    own_pages = -(-cell.seq_lens // cell.page_size)
+    pool = generator.permutation(cell.num_pages).astype(np.int32)
+    table = np.empty((cell.num_seqs, int(own_pages.max())), np.int32)
+    first = 0
+    for index, count in enumerate(own_pages):
+        table[index, :count] = pool[first : first + count]
+        table[index, count:] = pool[first + count - 1]
+        first += count
+    block_table = jnp.asarray(table)
     # Cached tokens per sequence before each call.
     if cell.scenario == "chunked_prefill":
         advance = cell.chunk
@@ -284,8 +377,9 @@ def make_inputs(cell):
         advance = 0
     else:
         advance = 1
+    contexts = cell.contexts
     starts = [
-        jnp.full((cell.num_seqs,), cell.context + i * advance, jnp.int32)
+        jnp.asarray((contexts + i * advance).astype(np.int32))
         for i in range(cell.num_calls)
     ]
     return jax.block_until_ready((calls, block_table, starts))
@@ -392,7 +486,7 @@ def build_flywheel(cell, inputs, args):
     # Note (david): the merged cache interleaves each kv head's K row and V
     # row (an fp8 cache pads an odd head count).
     shape = (
-        cell.num_seqs * block_table.shape[1],
+        cell.num_pages,
         cell.page_size,
         merged_cache_heads(cell.heads_k, cell.kv_dtype),
         cell.head_dim,
@@ -446,7 +540,7 @@ def build_rpa(cell, inputs, args):
     rpa = load_rpa_v3(args.rpa_source)
     calls, block_table, starts = inputs
     shape = rpa.get_kv_cache_shape(
-        cell.num_seqs * block_table.shape[1],
+        cell.num_pages,
         cell.page_size,
         cell.heads_k,
         cell.head_dim,
@@ -538,7 +632,7 @@ def build_batched_rpa(cell, inputs, args):
     wrapper = load_batched_rpa(args.torchtpu_source)
     calls, block_table, starts = inputs
     shape = wrapper.get_kv_cache_shape(
-        cell.num_seqs * block_table.shape[1],
+        cell.num_pages,
         cell.page_size,
         cell.heads_k,
         cell.head_dim,
@@ -595,10 +689,226 @@ def build_batched_rpa(cell, inputs, args):
     )
 
 
+def build_mla_v2_decode(cell, inputs, args):
+    """(step, fresh_state, info) running tpu-inference's
+    mla_ragged_paged_attention on decode or verify as its mla_attention layer
+    calls it."""
+    import jax
+    import jax.numpy as jnp
+
+    from flywheel_tpu.core.tpu import NUM_LANES
+
+    kernel, tuned = load_mla_v2(args.mla_v2_source)
+    calls, block_table, starts = inputs
+    # Note: tpu-inference's cache manager lays the MLA cache out by these env
+    # vars. Rows of kv_packing tokens (KV_PACKING_SIZE_DEFAULT, not the
+    # dtype's packing), each the latent and its RoPE part padded to whole
+    # lane tiles apiece; transposed, the RoPE part is not padded. load_mla_v2
+    # stubs tpu_inference.envs, so they are read here as envs.py reads them.
+    kv_packing = int(os.getenv("MLA_KV_PACKING_SIZE", KV_PACKING_SIZE_DEFAULT))
+    transpose = os.getenv("MLA_TRANSPOSE_KV_CACHE", "False").lower() in (
+        "1",
+        "true",
+    )
+    if cell.page_size % kv_packing:
+        raise ValueError(
+            f"--page-size {cell.page_size} is not a multiple of"
+            f" MLA_KV_PACKING_SIZE={kv_packing}."
+        )
+    rope_dim = ROPE_DIM if transpose else kernel.align_to(ROPE_DIM, NUM_LANES)
+    shape = kernel.get_kv_cache_shape(
+        cell.num_pages,
+        cell.page_size,
+        kernel.align_to(LATENT_DIM, NUM_LANES) + rope_dim,
+        jnp.dtype(cell.kv_dtype),
+        kv_packing,
+        transpose_kv_cache=transpose,
+    )
+    new_tokens = cell.verify_tokens if cell.scenario == "verify" else 1
+    # As in build_rpa: tpu-inference counts only a one-token request as
+    # decode, so a longer verify window runs the mixed case.
+    num_decode = cell.batch if new_tokens == 1 else 0
+    # Note: q, the new rows and the metadata are padded as the model runner
+    # pads a step, the way benchmarks/common/mla.py's prefill path is.
+    padded_tokens, max_num_seqs = mla_v2_padded_sizes(
+        cell.query_tokens, cell.batch
+    )
+    block_kwargs, cases = mla_v2_blocks(
+        tuned,
+        max_num_tokens=padded_tokens,
+        actual_num_q_heads=cell.heads,
+        actual_lkv_dim=LATENT_DIM,
+        actual_r_dim=ROPE_DIM,
+        kv_dtype=cell.kv_dtype,
+        q_dtype=cell.dtype,
+        page_size_per_kv_packing=shape[1],
+        kv_packing=shape[2],
+        max_num_seqs=max_num_seqs,
+        pages_per_seq=block_table.shape[1],
+    )
+    cu_q_lens = np.arange(cell.batch + 1, dtype=np.int32) * new_tokens
+    distribution = request_distribution(
+        num_decode=num_decode, num_seqs=cell.batch
+    )
+    metas = [
+        pad_mla_v2_meta(
+            cu_q_lens,
+            np.asarray(start) + new_tokens,
+            block_table,
+            distribution,
+            max_num_seqs=max_num_seqs,
+        )
+        for start in starts
+    ]
+    # Note: only kv_lens changes from call to call; the rest of the metadata
+    # is the jit's constant.
+    kv_lens = [meta[0] for meta in metas]
+    _, page_indices, cu_q_lens, distribution = metas[0]
+    # Every call reuses one step's operands, so they are padded once:
+    # ql_nope is head-major, the other three token-major.
+    ql_nope, q_pe, kv_c, k_pe = calls[0]
+    operands = jax.block_until_ready((
+        pad_mla_v2_tokens(ql_nope, padded_tokens, axis=1),
+        pad_mla_v2_tokens(q_pe, padded_tokens),
+        pad_mla_v2_tokens(kv_c, padded_tokens),
+        pad_mla_v2_tokens(k_pe, padded_tokens),
+    ))
+    # Note: without its own jax.jit, whose static arguments become constants
+    # of the jit below; it donates only the cache either way.
+    kernel_fn = kernel.mla_ragged_paged_attention.__wrapped__
+
+    def call(cache, ql_nope, q_pe, kv_c, k_pe, call_kv_lens):
+        out, cache = kernel_fn(
+            ql_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            cache,
+            call_kv_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            sm_scale=SM_SCALE,
+            transpose_kv_cache=transpose,
+            **block_kwargs,
+        )
+        return out, cache
+
+    kernel_jit = jax.jit(call, donate_argnums=(0,))
+
+    def step(cache):
+        out = None
+        for call_kv_lens in kv_lens:
+            out, cache = kernel_jit(cache, *operands, call_kv_lens)
+        return out, cache
+
+    case = "batched_decode" if num_decode else "mixed"
+    params, hit = cases[case]
+    generator = np.random.default_rng(1)
+    info = {
+        "block_source": f"tpu-inference {'tuned' if hit else 'default'}",
+        "block_case": case,
+        "tuned_params": dataclasses.asdict(params),
+        "q_dtype": cell.dtype,
+        "kv_packing": kv_packing,
+        "transpose_kv_cache": transpose,
+        "xpose_n_tile_size": kernel.envs.MLA_XPOSE_N_TILE_SIZE,
+        "padded_tokens": padded_tokens,
+        "max_num_seqs": max_num_seqs,
+    }
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
+
+
+def build_flywheel_mla_decode(cell, inputs, args):
+    """(step, fresh_state, info) running flash_mla_decode on decode or
+    verify."""
+    del args  # Unused.
+    import jax
+    import jax.numpy as jnp
+
+    from flywheel_tpu.softmax_attention.dispatch import get_tuned_mla_config
+    from flywheel_tpu.softmax_attention.mla_decode import (
+        flash_mla_decode,
+        mla_cache_shape,
+    )
+
+    calls, block_table, starts = inputs
+    shape = mla_cache_shape(
+        cell.num_pages, cell.page_size, jnp.dtype(cell.kv_dtype)
+    )
+    new_tokens = cell.verify_tokens if cell.scenario == "verify" else 1
+    batch, heads = cell.batch, cell.heads
+
+    @jax.jit
+    def token_major(ql_nope, q_pe, kv_c, k_pe):
+        """make_inputs' MLA operands in flash_mla_decode's layout and q
+        dtype: (batch, new_tokens, ...), q in bfloat16."""
+        q_nope = jnp.swapaxes(ql_nope, 0, 1).astype(jnp.bfloat16)
+        return (
+            q_nope.reshape(batch, new_tokens, heads, LATENT_DIM),
+            q_pe.astype(jnp.bfloat16).reshape(
+                batch, new_tokens, heads, ROPE_DIM
+            ),
+            kv_c.reshape(batch, new_tokens, LATENT_DIM),
+            k_pe.reshape(batch, new_tokens, ROPE_DIM),
+        )
+
+    # Note: every call reuses one step's operands, so they are relaid once.
+    operands = jax.block_until_ready(token_major(*calls[0]))
+    fp8 = jnp.dtype(cell.kv_dtype) == jnp.float8_e4m3fn
+    # The scale only scales the scores and the output, not the work timed.
+    kv_scale = jnp.float32(1.0) if fp8 else None
+    max_seqlen_k = int(cell.seq_lens.max())
+
+    def call(cache, q_nope, q_pe, kv_c, k_pe, start):
+        return flash_mla_decode(
+            q_nope,
+            q_pe,
+            kv_c,
+            k_pe,
+            cache,
+            start + new_tokens,
+            block_table,
+            sm_scale=SM_SCALE,
+            kv_scale=kv_scale,
+            causal=True,
+            s_dtype=jnp.bfloat16,
+            max_seqlen_k=max_seqlen_k,
+        )
+
+    kernel_jit = jax.jit(call, donate_argnums=(0,))
+
+    def step(cache):
+        out = None
+        for start in starts:
+            out, cache = kernel_jit(cache, *operands, start)
+        return out, cache
+
+    tuned = get_tuned_mla_config(
+        cache_dtype=cell.kv_dtype,
+        num_query_rows=new_tokens * heads,
+        batch=batch,
+        max_seqlen_k=max_seqlen_k,
+    )
+    generator = np.random.default_rng(1)
+    info = {
+        "block_source": f"flywheel {'default' if tuned is None else 'tuned'}",
+        "tuned_params": None if tuned is None else list(tuned),
+        "q_dtype": "bfloat16",
+        "max_seqlen_k": max_seqlen_k,
+    }
+    return step, (lambda: fill_cache(shape, cell.kv_dtype, generator)), info
+
+
 BUILDERS = {
     "flywheel": build_flywheel,
     "rpa": build_rpa,
     "batched_rpa": build_batched_rpa,
+}
+# An MLA impl's builder for decode and verify; build_mla runs its prefill.
+MLA_DECODE_BUILDERS = {
+    "flywheel_mla": build_flywheel_mla_decode,
+    "mla_v2": build_mla_v2_decode,
 }
 
 
@@ -645,7 +955,7 @@ def run(cell, args):
     if cell.scenario == "decode":
         kv_tokens_read = pairs
     elif cell.scenario == "verify":
-        kv_tokens_read = cell.num_calls * cell.batch * cell.seq
+        kv_tokens_read = cell.num_calls * int(cell.seq_lens.sum())
     elif cell.sliding_window is None:
         kv_tokens_read = sum(
             (i + 1) * cell.chunk for i in range(cell.num_calls)
@@ -667,6 +977,8 @@ def run(cell, args):
         "attn_flops": attn_flops,
         "kv_bytes_read": kv_bytes_read,
         "cache_bytes": cell.cache_bytes,
+        "seq_len_min": int(cell.seq_lens.min()),
+        "seq_len_max": int(cell.seq_lens.max()),
     }
     hbm = jax.devices()[0].memory_stats().get("bytes_limit")
     if hbm and cell.cache_bytes > 0.9 * hbm:
@@ -679,11 +991,12 @@ def run(cell, args):
         )
         return record
     try:
-        if cell.is_mla:
+        if cell.is_mla and cell.scenario == "chunked_prefill":
             step, fresh, info, check = build_mla(cell, args)
         else:
+            builders = MLA_DECODE_BUILDERS if cell.is_mla else BUILDERS
             inputs = make_inputs(cell)
-            step, fresh, info = BUILDERS[cell.impl](cell, inputs, args)
+            step, fresh, info = builders[cell.impl](cell, inputs, args)
             check = None
         record.update(info)
         timing, out = time_call(step, fresh())
@@ -737,10 +1050,13 @@ def run(cell, args):
 def main(argv=None):
     args = parse_args(argv)
     is_mla = args.impl in MLA_PREFILL_IMPLS
+    mla_decode = is_mla and args.scenario != "chunked_prefill"
     if args.page_size is not None:
         page_size = args.page_size
-    elif is_mla:
+    elif is_mla and args.scenario == "chunked_prefill":
         page_size = SERVING_PAGE[args.kv_dtype]
+    elif is_mla:
+        page_size = MLA_DECODE_PAGE
     else:
         page_size = 128
     cell = Cell(
@@ -757,10 +1073,20 @@ def main(argv=None):
         page_size,
         args.sliding_window,
         args.verify_tokens,
+        dtype=args.kv_dtype if mla_decode else "bfloat16",
         kv_dtype=args.kv_dtype,
+        pattern=args.pattern,
     )
     if args.scenario == "chunked_prefill" and args.seq % args.chunk:
         raise SystemExit("--seq must be a multiple of --chunk.")
+    if cell.pattern != "uniform":
+        try:
+            _ = cell.contexts
+        except ValueError as error:
+            raise SystemExit(
+                f"--pattern {cell.pattern}: {error}; the batch caches"
+                f" {cell.batch} * (seq - {cell.new_tokens}) tokens."
+            ) from None
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
@@ -800,6 +1126,16 @@ def parse_args(argv=None):
         help="decode: steps, the last tokens of --seq; verify: steps",
     )
     parser.add_argument(
+        "--pattern",
+        choices=PATTERNS,
+        default="uniform",
+        help=(
+            "decode, verify: how batch * (seq - new tokens) cached tokens"
+            " split across the sequences (benchmarks/common/lengths.py);"
+            " every pattern caches the same total"
+        ),
+    )
+    parser.add_argument(
         "--verify-tokens",
         type=int,
         default=1,
@@ -810,13 +1146,17 @@ def parse_args(argv=None):
         type=int,
         help=(
             "default: 128; for an MLA impl, MLA v2's serving page of the dtype"
+            f" on chunked_prefill and {MLA_DECODE_PAGE} on decode and verify"
         ),
     )
     parser.add_argument(
         "--kv-dtype",
         default="bfloat16",
         choices=("bfloat16", "float8_e4m3fn", "float8_e5m2"),
-        help="k, v and KV cache dtype; q stays bfloat16",
+        help=(
+            "k, v and KV cache dtype; q stays bfloat16, but takes it for"
+            " mla_v2 on decode and verify"
+        ),
     )
     parser.add_argument(
         "--sliding-window",
@@ -863,8 +1203,11 @@ def parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     is_mla = args.impl in MLA_PREFILL_IMPLS
-    if is_mla and args.scenario != "chunked_prefill":
-        parser.error(f"--impl {args.impl} runs chunked_prefill only")
+    if args.pattern != "uniform" and args.scenario == "chunked_prefill":
+        parser.error(
+            "--pattern splits decode and verify batches; chunked_prefill"
+            " prefills one sequence"
+        )
     elif is_mla and args.sliding_window is not None:
         parser.error(f"--impl {args.impl} takes no --sliding-window")
     elif is_mla and args.kv_dtype not in SERVING_PAGE:
