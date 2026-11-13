@@ -323,6 +323,7 @@ def varlen_fwd_body(
         is_first = kv == lo
         is_partial, needs_bounds = schedule.block_flags(si, kv, ctx)
         num_live_tiles = schedule.num_live_tiles(kv, ctx)
+        first_live_tile = schedule.first_live_tile(kv, ctx)
         # Note (david): row_sum and o scratch ping-pong, so a block's first kv
         # tile reads the previous block's exit state while later tiles update in
         # place; each head keeps its own guard flag, so one head's overflow
@@ -421,11 +422,17 @@ def varlen_fwd_body(
                 # against 3.78 ms (v6e, 32:8 d128, paged (512, 2048, 128, 512)).
                 # A live tile past a q tile's own frontier scores fully masked
                 # fragments, which leave every anchored row's state as it was.
-                # Tile 0 is peeled so the carry always holds a pending PV, and
-                # with two tiles per block only tile 0 is live.
+                # The first live tile is peeled so the carry always holds a
+                # pending PV, and with two tiles per block it is the only live
+                # tile.
                 last_q_tile = num_q_compute_tiles - 1
                 has_tile_loop = num_k_compute_tiles > 2
-                last_live_tile = num_live_tiles - 1 if has_tile_loop else 0
+                # A block clamped at the padded kv end starts with tiles of
+                # the previous sequence, which are fully masked; the first tile
+                # that runs is first_live_tile, which anchors the row.
+                last_live_tile = (
+                    num_live_tiles - 1 if has_tile_loop else first_live_tile
+                )
 
                 def _tile_fragments(
                     g, kv_compute_index, is_tile_zero, pending_pv
@@ -438,7 +445,7 @@ def varlen_fwd_body(
                         needs_mask=False,
                         guard_recovery=guard_recovery,
                         apply_bounds=True,
-                        last_kv_tile=None if has_tile_loop else 0,
+                        last_kv_tile=None if has_tile_loop else first_live_tile,
                         is_tile_zero=is_tile_zero,
                     )
                     for q_compute_index in range(num_q_compute_tiles):
@@ -454,12 +461,19 @@ def varlen_fwd_body(
 
                 pending_pv = None
                 for g in heads:
-                    pending_pv = _tile_fragments(g, 0, True, pending_pv)
+                    pending_pv = _tile_fragments(
+                        g, first_live_tile, True, pending_pv
+                    )
                     if has_tile_loop:
 
                         def _tile_step(kv_compute_index, carry, g=g):
-                            # Note (david): the carried PV is tile 0's on the
-                            # first iteration, so its parity stays runtime.
+                            # The carried PV is first_live_tile's on the first
+                            # iteration, so its parity stays runtime. The
+                            # runtime parity takes tile 0 as the first tile, so
+                            # after a clamped start it reads the wrong half.
+                            # That is safe only because a clamped block is its
+                            # row's only block, and its PV writes the output
+                            # without reading it.
                             carried_pv = (
                                 Fragment(g, kv_compute_index - 1, last_q_tile),
                                 carry,
@@ -472,7 +486,10 @@ def varlen_fwd_body(
 
                         _, tile_zero_pv, _ = pending_pv
                         carry = lax.fori_loop(
-                            1, num_live_tiles, _tile_step, tile_zero_pv
+                            first_live_tile + 1,
+                            num_live_tiles,
+                            _tile_step,
+                            tile_zero_pv,
                         )
                         pending_pv = (
                             Fragment(g, last_live_tile, last_q_tile),
@@ -649,7 +666,9 @@ def varlen_fwd_body(
         # the loop: running every masked block through it slowed the packed
         # varlen kernel by 7% (v6e, 32:8 d128: 7.35 against 6.85 ms).
         if num_k_compute_tiles > 1:
-            skips_dead_tiles = num_live_tiles < num_k_compute_tiles
+            skips_dead_tiles = jnp.logical_or(
+                num_live_tiles < num_k_compute_tiles, first_live_tile > 0
+            )
             runs_every_tile = jnp.logical_and(
                 needs_any_mask, jnp.logical_not(skips_dead_tiles)
             )

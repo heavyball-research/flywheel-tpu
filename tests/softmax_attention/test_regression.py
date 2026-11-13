@@ -11,12 +11,14 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.softmax_attention import fwd_blocks
 from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
     make_flash_attn_mha,
 )
 from flywheel_tpu.softmax_attention.inputs import pad_seqlen
+from flywheel_tpu.softmax_attention.kernels import fwd_varlen
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import attention_ref, randn
 
@@ -317,6 +319,53 @@ def test_flash_attn_varlen_ragged_last_block(seqlens, causal, window_size):
         )
         lse_error = max_abs(lse[:, rows] - lse_ref[0])
         assert lse_error <= 2 * max_abs(lse_bf16 - lse_ref) + 1e-3
+
+
+@pytest.mark.parametrize(
+    "seqlens",
+    [
+        # (1024, 1024, 256, 512) blocks, two kv tiles: the last sequence's kv
+        # window clamps to 1408 - 1024 = 384, so tile 0 is all sequence 0.
+        pytest.param([1024, 300], id="two_tiles"),
+        pytest.param(
+            # (2048, 2048, 256, 512) blocks, four kv tiles: the window clamps
+            # to 4992 - 2048 = 2944, so tiles 0 and 1 are all sequence 0.
+            [4096, 817],
+            id="four_tiles",
+            marks=pytest.mark.skipif(
+                INTERPRET, reason="interpret mode affords short sequences only"
+            ),
+        ),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_clamped_window_first_pass(
+    seqlens, causal, monkeypatch
+):
+    # A short last sequence's kv window clamps to the padded end and starts
+    # inside the previous sequence, so its leading kv tiles hold no key of
+    # its own. Anchoring the static row max on such a fully masked tile
+    # overflows every later tile into NaN. The overflow guard would replay
+    # such a block, so it is switched off here and the first pass alone must
+    # be right.
+    def no_flag(*args, **kwargs):
+        del args, kwargs
+
+    monkeypatch.setattr(fwd_blocks, "flag_overflow_risk", no_flag)
+    monkeypatch.setattr(fwd_varlen, "flag_overflow_risk", no_flag)
+    jax.clear_caches()
+    q, k, v, segments = packed_qkv(seqlens, 4, 2, 128)
+    cu = cu_seqlens_of(seqlens)
+    out = varlen_attn(
+        q, k, v, cu, cu, max(seqlens), max(seqlens), causal=causal
+    )
+    jax.clear_caches()
+    # max_abs alone misses the NaN on CPU, whose vectorized max reduction
+    # drops NaN in large arrays.
+    assert np.isfinite(np.asarray(out, np.float32)).all()
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu[index]), int(cu[index + 1]))
+        assert_output_close(out[rows][None], *segment, causal=causal)
 
 
 def random_sinks(nheads):
