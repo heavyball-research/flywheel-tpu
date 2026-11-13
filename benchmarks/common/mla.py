@@ -64,8 +64,10 @@ MLA_V2_PACKAGES = (
     "tpu_inference.kernels.mla.v2",
     "tpu_inference.kernels.ragged_paged_attention.v3",
 )
-# tpu_inference/envs.py's default.
+# tpu_inference/envs.py's defaults: MLA_XPOSE_N_TILE_SIZE, and
+# MLA_KV_PACKING_SIZE, the tokens of one packed row of the serving cache.
 XPOSE_N_TILE_SIZE_DEFAULT = "160"
+KV_PACKING_SIZE_DEFAULT = "32"
 
 
 def stub_module(name, **attributes):
@@ -164,6 +166,83 @@ CHECK_ROWS = 8
 COS_DIFF_BOUND = 1e-3
 
 
+def mla_v2_padded_sizes(num_tokens: int, batch: int) -> tuple[int, int]:
+    """(padded_tokens, max_num_seqs) of a step of num_tokens tokens of batch
+    requests."""
+    from flywheel_tpu.softmax_attention.config import next_pow2
+
+    # Note (david): the model runner pads the step's tokens and requests to
+    # the next power of two, and mla_attention keys the tuned params on the
+    # padded q and metadata.
+    return next_pow2(num_tokens), next_pow2(batch)
+
+
+def mla_v2_blocks(v2_tuned, **fields):
+    """(params, cases): MLA v2's block arguments under mla_attention's tuned
+    lookup of the TuningKey fields, and each case's (tuned params, whether the
+    tuned table holds its key)."""
+    cases = {}
+    for case in ("batched_decode", "mixed"):
+        key = v2_tuned.TuningKey(case=case, **fields)
+        cases[case] = (
+            v2_tuned.get_tuned_params(key),
+            key in v2_tuned.tuned_params_mapping,
+        )
+    decode, mixed = cases["batched_decode"][0], cases["mixed"][0]
+    # Note (david): mla_attention runs prefill on the mixed params.
+    params = {
+        "num_kv_pages_per_block": (
+            decode.num_kv_pages_per_block,
+            mixed.num_kv_pages_per_block,
+            mixed.num_kv_pages_per_block,
+        ),
+        "num_queries_per_block": (
+            decode.num_queries_per_block,
+            mixed.num_queries_per_block,
+            mixed.num_queries_per_block,
+        ),
+        "decode_batch_size": decode.decode_batch_size,
+        "mixed_q_split": mixed.q_split,
+    }
+    return params, cases
+
+
+def pad_mla_v2_tokens(
+    values: jax.Array, padded_tokens: int, axis: int = 0
+) -> jax.Array:
+    """values with its token axis zero-padded to padded_tokens."""
+    import jax.numpy as jnp
+
+    padding = [(0, 0)] * values.ndim
+    padding[axis] = (0, padded_tokens - values.shape[axis])
+    return jnp.pad(values, padding)
+
+
+def pad_mla_v2_meta(
+    cu_q_lens, kv_lens, block_table, distribution, *, max_num_seqs: int
+) -> tuple[jax.Array, ...]:
+    """(kv_lens, page_indices, cu_q_lens, distribution) of a step's requests
+    padded to max_num_seqs: a padding request has no tokens and no keys."""
+    import jax.numpy as jnp
+    import numpy as np
+
+    cu_q_lens = np.asarray(cu_q_lens, np.int32)
+    block_table = np.asarray(block_table, np.int32)
+    batch, pages_per_seq = block_table.shape
+    padded_kv_lens = np.zeros(max_num_seqs, np.int32)
+    padded_kv_lens[:batch] = kv_lens
+    padded_cu_q_lens = np.full(max_num_seqs + 1, cu_q_lens[-1], np.int32)
+    padded_cu_q_lens[: batch + 1] = cu_q_lens
+    page_indices = np.zeros((max_num_seqs, pages_per_seq), np.int32)
+    page_indices[:batch] = block_table
+    return (
+        jnp.asarray(padded_kv_lens),
+        jnp.asarray(page_indices.reshape(-1)),
+        jnp.asarray(padded_cu_q_lens),
+        jnp.asarray(np.asarray(distribution, np.int32)),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class MlaPrefill:
     """One MLA prefill path at a step's static shape: queries, tokens and meta
@@ -244,66 +323,34 @@ def build_mla_prefill(
             info={},
         )
     elif impl == "mla_v2":
-        from flywheel_tpu.softmax_attention.config import next_pow2
-
         v2_kernel, v2_tuned = load_mla_v2(mla_v2_source)
-        # Note (david): the model runner pads the step's tokens and requests to
-        # the next power of two, and mla_attention keys the tuned params on the
-        # padded q and metadata.
-        padded_tokens = next_pow2(num_tokens)
-        max_num_seqs = next_pow2(batch)
+        padded_tokens, max_num_seqs = mla_v2_padded_sizes(num_tokens, batch)
         _, words, packing, _ = cache_shape
-        fields = {
-            "max_num_tokens": padded_tokens,
-            "actual_num_q_heads": heads,
-            "actual_lkv_dim": LATENT_DIM,
-            "actual_r_dim": ROPE_DIM,
-            "kv_dtype": jnp.dtype(kv_dtype).name,
-            "q_dtype": jnp.dtype(jnp.bfloat16).name,
-            "page_size_per_kv_packing": words,
-            "kv_packing": packing,
-            "max_num_seqs": max_num_seqs,
-            "pages_per_seq": pages_per_seq,
-        }
-        decode = v2_tuned.get_tuned_params(
-            v2_tuned.TuningKey(case="batched_decode", **fields)
+        params, _ = mla_v2_blocks(
+            v2_tuned,
+            max_num_tokens=padded_tokens,
+            actual_num_q_heads=heads,
+            actual_lkv_dim=LATENT_DIM,
+            actual_r_dim=ROPE_DIM,
+            kv_dtype=jnp.dtype(kv_dtype).name,
+            q_dtype=jnp.dtype(jnp.bfloat16).name,
+            page_size_per_kv_packing=words,
+            kv_packing=packing,
+            max_num_seqs=max_num_seqs,
+            pages_per_seq=pages_per_seq,
         )
-        mixed = v2_tuned.get_tuned_params(
-            v2_tuned.TuningKey(case="mixed", **fields)
-        )
-        # Note (david): mla_attention runs prefill on the mixed params.
-        params = {
-            "num_kv_pages_per_block": (
-                decode.num_kv_pages_per_block,
-                mixed.num_kv_pages_per_block,
-                mixed.num_kv_pages_per_block,
-            ),
-            "num_queries_per_block": (
-                decode.num_queries_per_block,
-                mixed.num_queries_per_block,
-                mixed.num_queries_per_block,
-            ),
-            "decode_batch_size": decode.decode_batch_size,
-            "mixed_q_split": mixed.q_split,
-        }
         if kv_scale is None:
             scales = {}
         else:
             scales = {"k_scale": kv_scale, "v_scale": kv_scale}
-        padding = ((0, padded_tokens - num_tokens), (0, 0))
 
         def _meta(cu_q_lens, kv_lens, block_table):
-            padded_kv_lens = np.zeros(max_num_seqs, np.int32)
-            padded_kv_lens[:batch] = kv_lens
-            padded_cu_q_lens = np.full(max_num_seqs + 1, num_tokens, np.int32)
-            padded_cu_q_lens[: batch + 1] = cu_q_lens
-            page_indices = np.zeros((max_num_seqs, pages_per_seq), np.int32)
-            page_indices[:batch] = block_table
-            return (
-                jnp.asarray(padded_kv_lens),
-                jnp.asarray(page_indices.reshape(-1)),
-                jnp.asarray(padded_cu_q_lens),
-                jnp.asarray([0, 0, batch], jnp.int32),
+            return pad_mla_v2_meta(
+                cu_q_lens,
+                kv_lens,
+                block_table,
+                [0, 0, batch],
+                max_num_seqs=max_num_seqs,
             )
 
         def _attend(cache, q_latent, q_pe, new_kv_c, new_k_pe, *meta):
@@ -324,12 +371,14 @@ def build_mla_prefill(
         # transpose is not v2's time.
         return MlaPrefill(
             queries=lambda q_latent, q_pe: (
-                jnp.pad(jnp.transpose(q_latent, (1, 0, 2)), ((0, 0), *padding)),
-                jnp.pad(q_pe, (*padding, (0, 0))),
+                pad_mla_v2_tokens(
+                    jnp.transpose(q_latent, (1, 0, 2)), padded_tokens, axis=1
+                ),
+                pad_mla_v2_tokens(q_pe, padded_tokens),
             ),
             tokens=lambda new_kv_c, new_k_pe: (
-                jnp.pad(new_kv_c, padding),
-                jnp.pad(new_k_pe, padding),
+                pad_mla_v2_tokens(new_kv_c, padded_tokens),
+                pad_mla_v2_tokens(new_k_pe, padded_tokens),
             ),
             meta=_meta,
             attend=_attend,
