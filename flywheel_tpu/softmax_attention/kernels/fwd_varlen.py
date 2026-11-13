@@ -422,8 +422,9 @@ def varlen_fwd_body(
                 # against 3.78 ms (v6e, 32:8 d128, paged (512, 2048, 128, 512)).
                 # A live tile past a q tile's own frontier scores fully masked
                 # fragments, which leave every anchored row's state as it was.
-                # Tile 0 is peeled so the carry always holds a pending PV, and
-                # with two tiles per block only tile 0 is live.
+                # The first live tile is peeled so the carry always holds a
+                # pending PV, and with two tiles per block it is the only live
+                # tile.
                 last_q_tile = num_q_compute_tiles - 1
                 has_tile_loop = num_k_compute_tiles > 2
                 # A block clamped at the padded kv end starts with tiles of
@@ -466,8 +467,13 @@ def varlen_fwd_body(
                     if has_tile_loop:
 
                         def _tile_step(kv_compute_index, carry, g=g):
-                            # Note (david): the carried PV is tile 0's on the
-                            # first iteration, so its parity stays runtime.
+                            # The carried PV is first_live_tile's on the first
+                            # iteration, so its parity stays runtime. The
+                            # runtime parity takes tile 0 as the first tile, so
+                            # after a clamped start it reads the wrong half.
+                            # That is safe only because a clamped block is its
+                            # row's only block, and its PV writes the output
+                            # without reading it.
                             carried_pv = (
                                 Fragment(g, kv_compute_index - 1, last_q_tile),
                                 carry,

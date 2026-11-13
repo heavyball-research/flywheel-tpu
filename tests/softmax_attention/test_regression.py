@@ -345,9 +345,9 @@ def test_flash_attn_varlen_clamped_window_first_pass(
     # A short last sequence's kv window clamps to the padded end and starts
     # inside the previous sequence, so its leading kv tiles hold no key of
     # its own. Anchoring the static row max on such a fully masked tile
-    # overflows every later tile into NaN, which the guard replay used to
-    # hide at the cost of a replay per call. The guard is switched off here
-    # so the first pass alone must be right.
+    # overflows every later tile into NaN. The overflow guard would replay
+    # such a block, so it is switched off here and the first pass alone must
+    # be right.
     def no_flag(*args, **kwargs):
         del args, kwargs
 
