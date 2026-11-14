@@ -35,6 +35,11 @@ verify           --batch sequences each hold seq - verify_tokens tokens of KV
                  K/V and attend causally (bottom-right) to the whole cache.
                  Every step rewrites the same slots, as a step whose drafts
                  are all rejected does, so each attends its whole length.
+mixed            DSA only. One call of --batch decode tokens, sequence j's at
+                 position seq - 1 - j, then one --chunk-token prefill chunk
+                 that ends a --seq-token sequence (--chunk 0: decodes only),
+                 on a filled cache whose rows the call's tokens rewrite as
+                 they are.
 
 decode and verify cache batch * (seq - new tokens) tokens before the first
 call, split across the sequences by --pattern (benchmarks/common/lengths.py):
@@ -96,8 +101,13 @@ serving passes its bound. Its block comes from the mla| entries of
 tuned_configs.json, else its heuristic (block_source says which).
 flywheel_dsa, torchtpu_dsa and torchtpu_dsa_masked_dense run one DeepSeek
 sparse attention layer step per call (benchmarks/common/dsa.py) on fp8 caches
-of DSA_PAGE pages, on decode and chunked prefill. A DSA cell whose last call
-fails COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as check_failed.
+of DSA_PAGE pages, on decode, chunked prefill and mixed. A DSA cell whose
+last call fails COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as
+check_failed. With --dsa-indices, flywheel_dsa runs only
+dsa_attention_from_indices on mixed, each token taking the file's row of its
+position, and only COS_DIFF_BOUND applies. With --trace a DSA record also
+holds trace_module_ms, the device span of one call (kernel time), next to
+ms_per_call (wall-clock).
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
 reused, so a step's inputs cost nothing. With --trace the scenario also runs
@@ -175,8 +185,8 @@ from benchmarks.common.timing import time_call
 from benchmarks.softmax_attention import segments as segments_lib
 
 IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS, *DSA_IMPLS)
-SCENARIOS = ("chunked_prefill", "decode", "verify")
-DSA_SCENARIOS = ("chunked_prefill", "decode")
+SCENARIOS = ("chunked_prefill", "decode", "verify", "mixed")
+DSA_SCENARIOS = ("chunked_prefill", "decode", "mixed")
 # Note (david): MLA v2's kernel is named MLA-<case>-..., flywheel's MLA
 # kernels flash_mla_*.
 KERNEL_MARKERS = ("flash_attn", "RPA", "ragged_paged", "MLA-", "flash_mla")
@@ -213,8 +223,10 @@ class Cell:
     pattern: str = "uniform"
     # A DSA cell's DSA_GEOMETRIES entry.
     dsa_geometry: str | None = None
-    # flywheel_dsa's pinned route; None picks it on device.
+    # flywheel_dsa's pinned route; None routes each request by the rule.
     dsa_route: str | None = None
+    # flywheel_dsa's given indices: a .npy of one request's rows by position.
+    dsa_indices: str | None = None
 
     @property
     def is_mla(self):
@@ -231,10 +243,12 @@ class Cell:
         else:
             window_tag = f"-w{self.sliding_window}"
         kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
-        if self.is_dsa and self.dsa_route is not None:
-            heads_tag = f"{self.dsa_geometry}-{self.dsa_route}"
-        elif self.is_dsa:
+        if self.is_dsa:
             heads_tag = self.dsa_geometry
+            if self.dsa_route is not None:
+                heads_tag += f"-{self.dsa_route}"
+            if self.dsa_indices is not None:
+                heads_tag += f"-idx{pathlib.Path(self.dsa_indices).stem}"
         elif self.is_mla:
             heads_tag = f"h{self.heads}"
         else:
@@ -252,6 +266,8 @@ class Cell:
                 f"{shape}{batch_tag}-t{self.verify_tokens}"
                 f"-n{self.decode_tokens}"
             )
+        elif self.scenario == "mixed":
+            return f"{shape}-b{self.batch}-c{self.chunk}"
         return f"{shape}{batch_tag}-n{self.decode_tokens}"
 
     @property
@@ -288,11 +304,17 @@ class Cell:
     def num_calls(self):
         if self.scenario == "chunked_prefill":
             return self.seq // self.chunk
+        elif self.scenario == "mixed":
+            return 1
         return self.decode_tokens
 
     @property
     def num_seqs(self):
-        return 1 if self.scenario == "chunked_prefill" else self.batch
+        if self.scenario == "chunked_prefill":
+            return 1
+        elif self.scenario == "mixed":
+            return self.batch + min(self.chunk, 1)
+        return self.batch
 
     @property
     def query_tokens(self):
@@ -301,6 +323,8 @@ class Cell:
             return self.chunk
         elif self.scenario == "verify":
             return self.batch * self.verify_tokens
+        elif self.scenario == "mixed":
+            return self.batch + self.chunk
         return self.batch
 
     @property
@@ -538,21 +562,38 @@ def dsa_block_table(cell, pages_per_seq):
     return pages.astype(np.int32).reshape(cell.num_seqs, pages_per_seq)
 
 
+def dsa_cached_keys(page, table, base_keys, index_key, requests, positions):
+    """The keys filled_caches leaves at each (request, position): the
+    latents of the position's base page and the index key of its own page."""
+    import jax.numpy as jnp
+
+    pages = table[requests, positions // page]
+    offsets = positions % page
+    base_pages = base_keys.index_keys.shape[0] // page
+    cached = base_keys.rows(jnp.asarray((pages % base_pages) * page + offsets))
+    own_pages, page_slots = np.unique(pages, return_inverse=True)
+    index_keys = page_index_keys(
+        index_key, jnp.asarray(own_pages), base_keys.index_keys.shape[1]
+    )
+    return cached._replace(
+        index_keys=index_keys[jnp.asarray(page_slots * page + offsets)]
+    )
+
+
 def dsa_decode_logical(cell, table, base_keys, index_key, step_keys, request):
     """A decode request's keys after the steps: its pages' own index keys
     and their base pages' latents, then the steps' tokens."""
     import jax.numpy as jnp
 
-    page = cell.page_size
-    base_pages = base_keys.index_keys.shape[0] // page
     context = int(cell.contexts[request])
-    positions = np.arange(context)
-    rows = (table[request, positions // page] % base_pages) * page
-    cached = base_keys.rows(jnp.asarray(rows + positions % page))
-    index_keys = page_index_keys(
-        index_key, jnp.asarray(table[request]), base_keys.index_keys.shape[1]
+    cached = dsa_cached_keys(
+        cell.page_size,
+        table,
+        base_keys,
+        index_key,
+        np.full(context, request),
+        np.arange(context),
     )
-    cached = cached._replace(index_keys=index_keys[:context])
     return DsaKeys(*(
         jnp.concatenate([
             values,
@@ -606,6 +647,56 @@ def build_dsa_decode(cell, args):
         rows=edge_rows(0, cell.batch),
         logical=functools.partial(
             dsa_decode_logical, cell, table, base_keys, keys[3], step_keys
+        ),
+    )
+
+
+def build_dsa_mixed(cell, args):
+    """The mixed call on a filled cache (filled_caches); each token's keys
+    are the ones the cache holds at its position."""
+    import jax
+
+    geometry = DSA_GEOMETRIES[cell.dsa_geometry]
+    pages_per_seq = -(-cell.seq // cell.page_size)
+    num_pages = cell.num_seqs * pages_per_seq
+    table = dsa_block_table(cell, pages_per_seq)
+    base_pages = math.gcd(num_pages, DSA_BASE_PAGES)
+    num_prefill = cell.num_seqs - cell.batch
+    q_lens = [1] * cell.batch + [cell.chunk] * num_prefill
+    kv_lens = np.array(
+        [cell.seq - j for j in range(cell.batch)] + [cell.seq] * num_prefill
+    )
+    requests = DsaRequests(
+        np.concatenate([[0], np.cumsum(q_lens)]), kv_lens, table, cell.batch
+    )
+    keys = jax.random.split(jax.random.key(cell.heads * 1000 + cell.seq), 3)
+    queries = draw_dsa_queries(keys[0], geometry, requests.num_tokens)
+    base_keys = draw_dsa_keys(keys[1], geometry, base_pages * cell.page_size)
+    cached = functools.partial(
+        dsa_cached_keys, cell.page_size, table, base_keys, keys[2]
+    )
+    layer = build_dsa_layer(
+        cell.impl,
+        geometry,
+        num_tokens=requests.num_tokens,
+        batch=cell.num_seqs,
+        max_seqlen_k=cell.seq,
+        torchtpu_source=args.torchtpu_source,
+        route=cell.dsa_route,
+        indices_path=args.dsa_indices,
+    )
+    token_keys = cached(requests.token_requests(), requests.token_positions())
+    return DsaScenario(
+        layer=layer,
+        geometry=geometry,
+        fresh=lambda: filled_caches(layer, base_keys, num_pages, keys[2]),
+        queries=queries,
+        layer_queries=layer.queries(queries),
+        calls=[(layer.keys(token_keys), layer.meta(requests))],
+        requests=[requests],
+        rows=edge_rows(0, requests.num_tokens),
+        logical=lambda request: cached(
+            np.full(kv_lens[request], request), np.arange(kv_lens[request])
         ),
     )
 
@@ -1165,6 +1256,8 @@ def dsa_cell_record(cell, build_scenario, trace_directory):
         record["trace_ops_ms"] = dict(
             sorted(per_op.items(), key=lambda op: -op[1])
         )
+        trace = segments_lib.load(trace_directory / cell.key)
+        record["trace_module_ms"] = segments_lib.segments(trace)["module_ms"]
     return record
 
 
@@ -1181,6 +1274,8 @@ def run_dsa(cell, args):
         return record
     if cell.scenario == "decode":
         build = build_dsa_decode
+    elif cell.scenario == "mixed":
+        build = build_dsa_mixed
     else:
         build = build_dsa_chunked_prefill
     record.update(
@@ -1323,6 +1418,7 @@ def make_cell(args):
         pattern=args.pattern,
         dsa_geometry=args.dsa_geometry,
         dsa_route=args.dsa_route,
+        dsa_indices=None if args.dsa_indices is None else str(args.dsa_indices),
     )
 
 
@@ -1354,13 +1450,19 @@ def main(argv=None):
 def scenario_dsa_args_error(args):
     """Why the DSA arguments do not fit together, or None."""
     if args.impl in DSA_IMPLS and args.scenario not in DSA_SCENARIOS:
-        return f"--impl {args.impl} runs {' and '.join(DSA_SCENARIOS)} only"
+        return f"--impl {args.impl} runs {', '.join(DSA_SCENARIOS)} only"
+    elif args.scenario == "mixed" and args.impl not in DSA_IMPLS:
+        return "--scenario mixed runs the DSA impls only"
     elif args.impl in DSA_IMPLS and args.sliding_window is not None:
         return f"--impl {args.impl} takes no --sliding-window"
     elif args.impl in DSA_IMPLS and args.pattern != "uniform":
         return f"--impl {args.impl} takes no --pattern"
     elif args.dsa_route is not None and args.impl != FLYWHEEL_DSA:
         return f"--impl {args.impl} takes no --dsa-route"
+    elif args.dsa_indices is not None and (
+        args.impl != FLYWHEEL_DSA or args.scenario != "mixed"
+    ):
+        return "--dsa-indices runs flywheel_dsa on --scenario mixed only"
     return dsa_args_error(args.impl, args.dsa_geometry, args.page_size)
 
 
@@ -1381,10 +1483,16 @@ def parse_args(argv=None):
         "--chunk",
         type=int,
         default=1024,
-        help="chunked_prefill: query tokens per prefill call",
+        help=(
+            "chunked_prefill: query tokens per prefill call; mixed: the"
+            " prefill chunk's tokens"
+        ),
     )
     parser.add_argument(
-        "--batch", type=int, default=256, help="decode: concurrent sequences"
+        "--batch",
+        type=int,
+        default=256,
+        help="decode: concurrent sequences; mixed: decode tokens",
     )
     parser.add_argument(
         "--decode-tokens",
@@ -1471,8 +1579,18 @@ def parse_args(argv=None):
     parser.add_argument(
         "--dsa-route",
         help=(
-            "flywheel_dsa: pin dsa_attention's route (mixed or sparse);"
-            " default: picked on device"
+            "flywheel_dsa: put every request of dsa_attention or, with"
+            " --dsa-indices, of dsa_attention_from_indices on one mode"
+            " (sparse, masked_dense or union); default: each request by the"
+            " rule"
+        ),
+    )
+    parser.add_argument(
+        "--dsa-indices",
+        type=pathlib.Path,
+        help=(
+            "flywheel_dsa on mixed: a .npy of (positions, top_k) int32 rows,"
+            " row p one request's selection at position p"
         ),
     )
     parser.add_argument("--output", type=pathlib.Path)
