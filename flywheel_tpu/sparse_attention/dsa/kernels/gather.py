@@ -656,14 +656,24 @@ def dsa_gather_kernel(
             index_sems.at[slot],
         )
 
+    def reads_indices(first_slot):
+        """Whether the loaded token's chunk from first_slot reads its
+        indices: a chunk past the token's slots gathers nothing."""
+        return first_slot < ring.meta_row(meta_vmem)[META_SLOTS]
+
     def start(local):
         chunk = first_chunk + local
         slot = lax.rem(local, num_buffers)
         first_slot = lax.rem(chunk, chunks_per_token) * chunk_slots
-        pl.when(local + 1 < num_local)(index_copy(local + 1).start)
+        next_slot = lax.rem(chunk + 1, chunks_per_token) * chunk_slots
+        has_next = local + 1 < num_local
+        is_token_start = (local == 0) | (first_slot == 0)
+        # Note (david): a chunk that starts a token reads its indices; a later
+        # one only if its token's loaded row has slots there.
+        pl.when(has_next & (next_slot == 0))(index_copy(local + 1).start)
         # Note (david): a worker's chunks are consecutive, so a token's rows
         # are loaded once, at its first chunk or the worker's first.
-        pl.when((local == 0) | (first_slot == 0))(
+        pl.when(is_token_start)(
             functools.partial(
                 ring.load_token,
                 first_token + chunk // chunks_per_token,
@@ -671,7 +681,12 @@ def dsa_gather_kernel(
                 table_vmem,
             )
         )
-        index_copy(local).wait()
+        pl.when(has_next & (next_slot != 0) & reads_indices(next_slot))(
+            index_copy(local + 1).start
+        )
+        pl.when(is_token_start | reads_indices(first_slot))(
+            index_copy(local).wait
+        )
         ring.start_chunk(
             slot,
             first_slot,
