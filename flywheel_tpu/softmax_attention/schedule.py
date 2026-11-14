@@ -44,6 +44,7 @@ PER_SEQ_ROW_FIELDS = (
     "mask_from",
     "unmask_from",
     "live_tiles_hi",
+    "first_live_tile_hi",
 )
 PAGED_KV_FIELDS = ("kv_used_end", "kv_load_end", "page_base")
 TABLE_META_FIELDS = ("num_rows", "packed_q_end")
@@ -93,6 +94,7 @@ class ScheduleRow(NamedTuple):
     mask_from: jax.Array
     unmask_from: jax.Array
     live_tiles_hi: jax.Array
+    first_live_tile_hi: jax.Array | int = 0
     kv_used_end: jax.Array | None = None
     kv_load_end: jax.Array | None = None
     page_base: jax.Array | None = None
@@ -164,6 +166,9 @@ class FwdSchedule:
     kv_page: Callable[[jax.Array, BlockIndex, int], jax.Array] | None = None
     packed_q_end: jax.Array | None = None
     num_live_tiles: Callable[[BlockIndex, ScheduleRow], jax.Array] | None = None
+    first_live_tile: Callable[[BlockIndex, ScheduleRow], jax.Array] | None = (
+        None
+    )
 
 
 class DenseFwdParams(NamedTuple):
@@ -573,6 +578,11 @@ def per_seq_schedule_rows(
     live_tiles_hi = jnp.clip(
         -((hi_kv_tok - kv_frontier) // bkv_compute), 1, num_kv_tiles
     )
+    # A block clamped at the padded end can start inside the previous
+    # sequence; its leading tiles hold none of this sequence's keys.
+    first_live_tile_hi = jnp.clip(
+        (seq_kv_start - hi_kv_tok) // bkv_compute, 0, live_tiles_hi - 1
+    )
     fields = dict(
         q_tok=q_tok,
         q_start=q_start,
@@ -585,6 +595,7 @@ def per_seq_schedule_rows(
         mask_from=mask_from,
         unmask_from=unmask_from,
         live_tiles_hi=live_tiles_hi,
+        first_live_tile_hi=first_live_tile_hi,
     )
     return PerSeqRows(fields, seq_idx, qblk_prefix[batch], cu_q[batch])
 
@@ -680,7 +691,7 @@ def paged_schedule_table(
         fields=tuple(
             name
             for name in PER_SEQ_ROW_FIELDS
-            if name not in ("kv_start", "kv_base")
+            if name not in ("kv_start", "kv_base", "first_live_tile_hi")
         )
         + PAGED_KV_FIELDS,
         num_rows=rows.seq_idx.shape[0],
@@ -775,6 +786,12 @@ def make_per_seq_fwd_schedule(
         else:
             return jnp.where(kv == row.hi, row.live_tiles_hi, num_kv_tiles)
 
+    def _first_live_tile(kv, row):
+        if num_kv_tiles == 1:
+            return jnp.int32(0)
+        else:
+            return jnp.where(kv == row.hi, row.first_live_tile_hi, 0)
+
     return FwdSchedule(
         num_head_groups=num_head_groups,
         num_rows=table_ref[layout.meta_index("num_rows")],
@@ -790,6 +807,7 @@ def make_per_seq_fwd_schedule(
         blend_start=lambda row: row.q_start,
         packed_q_end=table_ref[layout.meta_index("packed_q_end")],
         num_live_tiles=_num_live_tiles,
+        first_live_tile=_first_live_tile,
     )
 
 
