@@ -5,7 +5,7 @@ description = "FlyWheel: attention kernels for TPU, implemented in JAX Pallas"
 dynamic = ["readme"]
 requires-python = ">=3.12"
 license = "Apache-2.0"
-license-files = ["LICENSE"]
+license-files = ["LICENSE", "NOTICE"]
 authors = [{ name = "heavyball-research" }]
 keywords = ["jax", "pallas", "tpu", "attention", "flash-attention", "linear-attention"]
 classifiers = [

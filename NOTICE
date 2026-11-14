@@ -1,0 +1,10 @@
+FlyWheel TPU
+Copyright 2026 heavyball-research
+
+This product includes software from the following projects, each licensed
+under the Apache License, Version 2.0:
+
+- vLLM tpu-inference (https://github.com/vllm-project/tpu-inference)
+  Copyright Google LLC
+- JAX (https://github.com/jax-ml/jax)
+  Copyright The JAX Authors
