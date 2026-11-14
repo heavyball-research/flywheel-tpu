@@ -27,9 +27,11 @@ import numpy as np
 import pytest
 
 from flywheel_tpu.sparse_attention.dsa.attention import (
-    ROUTE_MIXED,
+    ROUTE_MASKED_DENSE,
     ROUTE_SPARSE,
+    ROUTE_UNION,
     dsa_attention,
+    dsa_attention_from_indices,
 )
 from flywheel_tpu.sparse_attention.dsa.indexer import (
     INDEX_HEAD_DIM,
@@ -138,7 +140,7 @@ PIPELINE_CASES = [
     ),
 ]
 # Ragged prefill from an empty cache and after prefixes, every request
-# within top_k positions, where the mixed route runs no indexer.
+# within top_k positions, where the routed path runs no indexer.
 WITHIN_TOP_K_PARAM = DsaParam(
     q_lens=(300, 77, 140),
     prefix_lens=(0, 1500, 1900),
@@ -165,14 +167,17 @@ class RouteCase(NamedTuple):
     route: str | None
     max_seqlen_q: int | None = None
     max_seqlen_k: int | None = None
+    return_lse: bool = True
 
 
 ROUTE_CASES = [
-    # Within top_k: the route picked on device, and the mixed route under a
-    # static bound past top_k.
+    # Within top_k: the rule, and masked-dense under a static bound past
+    # top_k.
     RouteCase(WITHIN_TOP_K_PARAM, None),
-    RouteCase(WITHIN_TOP_K_PARAM, ROUTE_MIXED, max_seqlen_k=BOUND_PAST_TOP_K),
-    # Decode at short contexts, its q blocks one token.
+    RouteCase(
+        WITHIN_TOP_K_PARAM, ROUTE_MASKED_DENSE, max_seqlen_k=BOUND_PAST_TOP_K
+    ),
+    # Decode at short contexts on masked-dense, its q blocks one token.
     RouteCase(
         DsaParam(
             q_lens=(1,) * 16,
@@ -181,13 +186,14 @@ ROUTE_CASES = [
             page_size=128,
             seed=6,
         ),
-        ROUTE_MIXED,
+        ROUTE_MASKED_DENSE,
         max_seqlen_q=1,
     ),
     RouteCase(IDLE_DECODE_PARAM, None, max_seqlen_q=1),
-    RouteCase(IDLE_DECODE_PARAM, ROUTE_MIXED, max_seqlen_q=1),
-    # Prefill requests past top_k alone: masked-dense, but the tokens in
-    # the window.
+    RouteCase(IDLE_DECODE_PARAM, ROUTE_MASKED_DENSE, max_seqlen_q=1),
+    # Prefill requests past top_k alone: masked-dense within
+    # MAX_MASKED_DENSE_KV_LEN, the others sparse, as lse rules the union
+    # mode out.
     RouteCase(
         DsaParam(
             q_lens=(400, 77, 40),
@@ -196,10 +202,11 @@ ROUTE_CASES = [
             padded_tokens=2,
             seed=7,
         ),
-        ROUTE_MIXED,
+        None,
     ),
-    # Decode requests around a prefill chunk that crosses top_k: the decodes
-    # before it sparse, the chunk and the decodes after it masked-dense.
+    # Decode requests around a prefill chunk that crosses top_k: the
+    # decodes sparse on both sides of the masked-dense chunk, the one past
+    # MAX_MASKED_DENSE_KV_LEN too.
     RouteCase(
         DsaParam(
             q_lens=(1,) * 9 + (560,) + (1,) * 7,
@@ -211,11 +218,11 @@ ROUTE_CASES = [
             padded_tokens=3,
             seed=9,
         ),
-        ROUTE_MIXED,
+        None,
     ),
-    # top_k a multiple of 128 but not of ROPE_BLOCK_SLOTS: the window's
-    # gather takes whole rope blocks; the bitmaps and the masked-dense MLA
-    # take top_k as it is.
+    # top_k a multiple of 128 but not of ROPE_BLOCK_SLOTS: the sparse
+    # pass's gather takes whole rope blocks; the bitmaps and the
+    # masked-dense MLA take top_k as it is.
     RouteCase(
         DsaParam(
             q_lens=(1,) * 9 + (300,) + (1,) * 7,
@@ -228,10 +235,10 @@ ROUTE_CASES = [
             padded_tokens=3,
             seed=14,
         ),
-        ROUTE_MIXED,
+        None,
     ),
-    # More decode requests than the mixed route's window holds: the requests
-    # past it take masked-dense.
+    # Decode requests first, then a chunk: the sparse pass ends at the last
+    # decode.
     RouteCase(
         DsaParam(
             q_lens=(1,) * 80 + (480,),
@@ -240,20 +247,119 @@ ROUTE_CASES = [
             page_size=128,
             seed=10,
         ),
-        ROUTE_MIXED,
+        None,
     ),
     # A 2048-token chunk past top_k: its top-k and its selection bitmaps
     # compile in one jit.
     RouteCase(
         DsaParam(
             q_lens=(2048,),
-            prefix_lens=(1500,),
+            prefix_lens=(1000,),
             h_q=16,
             page_size=128,
             top_k=512,
             seed=11,
         ),
-        ROUTE_MIXED,
+        None,
+    ),
+    # A DP-padded step: decodes, then more padding rows than a sparse
+    # chunk, which the routed path leaves zero.
+    RouteCase(
+        DsaParam(
+            q_lens=(1,) * 64,
+            prefix_lens=tuple(range(100, 100 + 64 * 60, 60)),
+            h_q=64,
+            page_size=128,
+            padded_tokens=512,
+            seed=23,
+        ),
+        None,
+    ),
+    # Every mode in one step, without lse: union requests past
+    # MAX_MASKED_DENSE_KV_LEN and under MIN_MASKED_DENSE_Q_LEN around a
+    # masked-dense chunk and decodes.
+    RouteCase(
+        DsaParam(
+            q_lens=(1, 3, 300, 80, 1, 205, 16, 1),
+            prefix_lens=(20000, 9000, 9000, 2000, 70, 12000, 1500, 5000),
+            h_q=64,
+            page_size=128,
+            padded_tokens=2,
+            seed=19,
+        ),
+        None,
+        return_lse=False,
+    ),
+]
+# Batches of every mode in vLLM's order (decodes, then prefill chunks) and
+# in others, for the routed attention of given indices: union requests
+# whose last union is partial next to other modes' tokens, sparse requests
+# on both sides of the dense ones, and padding rows.
+MIXED_ORDER_PARAMS = [
+    DsaParam(
+        q_lens=(1, 1, 3, 1, 300, 80, 16, 205),
+        prefix_lens=(20000, 70, 9000, 5000, 9000, 2000, 1500, 12000),
+        h_q=64,
+        page_size=128,
+        padded_tokens=3,
+        seed=20,
+    ),
+    DsaParam(
+        q_lens=(300, 1, 80, 3, 16, 205, 1, 1),
+        prefix_lens=(9000, 20000, 2000, 9000, 1500, 12000, 70, 5000),
+        h_q=64,
+        page_size=128,
+        padded_tokens=3,
+        seed=21,
+    ),
+    DsaParam(
+        q_lens=(205, 80, 300, 1, 3, 16, 1, 1),
+        prefix_lens=(12000, 2000, 9000, 20000, 9000, 1500, 70, 5000),
+        h_q=64,
+        page_size=128,
+        seed=22,
+    ),
+]
+# Given indices on the union route.
+UNION_PARAMS = [
+    # Each request's last union partial, slots past their token or the
+    # cache, padding rows.
+    DsaParam(
+        q_lens=(300, 77, 5),
+        prefix_lens=(2500, 3000, 6000),
+        h_q=64,
+        page_size=128,
+        padded_tokens=3,
+        has_stray_indices=True,
+        seed=15,
+    ),
+    # A chunk that crosses top_k: its early tokens' stale slots ignored.
+    DsaParam(
+        q_lens=(600, 1),
+        prefix_lens=(1700, 5000),
+        h_q=64,
+        has_stale_slots=True,
+        seed=16,
+    ),
+    # A shorter top-k, dropped slots.
+    DsaParam(
+        q_lens=(40, 3, 1, 90),
+        prefix_lens=(2030, 100, 9000, 700),
+        h_q=64,
+        page_size=256,
+        top_k=256,
+        has_dropped_slots=True,
+        seed=17,
+    ),
+    # More unions than a chunk holds: the last chunk overlaps the one before
+    # it.
+    DsaParam(
+        q_lens=(1100,),
+        prefix_lens=(3000,),
+        h_q=64,
+        page_size=128,
+        top_k=512,
+        seed=18,
     ),
 ]
 # Note (david): more rows than a SparseCore subcore holds lengths for at
@@ -344,6 +450,7 @@ def route_case_id(case: RouteCase) -> str:
         f"{case.route}",
         f"msq{case.max_seqlen_q}",
         f"msk{case.max_seqlen_k}",
+        f"lse{int(case.return_lse)}",
     ])
 
 
@@ -363,6 +470,7 @@ def test_routes(case):
         max_seqlen_q=case.max_seqlen_q,
         max_seqlen_k=case.max_seqlen_k,
         route=case.route,
+        return_lse=case.return_lse,
     )
 
 
@@ -378,6 +486,44 @@ def test_large_chunks():
         seed=4,
     )
     check_attention(param, LARGE_CHUNK_TOKENS, route=ROUTE_SPARSE)
+
+
+@pytest.mark.parametrize("param", UNION_PARAMS, ids=param_id)
+def test_union_route(param):
+    """The union route's output of given indices matches the reference."""
+    check_given_indices(param, ROUTE_UNION)
+
+
+@pytest.mark.parametrize("param", MIXED_ORDER_PARAMS, ids=param_id)
+def test_mixed_orders(param):
+    """The rule's output of given indices matches the reference whatever the
+    order of the requests' modes."""
+    check_given_indices(param, None)
+
+
+def check_given_indices(param: DsaParam, route: str | None) -> None:
+    """dsa_attention_from_indices of param's batch through route against
+    the reference sparse MLA."""
+    case = make_dsa_case(param)
+    out_ref, _ = sparse_mla_reference(case)
+    nope_cache, rope_cache = dsa_split_cache(case.kv_cache)
+    out = dsa_attention_from_indices(
+        jnp.asarray(case.q_nope),
+        jnp.asarray(case.q_pe),
+        jnp.asarray(nope_cache),
+        jnp.asarray(rope_cache),
+        jnp.asarray(case.topk_indices),
+        jnp.asarray(case.cu_q_lens),
+        jnp.asarray(case.kv_lens),
+        jnp.asarray(case.block_table),
+        max_seqlen_k=int(case.kv_lens.max()),
+        sm_scale=SM_SCALE,
+        kv_scale=jnp.float32(case.kv_scale),
+        route=route,
+    )
+    assert check_is_allclose(
+        "out", out, out_ref.astype(jnp.bfloat16), **OUT_TOL
+    )
 
 
 def make_selection(param: DsaParam, max_seqlen_k: int | None):
@@ -414,6 +560,7 @@ def check_attention(
     max_seqlen_q: int | None = None,
     max_seqlen_k: int | None = None,
     route: str | None = None,
+    return_lse: bool = True,
 ) -> None:
     """dsa_attention of param's batch against the reference sparse MLA;
     max_seqlen_k defaults to the batch's longest request."""
@@ -422,7 +569,7 @@ def check_attention(
         dataclasses.replace(case, topk_indices=indices)
     )
     nope_cache, rope_cache = dsa_split_cache(case.kv_cache)
-    out, lse, selection = dsa_attention(
+    *outputs, selection = dsa_attention(
         jnp.asarray(index.q_fp8),
         jnp.asarray(index.weights),
         jnp.asarray(index.cache),
@@ -435,16 +582,17 @@ def check_attention(
         sm_scale=SM_SCALE,
         kv_scale=jnp.float32(case.kv_scale),
         top_k=param.top_k,
-        return_lse=True,
+        return_lse=return_lse,
         return_indices=True,
         chunk_tokens=chunk_tokens,
         max_seqlen_q=max_seqlen_q,
         route=route,
     )
     assert check_is_allclose(
-        "out", out, out_ref.astype(jnp.bfloat16), **OUT_TOL
+        "out", outputs[0], out_ref.astype(jnp.bfloat16), **OUT_TOL
     )
-    assert check_is_allclose("lse", lse, lse_ref, **LSE_TOL)
+    if return_lse:
+        assert check_is_allclose("lse", outputs[1], lse_ref, **LSE_TOL)
     check_selection(case, np.asarray(selection), indices, param.top_k)
 
 
