@@ -181,6 +181,7 @@ def gather_plan(
     page_size: int,
     pages_per_seq: int,
     vmem_words: int,
+    writes_cache_rows: bool,
 ) -> GatherPlan:
     """The gather of num_tokens tokens' top_k slots on this chip's
     SparseCores, its scratch within vmem_words of each subcore's VMEM."""
@@ -199,6 +200,7 @@ def gather_plan(
         page_shift=page_size.bit_length() - 1,
         num_subcores=sparse_core.num_subcores,
         num_lanes=sparse_core.num_lanes,
+        writes_cache_rows=writes_cache_rows,
     )
     scratch_types = (
         pltpu.VMEM((num_buffers, chunk_slots), jnp.int32),
@@ -207,18 +209,27 @@ def gather_plan(
         pltpu.VMEM((pages_per_seq,), jnp.int32),
         *ring_scratch_types(num_buffers, chunk_slots),
     )
-    return GatherPlan(body, gathered_types(num_tokens, top_k), scratch_types)
+    out_type = gathered_types(num_tokens, top_k, writes_cache_rows)
+    return GatherPlan(body, out_type, scratch_types)
 
 
 def gathered_types(
-    num_tokens: int, top_k: int
+    num_tokens: int, top_k: int, writes_cache_rows: bool
 ) -> tuple[jax.ShapeDtypeStruct, ...]:
     """The gather's outputs: num_tokens tokens' top_k nope rows, their rope
-    rows and their flag rows."""
+    rows, as the cache holds them if writes_cache_rows, else as quads, and
+    their flag rows."""
     num_slots = num_tokens * top_k
-    return tuple(
-        jax.ShapeDtypeStruct((num_slots // row_slots, NOPE_WORDS), jnp.int32)
-        for row_slots in (1, ROPE_ROW_SLOTS, FLAG_ROW_SLOTS)
+    if writes_cache_rows:
+        rope_shape = (num_slots, ROPE_WORDS)
+    else:
+        rope_shape = (num_slots // ROPE_ROW_SLOTS, NOPE_WORDS)
+    return (
+        jax.ShapeDtypeStruct((num_slots, NOPE_WORDS), jnp.int32),
+        jax.ShapeDtypeStruct(rope_shape, jnp.int32),
+        jax.ShapeDtypeStruct(
+            (num_slots // FLAG_ROW_SLOTS, NOPE_WORDS), jnp.int32
+        ),
     )
 
 
@@ -271,6 +282,7 @@ def dsa_gather_pallas(
     top_k: int,
     page_size: int,
     pages_per_seq: int,
+    writes_cache_rows: bool,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The gather's SparseCore call on checked operands, for num_tokens
     consecutive tokens of a call.
@@ -289,17 +301,25 @@ def dsa_gather_pallas(
       top_k: slots a token, a multiple of ROPE_BLOCK_SLOTS.
       page_size: tokens a page, a power of two.
       pages_per_seq: block-table entries a request, a multiple of 8.
+      writes_cache_rows: write the rope rows as the cache holds them, so
+        that each token's slots form a cache of their own.
 
     Returns:
       (nope_rows, rope_rows, flag_rows): (num_tokens * top_k, NOPE_WORDS)
-      int32 gathered rows; (num_tokens * top_k / ROPE_ROW_SLOTS,
+      int32 gathered rows; (num_tokens * top_k, ROPE_WORDS) int32 rope rows
+      with writes_cache_rows, else (num_tokens * top_k / ROPE_ROW_SLOTS,
       NOPE_WORDS) int32, the slots' quads as 4-token words, two quads a row
       (see ROPE_ROW_SLOTS); and (num_tokens * top_k / FLAG_ROW_SLOTS,
       NOPE_WORDS) int32 unused-slot flags. Only the rows of each token's
       first META_SLOTS slots are written, an unused slot's finite.
     """
     plan = gather_plan(
-        num_tokens, top_k, page_size, pages_per_seq, sparse_core_vmem_words()
+        num_tokens,
+        top_k,
+        page_size,
+        pages_per_seq,
+        sparse_core_vmem_words(),
+        writes_cache_rows,
     )
     kernel = pl.kernel(
         plan.body,
@@ -307,7 +327,7 @@ def dsa_gather_pallas(
         mesh=sparse_core_mesh(),
         scratch_types=plan.scratch_types,
         compiler_params=gather_compiler_params(),
-        name="dsa_gather",
+        name="dsa_gather_cache_rows" if writes_cache_rows else "dsa_gather",
     )
     return kernel(
         chunk_row, indices, token_meta, block_table, nope_cache, rope_cache
@@ -350,15 +370,23 @@ class _GatherRing:
     slot (its index in [0, the token's position]) reads the cache row of its
     index through the token's block-table row. An unused slot reads nothing
     and is flagged; its output rows hold finite words the attention weighs
-    by 0.
+    by 0. A ring that writes cache rows writes the rope rows as they are.
     """
 
-    def __init__(self, refs: RingRefs, *, page_shift: int, num_lanes: int):
+    def __init__(
+        self,
+        refs: RingRefs,
+        *,
+        page_shift: int,
+        num_lanes: int,
+        writes_cache_rows: bool,
+    ):
         self.refs = refs
         self.num_buffers, self.chunk_slots = refs.row_vmem.shape
         self.quads_per_chunk = self.chunk_slots // QUAD_TOKENS
         self.page_shift = page_shift
         self.num_lanes = num_lanes
+        self.writes_cache_rows = writes_cache_rows
 
     def load_chunk_row(self, chunk_hbm: jax.Array) -> jax.Array:
         """The call's chunk row, as a vector."""
@@ -408,15 +436,16 @@ class _GatherRing:
             ),
         )
 
-    def out_copies(self, chunk, slot):
-        """The chunk's nope, rope and flag write-backs from buffer slot. The
-        chunk fills half of a rope block's rope rows. A push stream ignores a
-        destination semaphore, and one without a source semaphore signals the
-        subcore's shared push flag, so the slot's source semaphore tracks the
-        read of its own buffer.
-        """
+    def rope_out_copy(self, first_slot, slot, sem):
+        """The rope write-back of the chunk from first_slot: its cache rows,
+        or its quads, which fill half of a rope block's rope rows."""
         refs = self.refs
-        first_slot = chunk * self.chunk_slots
+        if self.writes_cache_rows:
+            return pltpu.make_async_copy(
+                refs.rope_buffer.at[slot],
+                refs.rope_out_hbm.at[pl.ds(first_slot, self.chunk_slots)],
+                src_sem=sem,
+            )
         block, within = (
             first_slot // ROPE_BLOCK_SLOTS,
             first_slot % ROPE_BLOCK_SLOTS,
@@ -426,6 +455,23 @@ class _GatherRing:
             + within % ROPE_HALF_SLOTS // QUAD_TOKENS
         )
         rope_word = within // ROPE_HALF_SLOTS * ROPE_HALF_WORDS
+        return pltpu.make_async_copy(
+            refs.rope_stage.at[slot],
+            refs.rope_out_hbm.at[
+                pl.ds(rope_row, self.quads_per_chunk),
+                pl.ds(rope_word, ROPE_HALF_WORDS),
+            ],
+            src_sem=sem,
+        )
+
+    def out_copies(self, chunk, slot):
+        """The chunk's nope, rope and flag write-backs from buffer slot. A
+        push stream ignores a destination semaphore, and one without a source
+        semaphore signals the subcore's shared push flag, so the slot's
+        source semaphore tracks the read of its own buffer.
+        """
+        refs = self.refs
+        first_slot = chunk * self.chunk_slots
         sem = refs.sems.at[SEM_OUT, slot]
         return (
             pltpu.make_async_copy(
@@ -433,14 +479,7 @@ class _GatherRing:
                 refs.nope_out_hbm.at[pl.ds(first_slot, self.chunk_slots)],
                 src_sem=sem,
             ),
-            pltpu.make_async_copy(
-                refs.rope_stage.at[slot],
-                refs.rope_out_hbm.at[
-                    pl.ds(rope_row, self.quads_per_chunk),
-                    pl.ds(rope_word, ROPE_HALF_WORDS),
-                ],
-                src_sem=sem,
-            ),
+            self.rope_out_copy(first_slot, slot, sem),
             pltpu.make_async_copy(
                 refs.flag_vmem.at[slot],
                 refs.flag_out_hbm.at[
@@ -565,7 +604,8 @@ class _GatherRing:
                 )
                 state[STATE_FILLED, slot] = 1
 
-            self.transpose_rope(slot)
+            if not self.writes_cache_rows:
+                self.transpose_rope(slot)
             for copy in self.out_copies(chunk, slot):
                 copy.start()
 
@@ -607,6 +647,7 @@ def dsa_gather_kernel(
     page_shift: int,
     num_subcores: int,
     num_lanes: int,
+    writes_cache_rows: bool,
 ) -> None:
     """Each worker gathers its run of chunks in a _GatherRing, chunk c being
     chunk_slots top-k slots of the call's token c // chunks_per_token.
@@ -628,6 +669,7 @@ def dsa_gather_kernel(
         ),
         page_shift=page_shift,
         num_lanes=num_lanes,
+        writes_cache_rows=writes_cache_rows,
     )
     num_buffers, chunk_slots = ring.num_buffers, ring.chunk_slots
     worker = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
@@ -929,6 +971,7 @@ def dsa_topk_gather_kernel(
         ),
         page_shift=page_shift,
         num_lanes=num_lanes,
+        writes_cache_rows=False,
     )
     topk = topk_worker(
         row_lengths_hbm,
@@ -1027,7 +1070,7 @@ def dsa_topk_gather_pallas(
     kernel = pl.kernel(
         body,
         out_type=(
-            *gathered_types(num_tokens, top_k),
+            *gathered_types(num_tokens, top_k, writes_cache_rows=False),
             jax.ShapeDtypeStruct((num_tokens, geometry.k), jnp.int32),
         ),
         mesh=sparse_core_mesh(),

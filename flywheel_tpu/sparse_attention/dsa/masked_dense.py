@@ -29,6 +29,7 @@ from flywheel_tpu.sparse_attention.dsa.cache_write import token_positions
 from flywheel_tpu.sparse_attention.dsa.kernels.masked_dense import (
     SLAB_POSITIONS,
     MaskedDenseConfig,
+    MaskedDensePlan,
     bitmap_rows,
     default_masked_dense_config,
     dsa_masked_dense_pallas,
@@ -112,6 +113,13 @@ def dsa_masked_dense(
         )
     else:
         bitmap = None
+    plan = masked_dense_plan(
+        cu_q_lens,
+        kv_lens,
+        num_tokens=num_tokens,
+        max_seqlen_q=max_seqlen_q,
+        config=config,
+    )
     return masked_dense_attention(
         q_nope,
         q_pe,
@@ -121,14 +129,13 @@ def dsa_masked_dense(
         cu_q_lens,
         kv_lens,
         block_table,
-        attended_cu_q_lens=cu_q_lens,
-        config=config,
-        max_seqlen_q=max_seqlen_q,
+        plan=plan,
         sm_scale=sm_scale,
         kv_scale=kv_scale,
         top_k=top_k,
         max_seqlen_k=max_seqlen_k,
         return_lse=return_lse,
+        previous_out=None,
     )
 
 
@@ -182,30 +189,23 @@ def masked_dense_attention(
     kv_lens: jax.Array,
     block_table: jax.Array,
     *,
-    attended_cu_q_lens: jax.Array,
-    config: MaskedDenseConfig,
-    max_seqlen_q: int,
+    plan: MaskedDensePlan,
     sm_scale: float,
     kv_scale: jax.Array,
     top_k: int,
     max_seqlen_k: int,
     return_lse: bool,
+    previous_out: jax.Array | None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """dsa_masked_dense on checked operands at config, its bitmap given:
+    """dsa_masked_dense on checked operands at plan, its bitmap given:
     None when every request it attends holds at most top_k positions.
 
-    It attends the requests that attended_cu_q_lens gives their own q_len,
-    cu_q_lens itself for all of them; the rows of a request it gives 0 are
-    unspecified, its lse too, and rows past cu_q_lens[B] are zero.
+    It attends the q blocks of plan, made of attended q_lens within
+    cu_q_lens, all of them or some; the rows of a request with none keep
+    previous_out's, or are unspecified without it, its lse too, and rows
+    past cu_q_lens[B] are zero.
     """
     num_tokens, num_heads, _ = q_nope.shape
-    plan = masked_dense_plan(
-        attended_cu_q_lens,
-        kv_lens,
-        num_tokens=num_tokens,
-        max_seqlen_q=max_seqlen_q,
-        config=config,
-    )
     # Note (david): the kernel reads q_pe with the heads minor, as XLA lays
     # (T, 128, ROPE_DIM) out, so the swap is a bitcast.
     outputs = dsa_masked_dense_pallas(
@@ -223,6 +223,7 @@ def masked_dense_attention(
         top_k=top_k,
         num_slabs=bitmap_slabs(max_seqlen_k),
         return_lse=return_lse,
+        previous_out=previous_out,
     )
     if not return_lse:
         return outputs[0]
