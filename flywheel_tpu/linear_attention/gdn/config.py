@@ -127,6 +127,12 @@ class GDNConfig:
     # around the kernel. The VMEM slots are [prev_kernel_size, dim_size]
     # either way; only the DMAs differ.
     conv_slot_major: bool = False
+    # Note: the output is [batch, v_dim_size], or (True) [batch,
+    # num_v_heads, v_head_dim], where a token's heads fill one tile and the
+    # token axis is untiled. A caller that views the output per head (a gated
+    # RMSNorm over v_head_dim) reads the latter in place; from the former XLA
+    # retiles the whole output first.
+    split_out_heads: bool = False
 
     def __post_init__(self) -> None:
         assert (
@@ -185,6 +191,14 @@ class GDNConfig:
     @property
     def v_dim_size(self) -> int:
         return self.num_v_heads * self.v_head_dim
+
+    @property
+    def out_row_shape(self) -> tuple[int, ...]:
+        """Shape of one token's output row."""
+        if self.split_out_heads:
+            return (self.num_v_heads, self.v_head_dim)
+        else:
+            return (self.v_dim_size,)
 
     @property
     def v_per_kq_head(self) -> int:
@@ -321,7 +335,7 @@ class GDNConfig:
             "replay_gate_in_buf": replay_gate_in_buf,
             "replay_gate_out_buf": replay_gate_out_buf,
             "out_buf": pltpu.VMEM(
-                (slots, self.out_window_rows, self.v_dim_size),
+                (slots, self.out_window_rows, *self.out_row_shape),
                 self.dtypes.act_out,
             ),
             "carry_conv_scratch_ref": carry_conv_scratch,

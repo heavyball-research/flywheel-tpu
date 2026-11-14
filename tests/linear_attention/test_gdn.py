@@ -671,6 +671,106 @@ def test_slot_major_conv_pool_windows(
     _assert_bitwise("windows", *_slot_major_runs(run))
 
 
+@pytest.mark.parametrize(
+    (
+        "query_lens",
+        "num_spec_tokens",
+        "num_decode",
+        "n_kq",
+        "n_v",
+        "num_tokens",
+    ),
+    [
+        ((1, 1, 37, 300), 0, 2, 2, 4, 344),
+        ((4, 4, 4), 3, 3, 2, 4, 16),
+        ((1,) * 9 + (600, 13), 0, 9, 4, 8, 1024),
+    ],
+    ids=["decode_then_prefill", "verify_windows", "serving_tiles_padded"],
+)
+def test_split_out_heads(
+    query_lens: tuple[int, ...],
+    num_spec_tokens: int,
+    num_decode: int,
+    n_kq: int,
+    n_v: int,
+    num_tokens: int,
+) -> None:
+    """split_out_heads gives the [T, n_v * d_v] output as [T, n_v, d_v] and
+    the same states, bit for bit, padded rows past the last token included;
+    the last case runs serving's tiles (8 decodes, 256-row tiles of 128-token
+    chunks) at serving's head counts."""
+    d = 128
+    dim = (2 * n_kq + n_v) * d
+    kernel_size = 4
+    window = num_spec_tokens + 1
+    num_seqs = len(query_lens)
+    num_slots = 1 + num_seqs * window
+    rng = np.random.default_rng(5)
+    qkv = randn(rng, (num_tokens, dim)).astype(jnp.bfloat16)
+    b = randn(rng, (num_tokens, n_v)).astype(jnp.bfloat16)
+    a = randn(rng, (num_tokens, n_v)).astype(jnp.bfloat16)
+    conv_pool = randn(rng, (num_slots, kernel_size - 1, 1, dim))
+    recurrent = randn(rng, (num_slots, n_v, d, d)) * 0.1
+    bound = kernel_size**-0.5
+    conv_weight = uniform(rng, (dim, 1, kernel_size), -bound, bound)
+    a_log = randn(rng, (n_v,)) * 0.1
+    dt_bias = randn(rng, (n_v,)) * 0.1
+    state_indices = jnp.asarray(1 + np.arange(num_seqs) * window, jnp.int32)
+    query_start_loc = jnp.asarray(
+        np.concatenate([[0], np.cumsum(query_lens)]), jnp.int32
+    )
+    seq_lens = jnp.asarray(np.asarray(query_lens) + 50, jnp.int32)
+    distribution = jnp.asarray([num_decode, num_decode, num_seqs], jnp.int32)
+    read_offsets = (
+        jnp.asarray(rng.integers(0, window, num_seqs), jnp.int32)
+        if num_spec_tokens
+        else None
+    )
+    tiles = (
+        {
+            "decode_tile_size": 8,
+            "mixed_tile_size": 256,
+            "compute_chunk_size": 128,
+        }
+        if n_v == 8
+        else {}
+    )
+
+    def run(split):
+        (conv, rec), out = gdn_wrapper.fused_conv1d_gdn(
+            qkv,
+            b,
+            a,
+            jnp.array(conv_pool),
+            jnp.array(recurrent),
+            conv_weight,
+            None,
+            a_log,
+            dt_bias,
+            query_start_loc,
+            state_indices,
+            distribution,
+            seq_lens,
+            state_indices,
+            read_offsets,
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d,
+            d_v=d,
+            kernel_size=kernel_size,
+            num_spec_tokens=num_spec_tokens,
+            split_out_heads=split,
+            **tiles,
+        )
+        expected_shape = (
+            (num_tokens, n_v, d) if split else (num_tokens, n_v * d)
+        )
+        assert out.shape == expected_shape
+        return out.reshape(num_tokens, n_v * d), conv, rec
+
+    _assert_bitwise("split_out_heads", run(False), run(True))
+
+
 def test_slot_major_conv_pool_shape_is_checked() -> None:
     rng = np.random.default_rng(0)
     dim, n_v, d = 1024, 4, 128

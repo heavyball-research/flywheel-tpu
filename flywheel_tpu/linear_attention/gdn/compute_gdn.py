@@ -991,6 +991,37 @@ def recurrent_gdn_per_seq(
     return jnp.concatenate(token_outs, axis=0), jnp.stack(window_states, axis=0)
 
 
+def recurrent_gdn_one_token(
+    q_token: jax.Array,
+    k_token: jax.Array,
+    k_token_t: jax.Array,
+    v_token: jax.Array,
+    decay: jax.Array,
+    beta: jax.Array,
+    state_prev: jax.Array,
+    cfg: config.GDNConfig,
+) -> tuple[jax.Array, jax.Array]:
+    """recurrent_gdn_per_seq for a single token, with one weight push of S.
+
+    With S' = decay * S the decayed state, the output q S_new equals
+    q S' + (q . k) v_new, so q reads S' in the same dot as k, stacked as two
+    LHS rows, instead of a second dot against S_new after the update.
+    """
+    q_curr = jnp.repeat(q_token[:, 0], cfg.v_per_kq_head, axis=0)
+    k_curr = jnp.repeat(k_token[:, 0], cfg.v_per_kq_head, axis=0)
+    k_curr_t = jnp.repeat(k_token_t[:, 0], cfg.v_per_kq_head, axis=0)
+
+    state_decayed = state_prev * decay[:, 0]
+    state_reads = batched_matmul(
+        jnp.concatenate([k_curr, q_curr], axis=1), state_decayed
+    ).astype(cfg.dtypes.compute)
+    v_new = beta[:, 0] * (v_token[:, 0] - state_reads[:, :1])
+    q_dot_k = jnp.sum(q_curr * k_curr, axis=-1, keepdims=True)
+    out = state_reads[:, 1:] + q_dot_k * v_new
+    state = state_decayed + k_curr_t * v_new
+    return pack_out(out, cfg), state[None]
+
+
 def recurrent_gdn(
     real_sizes: jax.Array,
     q_token: jax.Array,
@@ -1048,10 +1079,14 @@ def recurrent_gdn(
         :, : cfg.num_v_heads
     ]
 
+    if cfg.compute_chunk_size == 1:
+        per_seq = recurrent_gdn_one_token
+    else:
+        per_seq = recurrent_gdn_per_seq
     seq_outs = []
     seq_states = []
     for seq_idx in range(cfg.seq_tile_size):
-        out, window_states = recurrent_gdn_per_seq(
+        out, window_states = per_seq(
             q_token[seq_idx],
             k_token[seq_idx],
             k_token_t[seq_idx],
