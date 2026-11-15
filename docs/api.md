@@ -94,7 +94,7 @@ flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_se
                        rotary_cos=None, rotary_sin=None, rotary_interleaved=False,
                        rotary_k=True, block_table=None, seqused_k=None, num_active=None,
                        k_descale=None, v_descale=None, nheads_k=None,
-                       learnable_sink=None):
+                       learnable_sink=None, guard_replay_unroll=1):
 """Attention over sequences packed along the token axis. Unlike flash-attn, the default layout
 is head-major, (nheads, total, headdim), which is the kernel's own layout, so no operand is
 relaid out.
@@ -120,6 +120,11 @@ Arguments:
     block_sizes [optional]: (block_q, block_kv, block_q_compute, block_kv_compute). Pins the
         forward tiles instead of the tuned or analytic ones; block_q and block_kv must be
         multiples of 128.
+    guard_replay_unroll [optional]: int >= 1, packed K/V only. Unroll factor of the replay
+        that recomputes a head whose scores overflow the first pass's softmax base. The
+        default 1 keeps the replay rolled and the kernel's code small. A larger factor
+        speeds up the replay when it runs, but the larger kernel slows every call once
+        libtpu splits its hot loop over several instruction overlays.
     block_table [optional]: (batch_size, max_num_blocks_per_seq), int. Reads k as a paged KV
         cache, read-only: one merged (num_blocks, page_block_size, cache_heads, headdim)
         cache laid out as flash_attn_with_kvcache's, bf16 or fp8, with v and cu_seqlens_k

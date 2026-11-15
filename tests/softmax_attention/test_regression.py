@@ -178,6 +178,60 @@ def test_flash_attn_varlen_func_feeds_the_program(seqlens):
     assert jnp.array_equal(layer(q, k, v, cu).reshape(expected.shape), expected)
 
 
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_varlen_guard_replay_unroll(causal):
+    # Note (deepolar): the second sequence's last keys score far above the
+    # first kv block's anchor, so its heads replay; every unroll factor of the
+    # replay loop must give the rolled replay's output.
+    seqlens = [384, 1024]
+    q, k, v, segments = packed_qkv(seqlens, 4, 2, 128)
+    k = k.at[384 + 768 :].multiply(40.0)
+    segments[1] = (segments[1][0], k[None, 384:], segments[1][2])
+    cu = cu_seqlens_of(seqlens)
+    outs = [
+        varlen_attn(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=causal,
+            guard_replay_unroll=unroll,
+        )
+        for unroll in (1, 2, 64)
+    ]
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu[index]), int(cu[index + 1]))
+        assert_output_close(outs[0][rows][None], *segment, causal=causal)
+    for out in outs[1:]:
+        assert jnp.array_equal(out, outs[0])
+
+
+def test_guard_replay_unroll_rejects_bad_values():
+    q, k, v, _ = packed_qkv([128], 2, 2, 128)
+    cu = cu_seqlens_of([128])
+    with pytest.raises(ValueError, match="guard_replay_unroll must be >= 1"):
+        varlen_attn(q, k, v, cu, cu, 128, 128, guard_replay_unroll=0)
+    with pytest.raises(
+        ValueError, match="guard_replay_unroll applies to packed"
+    ):
+        flash_attn_varlen_func(
+            to_head_major(q),
+            jnp.zeros((4, 128, 2, 128), jnp.bfloat16),
+            None,
+            cu,
+            None,
+            128,
+            128,
+            block_table=jnp.zeros((1, 1), jnp.int32),
+            seqused_k=jnp.array([128], jnp.int32),
+            guard_replay_unroll=2,
+            interpret=INTERPRET,
+        )
+
+
 @pytest.mark.parametrize("entry", ["dense", "varlen"])
 @pytest.mark.parametrize("array_type", ["jax", "numpy"])
 def test_flash_attn_array_softmax_scale(entry, array_type):

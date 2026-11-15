@@ -846,6 +846,7 @@ def make_flash_attn_mha(
     varlen_max_seqlen_kv: int | None = None,
     token_major: TokenMajorInfo | None = None,
     heads_outer_batch: int | None = None,
+    guard_replay_unroll: int = 1,
 ) -> Callable[..., jax.Array | tuple[jax.Array, jax.Array]]:
     """Build the MHA forward kernel for one static attention configuration.
 
@@ -878,6 +879,8 @@ def make_flash_attn_mha(
     heads_outer_batch: B for a heads-outer dense fold of B sequences, where q
       fold index n * B + b reads kv fold index (n // q_heads_per_kv_head) * B +
       b; None keeps the batch-outer fold.
+    guard_replay_unroll: unroll factor of the varlen overflow replay loop; 1
+      keeps it rolled. Varlen only.
     """
     if variant.runtime_causal_offset and (
         not variant.causal
@@ -924,6 +927,15 @@ def make_flash_attn_mha(
             " revisit a q slice while its rescale alpha is still pending."
         )
     is_varlen = varlen_max_seqlen_kv is not None
+    if guard_replay_unroll < 1:
+        raise ValueError(
+            f"guard_replay_unroll must be >= 1, got {guard_replay_unroll}."
+        )
+    if guard_replay_unroll != 1 and not is_varlen:
+        raise ValueError(
+            "guard_replay_unroll applies to the packed varlen forward only;"
+            " a dense build always unrolls its replay."
+        )
     # Note (david): per-seq blocks address HBM at arbitrary token offsets, which
     # only a second-minor (sublane) token axis supports.
     if is_varlen and (
@@ -1077,6 +1089,7 @@ def make_flash_attn_mha(
         token_major=token_major,
         is_per_seq=is_varlen,
         guard_threshold=guard_threshold,
+        guard_replay_unroll=guard_replay_unroll,
     )
 
     if is_varlen:
@@ -1132,6 +1145,7 @@ def get_kernel(
     kernel_batch: int | None = None,
     blocks_override: tuple[int, int, int, int] | None = None,
     heads_outer_batch: int | None = None,
+    guard_replay_unroll: int = 1,
 ) -> functools.partial:
     # Note (david): seqlen_q and seqlen_kv are padded lengths while
     # causal_offset comes from the original ones. Different original pairs can
@@ -1260,6 +1274,7 @@ def get_kernel(
         varlen_max_seqlen_kv=varlen_max_seqlen_kv,
         token_major=token_major_info,
         heads_outer_batch=heads_outer_batch,
+        guard_replay_unroll=guard_replay_unroll,
     )
 
 
