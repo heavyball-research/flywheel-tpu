@@ -19,7 +19,8 @@
 [heavyball-research](https://github.com/heavyball-research). It implements
 softmax attention (MHA and MQA/GQA) behind flash-attn's API, and the fused
 linear attention layers of hybrid models (GDN and KDA), for prefill, decode
-and training on TPU v6e and v7x.
+and training on TPU v6e and v7x. It also runs the routed experts of MoE
+layers as one fused MLP kernel.
 
 ## Why FlyWheel?
 
@@ -60,6 +61,15 @@ and training on TPU v6e and v7x.
   speculative verify windows
 - **ReplaySSM decode**: decode from a state checkpoint plus the records of
   recent tokens, as in [ReplaySSM](https://arxiv.org/abs/2610.13778)
+
+### MoE
+- **Fused expert MLP**: the token gather, both matmuls and the gated
+  activation in one kernel, with the intermediate kept in VMEM
+- **Any routing**: softmax top-k from the router logits, or `topk_weights`
+  and `topk_ids` from any other routing; on v7x the top-k, token sort and
+  combine run on SparseCore
+- **Any expert size**: tensor-parallel slices of the intermediate are padded
+  at weight load time, and experts larger than VMEM stream in blocks
 
 ## News
 
@@ -127,7 +137,7 @@ Off TPU, pass `interpret=True` to run the Pallas TPU interpreter.
 ### Documentation
 
 - [API reference](docs/api.md): every argument of the softmax and linear
-  attention kernels, and where the layouts differ from flash-attn's
+  attention and MoE kernels, and where the layouts differ from flash-attn's
 - [Benchmarks](docs/benchmarks.md) on v6e, and the [v7x results](docs/v7x.md)
 - [End-to-end evaluation](docs/e2e_evaluation.md): reproduce the paper's
   RULER, BABILong and Video-MME results with vLLM
@@ -148,6 +158,9 @@ FlyWheel powers attention in:
 FlyWheel's API follows [FlashAttention](https://github.com/Dao-AILab/flash-attention).
 Its GDN and KDA kernels start from tpu-inference's
 [GDN v3 kernel](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/gdn/v3),
+its MoE kernels from tpu-inference's
+[megablox gmm_v2](https://github.com/vllm-project/tpu-inference/blob/main/tpu_inference/kernels/megablox/gmm_v2.py)
+by way of sglang-jax,
 and its design draws on tpu-inference's
 [RPA v3](https://github.com/vllm-project/tpu-inference/tree/4420cae/tpu_inference/kernels/ragged_paged_attention/v3),
 Tokamax's [Splash Attention](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/tpu/splash_attention)

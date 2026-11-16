@@ -546,3 +546,137 @@ stored as two 16-bit planes, so a decode step reads only the bf16 high plane;
 `replay_layout`, `split_checkpoint` and `merge_checkpoint` in each wrapper give
 the buffer shapes and convert the checkpoint from and to f32. Their arguments
 are documented in their docstrings.
+
+## MoE
+
+`fused_moe_softmax_topk` and `fused_moe` run the routed experts of a MoE
+layer, from the routing to the combined output:
+
+```python
+from flywheel_tpu import fused_moe, fused_moe_softmax_topk
+from flywheel_tpu.moe import prepare_expert_weights
+```
+
+`fused_moe_softmax_topk` takes the router logits and computes the
+renormalized softmax top-k routing itself. `fused_moe` takes the routing
+(`topk_weights`, `topk_ids`) from the caller, for any other routing (sigmoid
+scores, grouped or biased selection). Both then sort the (token, expert) pairs
+by expert, moving only the indices and the routing weights. The fused MLP
+kernel gathers each expert's token rows straight from the unsorted
+activations, runs the gate/up matmul, the gated activation and the down matmul
+with the intermediate kept in VMEM, and scales each row by its routing weight.
+The combine gathers each token's top_k rows back and sums them in f32.
+
+On v7x the sort runs on SparseCore, and so do the combine and the routing of
+`fused_moe_softmax_topk` on batches large enough to fill its vector subcores;
+on v6e the routing and the sort are XLA ops and the combine is a TensorCore
+kernel. The SparseCore and TensorCore sort and combine give the same bits. The
+fused MLP streams each expert's weights whole when two experts of w1 and of w2
+fit VMEM next to its other buffers, and otherwise in intermediate-dim blocks
+sized to fit.
+
+Both are single-device and inference-only (no backward pass), and take
+bfloat16 activations and weights. The API is in
+[fused_moe.py](../flywheel_tpu/moe/fused_moe.py) and the Pallas kernels in
+[kernels/](../flywheel_tpu/moe/kernels/), with tests in
+[tests/moe/](../tests/moe/).
+
+The kernels take an intermediate size that is a multiple of 128.
+`prepare_expert_weights(w_gate, w_up, w2)` merges the gate and up projections
+into `w1` and zero-pads the intermediate up to a multiple of 128, so
+tensor-parallel slices such as 192 (TP4) or 96 (TP8) of 768 run too; the zero
+columns and rows leave the output unchanged. It copies the weights, so call
+it once when they are loaded, not in the jitted forward.
+
+### fused_moe_softmax_topk
+
+```python
+fused_moe_softmax_topk(hidden_states, router_logits, w1, w2, *, top_k,
+                       activation="silu", tile_m=None, tail_bucket=True,
+                       tail_bucket_m_values=None, pipeline_depths=None,
+                       weight_block_columns=None, weight_block_segment_rows=None,
+                       gather_pipeline_rows=None, interpret=False):
+"""fused_moe on the renormalized softmax top-k routing of the router logits.
+Each token's experts are lax.top_k's choice and order of its logits (ties to the lower
+expert), and its weights the softmax over those top_k logits, which equals the softmax
+over all experts renormalized over the selected ones. The output is fused_moe's on that
+routing, bit for bit; where the routing runs on SparseCore, its exp can differ from
+XLA's in the last f32 bit.
+
+Arguments:
+    hidden_states: (num_tokens, hidden), bfloat16. hidden must be a multiple of 256.
+    router_logits: (num_tokens, num_experts), bfloat16.
+    w1, w2: as in fused_moe.
+    top_k: int. Experts per token, at most 16 on SparseCore.
+    The remaining arguments are fused_moe's.
+Return:
+    out: (num_tokens, hidden), bfloat16.
+"""
+```
+
+### fused_moe
+
+```python
+fused_moe(hidden_states, topk_weights, topk_ids, w1, w2, *, activation="silu",
+          tile_m=None, tail_bucket=True, tail_bucket_m_values=None,
+          pipeline_depths=None, weight_block_columns=None,
+          weight_block_segment_rows=None, gather_pipeline_rows=None,
+          interpret=False):
+"""For each token t:
+    out[t] = sum_k topk_weights[t, k] * (act(h @ gate) * (h @ up)) @ w2[e]
+with h = hidden_states[t], e = topk_ids[t, k] and [gate | up] = w1[e].
+
+Arguments:
+    hidden_states: (..., hidden), bfloat16. hidden must be a multiple of 256.
+    topk_weights: (..., top_k), float. The routing weights.
+    topk_ids: (..., top_k), int. The selected experts, in [0, num_experts).
+    w1: (num_experts, hidden, 2 * intermediate), bfloat16. The gate and up projections,
+        merged along the last axis by prepare_expert_weights. intermediate must be a
+        multiple of 128.
+    w2: (num_experts, intermediate, hidden), bfloat16. The down projection, from
+        prepare_expert_weights.
+    activation: "silu" or "gelu" (tanh approximation).
+    tile_m: int. Expert-sorted rows per step of the fused MLP. Default: a tile that
+        holds a typical expert's rows when two whole experts fit VMEM, else 256 with
+        weight blocks; either steps down while the buffers exceed VMEM.
+    tail_bucket: bool. Run the last, partial tile of each expert at the smallest of
+        tail_bucket_m_values that covers it, instead of at tile_m, which cuts the work
+        spent on rows of other experts.
+    tail_bucket_m_values: The static row counts tail_bucket picks from. Values at or
+        above tile_m are dropped and tile_m is appended; each must be a multiple of 8
+        (16 on v7x). Default: derived from the rows per expert, keeping on the
+        whole-expert path the buckets whose kernel code fits the instruction memory.
+    pipeline_depths: flywheel_tpu.moe.PipelineDepths. The buffer depth and issue lead
+        of each DMA stream of the fused MLP. Default: the tuned depths. The output is
+        bitwise the same for every legal value.
+    weight_block_columns: int. Force streaming the expert weights in intermediate-dim
+        blocks of this many columns, a multiple of 128 that divides intermediate.
+        Default: whole experts when two of w1 and of w2 fit VMEM next to the other
+        buffers, else blocks sized to fit.
+    weight_block_segment_rows: int. On the weight-blocked path, run each weight block
+        over static segments of this many rows.
+    gather_pipeline_rows: int. On the weight-blocked path, issue the next tile's row
+        gathers in segments of this many rows (a divisor of tile_m, one segment per
+        weight block), interleaved with the current tile's compute.
+    interpret: bool. Run the Pallas TPU interpreter, e.g. on CPU.
+Return:
+    out: (..., hidden), bfloat16.
+"""
+```
+
+### prepare_expert_weights
+
+```python
+prepare_expert_weights(w_gate, w_up, w2):
+"""The fused_moe w1 and w2 of the experts' gate, up and down projections, with
+intermediate zero-padded up to padded, the next multiple of 128.
+
+Arguments:
+    w_gate, w_up: (num_experts, hidden, intermediate). The gate and up projections.
+    w2: (num_experts, intermediate, hidden). The down projection.
+Return:
+    w1: (num_experts, hidden, 2 * padded). The padded gate and up projections, merged
+        along the last axis.
+    w2: (num_experts, padded, hidden).
+"""
+```
