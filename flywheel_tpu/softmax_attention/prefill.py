@@ -694,6 +694,7 @@ def flash_attn_varlen_func(
     v_descale: float | jax.Array | None = None,
     nheads_k: int | None = None,
     learnable_sink: jax.Array | None = None,
+    guard_replay_unroll: int = 1,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """flash_attn.flash_attn_varlen_func on TPU for packed sequences.
 
@@ -723,6 +724,13 @@ def flash_attn_varlen_func(
     block_kv_compute) pins the forward tiles instead of the tuned or analytic
     ones. block_q and block_kv must be multiples of 128, and each packed total
     then pads to a multiple of its own block.
+
+    guard_replay_unroll (TPU extension, packed K/V only): unroll factor of the
+    replay that recomputes a head whose scores overflow the first pass's
+    softmax base. The default 1 keeps the replay rolled, which keeps the
+    kernel's code small. A larger factor makes the replay faster when it
+    fires but the kernel larger, which slows every call once libtpu splits
+    its hot loop over several instruction overlays.
 
     Paged KV cache (block_table given; read-only, as in FlashAttention): k is
     one merged (num_pages, page_size, cache_heads, headdim) pool laid out as
@@ -773,6 +781,11 @@ def flash_attn_varlen_func(
                 f" native tile); got {blocks_override!r}."
             )
     if block_table is not None:
+        if guard_replay_unroll != 1:
+            raise ValueError(
+                "guard_replay_unroll applies to packed K/V; a paged KV cache"
+                " always unrolls its replay."
+            )
         return paged_varlen_attn(
             q,
             k,
@@ -920,6 +933,7 @@ def flash_attn_varlen_func(
             varlen_max_seqlen_q=max_seqlen_q_bucket,
             token_major=bool(token_major),
             blocks_override=blocks_override,
+            guard_replay_unroll=int(guard_replay_unroll),
         )
         sinks = check_sinks(learnable_sink, nheads)
         sink_args = () if sinks is None else (sinks,)

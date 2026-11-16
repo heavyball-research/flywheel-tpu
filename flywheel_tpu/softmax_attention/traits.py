@@ -162,7 +162,8 @@ class FwdTraits(QKVTraits):
     schedule. guard_threshold is the overflow guard's log2 bound for the
     build's kv length. rotary_dim 0 means no fused RoPE; otherwise
     rotary_batch is the coefficient planes' batch, and rotary_k False means K
-    arrives rotated.
+    arrives rotated. guard_replay_unroll is the unroll factor of a varlen
+    build's overflow replay loop; 1 keeps it rolled.
     """
 
     transposed_pv: bool
@@ -172,6 +173,7 @@ class FwdTraits(QKVTraits):
     rotary_batch: int = 1
     rotary_interleaved: bool = False
     rotary_k: bool = True
+    guard_replay_unroll: int = 1
     # A dense or varlen build reads separate K and V operands and stages one q
     # head per pipeline head; PagedFwdTraits sets both fields.
     paged: PagedKVInfo | None = dataclasses.field(default=None, init=False)

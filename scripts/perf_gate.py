@@ -64,6 +64,7 @@ import hashlib
 import importlib
 import importlib.metadata
 import json
+import math
 import pathlib
 import socket
 import statistics
@@ -91,6 +92,10 @@ DENSE_SEQ = 8192
 # A ragged prefill batch of 8 prompts, 16384 tokens in all, none a multiple
 # of the 128-token tile, so every tail path runs.
 PREFILL_LENGTHS = (3989, 3127, 2577, 2049, 1531, 1283, 1011, 817)
+# The same prompts repeated 48 times, 786432 tokens in all: the program's 15
+# GiB of HBM makes libtpu on v6e compile it as HLO functions, whose smaller
+# instruction overlays split a large kernel's hot loop.
+LARGE_PREFILL_LENGTHS = PREFILL_LENGTHS * 48
 # Decode rows hold a context drawn uniformly from [low, high).
 DECODE_BATCH = 64
 DECODE_CONTEXT = (6144, 10240)
@@ -159,8 +164,25 @@ def device_normal(seed: int, shape: tuple[int, ...], dtype: Any) -> Any:
     import jax
     import jax.numpy as jnp
 
-    sampler = normal_sampler(tuple(shape), jnp.dtype(dtype).name)
-    return jax.block_until_ready(sampler(jax.random.key(seed, impl="rbg")))
+    shape = tuple(shape)
+    dtype_name = jnp.dtype(dtype).name
+    key = jax.random.key(seed, impl="rbg")
+    # An array whose float32 draw passes 1 GiB is drawn one leading-axis
+    # slice at a time into a donated buffer, so the draw never holds a second
+    # full-size copy (768K-token q is 12 GiB in float32).
+    if shape[0] == 1 or 4 * math.prod(shape) <= 2**30:
+        return jax.block_until_ready(normal_sampler(shape, dtype_name)(key))
+    sampler = normal_sampler((1, *shape[1:]), dtype_name)
+    put = jax.jit(
+        lambda out, part, i: jax.lax.dynamic_update_index_in_dim(
+            out, part, i, 0
+        ),
+        donate_argnums=0,
+    )
+    out = jnp.zeros(shape, dtype_name)
+    for i in range(shape[0]):
+        out = put(out, sampler(jax.random.fold_in(key, i)), i)
+    return jax.block_until_ready(out)
 
 
 def page_table(
@@ -737,6 +759,12 @@ CONFIGS = (
         "varlen_fwd",
         "flash_attn_varlen_func: packed K/V, causal per sequence",
         {**ATTN, "lengths": PREFILL_LENGTHS},
+        build_varlen_fwd,
+    ),
+    Config(
+        "varlen_fwd_large",
+        "flash_attn_varlen_func: packed K/V, causal, 768K tokens",
+        {**ATTN, "lengths": LARGE_PREFILL_LENGTHS},
         build_varlen_fwd,
     ),
     Config(
