@@ -86,11 +86,13 @@ META_SLOTS = 2
 STATE_ACTIVE = 0
 STATE_FILLED = 1
 NUM_STATE_ROWS = 2
-# Lanes of the call's chunk row: the index row of its first token, and that
-# token's row of the metadata.
+# Lanes of the call's chunk row: the index row of its first token, that
+# token's row of the metadata, and the call's last tokens that gather
+# nothing, which its workers skip.
 CHUNK_WORDS = 16
 CHUNK_FIRST_INDEX_ROW = 0
 CHUNK_FIRST_TOKEN = 1
+CHUNK_EMPTY_TOKENS = 2
 SEM_NOPE = 0
 SEM_ROPE = 1
 SEM_OUT = 2
@@ -190,13 +192,11 @@ def gather_plan(
     chunk_slots, num_buffers = gather_layout(
         num_tokens, top_k, pages_per_seq, vmem_words
     )
-    chunks_per_token = top_k // chunk_slots
-    num_chunks = num_tokens * chunks_per_token
     body = functools.partial(
         dsa_gather_kernel,
-        num_chunks=num_chunks,
-        chunks_per_worker=pl.cdiv(num_chunks, num_workers),
-        chunks_per_token=chunks_per_token,
+        num_tokens=num_tokens,
+        num_workers=num_workers,
+        chunks_per_token=top_k // chunk_slots,
         page_shift=page_size.bit_length() - 1,
         num_subcores=sparse_core.num_subcores,
         num_lanes=sparse_core.num_lanes,
@@ -289,8 +289,9 @@ def dsa_gather_pallas(
 
     Args:
       chunk_row: (CHUNK_WORDS,) int32, lane CHUNK_FIRST_INDEX_ROW the index
-        row of the first token and lane CHUNK_FIRST_TOKEN its metadata row;
-        traced, so every chunk of one size shares one kernel.
+        row of the first token, lane CHUNK_FIRST_TOKEN its metadata row and
+        lane CHUNK_EMPTY_TOKENS the last tokens, which gather nothing; traced,
+        so every chunk of one size shares one kernel.
       indices: (R * top_k,) int32 flat rows of top_k logical positions, a
         real token's row inside them; read in place.
       token_meta: (T, META_WORDS) int32 rows of token_metadata.
@@ -641,8 +642,8 @@ def dsa_gather_kernel(
     meta_vmem: jax.Array,
     table_vmem: jax.Array,
     *ring_scratch: jax.Array,
-    num_chunks: int,
-    chunks_per_worker: int,
+    num_tokens: int,
+    num_workers: int,
     chunks_per_token: int,
     page_shift: int,
     num_subcores: int,
@@ -650,7 +651,9 @@ def dsa_gather_kernel(
     writes_cache_rows: bool,
 ) -> None:
     """Each worker gathers its run of chunks in a _GatherRing, chunk c being
-    chunk_slots top-k slots of the call's token c // chunks_per_token.
+    chunk_slots top-k slots of the call's token c // chunks_per_token; the
+    runs split the chunks of the call's tokens but the empty ones its chunk
+    row names.
 
     The call's tokens are the metadata rows from the chunk row's first token
     on, and their index rows from its first index row on. ring_scratch:
@@ -673,9 +676,11 @@ def dsa_gather_kernel(
     )
     num_buffers, chunk_slots = ring.num_buffers, ring.chunk_slots
     worker = lax.axis_index("core") * num_subcores + lax.axis_index("subcore")
+    chunk_row = ring.load_chunk_row(chunk_hbm)
+    num_chunks = (num_tokens - chunk_row[CHUNK_EMPTY_TOKENS]) * chunks_per_token
+    chunks_per_worker = (num_chunks + num_workers - 1) // num_workers
     first_chunk = worker * chunks_per_worker
     num_local = jnp.clip(num_chunks - first_chunk, 0, chunks_per_worker)
-    chunk_row = ring.load_chunk_row(chunk_hbm)
     first_token = chunk_row[CHUNK_FIRST_TOKEN]
     first_index_slot = chunk_row[CHUNK_FIRST_INDEX_ROW] * (
         chunks_per_token * chunk_slots

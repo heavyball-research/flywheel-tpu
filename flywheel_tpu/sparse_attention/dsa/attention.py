@@ -17,8 +17,10 @@ scores, their top-k, and the attention over the selected latents, each
 request in the mode routing.py gives it.
 
 Tokens run in chunks: the SparseCore selects and gathers one chunk while the
-TensorCore scores the next. dsa_indices and dsa_attention_from_indices split
-a layer into selection and attention for callers that run them apart.
+TensorCore scores the next, and in a step with union requests it selects,
+unites and gathers one chunk while the TensorCore scores or attends another.
+dsa_indices and dsa_attention_from_indices split a layer into selection and
+attention for callers that run them apart.
 """
 
 import collections
@@ -91,12 +93,14 @@ from flywheel_tpu.sparse_attention.dsa.sparse_mla import (
     slot_indices,
 )
 from flywheel_tpu.sparse_attention.dsa.union_attention import (
-    UnionSelection,
+    UnionPass,
+    after,
+    attend_given,
+    chunk_union_slots,
     max_unions,
     token_unions,
-    union_attention,
     union_fits,
-    union_selection,
+    union_pass,
 )
 from flywheel_tpu.topk import topk
 from flywheel_tpu.topk.kernels.sparse_core_topk import WORD_BYTES
@@ -117,6 +121,10 @@ ATTEND_LAG = 3
 # Note (david): ATTEND_LAG + 1 chunks of rows and scores are live at once;
 # together they fit HBM >> PIPELINE_HBM_SHIFT, each under a SparseCore limit.
 PIPELINE_HBM_SHIFT = 1
+# Note (david): in a step with union requests, chunk c attends after chunk
+# c + UNION_ATTEND_LAG's scores, so its union and gather each run under a
+# TensorCore step.
+UNION_ATTEND_LAG = 2
 MAX_SPARSE_CORE_TENSOR_BYTES = 16 << 30
 ROUTE_SPARSE = "sparse"
 ROUTE_MASKED_DENSE = "masked_dense"
@@ -125,6 +133,8 @@ ROUTES = (ROUTE_SPARSE, ROUTE_MASKED_DENSE, ROUTE_UNION)
 # Note (david): the heads the union mode was measured at; its masked-dense
 # items grow with the heads.
 UNION_HEADS = (64,)
+# The fewest tokens of a request on the pinned union route.
+PINNED_UNION_Q_LEN = 1
 # Note (david): a call under MIN_ROUTED_TOKENS tokens (decode) compiles the
 # sparse MLA alone: routing on device costs it more than the dense modes save.
 MIN_ROUTED_TOKENS = 512
@@ -134,12 +144,6 @@ MIN_ROUTED_TOKENS = 512
 # still costs a call of each kernel, so the chunks after them run in a loop,
 # one at a time.
 SPARSE_HEAD_TOKENS = 256
-
-
-def after(value: jax.Array, anchor: jax.Array) -> jax.Array:
-    """value, which XLA may use only once anchor exists. Both must be
-    TensorCore values, as XLA moves a SparseCore call's done past barriers."""
-    return lax.optimization_barrier((value, anchor))[0]
 
 
 def max_chunk_tokens(top_k: int, max_seqlen_k: int) -> int:
@@ -211,6 +215,17 @@ class IndexerChunks(NamedTuple):
             *chunk_lengths(self.cu_q_lens, self.kv_lens, first, num_tokens),
             self.block_table,
             max_seqlen_k=self.max_seqlen_k,
+        )
+
+    def select(
+        self, first: int, num_tokens: int, scores: jax.Array
+    ) -> jax.Array:
+        """The (num_tokens, top_k) top-k of the call's tokens [first, first +
+        num_tokens) from their scores."""
+        return topk.top_k(
+            scores,
+            self.top_k,
+            row_lengths=self.row_lengths[first : first + num_tokens],
         )
 
 
@@ -362,6 +377,57 @@ def run_chunks(
     return outputs, assemble_indices(selections, padded_tokens)
 
 
+def attend_selected(
+    indexer: IndexerChunks,
+    unions: UnionPass,
+    starts: list[int],
+    chunk_tokens: int,
+    out: jax.Array,
+) -> tuple[jax.Array, list[tuple[int, jax.Array]]]:
+    """out with the unions' rows written in place, and each chunk's (first
+    token, top-k); scores c + UNION_ATTEND_LAG runs before attention c."""
+    num_chunks = len(starts)
+    selected, selections, gathered = ([None] * num_chunks for _ in range(3))
+
+    def score(chunk, anchor):
+        scores = indexer.scores(starts[chunk], chunk_tokens, anchor)
+        selected[chunk] = indexer.select(starts[chunk], chunk_tokens, scores)
+        return scores
+
+    def unite(chunk, anchor):
+        selections[chunk] = unions.select(
+            chunk, selected[chunk], selected[max(chunk - 1, 0)], anchor
+        )
+        return [selected[chunk], selections[chunk].table]
+
+    def gather(chunk, anchor):
+        gathered[chunk] = unions.gather(selections[chunk], anchor)
+        return [selections[chunk].meta, gathered[chunk].block_table]
+
+    step = score(0, None)
+    if num_chunks > 1:
+        step = score(1, step)
+    launched = unite(0, step)
+    step = queries = unions.queries((step, launched))
+    launched = gather(0, step)
+    if num_chunks > 1:
+        launched += unite(1, step)
+    for chunk in range(num_chunks):
+        later = chunk + UNION_ATTEND_LAG
+        if later < num_chunks:
+            step = score(later, (step, launched))
+            launched = []
+        if chunk + 1 < num_chunks:
+            launched += gather(chunk + 1, step)
+        out = unions.attend(
+            selections[chunk], gathered[chunk], queries, out, (step, launched)
+        )
+        step, launched = out, []
+        if later < num_chunks:
+            launched = unite(later, step)
+    return out, list(zip(starts, selected))
+
+
 class LayerOperands(NamedTuple):
     """One DSA layer call's checked operands and static parameters."""
 
@@ -487,48 +553,69 @@ def selected_indices(
     selections = []
     for first in chunk_starts(padded_tokens, chunk_tokens):
         scores = indexer.scores(first, chunk_tokens, None)
-        row_lengths = indexer.row_lengths[first : first + chunk_tokens]
-        indices = topk.top_k(scores, indexer.top_k, row_lengths=row_lengths)
-        selections.append((first, indices))
+        selections.append((first, indexer.select(first, chunk_tokens, scores)))
     return assemble_indices(selections, num_tokens)
+
+
+def by_selection(
+    indexer: IndexerChunks,
+    num_tokens: int,
+    causal: Callable[[jax.Array], object],
+    selected: Callable[[], object],
+) -> object:
+    """selected(), or with no indexer causal(each position a token sees, in
+    order, as (T, top_k) indices) when every request holds at most top_k
+    positions, which each token's exact top-k selects whole. The step's
+    lengths pick on device unless max_seqlen_k rules the indexer out."""
+
+    def _causal():
+        return causal(
+            causal_indices(
+                indexer.cu_q_lens, indexer.kv_lens, num_tokens, indexer.top_k
+            )
+        )
+
+    if indexer.max_seqlen_k <= indexer.top_k:
+        return _causal()
+    return lax.cond(
+        jnp.max(indexer.kv_lens) <= indexer.top_k, _causal, selected
+    )
 
 
 def routed_indices(
     indexer: IndexerChunks, num_tokens: int, chunk_tokens: int | None
 ) -> jax.Array:
     """Every token's (T, top_k) indices for the routed attention:
-    selected_indices, or with no indexer each position a token sees, in
-    order, when every request holds at most top_k positions, which each
-    token's exact top-k selects whole. The step's lengths pick on device
-    unless max_seqlen_k rules the indexer out."""
-    causal = functools.partial(
-        causal_indices,
-        indexer.cu_q_lens,
-        indexer.kv_lens,
+    selected_indices, or by_selection's causal indices."""
+    return by_selection(
+        indexer,
         num_tokens,
-        indexer.top_k,
-    )
-    if indexer.max_seqlen_k <= indexer.top_k:
-        return causal()
-    return lax.cond(
-        jnp.max(indexer.kv_lens) <= indexer.top_k,
-        causal,
+        lambda indices: indices,
         functools.partial(selected_indices, indexer, num_tokens, chunk_tokens),
     )
 
 
 class RoutePlan(NamedTuple):
     """A call's static route: the modes its requests may take, the mode
-    every request takes when the route is pinned, else None, and the most
-    unions the union mode builds."""
+    every request takes when the route is pinned, else None, the most
+    unions the union mode builds, and the fewest tokens of a union
+    request."""
 
     modes: tuple[int, ...]
     pinned_mode: int | None
     num_unions: int
+    min_union_q_len: int = MIN_UNION_Q_LEN
 
     @property
     def is_sparse_only(self) -> bool:
         return self.modes == (MODE_SPARSE,)
+
+    def union_slots(self, window_tokens: int, batch: int) -> int:
+        """Slots of a union chunk whose window holds window_tokens tokens of
+        batch requests."""
+        return chunk_union_slots(
+            window_tokens, batch, self.min_union_q_len, self.num_unions
+        )
 
     def request_modes(
         self, cu_q_lens: jax.Array, kv_lens: jax.Array
@@ -565,9 +652,11 @@ def route_plan(
         check_masked_dense_heads(num_heads)
         return RoutePlan((MODE_MASKED_DENSE,), MODE_MASKED_DENSE, 0)
     elif route == ROUTE_UNION:
-        num_unions = max_unions(num_tokens, batch, 1)
+        num_unions = max_unions(num_tokens, batch, PINNED_UNION_Q_LEN)
         check_union(num_heads, return_lse, num_unions, top_k, max_seqlen_k)
-        return RoutePlan((MODE_UNION,), MODE_UNION, num_unions)
+        return RoutePlan(
+            (MODE_UNION,), MODE_UNION, num_unions, PINNED_UNION_Q_LEN
+        )
     elif route is not None:
         raise ValueError(f"route must be None or one of {ROUTES}; got {route}.")
     num_unions = max_unions(num_tokens, batch, MIN_UNION_Q_LEN)
@@ -846,27 +935,6 @@ def masked_dense_pass(
         return out, lse_rows(lse, tokens_per_step(num_tokens))
 
 
-def union_pass(
-    operands: RoutedOperands,
-    selection: UnionSelection,
-    outputs: tuple[jax.Array, ...],
-) -> tuple[jax.Array, ...]:
-    """The union attention of selection's unions, written into outputs."""
-    out = union_attention(
-        operands.q_nope,
-        operands.q_pe,
-        operands.nope_cache,
-        operands.rope_cache,
-        selection,
-        operands.block_table,
-        outputs[0],
-        top_k=operands.topk_indices.shape[1],
-        sm_scale=operands.sm_scale,
-        kv_scale=operands.kv_scale,
-    )
-    return (out,)
-
-
 def sparse_chunk_tokens(chunk_tokens: int | None, num_tokens: int) -> int:
     """The sparse MLA's chunk of a call of num_tokens tokens: chunk_tokens,
     a multiple of the attention step's tokens, or its default if None; at
@@ -883,7 +951,7 @@ def attend_routed(
     q_pe: jax.Array,
     nope_cache: jax.Array,
     rope_cache: jax.Array,
-    topk_indices: jax.Array,
+    topk_indices: jax.Array | None,
     cu_q_lens: jax.Array,
     kv_lens: jax.Array,
     block_table: jax.Array,
@@ -896,29 +964,19 @@ def attend_routed(
     return_lse: bool,
     chunk_tokens: int | None,
     with_union: bool,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
-    """The attention of given indices with each request on its plan's mode,
-    in one output, each pass writing only its requests' rows. Without union
-    requests, the masked-dense pass makes the output, then the sparse pass
-    runs, whose head's gathers run under it. With them (with_union), the
-    output starts as initial_outputs: the union pass, the sparse head, the
+    union_chunk_tokens: int | None = None,
+    indexer: IndexerChunks | None = None,
+) -> RouteOutputs:
+    """The attention with each request on its plan's mode, each pass writing
+    only its requests' rows, of topk_indices, or of the indexer's top-k when
+    indexer is given; returns the outputs and the (T, top_k) indices.
+    Without union requests: the masked-dense pass, then the sparse pass.
+    With them (with_union): the union chunks, the sparse head, the
     masked-dense pass when a request takes it, then the sparse tail."""
     num_tokens, num_heads, _ = q_nope.shape
     padded_tokens = whole_steps(num_tokens)
     token_pad = ((0, padded_tokens - num_tokens), (0, 0), (0, 0))
-    operands = RoutedOperands(
-        jnp.pad(q_nope, token_pad),
-        jnp.pad(q_pe, token_pad),
-        nope_cache,
-        rope_cache,
-        topk_indices,
-        cu_q_lens,
-        kv_lens,
-        block_table,
-        kv_scale,
-        sm_scale,
-        return_lse,
-    )
+    q_nope, q_pe = jnp.pad(q_nope, token_pad), jnp.pad(q_pe, token_pad)
     modes = plan.request_modes(cu_q_lens, kv_lens)
     q_lens = request_q_lens(cu_q_lens)
     is_masked, is_union, is_sparse = (
@@ -929,59 +987,192 @@ def attend_routed(
         masked_seqlen_k = min(max_seqlen_k, MAX_MASKED_DENSE_KV_LEN)
     else:
         masked_seqlen_k = max_seqlen_k
+    route = RouteContext(
+        q_nope=q_nope,
+        q_pe=q_pe,
+        nope_cache=nope_cache,
+        rope_cache=rope_cache,
+        cu_q_lens=cu_q_lens,
+        kv_lens=kv_lens,
+        block_table=block_table,
+        plan=plan,
+        is_masked=is_masked,
+        is_union=is_union,
+        is_sparse=is_sparse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        masked_seqlen_k=masked_seqlen_k,
+        sm_scale=sm_scale,
+        kv_scale=kv_scale,
+        return_lse=return_lse,
+        chunk_tokens=chunk_tokens,
+        union_chunk_tokens=union_chunk_tokens,
+        num_tokens=num_tokens,
+    )
+    if with_union:
+        outputs, indices = attend_with_union(route, topk_indices, indexer)
+    else:
+        outputs, indices = attend_without_union(route, topk_indices)
+    return chunk_outputs(outputs, num_tokens, num_heads), indices
+
+
+class RouteContext(NamedTuple):
+    """One routed call's padded queries, operands, request masks and static
+    lengths."""
+
+    q_nope: jax.Array
+    q_pe: jax.Array
+    nope_cache: jax.Array
+    rope_cache: jax.Array
+    cu_q_lens: jax.Array
+    kv_lens: jax.Array
+    block_table: jax.Array
+    plan: RoutePlan
+    is_masked: jax.Array
+    is_union: jax.Array
+    is_sparse: jax.Array
+    max_seqlen_q: int
+    max_seqlen_k: int
+    masked_seqlen_k: int
+    sm_scale: float
+    kv_scale: jax.Array
+    return_lse: bool
+    chunk_tokens: int | None
+    union_chunk_tokens: int | None
+    num_tokens: int
+
+    @property
+    def padded_tokens(self) -> int:
+        return self.q_nope.shape[0]
+
+
+def route_passes(
+    route: RouteContext, topk_indices: jax.Array
+) -> tuple[Callable, "SparsePass"]:
+    """The route's masked-dense pass and sparse pass over topk_indices."""
+    operands = RoutedOperands(
+        route.q_nope,
+        route.q_pe,
+        route.nope_cache,
+        route.rope_cache,
+        topk_indices,
+        route.cu_q_lens,
+        route.kv_lens,
+        route.block_table,
+        route.kv_scale,
+        route.sm_scale,
+        route.return_lse,
+    )
     masked_dense = functools.partial(
         masked_dense_pass,
         operands,
-        is_masked,
-        max_seqlen_q=max_seqlen_q,
-        max_seqlen_k=masked_seqlen_k,
+        route.is_masked,
+        max_seqlen_q=route.max_seqlen_q,
+        max_seqlen_k=route.masked_seqlen_k,
     )
     sparse = SparsePass.of(
-        operands, is_sparse, sparse_chunk_tokens(chunk_tokens, padded_tokens)
+        operands,
+        route.is_sparse,
+        sparse_chunk_tokens(route.chunk_tokens, route.padded_tokens),
     )
+    return masked_dense, sparse
 
-    def _without_union():
-        if MODE_MASKED_DENSE in plan.modes:
-            outputs = masked_dense(None)
-        else:
-            outputs = initial_outputs(
-                cu_q_lens, operands.q_nope.shape, q_nope.dtype
-            )
-        if MODE_SPARSE in plan.modes:
-            outputs = sparse.tail(sparse.head(outputs))
-        return outputs
 
-    def _with_union():
-        # Note (david): the union pass runs first, so the SparseCore gathers
-        # its first chunk before the sparse head's, whose gathers then run
-        # under the union attention.
-        selection = union_selection(
-            topk_indices,
-            token_unions(cu_q_lens, kv_lens, is_union, plan.num_unions),
-            max_seqlen_k=max_seqlen_k,
-        )
-        outputs = initial_outputs(
-            cu_q_lens, operands.q_nope.shape, q_nope.dtype
-        )
-        outputs = union_pass(operands, selection, outputs)
-        if MODE_SPARSE in plan.modes:
-            outputs = sparse.head(outputs)
-        if MODE_MASKED_DENSE in plan.modes:
-            outputs = lax.cond(
-                jnp.any(is_masked),
-                masked_dense,
-                lambda outputs: outputs,
-                outputs,
-            )
-        if MODE_SPARSE in plan.modes:
-            outputs = sparse.tail(outputs)
-        return outputs
-
-    if with_union:
-        outputs = _with_union()
+def attend_without_union(
+    route: RouteContext, topk_indices: jax.Array
+) -> tuple[tuple, jax.Array]:
+    """The masked-dense pass, then the sparse pass, of topk_indices."""
+    masked_dense, sparse = route_passes(route, topk_indices)
+    if MODE_MASKED_DENSE in route.plan.modes:
+        outputs = masked_dense(None)
     else:
-        outputs = _without_union()
-    return chunk_outputs(outputs, num_tokens, num_heads)
+        outputs = initial_outputs(
+            route.cu_q_lens, route.q_nope.shape, route.q_nope.dtype
+        )
+    if MODE_SPARSE in route.plan.modes:
+        outputs = sparse.tail(sparse.head(outputs))
+    return outputs, topk_indices
+
+
+def attend_unions(
+    route: RouteContext,
+    starts: list[int],
+    union_chunk: int,
+    top_k: int,
+    given_indices: jax.Array | None,
+    indexer: IndexerChunks | None,
+) -> tuple[jax.Array, jax.Array]:
+    """The union chunks' out and the (T, top_k) indices: given_indices, or
+    the indexer's top-k when given_indices is None."""
+    unions = union_pass(
+        route.q_nope,
+        route.q_pe,
+        route.nope_cache,
+        route.rope_cache,
+        route.block_table,
+        token_unions(
+            route.cu_q_lens,
+            route.kv_lens,
+            route.is_union,
+            route.plan.num_unions,
+        ),
+        starts,
+        union_chunk,
+        # Note (david): the indexer's chunks select their own tokens; given
+        # indices hold every token's row.
+        index_starts=starts if given_indices is None else [0] * len(starts),
+        num_slots=route.plan.union_slots(union_chunk, route.kv_lens.shape[0]),
+        top_k=top_k,
+        sm_scale=route.sm_scale,
+        kv_scale=route.kv_scale,
+        max_seqlen_k=route.max_seqlen_k,
+    )
+    out = initial_outputs(
+        route.cu_q_lens, route.q_nope.shape, route.q_nope.dtype
+    )[0]
+    if given_indices is not None:
+        return attend_given(unions, given_indices, out), given_indices
+    out, selections = attend_selected(indexer, unions, starts, union_chunk, out)
+    return out, assemble_indices(selections, route.num_tokens)
+
+
+def attend_with_union(
+    route: RouteContext,
+    topk_indices: jax.Array | None,
+    indexer: IndexerChunks | None,
+) -> tuple[tuple, jax.Array]:
+    """The union chunks, the sparse head, the masked-dense pass when a
+    request takes it, then the sparse tail."""
+    top_k = indexer.top_k if indexer is not None else topk_indices.shape[1]
+    union_chunk = call_chunk_tokens(
+        route.union_chunk_tokens, route.padded_tokens, top_k, route.max_seqlen_k
+    )
+    starts = chunk_starts(route.padded_tokens, union_chunk)
+    unions = functools.partial(
+        attend_unions, route, starts, union_chunk, top_k, indexer=indexer
+    )
+    # Note (david): only the union chunks sit in the selection's cond, so the
+    # other passes see their operands as without the union mode.
+    if indexer is None:
+        out, indices = unions(topk_indices)
+    else:
+        out, indices = by_selection(
+            indexer, route.num_tokens, unions, lambda: unions(None)
+        )
+    masked_dense, sparse = route_passes(route, indices)
+    outputs = (out,)
+    if MODE_SPARSE in route.plan.modes:
+        outputs = sparse.head(outputs)
+    if MODE_MASKED_DENSE in route.plan.modes:
+        outputs = lax.cond(
+            jnp.any(route.is_masked),
+            masked_dense,
+            lambda outputs: outputs,
+            outputs,
+        )
+    if MODE_SPARSE in route.plan.modes:
+        outputs = sparse.tail(outputs)
+    return outputs, indices
 
 
 def initial_outputs(
@@ -1040,10 +1231,7 @@ def routed(
     route: str | None,
     return_indices: bool,
 ) -> jax.Array | tuple[jax.Array, ...]:
-    """The layer through route, or by the rule if None: the sparse pipeline,
-    or every token's indices (routed_indices) and their routed attention,
-    as call_route picks. Each path builds only the outputs that
-    with_indices keeps."""
+    """The layer through route, or by the rule if None, as call_route picks."""
     num_tokens, num_heads, _ = layer.q_nope.shape
     plan = route_plan(
         route,
@@ -1060,12 +1248,11 @@ def routed(
         return with_indices(sparse_route(layer), return_indices)
 
     def _routed(with_union):
-        indices = routed_indices(
-            layer_indexer(layer, whole_steps(num_tokens)),
-            num_tokens,
-            layer.chunk_tokens,
-        )
-        outputs = attend_routed(
+        indexer = layer_indexer(layer, whole_steps(num_tokens))
+        indices = None
+        if not with_union:
+            indices = routed_indices(indexer, num_tokens, layer.chunk_tokens)
+        route_outputs = attend_routed(
             layer.q_nope,
             layer.q_pe,
             layer.nope_cache,
@@ -1081,9 +1268,11 @@ def routed(
             kv_scale=layer.kv_scale,
             return_lse=layer.return_lse,
             chunk_tokens=None,
+            union_chunk_tokens=layer.chunk_tokens,
             with_union=with_union,
+            indexer=indexer if with_union else None,
         )
-        return with_indices((outputs, indices), return_indices)
+        return with_indices(route_outputs, return_indices)
 
     return call_route(
         plan, layer.cu_q_lens, layer.kv_lens, num_tokens, _sparse, _routed
@@ -1308,7 +1497,7 @@ def dsa_attention_from_indices(
             return_lse=return_lse,
             chunk_tokens=chunk_tokens,
             with_union=with_union,
-        )
+        )[0]
 
     return call_route(plan, cu_q_lens, kv_lens, num_tokens, sparse, _routed)
 

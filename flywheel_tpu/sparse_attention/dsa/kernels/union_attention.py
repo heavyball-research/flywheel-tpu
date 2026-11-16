@@ -109,25 +109,23 @@ NUM_STATE_SLOTS = 2
 NUM_OUTPUT_SLOTS = 2
 FP8_MAX = 448.0
 HALF_NO_KEY = 0.5 * NO_KEY_MAX
-# Lanes of a union's row in the schedule: the call's row of its first token,
-# its tokens, its size, its first gathered row, its periods and the next
-# union with periods.
+# The schedule's rows: the header, then a row per union. Lanes of a union's
+# row: the call's row of its first token, its tokens, its size, its first
+# gathered row, its periods (union_periods) and the next union with tokens.
 ROW_FIRST_TOKEN = 0
 ROW_NUM_TOKENS = 1
 ROW_SIZE = 2
 ROW_FIRST_ROW = 3
 ROW_NUM_PERIODS = 4
 ROW_NEXT_UNION = 5
-ROW_WORDS = 8
-# Words of the schedule's header: the call's periods, its first and last
-# unions with periods and its real tokens, before the union rows.
-HEADER_NUM_PERIODS = 0
-HEADER_FIRST_UNION = 1
-HEADER_LAST_UNION = 2
-HEADER_NUM_REAL = 3
-# Note (david): set, every union replays, which tests the replay.
-HEADER_FORCE_REPLAY = 4
-HEADER_WORDS = 8
+ROW_WORDS = 16
+# Lanes of the schedule's header: the call's first and last unions with
+# tokens and its real tokens.
+HEADER_FIRST_UNION = 0
+HEADER_LAST_UNION = 1
+HEADER_NUM_REAL = 2
+HEADER_WORDS = 16
+HEADER_ROW = 0
 SEM_NOPE = 0
 SEM_ROPE = 1
 SEM_QUERY = 2
@@ -144,7 +142,7 @@ PENDING_WORDS = 2
 class UnionAttentionParams(NamedTuple):
     """Static parameters of one union attention call. has_previous_out: out
     aliases an earlier call's out; else the call zeros the rows past its real
-    tokens."""
+    tokens. force_replay: every union replays, which tests the replay."""
 
     union_tokens: int
     num_heads: int
@@ -153,6 +151,7 @@ class UnionAttentionParams(NamedTuple):
     bitmap_rows: int
     sm_scale_log2: float
     has_previous_out: bool
+    force_replay: bool
 
 
 class UnionAttentionRefs(NamedTuple):
@@ -226,8 +225,16 @@ class UnionAttentionKernel:
         ]
         self.qk_accumulators = per_mxu[:NUM_MXUS]
         self.pv_accumulators = per_mxu[NUM_MXUS:]
-        self.num_periods = refs.schedule[HEADER_NUM_PERIODS]
-        self.last_union = refs.schedule[HEADER_LAST_UNION]
+        self.first_union = refs.schedule[HEADER_ROW, HEADER_FIRST_UNION]
+        self.last_union = refs.schedule[HEADER_ROW, HEADER_LAST_UNION]
+        self.num_periods = lax.fori_loop(
+            self.first_union,
+            self.last_union + 1,
+            lambda union, total: (
+                total + refs.schedule[HEADER_ROW + 1 + union, ROW_NUM_PERIODS]
+            ),
+            jnp.int32(0),
+        )
         self.kv_scale = refs.kv_scale[0]
         # Note (david): K and V share the cache's kv_scale, so it folds into
         # the score scale and the output normalization.
@@ -240,10 +247,9 @@ class UnionAttentionKernel:
         union = jnp.where(
             (union < 0) | (union > self.last_union), self.last_union, union
         )
-        first = HEADER_WORDS + ROW_WORDS * union
+        row = HEADER_ROW + 1 + union
         return UnionRow(*(
-            self.refs.schedule[first + lane]
-            for lane in range(ROW_NEXT_UNION + 1)
+            self.refs.schedule[row, lane] for lane in range(ROW_NEXT_UNION + 1)
         ))
 
     def next_period(self, period: Period) -> Period:
@@ -538,7 +544,7 @@ class UnionAttentionKernel:
         row = self.union_row(done)
         slot = lax.rem(done_ordinal + NUM_OUTPUT_SLOTS, NUM_OUTPUT_SLOTS)
         is_real = done >= 0
-        is_forced = refs.schedule[HEADER_FORCE_REPLAY] > 0
+        is_forced = self.params.force_replay
         is_flagged = is_real & ((jnp.max(flags) > 0.0) | is_forced)
         count = refs.replay[0]
         refs.replay[1 + count] = done
@@ -681,10 +687,7 @@ class UnionAttentionKernel:
         """The first union's queries and the first periods' rows, the first
         period's keys staged and its first RHS tiles pushed; returns the
         first step's carry."""
-        refs = self.refs
-        first = Period(
-            refs.schedule[HEADER_FIRST_UNION], jnp.int32(0), jnp.int32(0)
-        )
+        first = Period(self.first_union, jnp.int32(0), jnp.int32(0))
         second_union = self.union_row(first.union).next_union
         for ordinal, union in enumerate((first.union, second_union)):
             for copy in self.union_copies(union, jnp.int32(ordinal)):
@@ -732,7 +735,7 @@ class UnionAttentionKernel:
         refs = self.refs
         num_tokens = refs.out.shape[0]
         union_tokens = self.params.union_tokens
-        first_padding = refs.schedule[HEADER_NUM_REAL]
+        first_padding = refs.schedule[HEADER_ROW, HEADER_NUM_REAL]
         num_chunks = (
             num_tokens - first_padding + union_tokens - 1
         ) // union_tokens
@@ -935,48 +938,12 @@ def union_attention_kernel(
     pl.run_scoped(_body, *accumulators)
 
 
-def union_schedule(
-    unions: jax.Array, num_real: jax.Array, period_keys: int
-) -> jax.Array:
-    """(..., HEADER_WORDS + U * ROW_WORDS) int32 schedules of
-    (..., U, 4) union rows (first token, tokens, size, first gathered row):
-    each union with tokens takes its size in periods of period_keys keys, at
-    least MIN_PERIODS; one without takes none. num_real: the calls' real
-    tokens."""
-    first_token, num_tokens, size, first_row = jnp.moveaxis(unions, -1, 0)
-    num_unions = size.shape[-1]
-    num_periods = jnp.where(
-        num_tokens > 0, jnp.maximum(pl.cdiv(size, period_keys), MIN_PERIODS), 0
+def union_periods(num_tokens: jax.Array, size: jax.Array) -> jax.Array:
+    """A union's periods: its size in periods of PERIOD_KEYS keys, at least
+    MIN_PERIODS, with tokens; none without."""
+    return jnp.where(
+        num_tokens > 0, jnp.maximum(pl.cdiv(size, PERIOD_KEYS), MIN_PERIODS), 0
     )
-    union = jnp.broadcast_to(
-        jnp.arange(num_unions, dtype=jnp.int32), size.shape
-    )
-    # Note (david): a union's next is the first later one with periods, the
-    # union count when none follows.
-    with_periods = jnp.where(num_periods > 0, union, num_unions)
-    later = lax.cummin(with_periods, axis=with_periods.ndim - 1, reverse=True)
-    tail = jnp.full(size.shape[:-1] + (1,), num_unions, jnp.int32)
-    next_union = jnp.concatenate([later[..., 1:], tail], axis=-1)
-    zeros = jnp.zeros_like(size)
-    rows = jnp.stack(
-        [first_token, num_tokens, size, first_row, num_periods, next_union]
-        + [zeros] * (ROW_WORDS - ROW_NEXT_UNION - 1),
-        axis=-1,
-    )
-    last_union = jnp.max(jnp.where(num_periods > 0, union, -1), axis=-1)
-    header = jnp.stack(
-        [
-            num_periods.sum(axis=-1),
-            later[..., 0],
-            last_union,
-            jnp.broadcast_to(num_real, size.shape[:-1]),
-        ]
-        + [zeros[..., 0]] * (HEADER_WORDS - HEADER_NUM_REAL - 1),
-        axis=-1,
-    )
-    return jnp.concatenate(
-        [header, rows.reshape(*size.shape[:-1], -1)], axis=-1
-    ).astype(jnp.int32)
 
 
 def scratch_shapes(params: UnionAttentionParams, q_dtype: jnp.dtype) -> list:
@@ -1021,7 +988,13 @@ def scratch_shapes(params: UnionAttentionParams, q_dtype: jnp.dtype) -> list:
 # the kernel once for all of them.
 @functools.partial(
     jax.jit,
-    static_argnames=("union_tokens", "sm_scale", "num_slabs", "force_replay"),
+    static_argnames=(
+        "union_tokens",
+        "num_unions",
+        "sm_scale",
+        "num_slabs",
+        "force_replay",
+    ),
 )
 def dsa_union_attention_pallas(
     q_nope: jax.Array,
@@ -1033,6 +1006,7 @@ def dsa_union_attention_pallas(
     kv_scale: jax.Array,
     *,
     union_tokens: int,
+    num_unions: int,
     sm_scale: float,
     num_slabs: int,
     previous_out: jax.Array | None,
@@ -1050,13 +1024,13 @@ def dsa_union_attention_pallas(
         rows, as the cache holds them.
       bitmap: (T * bitmap_rows(num_slabs), NUM_LANES) int32 membership
         bitmaps of each token over its union's positions.
-      schedule: union_schedule's row of the call, at PERIOD_KEYS.
+      schedule: (1 + U, NUM_LANES) int32 rows the union kernel writes: the
+        header, then a row for each of the num_unions unions read.
       kv_scale: (1,) f32.
       union_tokens: the most tokens a union holds, at most MAX_BLOCK_Q.
       sm_scale: positive scale of q_nope . latent + q_pe . rope.
       num_slabs: the bitmaps' slabs a token.
-      previous_out: an earlier call's out, which out is written into in
-        place, or None.
+      previous_out: an earlier call's out, written into in place, or None.
       force_replay: replay every union, as an overflowing one is.
 
     Returns:
@@ -1068,14 +1042,13 @@ def dsa_union_attention_pallas(
     params = UnionAttentionParams(
         union_tokens=union_tokens,
         num_heads=num_heads,
-        num_unions=(schedule.shape[0] - HEADER_WORDS) // ROW_WORDS,
+        num_unions=num_unions,
         num_slabs=num_slabs,
         bitmap_rows=bitmap_rows(num_slabs),
         sm_scale_log2=sm_scale * LOG2E,
         has_previous_out=previous_out is not None,
+        force_replay=force_replay,
     )
-    if force_replay:
-        schedule = schedule.at[HEADER_FORCE_REPLAY].set(1)
     hbm_spec = pl.BlockSpec(memory_space=pltpu.HBM)
     inputs = [kv_scale, q_nope, q_pe_t, nope_rows, rope_rows, bitmap]
     in_specs = [pl.BlockSpec(memory_space=pltpu.SMEM)] + [hbm_spec] * 5
