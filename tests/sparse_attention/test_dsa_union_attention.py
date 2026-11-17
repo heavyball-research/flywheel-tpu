@@ -13,15 +13,24 @@
 # limitations under the License.
 
 """The union attention of some of a call's unions, against the reference
-sparse MLA on their tokens' rows."""
+sparse MLA on their tokens' rows; and of every token's unions from scores,
+each chunk's top-k, union and gather in one SparseCore call."""
 
+import dataclasses
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.sparse_attention.dsa.attention import (
+    assemble_indices,
+    attend_selected,
+)
+from flywheel_tpu.sparse_attention.dsa.indexer import score_columns
 from flywheel_tpu.sparse_attention.dsa.sparse_mla import chunk_starts
 from flywheel_tpu.sparse_attention.dsa.union_attention import (
     attend_given,
@@ -34,6 +43,8 @@ from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
     dsa_split_cache,
     grid_params,
+    indexer_row_lengths,
+    indexer_topk,
     make_dsa_case,
     param_id,
     sparse_mla_reference,
@@ -127,3 +138,89 @@ def test_union_subset(param, force_replay):
     )
     other_rows = np.setdiff1d(np.arange(num_tokens), rows)
     np.testing.assert_array_equal(np.asarray(out[other_rows], np.float32), 1.0)
+
+
+class GivenScores(NamedTuple):
+    """An IndexerChunks of given flat scores: a chunk's scores are its rows
+    of them."""
+
+    flat_scores: jax.Array
+    row_lengths: jax.Array
+
+    def scores(self, first, num_tokens, anchor):
+        del anchor  # Unused: the scores exist already.
+        return self.flat_scores[first : first + num_tokens]
+
+
+@pytest.mark.parametrize("param", PARAMS, ids=param_id)
+def test_union_selection(param):
+    """From scores, each chunk's top-k, union and gather in one SparseCore
+    call: every token attends as the reference over the scores' exact
+    top-k, and its top-k comes back."""
+    case = make_dsa_case(param)
+    num_tokens, batch = case.q_nope.shape[0], case.kv_lens.shape[0]
+    max_seqlen_k = int(case.kv_lens.max())
+    lengths = indexer_row_lengths(case.cu_q_lens, case.kv_lens, num_tokens)
+    scores = np.random.default_rng(param.seed).standard_normal(
+        (num_tokens, score_columns(max_seqlen_k)), np.float32
+    )
+    expected = indexer_topk(scores, lengths, param.top_k)
+    out_ref, _ = sparse_mla_reference(
+        dataclasses.replace(case, topk_indices=expected)
+    )
+    nope_cache, rope_cache = dsa_split_cache(case.kv_cache)
+    num_unions = max_unions(num_tokens, batch, 1)
+    chunk_tokens = min(MAX_CHUNK_TOKENS, num_tokens)
+    starts = chunk_starts(num_tokens, chunk_tokens)
+
+    @jax.jit
+    def attend(q_nope, q_pe, nope_cache, rope_cache, requests, flat, scale):
+        cu_q_lens, kv_lens, block_table, row_lengths = requests
+        unions = union_pass(
+            q_nope,
+            q_pe,
+            nope_cache,
+            rope_cache,
+            block_table,
+            token_unions(
+                cu_q_lens, kv_lens, jnp.ones((batch,), bool), num_unions
+            ),
+            starts,
+            chunk_tokens,
+            index_starts=starts,
+            num_slots=chunk_union_slots(chunk_tokens, batch, 1, num_unions),
+            top_k=param.top_k,
+            sm_scale=SM_SCALE,
+            kv_scale=scale,
+            max_seqlen_k=max_seqlen_k,
+        )
+        out, selections = attend_selected(
+            GivenScores(flat, row_lengths),
+            unions,
+            starts,
+            chunk_tokens,
+            jnp.zeros(q_nope.shape, q_nope.dtype),
+        )
+        return out, assemble_indices(selections, num_tokens)
+
+    requests = (case.cu_q_lens, case.kv_lens, case.block_table, lengths)
+    out, indices = attend(
+        jnp.asarray(case.q_nope),
+        jnp.asarray(case.q_pe),
+        jnp.asarray(nope_cache),
+        jnp.asarray(rope_cache),
+        tuple(jnp.asarray(values) for values in requests),
+        jnp.asarray(scores).reshape(num_tokens, -1, NUM_LANES),
+        jnp.float32(case.kv_scale),
+    )
+    num_real = int(case.cu_q_lens[-1])
+    np.testing.assert_array_equal(
+        np.sort(np.asarray(indices)[:num_real], axis=1),
+        np.sort(expected[:num_real], axis=1),
+    )
+    assert check_is_allclose(
+        "out",
+        out[:num_real],
+        out_ref[:num_real].astype(jnp.bfloat16),
+        **OUT_TOL,
+    )
