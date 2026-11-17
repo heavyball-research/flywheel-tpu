@@ -105,8 +105,11 @@ of DSA_PAGE pages, on decode, chunked prefill and mixed. A DSA cell whose
 last call fails COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as
 check_failed. With --dsa-indices, flywheel_dsa runs only
 dsa_attention_from_indices on mixed, each token taking the file's row of its
-position, and only COS_DIFF_BOUND applies. With --trace a DSA record also
-holds trace_module_ms, the device span of one call (kernel time), next to
+position, and only COS_DIFF_BOUND applies. flywheel_dsa_indexer and
+torchtpu_dsa_indexer run the indexer's scores and top-k alone on the same
+calls, every call's keys written before the clock, and only
+INDEX_DEFICIT_BOUND applies. With --trace a DSA record also holds
+trace_module_ms, the device span of one call (kernel time), next to
 ms_per_call (wall-clock).
 
 Only the kernel calls are inside the clock: q, k and v are drawn once and
@@ -1248,7 +1251,7 @@ def dsa_cell_record(cell, build_scenario, trace_directory):
     if trace_directory is None:
         return record
     per_op = trace_scenario(
-        cell, scenario.step, scenario.fresh(), trace_directory
+        cell, scenario.step, scenario.initial_caches(), trace_directory
     )
     if per_op is None:
         record["trace_error"] = "no device events in the trace"
