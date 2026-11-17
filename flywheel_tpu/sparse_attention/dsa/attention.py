@@ -18,7 +18,8 @@ request in the mode routing.py gives it.
 
 Tokens run in chunks: the SparseCore selects and gathers one chunk while the
 TensorCore scores the next, and in a step with union requests it selects,
-unites and gathers one chunk while the TensorCore scores or attends another.
+unites and gathers one chunk in one call while the TensorCore attends the
+chunk before.
 dsa_indices and dsa_attention_from_indices split a layer into selection and
 attention for callers that run them apart.
 """
@@ -121,10 +122,6 @@ ATTEND_LAG = 3
 # Note (david): ATTEND_LAG + 1 chunks of rows and scores are live at once;
 # together they fit HBM >> PIPELINE_HBM_SHIFT, each under a SparseCore limit.
 PIPELINE_HBM_SHIFT = 1
-# Note (david): in a step with union requests, chunk c attends after chunk
-# c + UNION_ATTEND_LAG's scores, so its union and gather each run under a
-# TensorCore step.
-UNION_ATTEND_LAG = 2
 MAX_SPARSE_CORE_TENSOR_BYTES = 16 << 30
 ROUTE_SPARSE = "sparse"
 ROUTE_MASKED_DENSE = "masked_dense"
@@ -385,47 +382,54 @@ def attend_selected(
     out: jax.Array,
 ) -> tuple[jax.Array, list[tuple[int, jax.Array]]]:
     """out with the unions' rows written in place, and each chunk's (first
-    token, top-k); scores c + UNION_ATTEND_LAG runs before attention c."""
+    token, top-k). Chunk c's top-k, union and gather run in one SparseCore
+    call, which reads chunk c - 1's top-k and launches before attention
+    c - 1, so that it runs under it; chunk 0's call runs under the scores of
+    chunks 1 to ATTEND_LAG, and scores c + ATTEND_LAG runs before attention
+    c."""
     num_chunks = len(starts)
-    selected, selections, gathered = ([None] * num_chunks for _ in range(3))
+    lag = min(ATTEND_LAG, num_chunks - 1)
+    scores, selected = [None] * num_chunks, [None] * num_chunks
 
     def score(chunk, anchor):
-        scores = indexer.scores(starts[chunk], chunk_tokens, anchor)
-        selected[chunk] = indexer.select(starts[chunk], chunk_tokens, scores)
-        return scores
+        scores[chunk] = indexer.scores(starts[chunk], chunk_tokens, anchor)
 
-    def unite(chunk, anchor):
-        selections[chunk] = unions.select(
-            chunk, selected[chunk], selected[max(chunk - 1, 0)], anchor
+    def select(chunk, anchor):
+        first = starts[chunk]
+        selected[chunk] = unions.select_and_gather(
+            chunk,
+            scores[chunk],
+            indexer.row_lengths[first : first + chunk_tokens],
+            selected[chunk - 1].indices if chunk > 0 else None,
+            anchor,
         )
-        return [selected[chunk], selections[chunk].table]
 
-    def gather(chunk, anchor):
-        gathered[chunk] = unions.gather(selections[chunk], anchor)
-        return [selections[chunk].meta, gathered[chunk].block_table]
-
-    step = score(0, None)
-    if num_chunks > 1:
-        step = score(1, step)
-    launched = unite(0, step)
-    step = queries = unions.queries((step, launched))
-    launched = gather(0, step)
-    if num_chunks > 1:
-        launched += unite(1, step)
+    # Note (david): a step anchored on a call's output waits for the call
+    # there, so no step is: a call is pinned after the step before its
+    # launch, and XLA launches it there.
+    score(0, None)
+    select(0, None)
+    for chunk in range(1, lag + 1):
+        score(chunk, scores[chunk - 1])
+    step = queries = unions.queries(scores[lag])
     for chunk in range(num_chunks):
-        later = chunk + UNION_ATTEND_LAG
-        if later < num_chunks:
-            step = score(later, (step, launched))
-            launched = []
         if chunk + 1 < num_chunks:
-            launched += gather(chunk + 1, step)
-        out = unions.attend(
-            selections[chunk], gathered[chunk], queries, out, (step, launched)
+            select(chunk + 1, step)
+        later = chunk + lag
+        if chunk > 0 and later < num_chunks:
+            score(later, step)
+            step = scores[later]
+        step = out = unions.attend(
+            selected[chunk].selection,
+            selected[chunk].gathered,
+            queries,
+            out,
+            step,
         )
-        step, launched = out, []
-        if later < num_chunks:
-            launched = unite(later, step)
-    return out, list(zip(starts, selected))
+    # Note (david): an op that reads a call's top-k waits for the call where
+    # XLA puts it, so the top-k are read after the last attention.
+    indices = after([chunk.indices for chunk in selected], out)
+    return out, list(zip(starts, indices))
 
 
 class LayerOperands(NamedTuple):

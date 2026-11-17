@@ -15,7 +15,9 @@
 """SparseCore union of the top-k selections of each run of tokens: the
 positions any of its tokens selects, once each, each token's membership
 bitmap over the union, the bits of the union indices of the positions it
-selects, and the union's metadata row for the gather of its positions."""
+selects, and the union's metadata row for the gather of its positions;
+alone, or in one call between the top-k that selects the rows and the
+gather of the unions' positions."""
 
 import functools
 import math
@@ -37,7 +39,10 @@ from flywheel_tpu.sparse_attention.dsa.kernels.gather import (
     META_TABLE_OFFSET,
     META_WORDS,
     UNUSED_INDEX,
+    SparseCorePlan,
     gather_compiler_params,
+    gather_plan,
+    sparse_core_barrier,
     sparse_core_mesh,
 )
 from flywheel_tpu.sparse_attention.dsa.kernels.masked_dense import (
@@ -62,7 +67,14 @@ from flywheel_tpu.sparse_attention.dsa.kernels.union_attention import (
     ROW_WORDS,
     union_periods,
 )
-from flywheel_tpu.topk.kernels.sparse_core_topk import sparse_core_vmem_words
+from flywheel_tpu.topk.kernels.sparse_core_topk import (
+    TopkGeometry,
+    check_vmem as check_topk_vmem,
+    scratch_types as topk_scratch_types,
+    sparse_core_vmem_words,
+    topk_worker,
+    worker_major_rows,
+)
 
 # Lanes of a union's row: its first token's call row, its tokens (consecutive,
 # in one request), that token's position, its index row (negative: in the
@@ -97,6 +109,12 @@ SEM_BITMAP = 1
 SEM_UNION = 2
 NUM_UNION_SEMS = 3
 UNION_UNROLL = 4
+TOPK_UNION_GATHER = "dsa_topk_union_gather"
+# Note (david): the phases of the top-k, union and gather call run one after
+# another, so their VMEM buffers share one pool, views of its rows of
+# POOL_WIDTH words, a DMA granule; the allocator gives each scope of a
+# kernel its own memory.
+POOL_WIDTH = 8
 
 
 def num_union_workers() -> int:
@@ -596,36 +614,88 @@ def union_kernel(
     pl.when(num_local > 0)(functools.partial(union.run, num_local))
 
 
+class UnionShape(NamedTuple):
+    """Static sizes of one chunk's union: the call's tokens, a union's most
+    tokens, slots of a union's row (whole UNION_PAGE, at least union_tokens
+    * top_k + UNION_FILL_SLOTS), a bitmap's slabs, the positions' bound and
+    the chunk's slots, the unions of its schedule."""
+
+    num_tokens: int
+    union_tokens: int
+    union_slots: int
+    num_slabs: int
+    max_seqlen_k: int
+    num_slots: int
+
+
+def union_plan(
+    table_words: int, top_k: int, shape: UnionShape
+) -> SparseCorePlan:
+    """The union of one chunk of a union table of table_words words, top_k
+    selected positions a token, on this chip's SparseCores."""
+    slots = padded_union_slots(shape.num_slots)
+    check_union_operands(
+        table_words % ((1 + slots) * UNION_WORDS),
+        slots,
+        top_k,
+        shape.union_tokens,
+        shape.union_slots,
+        shape.num_slabs,
+        shape.max_seqlen_k,
+    )
+    scratch_shapes = union_scratch_shapes(
+        slots,
+        shape.union_tokens,
+        top_k,
+        shape.union_slots,
+        shape.num_slabs,
+        shape.max_seqlen_k,
+    )
+    sparse_core = pltpu.get_tpu_info().sparse_core
+    body = functools.partial(
+        union_kernel,
+        top_k=top_k,
+        num_slabs=shape.num_slabs,
+        num_slots=shape.num_slots,
+        num_real=shape.num_tokens,
+        num_subcores=sparse_core.num_subcores,
+        num_lanes=sparse_core.num_lanes,
+    )
+    out_type = union_out_types(
+        slots, shape.union_slots, shape.num_tokens, shape.num_slabs
+    )
+    scratch_types = (
+        *(pltpu.VMEM(scratch, jnp.int32) for scratch in scratch_shapes),
+        pltpu.SemaphoreType.DMA(
+            (NUM_UNION_SEMS, max(NUM_INDEX_BUFFERS, NUM_TOKEN_BITMAPS))
+        ),
+    )
+    return SparseCorePlan(body, out_type, scratch_types)
+
+
 def dsa_union_pallas(
     indices: jax.Array,
     previous_indices: jax.Array,
     unions: jax.Array,
     chunk_row: jax.Array,
     *,
-    num_tokens: int,
-    union_tokens: int,
-    union_slots: int,
-    num_slabs: int,
-    max_seqlen_k: int,
-    num_slots: int,
+    shape: UnionShape,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     """One chunk's union on the SparseCores.
 
     Args:
       indices: (R, top_k) int32 positions within each token's request, of
         the rows UNION_INDEX_ROW names; a token's used indices distinct and
-        below max_seqlen_k, top_k a multiple of the SparseCore's lanes.
+        below shape.max_seqlen_k, top_k a multiple of the SparseCore's
+        lanes.
       previous_indices: (R', top_k) int32 rows UNION_PREVIOUS_ROW names, for
         a token whose UNION_INDEX_ROW is negative.
       unions: the union table: per chunk a count row (lane COUNT_UNIONS) and
-        padded_union_slots(num_slots) union rows, the ones with tokens first.
+        padded_union_slots(shape.num_slots) union rows, the ones with tokens
+        first.
       chunk_row: (UNION_WORDS,) int32, lane CHUNK_BLOCK_WORD the chunk's
         first word in the table.
-      num_tokens, union_tokens, num_slabs, max_seqlen_k: the call's tokens,
-        a union's most tokens, a bitmap's slabs, the positions' bound.
-      union_slots: slots of a union's row, whole UNION_PAGE, at least
-        union_tokens * top_k + UNION_FILL_SLOTS.
-      num_slots: the chunk's slots, the unions of its schedule.
+      shape: the union's static sizes.
 
     Returns:
       (union, meta, bitmap, schedule, gather_row): each union's positions in
@@ -633,44 +703,229 @@ def dsa_union_pallas(
       metadata rows; the tokens' bitmaps over their union; the attention's
       schedule rows; the gather's chunk row, past the unions' slots empty.
     """
-    top_k = indices.shape[1]
-    slots = padded_union_slots(num_slots)
-    check_union_operands(
-        unions.shape[0] % ((1 + slots) * UNION_WORDS),
-        slots,
-        top_k,
-        union_tokens,
-        union_slots,
-        num_slabs,
-        max_seqlen_k,
-    )
-    scratch_shapes = union_scratch_shapes(
-        slots, union_tokens, top_k, union_slots, num_slabs, max_seqlen_k
-    )
-    sparse_core = pltpu.get_tpu_info().sparse_core
-    body = functools.partial(
-        union_kernel,
-        top_k=top_k,
-        num_slabs=num_slabs,
-        num_slots=num_slots,
-        num_real=num_tokens,
-        num_subcores=sparse_core.num_subcores,
-        num_lanes=sparse_core.num_lanes,
-    )
+    plan = union_plan(unions.shape[0], indices.shape[1], shape)
     kernel = pl.kernel(
-        body,
-        out_type=union_out_types(slots, union_slots, num_tokens, num_slabs),
+        plan.body,
+        out_type=plan.out_type,
         mesh=sparse_core_mesh(),
-        scratch_types=(
-            *(pltpu.VMEM(shape, jnp.int32) for shape in scratch_shapes),
-            pltpu.SemaphoreType.DMA(
-                (NUM_UNION_SEMS, max(NUM_INDEX_BUFFERS, NUM_TOKEN_BITMAPS))
-            ),
-        ),
+        scratch_types=plan.scratch_types,
         compiler_params=gather_compiler_params(),
         name="dsa_union",
     )
     return kernel(indices, previous_indices, unions, chunk_row)
+
+
+def is_vmem(buffer: pl.MemoryRef) -> bool:
+    return buffer.memory_space == pltpu.VMEM
+
+
+def unpooled_types(scratch_types: tuple) -> tuple:
+    """A phase's scratch outside the pool, in order."""
+    return tuple(buffer for buffer in scratch_types if not is_vmem(buffer))
+
+
+def pool_rows(scratch_types: tuple) -> int:
+    """Rows of the pool that holds a phase's VMEM buffers; fails unless each
+    is int32 in whole rows."""
+    num_rows = 0
+    for buffer in filter(is_vmem, scratch_types):
+        num_words = math.prod(buffer.shape)
+        if buffer.dtype != jnp.int32 or num_words % POOL_WIDTH:
+            raise ValueError(
+                f"A pooled buffer is int32 in whole rows of {POOL_WIDTH}"
+                f" words; got {buffer.shape} {buffer.dtype}."
+            )
+        num_rows += num_words // POOL_WIDTH
+    return num_rows
+
+
+def pooled_scratch(
+    pool: jax.Array, scratch_types: tuple, unpooled_refs: list[jax.Array]
+) -> list[jax.Array]:
+    """A phase's scratch refs in scratch_types order: each VMEM buffer a
+    view of the pool's next rows from its first, the other scratch
+    unpooled_refs in order."""
+    refs, row, unpooled = [], 0, iter(unpooled_refs)
+    for buffer in scratch_types:
+        if is_vmem(buffer):
+            num_rows = math.prod(buffer.shape) // POOL_WIDTH
+            refs.append(pool.at[pl.ds(row, num_rows)].reshape(*buffer.shape))
+            row += num_rows
+        else:
+            refs.append(next(unpooled))
+    return refs
+
+
+def topk_union_gather_kernel(
+    row_lengths_hbm: jax.Array,
+    scores_hbm: jax.Array,
+    previous_indices_hbm: jax.Array,
+    unions_hbm: jax.Array,
+    chunk_hbm: jax.Array,
+    block_table_hbm: jax.Array,
+    nope_cache_hbm: jax.Array,
+    rope_cache_hbm: jax.Array,
+    indices_hbm: jax.Array,
+    union_hbm: jax.Array,
+    meta_hbm: jax.Array,
+    bitmap_hbm: jax.Array,
+    schedule_hbm: jax.Array,
+    gather_row_hbm: jax.Array,
+    nope_out_hbm: jax.Array,
+    rope_out_hbm: jax.Array,
+    flag_out_hbm: jax.Array,
+    pool: jax.Array,
+    barrier_sem: jax.Array,
+    *unpooled_scratch: jax.Array,
+    topk_geometry: TopkGeometry,
+    topk_scratch: tuple,
+    union: SparseCorePlan,
+    gather: SparseCorePlan,
+) -> None:
+    """The top-k of the chunk's score rows, then the union of its unions
+    from those rows in HBM, then the gather of the unions' positions, each
+    phase with the work split of its own kernel, its VMEM buffers in the
+    pool and its other scratch in unpooled_scratch, phase by phase. Every
+    subcore of both SparseCores finishes a phase before any starts the
+    next."""
+    unpooled = iter(unpooled_scratch)
+    topk_refs, union_refs, gather_refs = (
+        pooled_scratch(
+            pool,
+            scratch_types,
+            [next(unpooled) for _ in unpooled_types(scratch_types)],
+        )
+        for scratch_types in (
+            topk_scratch,
+            union.scratch_types,
+            gather.scratch_types,
+        )
+    )
+    topk_worker(
+        row_lengths_hbm,
+        scores_hbm,
+        indices_hbm,
+        *topk_refs,
+        geometry=topk_geometry,
+    ).run()
+    sparse_core_barrier(barrier_sem)
+    union.body(
+        indices_hbm,
+        previous_indices_hbm,
+        unions_hbm,
+        chunk_hbm,
+        union_hbm,
+        meta_hbm,
+        bitmap_hbm,
+        schedule_hbm,
+        gather_row_hbm,
+        *union_refs,
+    )
+    sparse_core_barrier(barrier_sem)
+    gather.body(
+        gather_row_hbm,
+        union_hbm,
+        meta_hbm,
+        block_table_hbm,
+        nope_cache_hbm,
+        rope_cache_hbm,
+        nope_out_hbm,
+        rope_out_hbm,
+        flag_out_hbm,
+        *gather_refs,
+    )
+
+
+def dsa_topk_union_gather_pallas(
+    row_lengths: jax.Array,
+    scores: jax.Array,
+    previous_indices: jax.Array,
+    unions: jax.Array,
+    chunk_row: jax.Array,
+    block_table: jax.Array,
+    nope_cache: jax.Array,
+    rope_cache: jax.Array,
+    *,
+    geometry: TopkGeometry,
+    shape: UnionShape,
+    page_size: int,
+    pages_per_seq: int,
+) -> tuple[jax.Array, ...]:
+    """One chunk's top-k, union and gather in one SparseCore call: the
+    top-k of its tokens' scores as topk.top_k selects them, the union of its
+    unions from those rows as dsa_union_pallas unites them, and the gather
+    of the unions' positions as dsa_gather_pallas gathers them with
+    writes_cache_rows.
+
+    Args:
+      row_lengths: (num_tokens,) int32 valid scores of each of the chunk's
+        rows, geometry.num_rows of them.
+      scores: the chunk's flat scores, as top_k takes them.
+      previous_indices: (R', geometry.k) int32 top-k rows of the chunk
+        before, which a union row with a negative UNION_INDEX_ROW reads.
+      unions, chunk_row, shape: as dsa_union_pallas takes them; the union
+        rows' index rows name the chunk's top-k rows.
+      block_table, nope_cache, rope_cache, page_size, pages_per_seq: as
+        dsa_gather_pallas takes them.
+      geometry: the top-k's of the scores and row_lengths within a
+        subcore's VMEM.
+
+    Returns:
+      (indices, union, meta, bitmap, schedule, gather_row, nope_rows,
+      rope_rows, flag_rows): the (num_tokens, geometry.k) int32 top-k,
+      dsa_union_pallas's outputs and the gather's rows of the unions'
+      positions.
+    """
+    union = union_plan(unions.shape[0], geometry.k, shape)
+    gather = gather_plan(
+        shape.num_slots,
+        shape.union_slots,
+        page_size,
+        pages_per_seq,
+        sparse_core_vmem_words(),
+        writes_cache_rows=True,
+    )
+    topk_scratch = topk_scratch_types(geometry)
+    check_topk_vmem(topk_scratch, geometry.num_subcores, TOPK_UNION_GATHER)
+    phases = (topk_scratch, union.scratch_types, gather.scratch_types)
+    num_rows = max(pool_rows(scratch_types) for scratch_types in phases)
+    body = functools.partial(
+        topk_union_gather_kernel,
+        topk_geometry=geometry,
+        topk_scratch=topk_scratch,
+        union=union,
+        gather=gather,
+    )
+    kernel = pl.kernel(
+        body,
+        out_type=(
+            jax.ShapeDtypeStruct((geometry.num_rows, geometry.k), jnp.int32),
+            *union.out_type,
+            *gather.out_type,
+        ),
+        mesh=sparse_core_mesh(),
+        scratch_types=(
+            pltpu.VMEM((num_rows, POOL_WIDTH), jnp.int32),
+            pltpu.SemaphoreType.REGULAR,
+            *(
+                buffer
+                for scratch_types in phases
+                for buffer in unpooled_types(scratch_types)
+            ),
+        ),
+        compiler_params=gather_compiler_params(),
+        name=TOPK_UNION_GATHER,
+    )
+    return kernel(
+        worker_major_rows(row_lengths, geometry),
+        scores,
+        previous_indices,
+        unions,
+        chunk_row,
+        block_table,
+        nope_cache,
+        rope_cache,
+    )
 
 
 def union_out_types(

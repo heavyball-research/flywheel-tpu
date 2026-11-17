@@ -19,7 +19,9 @@ union attention attends, each token masked to the positions it selects.
 
 The unions run in chunks that follow the call's token chunks: chunk c takes
 the unions whose last token lies in its tokens. Each chunk is a union, a
-gather of its positions and a union attention over the gathered rows.
+gather of its positions and a union attention over the gathered rows; from
+the indexer's scores, the chunk's top-k, union and gather run in one
+SparseCore call.
 """
 
 from typing import NamedTuple
@@ -42,7 +44,10 @@ from flywheel_tpu.sparse_attention.dsa.kernels.union import (
     UNION_PREVIOUS_ROW,
     UNION_TABLE_OFFSET,
     UNION_WORDS,
+    UnionShape,
+    dsa_topk_union_gather_pallas,
     dsa_union_pallas,
+    num_union_workers,
     padded_union_slots,
     union_vmem_words,
 )
@@ -61,6 +66,7 @@ from flywheel_tpu.sparse_attention.dsa.sparse_mla import (
     lane_rows,
     split_cache,
 )
+from flywheel_tpu.topk import topk
 from flywheel_tpu.topk.kernels.sparse_core_topk import sparse_core_vmem_words
 
 UNION_TOKENS = 8
@@ -70,23 +76,17 @@ EDGE_REQUESTS = 2
 EDGE_UNIONS = 1
 # Note (david): a chunk's kernels lower once per shape, however many chunks
 # of a call run them.
-unite_chunk = jax.jit(
-    dsa_union_pallas,
-    static_argnames=(
-        "num_tokens",
-        "union_tokens",
-        "union_slots",
-        "num_slabs",
-        "max_seqlen_k",
-        "num_slots",
-    ),
+unite_chunk = jax.jit(dsa_union_pallas, static_argnames=("shape",))
+topk_union_gather_chunk = jax.jit(
+    dsa_topk_union_gather_pallas,
+    static_argnames=("geometry", "shape", "page_size", "pages_per_seq"),
 )
 
 
 def after[Value](value: Value, anchor: object) -> Value:
-    """value, which XLA may use only once anchor exists; both must be
-    TensorCore values. A SparseCore call with a pinned operand launches
-    after anchor."""
+    """value, which XLA may use only once anchor exists. A SparseCore call
+    with a pinned operand launches after anchor; a SparseCore call's output
+    in value or anchor waits for the call there."""
     return lax.optimization_barrier((value, anchor))[0]
 
 
@@ -277,6 +277,15 @@ class GatheredRows(NamedTuple):
     rope_rows: jax.Array
 
 
+class SelectedChunk(NamedTuple):
+    """A union chunk's top-k, union and gather call: the (T_c, top_k) top-k
+    of its tokens, its union and its gathered rows."""
+
+    indices: jax.Array
+    selection: UnionSelection
+    gathered: GatheredRows
+
+
 class UnionPass(NamedTuple):
     """The operands every union chunk of a call shares: the queries, the
     gather's view of the cache and the union table of the num_chunks chunks
@@ -297,6 +306,17 @@ class UnionPass(NamedTuple):
     @property
     def num_slabs(self) -> int:
         return bitmap_slabs(UNION_TOKENS * self.top_k)
+
+    @property
+    def union_shape(self) -> UnionShape:
+        return UnionShape(
+            num_tokens=self.q_nope.shape[0],
+            union_tokens=UNION_TOKENS,
+            union_slots=self.cache.top_k,
+            num_slabs=self.num_slabs,
+            max_seqlen_k=self.max_seqlen_k,
+            num_slots=self.num_slots,
+        )
 
     def queries(self, anchor: object) -> tuple[jax.Array, jax.Array]:
         """(q_nope, q_pe heads minor) as the union attention reads them,
@@ -332,14 +352,61 @@ class UnionPass(NamedTuple):
             previous_indices,
             table,
             self.chunk_row(chunk),
-            num_tokens=self.q_nope.shape[0],
-            union_tokens=UNION_TOKENS,
-            union_slots=self.cache.top_k,
-            num_slabs=self.num_slabs,
-            max_seqlen_k=self.max_seqlen_k,
-            num_slots=self.num_slots,
+            shape=self.union_shape,
         )
         return UnionSelection(table, *outputs)
+
+    def select_and_gather(
+        self,
+        chunk: int,
+        scores: jax.Array,
+        row_lengths: jax.Array,
+        previous_indices: jax.Array | None,
+        anchor: object,
+    ) -> SelectedChunk:
+        """The top-k of chunk's tokens from their flat scores and
+        row_lengths, the union of chunk's unions from it and the gather of
+        their positions in one SparseCore call, launched after anchor if one
+        is given. previous_indices: the chunk before's top-k, which its
+        union rows name before the chunk's first token; None for the first
+        chunk, whose unions start in its tokens."""
+        table = self.table
+        if anchor is not None:
+            table = after(table, anchor)
+        num_tokens = scores.shape[0]
+        if previous_indices is None:
+            previous_indices = lax.empty((num_tokens, self.top_k), jnp.int32)
+        # Note (david): a top-k whose subcores share a row, of fewer rows than
+        # workers, hangs the gather that reuses its VMEM, so the call's top-k
+        # selects a row or more a worker: empty rows after the chunk's.
+        num_padding = max(num_union_workers() - num_tokens, 0)
+        scores = jnp.pad(scores, ((0, num_padding), (0, 0), (0, 0)))
+        row_lengths = jnp.pad(row_lengths, (0, num_padding))
+        geometry = topk.flat_topk_geometry(
+            scores, row_lengths, self.top_k, sparse_core_vmem_words()
+        )
+        cache = self.cache
+        indices, *union_outputs, nope_rows, rope_rows, _ = (
+            topk_union_gather_chunk(
+                row_lengths,
+                scores,
+                previous_indices,
+                table,
+                self.chunk_row(chunk),
+                cache.block_table,
+                cache.nope_cache,
+                cache.rope_cache,
+                geometry=geometry,
+                shape=self.union_shape,
+                page_size=cache.page_size,
+                pages_per_seq=cache.pages_per_seq,
+            )
+        )
+        return SelectedChunk(
+            indices[:num_tokens],
+            UnionSelection(table, *union_outputs),
+            GatheredRows(cache.block_table, nope_rows, rope_rows),
+        )
 
     def gather(self, selection: UnionSelection, anchor: object) -> GatheredRows:
         """The gather of the selection's positions on the SparseCores, the

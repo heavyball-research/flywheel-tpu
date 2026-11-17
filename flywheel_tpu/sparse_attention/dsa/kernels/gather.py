@@ -169,8 +169,8 @@ def gather_layout(
     )
 
 
-class GatherPlan(NamedTuple):
-    """The gather's kernel body on its operands, outputs and scratch."""
+class SparseCorePlan(NamedTuple):
+    """A SparseCore kernel's body on its operands, outputs and scratch."""
 
     body: functools.partial
     out_type: tuple[jax.ShapeDtypeStruct, ...]
@@ -184,7 +184,7 @@ def gather_plan(
     pages_per_seq: int,
     vmem_words: int,
     writes_cache_rows: bool,
-) -> GatherPlan:
+) -> SparseCorePlan:
     """The gather of num_tokens tokens' top_k slots on this chip's
     SparseCores, its scratch within vmem_words of each subcore's VMEM."""
     sparse_core = pltpu.get_tpu_info().sparse_core
@@ -210,7 +210,7 @@ def gather_plan(
         *ring_scratch_types(num_buffers, chunk_slots),
     )
     out_type = gathered_types(num_tokens, top_k, writes_cache_rows)
-    return GatherPlan(body, out_type, scratch_types)
+    return SparseCorePlan(body, out_type, scratch_types)
 
 
 def gathered_types(
@@ -258,6 +258,15 @@ def sparse_core_mesh() -> plsc.VectorSubcoreMesh:
         num_cores=sparse_core.num_cores,
         num_subcores=sparse_core.num_subcores,
     )
+
+
+def sparse_core_barrier(sem: jax.Array) -> None:
+    """Blocks until every subcore of sparse_core_mesh reaches it, with sem a
+    regular semaphore: each subcore meets its peers on the other cores, then
+    the subcores of its own core meet. The writes a subcore waited before it
+    are done for every subcore after it."""
+    pltpu.core_barrier(sem, core_axis_name="core")
+    plsc.subcore_barrier()
 
 
 def gather_compiler_params() -> pltpu.CompilerParams:
