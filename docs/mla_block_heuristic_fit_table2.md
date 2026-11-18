@@ -3,6 +3,7 @@
 这是 `docs/mla_block_heuristic_fit_table.md` 的第二版。数据仍然是已有的 649 个 cell，**没有重跑任何 kernel**。这一版先检查哪些输入是离散分组，再按分组重新拟合，最后给出新的分档表。
 
 第三版（按 scenario × dtype 分支重新拟合）见 [`mla_block_heuristic_fit_table3.md`](./mla_block_heuristic_fit_table3.md)。
+第四版（只分 scenario，按 VMEM / HBM 行为重写公式）见 [`mla_block_heuristic_fit_table4.md`](./mla_block_heuristic_fit_table4.md)。
 
 ## 1. 哪些维度是离散分组
 

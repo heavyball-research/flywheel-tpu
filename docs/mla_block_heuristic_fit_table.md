@@ -4,6 +4,7 @@
 
 第二版（按 decode / verify 离散分支重新拟合）见 [`mla_block_heuristic_fit_table2.md`](./mla_block_heuristic_fit_table2.md)。
 第三版（按 scenario × dtype 分支重新拟合）见 [`mla_block_heuristic_fit_table3.md`](./mla_block_heuristic_fit_table3.md)。
+第四版（只分 scenario，按 VMEM / HBM 行为重写公式）见 [`mla_block_heuristic_fit_table4.md`](./mla_block_heuristic_fit_table4.md)。
 
 ## 1. 分档规则
 

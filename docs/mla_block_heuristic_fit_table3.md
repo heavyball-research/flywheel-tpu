@@ -2,6 +2,8 @@
 
 这是 `docs/mla_block_heuristic_fit_table2.md` 的第三版。按你的要求，把 **decode / verify 和 bf16 / fp8 都拆成独立分支**重新拟合。数据仍然是已有的 649 个 cell，**没有重跑任何 kernel**。
 
+第四版（只分 scenario，按 VMEM / HBM 行为重写公式）见 [`mla_block_heuristic_fit_table4.md`](./mla_block_heuristic_fit_table4.md)。
+
 ## 1. 分支规则
 
 每个 scenario × dtype 组合单独拟合，decode · fp8 再按 batch 分大小两段：
