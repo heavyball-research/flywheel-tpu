@@ -103,9 +103,10 @@ flywheel_dsa, torchtpu_dsa and torchtpu_dsa_masked_dense run one DeepSeek
 sparse attention layer step per call (benchmarks/common/dsa.py) on fp8 caches
 of DSA_PAGE pages, on decode, chunked prefill and mixed. A DSA cell whose
 last call fails COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as
-check_failed. With --dsa-indices, flywheel_dsa runs only
-dsa_attention_from_indices on mixed, each token taking the file's row of its
-position, and only COS_DIFF_BOUND applies. flywheel_dsa_indexer and
+check_failed. With --dsa-indices, a DSA layer impl runs a layer that reuses
+a selection, its latent cache write and its attention with no indexer, each
+token taking the file's row of its position, and only COS_DIFF_BOUND
+applies. flywheel_dsa_indexer and
 torchtpu_dsa_indexer run the indexer's scores and top-k alone on the same
 calls, every call's keys written before the clock, and only
 INDEX_DEFICIT_BOUND applies. With --trace a DSA record also holds
@@ -139,6 +140,7 @@ from benchmarks.common.dsa import (
     DSA_CACHE_TOKEN_BYTES,
     DSA_GEOMETRIES,
     DSA_IMPLS,
+    DSA_INDEXER_IMPLS,
     DSA_KV_DTYPE,
     DSA_PAGE,
     FLYWHEEL_DSA,
@@ -228,7 +230,7 @@ class Cell:
     dsa_geometry: str | None = None
     # flywheel_dsa's pinned route; None routes each request by the rule.
     dsa_route: str | None = None
-    # flywheel_dsa's given indices: a .npy of one request's rows by position.
+    # A DSA cell's given indices: a .npy of one request's rows by position.
     dsa_indices: str | None = None
 
     @property
@@ -628,6 +630,7 @@ def build_dsa_decode(cell, args):
         max_seqlen_k=cell.seq,
         torchtpu_source=args.torchtpu_source,
         route=cell.dsa_route,
+        indices_path=args.dsa_indices,
     )
     requests = [
         DsaRequests(
@@ -723,6 +726,7 @@ def build_dsa_chunked_prefill(cell, args):
         max_seqlen_k=cell.seq,
         torchtpu_source=args.torchtpu_source,
         route=cell.dsa_route,
+        indices_path=args.dsa_indices,
     )
     requests = [
         DsaRequests(
@@ -1463,9 +1467,9 @@ def scenario_dsa_args_error(args):
     elif args.dsa_route is not None and args.impl != FLYWHEEL_DSA:
         return f"--impl {args.impl} takes no --dsa-route"
     elif args.dsa_indices is not None and (
-        args.impl != FLYWHEEL_DSA or args.scenario != "mixed"
+        args.impl not in DSA_IMPLS or args.impl in DSA_INDEXER_IMPLS
     ):
-        return "--dsa-indices runs flywheel_dsa on --scenario mixed only"
+        return f"--impl {args.impl} takes no --dsa-indices"
     return dsa_args_error(args.impl, args.dsa_geometry, args.page_size)
 
 
@@ -1592,8 +1596,9 @@ def parse_args(argv=None):
         "--dsa-indices",
         type=pathlib.Path,
         help=(
-            "flywheel_dsa on mixed: a .npy of (positions, top_k) int32 rows,"
-            " row p one request's selection at position p"
+            "a DSA layer impl: a .npy of (positions, top_k) int32 rows, row p"
+            " one request's selection at position p (read from position"
+            " top_k on); the layer writes its latent cache and attends them"
         ),
     )
     parser.add_argument("--output", type=pathlib.Path)
