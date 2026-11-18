@@ -1645,6 +1645,7 @@ def test_paged_mxu_guard_replays_a_middle_unit_with_sinks(
         pytest.param(16, 2, 128, 4, id="fold8"),
         pytest.param(16, 4, 512, 4, id="fold4-page512"),
         pytest.param(32, 1, 128, 2, id="fold32"),
+        pytest.param(16, 4, 2048, 8, id="fold4-page2048"),
     ],
 )
 def test_paged_mxu_forced_guard_replays_units(

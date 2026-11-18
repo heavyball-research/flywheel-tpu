@@ -638,19 +638,18 @@ class PagedMxuLoop:
         """The first check unit of a row's final unit, given its tiles in
         unmasked blocks: the units before it are checked (checked_unit), and
         its first body ends the last first body, whose unit is fully unmasked
-        too; 0 when the row has no checked unit."""
+        too; 0 when the row has no checked unit, as in a build whose check
+        units do not hold whole kv blocks."""
+        if UNIT_TILES % self.traits.num_k_compute_tiles != 0:
+            return 0
         return first_final_unit(num_unmasked // UNIT_TILES)
 
     @property
     def has_checked_units(self) -> bool:
-        """Whether a check unit holds whole kv blocks and a row of the build's
-        capacity can hold a checked unit."""
+        """Whether a row of the build's capacity can hold a checked unit."""
         paged = self.traits.paged
         max_row_tiles = paged.pages_per_seq * paged.page_size // MXU_COLUMNS
-        return (
-            UNIT_TILES % self.traits.num_k_compute_tiles == 0
-            and self.final_unit(max_row_tiles) > 0
-        )
+        return self.final_unit(max_row_tiles) > 0
 
     def key_start(self, row: PagedRow, tile_number: jax.Array) -> jax.Array:
         """The first key of row's live tile tile_number."""
