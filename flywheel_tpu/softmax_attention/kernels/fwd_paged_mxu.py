@@ -27,8 +27,19 @@ finish in the next row's first segment, which also stages that row's finish.
 kv streams tile by tile (PagedMxuLoop.start_tiles), and rows alternate
 between NUM_ROW_PARITIES parities. After the grid's last row, that row runs
 once more as a drain row of two tiles whose own output is dropped, so the
-last row finishes as every other row does. A row the overflow guard flags
-replays after the grid (PagedMxuLoop.replay_flagged_rows).
+last row finishes as every other row does.
+
+The overflow guard checks a row's unmasked tiles by check units of
+UNIT_TILES tiles, whole kv blocks of two loop bodies (PagedMxuLoop.
+checked_unit). The items of a unit's last tile also write the row state they
+leave into the next unit's checkpoint, that unit's entry state, and collect
+their row sums; the next unit's first body finishes them in its first qk_pop
+ticks, and those sums decide whether the unit replays, at the end of the
+first body: from its checkpoint, through the first body's tiles. The next
+body adds nothing for the items the replay redid. A row's final unit, from
+its last checked unit on, replays when the row's own sums flag it, as the row
+is completed in flight (PagedMxuLoop.complete_row). The row state stays in
+place at the row's parity.
 """
 
 import dataclasses
@@ -42,17 +53,15 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tpu import MXU_COLUMNS, NUM_LANES
+from flywheel_tpu.core.tpu import MXU_COLUMNS
 from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     PAGE_SIZE_MULTIPLE,
     BlockSizes,
 )
-from flywheel_tpu.softmax_attention.dma import advance, drain, hbm_window
+from flywheel_tpu.softmax_attention.dma import advance, drain
 from flywheel_tpu.softmax_attention.fwd_blocks import (
     SEM_K,
-    SEM_LSE,
-    SEM_OUT,
     OutRefs,
     PagedKVRefs,
     PagedRefs,
@@ -73,15 +82,25 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
 from flywheel_tpu.softmax_attention.fwd_mxu import (
     ENTRY_PARITY,
     LOOP_BODY_TILES,
+    NUM_CHECKPOINTS,
     NUM_ROW_PARITIES,
+    REPLAY_RESULT_SLOTS,
     ROW_START_TILES,
+    UNIT_TILES,
+    FlaggedTailOps,
+    LargestSums,
+    RowCheckpoints,
+    UnitCheckpoint,
     accumulate_fragment,
-    across_lanes,
     aligned_rows,
-    anchored_probs,
+    first_final_unit,
     fold_fragment_scores,
+    fold_replayed_fragment,
+    fold_unit_end_scores,
     fragment_rows,
+    guard_flag,
     mxu_pipeline_applies,
+    replay_matmul,
     row_finish_state,
     stage_row_finish,
 )
@@ -106,12 +125,12 @@ from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 # MXU_PREFETCH_TILES tiles before it runs, into a ring of MXU_STREAM_SLOTS
 # tile slots, a power of two so a slot is a mask of the stream position (a
 # body of LOOP_BODY_TILES tiles starts that many tiles' DMAs while its first
-# tile is still read), and a replay stages its tiles into MXU_REPLAY_SLOTS
-# more.
+# tile is still read), and a replay stages its tiles one at a time into
+# MXU_REPLAY_SLOT, the slot past the ring.
 MXU_STREAM_SLOTS = 8
 MXU_PREFETCH_TILES = MXU_STREAM_SLOTS - LOOP_BODY_TILES
-MXU_REPLAY_SLOTS = 2
-MXU_STAGING_SLOTS = MXU_STREAM_SLOTS + MXU_REPLAY_SLOTS
+MXU_REPLAY_SLOT = MXU_STREAM_SLOTS
+MXU_STAGING_SLOTS = MXU_REPLAY_SLOT + 1
 # A segment starts at most MXU_DESCRIBED_TILES tiles' DMAs, whose operands
 # were written before it; a power of two, so an operand set is a mask of the
 # stream position.
@@ -270,10 +289,8 @@ class PagedFragmentOps:
     row state of the row's parity. tiles maps a WorkItem's tile key to its
     staged tile, and lower_bounds (paged_tile_lower_bounds, one per tile
     key) masks the scores; None leaves the segment unmasked. A WorkItem's
-    mode is whether its tile starts the row. rescale None runs the static
-    anchor of fwd_mxu.py; a replay passes a (group_bq, NUM_LANES) scratch and
-    runs the exact rebasing softmax, rescale holding each fragment's
-    accumulator factor from its softmax to its PV.
+    mode is whether its tile starts the row. unit_end names a check unit's
+    last tile (UnitCheckpoint).
     """
 
     traits: PagedFwdTraits
@@ -288,7 +305,7 @@ class PagedFragmentOps:
     o: jax.Array
     tiles: tuple[TileSource, ...] = ()
     lower_bounds: tuple[jax.Array, ...] | None = None
-    rescale: jax.Array | None = None
+    unit_end: UnitCheckpoint | None = None
     masks: dict[tuple, jax.Array] = dataclasses.field(default_factory=dict)
 
     def k_tile(self, tile: int) -> jax.Array:
@@ -307,60 +324,59 @@ class PagedFragmentOps:
             q_ref = self.q_buf.at[self.q_slot]
         return q_ref[pl.ds(token, FRAGMENT_ROWS), :]
 
+    def visible_keys(self, token: jax.Array | int, tile: int) -> jax.Array:
+        """The (FRAGMENT_ROWS, MXU_COLUMNS) keys of tile key tile that the q
+        rows from token on see, by lower_bounds."""
+        q_ids = (
+            self.q_tok
+            + token
+            + lax.broadcasted_iota(jnp.int32, (FRAGMENT_ROWS, MXU_COLUMNS), 0)
+        )
+        return q_ids >= self.lower_bounds[tile]
+
     def masked_scores(self, item: WorkItem, scores: jax.Array) -> jax.Array:
         """item's softcapped scores, bounds-masked under lower_bounds; the
-        folded heads of a token chunk share one compare (masks)."""
+        folded heads of a static token chunk share one compare (masks)."""
         scores = self.variant.transform_logits(scores)
         if self.lower_bounds is None:
             return scores
         _, token = fragment_q_rows(self.traits, item.fragment)
+        if not isinstance(token, int):
+            return jnp.where(
+                self.visible_keys(token, item.tile), scores, DEFAULT_MASK_VALUE
+            )
         key = (token, item.tile)
         if key not in self.masks:
-            q_ids = (
-                self.q_tok
-                + token
-                + lax.broadcasted_iota(jnp.int32, scores.shape, 0)
-            )
-            self.masks[key] = q_ids >= self.lower_bounds[item.tile]
+            self.masks[key] = self.visible_keys(token, item.tile)
         return jnp.where(self.masks[key], scores, DEFAULT_MASK_VALUE)
 
+    def rows(self, item: WorkItem) -> pl.Slice:
+        """The row-state rows of item's fragment."""
+        return fragment_rows(item.fragment)
+
+    def is_unit_end(self, item: WorkItem) -> bool:
+        return self.unit_end is not None and item.tile == self.unit_end.tile
+
     def softmax(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+        rows = self.rows(item)
         scores = self.masked_scores(item, scores)
-        rows = fragment_rows(item.fragment)
-        if self.rescale is None:
+        if not self.is_unit_end(item):
             return fold_fragment_scores(
                 self.row_max, self.row_sum, rows, scores, is_row_start=item.mode
             )
-        row_max = across_lanes(scores.max(axis=-1))
-        if not item.mode:
-            row_max = jnp.maximum(self.row_max[rows, :], row_max)
-            self.rescale[rows, :] = jnp.exp2(self.row_max[rows, :] - row_max)
-        self.row_max[rows, :] = row_max
-        probs = anchored_probs(scores, row_max)
-        num_lane_tiles = scores.shape[-1] // NUM_LANES
-        lane_sums = sum(
-            probs[:, tile * NUM_LANES : (tile + 1) * NUM_LANES]
-            for tile in range(num_lane_tiles)
+        assert not item.mode, item
+        return fold_unit_end_scores(
+            self.row_max, self.row_sum, rows, scores, self.unit_end
         )
-        if item.mode:
-            self.row_sum[rows, :] = lane_sums
-        else:
-            self.row_sum[rows, :] = (
-                self.rescale[rows, :] * self.row_sum[rows, :] + lane_sums
-            )
-        return probs.astype(jnp.bfloat16)
 
     def accumulate(self, item: WorkItem, weighted_values: jax.Array) -> None:
-        rows = fragment_rows(item.fragment)
-        if self.rescale is None or item.mode:
-            accumulate_fragment(
-                self.o, rows, weighted_values, is_row_start=item.mode
-            )
-        else:
-            rescale = jnp.tile(
-                self.rescale[rows, :], (1, self.traits.head_dim_v_repeats)
-            )
-            self.o[rows, :] = rescale * self.o[rows, :] + weighted_values
+        accumulate_fragment(
+            self.o,
+            self.rows(item),
+            weighted_values,
+            is_row_start=item.mode,
+            checkpoint_o=self.unit_end.o if self.is_unit_end(item) else None,
+        )
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -499,6 +515,24 @@ class PagedRow(NamedTuple):
     next_kv_head: jax.Array
 
 
+class QPrefetch(NamedTuple):
+    """The Q stream after a row step's dma.advance: the row's Q slot and the
+    flat grid row whose Q is prefetched (-1: none), its group and row."""
+
+    q_slot: jax.Array
+    inflight: jax.Array
+    group: jax.Array
+    si: jax.Array
+
+    @property
+    def is_started(self) -> jax.Array:
+        return self.inflight >= 0
+
+    def slot(self, num_stages: int) -> jax.Array:
+        """The Q slot the prefetch fills."""
+        return lax.rem(self.q_slot + 1, num_stages)
+
+
 class PagedRowCarry(NamedTuple):
     """The explicit row loop's carry: the Q stream's advance state, the
     stream position of the row's first tile, the row's group and schedule
@@ -517,35 +551,15 @@ class PagedRowCarry(NamedTuple):
     num_out_copies: jax.Array
 
 
-def merge_owned_rows(
-    stage: jax.Array, owned_start: jax.Array, owned_end: jax.Array
-) -> None:
-    """Keep stage slot 0's token rows in [owned_start, owned_end) and take
-    every other row from slot 1, FRAGMENT_ROWS rows at a time."""
-
-    def _merge_rows(index, carry):
-        rows = fragment_rows(index)
-        owned = stage[0, ..., rows, :]
-        row_ids = index * FRAGMENT_ROWS + lax.broadcasted_iota(
-            jnp.int32, owned.shape, owned.ndim - 2
-        )
-        is_owned = jnp.logical_and(row_ids >= owned_start, row_ids < owned_end)
-        stage[0, ..., rows, :] = jnp.where(
-            is_owned, owned, stage[1, ..., rows, :]
-        )
-        return carry
-
-    lax.fori_loop(0, stage.shape[-2] // FRAGMENT_ROWS, _merge_rows, None)
-
-
 @dataclasses.dataclass(frozen=True, eq=False)
 class PagedMxuLoop:
     """The steps of paged_mxu_fwd_body's row loop, over the build's refs.
 
     row_max, row_sum and o hold the row state of each of the
-    NUM_ROW_PARITIES parities. In SMEM, replay_rows holds the flat grid rows
-    the guard flagged, replay_count how many, stream_state the kv tile stream
-    (the STREAM_* words) and guard the flag finish_row_sums sets for a row.
+    NUM_ROW_PARITIES parities, and checkpoint_sum and checkpoint_o a check
+    unit's entry state (UnitCheckpoint). In SMEM, stream_state holds the kv
+    tile stream (the STREAM_* words), guard the flag finish_row_sums sets for
+    a row and unit_guard the flag of a check unit (checked_unit).
     """
 
     traits: PagedFwdTraits
@@ -559,10 +573,11 @@ class PagedMxuLoop:
     row_max: jax.Array
     row_sum: jax.Array
     o: jax.Array
-    replay_rows: jax.Array
-    replay_count: jax.Array
+    checkpoint_sum: jax.Array
+    checkpoint_o: jax.Array
     stream_state: jax.Array
     guard: jax.Array
+    unit_guard: jax.Array
     is_causal: bool
 
     @property
@@ -585,17 +600,11 @@ class PagedMxuLoop:
             item._replace(tile=1) for item in self.tile_items()
         )
 
-    def grid_row(self, flat_row: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """(group, row) of flat grid row flat_row, clamped into the grid."""
-        num_rows = jnp.maximum(self.schedule.num_rows, 1)
-        clamped = jnp.clip(flat_row, 0, jnp.maximum(self.num_grid_rows - 1, 0))
-        return clamped // num_rows, clamped % num_rows
-
     def next_grid_row(
         self, flat_row: jax.Array, group: jax.Array, si: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
-        """grid_row(flat_row + 1) from (group, si) = grid_row(flat_row),
-        without a division."""
+        """(group, row) of flat grid row flat_row + 1, clamped into the grid,
+        from (group, si) of flat_row, without a division."""
         is_group_end = si + 1 >= self.schedule.num_rows
         is_last = flat_row + 1 >= self.num_grid_rows
         return (
@@ -614,6 +623,33 @@ class PagedMxuLoop:
         """The live kv tiles of the row of ctx over blocks lo..hi."""
         return (hi - lo) * self.traits.num_k_compute_tiles + (
             self.schedule.num_live_tiles(hi, ctx)
+        )
+
+    def num_unmasked_tiles(
+        self, lo: jax.Array, hi: jax.Array, ctx: ScheduleRow
+    ) -> jax.Array:
+        """The tiles of the row of ctx in its unmasked blocks of lo..hi."""
+        return (
+            jnp.clip(ctx.mask_from - lo, 0, hi - lo + 1)
+            * self.traits.num_k_compute_tiles
+        )
+
+    def final_unit(self, num_unmasked: jax.Array | int) -> jax.Array | int:
+        """The first check unit of a row's final unit, given its tiles in
+        unmasked blocks: the units before it are checked (checked_unit), and
+        its first body ends the last first body, whose unit is fully unmasked
+        too; 0 when the row has no checked unit."""
+        return first_final_unit(num_unmasked // UNIT_TILES)
+
+    @property
+    def has_checked_units(self) -> bool:
+        """Whether a check unit holds whole kv blocks and a row of the build's
+        capacity can hold a checked unit."""
+        paged = self.traits.paged
+        max_row_tiles = paged.pages_per_seq * paged.page_size // MXU_COLUMNS
+        return (
+            UNIT_TILES % self.traits.num_k_compute_tiles == 0
+            and self.final_unit(max_row_tiles) > 0
         )
 
     def key_start(self, row: PagedRow, tile_number: jax.Array) -> jax.Array:
@@ -894,7 +930,6 @@ class PagedMxuLoop:
         parity: jax.Array | int,
         tiles: tuple[TileSource, ...] = (),
         lower_bounds: tuple[jax.Array, ...] | None = None,
-        rescale: jax.Array | None = None,
     ) -> PagedFragmentOps:
         return PagedFragmentOps(
             traits=self.traits,
@@ -909,15 +944,33 @@ class PagedMxuLoop:
             o=self.o.at[parity],
             tiles=tiles,
             lower_bounds=lower_bounds,
-            rescale=rescale,
         )
+
+    def row_ops(
+        self, row: PagedRow, tiles: tuple[TileSource, ...] = ()
+    ) -> PagedFragmentOps:
+        """The unmasked ops of row's items of tiles."""
+        return self.ops(row.q_slot, row.q_tok, row.parity, tiles)
+
+    def unit_end_ops(
+        self, ops: PagedFragmentOps, slot: jax.Array, largest: LargestSums
+    ) -> PagedFragmentOps:
+        """ops whose items of a body's last tile key, a check unit's last
+        tile, also write the row state they leave into checkpoint slot slot
+        and fold their row sums into largest (UnitCheckpoint)."""
+        unit_end = UnitCheckpoint(
+            tile=LOOP_BODY_TILES - 1,
+            row_sum=self.checkpoint_sum.at[slot],
+            o=self.checkpoint_o.at[slot],
+            largest=largest,
+        )
+        return dataclasses.replace(ops, unit_end=unit_end)
 
     def masked_ops(
         self,
         row: PagedRow,
         tiles: tuple[TileSource, ...],
         tile_numbers: tuple[jax.Array | int, ...],
-        rescale: jax.Array | None = None,
     ) -> PagedFragmentOps:
         """The ops of row's live tiles tile_numbers (one per tile key), every
         score bounds-masked; tiles is empty for a tail's ops."""
@@ -930,9 +983,7 @@ class PagedMxuLoop:
             )
             for tile_number in tile_numbers
         )
-        return self.ops(
-            row.q_slot, row.q_tok, row.parity, tiles, bounds, rescale
-        )
+        return self.ops(row.q_slot, row.q_tok, row.parity, tiles, bounds)
 
     def finished_row(
         self,
@@ -1072,22 +1123,21 @@ class PagedMxuLoop:
             probs,
         )
 
-    def write_previous_row(self, finished: FinishedRow) -> None:
-        """Write finished's row out once row's start segment staged it; a row
-        the guard flags joins the replay list (replay_flagged_rows)."""
+    def complete_row(self, finished: FinishedRow, prefetch: QPrefetch) -> None:
+        """Write finished's row out once the next row's start segment staged
+        it. A row its row sums flag first replays its final unit
+        (replay_row_end) and is staged again; prefetch is the next row's Q
+        stream."""
         traits = self.traits
         finish = finished.finish
-        is_live = finish.is_live > 0
-        num_flagged = self.replay_count[0]
-        self.replay_rows[num_flagged] = (
-            finished.group * self.schedule.num_rows + finish.si
-        )
-        self.replay_count[0] = num_flagged + jnp.logical_and(
-            is_live, self.guard[0] > 0
-        ).astype(jnp.int32)
 
-        @pl.when(is_live)
-        def _write():
+        @pl.when(finish.is_live > 0)
+        def _complete():
+            @pl.when(self.guard[0] > 0)
+            def _replay():
+                self.replay_row_end(finished, prefetch)
+                self.stage_row_finish(finish)
+
             if self.variant.return_lse:
                 copy_row_lse(
                     traits,
@@ -1105,8 +1155,66 @@ class PagedMxuLoop:
                 self.schedule.packed_q_end,
             )
 
-    def replayed_row(self, finished: FinishedRow) -> PagedRow:
-        """finished's row as a replay runs it: every tile bounds-masked."""
+    def replay_row_end(
+        self, finished: FinishedRow, prefetch: QPrefetch
+    ) -> None:
+        """Replay finished's final unit (final_unit) into its parity's row
+        state from the unit's checkpoint, or from the row start, between the
+        next row's start segment and its next segment, which writes no
+        checkpoint. The row's Q borrows the slot of the next row's Q prefetch
+        (borrow_q_slot)."""
+        q_slot = self.borrow_q_slot(finished, prefetch)
+        row = self.replayed_row(finished, q_slot)
+        start_tail = self.pipeline.tail_of(
+            self.start_items(), DiscardedFragmentOps(self.traits.head_dim_qk)
+        )
+        self.replay_tiles(
+            row,
+            self.final_unit(row.num_unmasked),
+            jnp.maximum(row.num_tiles, ROW_START_TILES),
+            self.pipeline.free_slots(start_tail, REPLAY_RESULT_SLOTS),
+        )
+        self.return_q_slot(prefetch, q_slot)
+
+    def borrow_q_slot(
+        self, finished: FinishedRow, prefetch: QPrefetch
+    ) -> jax.Array:
+        """Stage finished's Q into the slot of the next row's Q prefetch, once
+        that prefetch has landed, and return the slot: the prefetch fills the
+        slot finished's Q was in."""
+        traits, q_refs = self.traits, self.q_refs
+        slot = prefetch.slot(traits.num_stages)
+
+        @pl.when(prefetch.is_started)
+        def _wait_prefetch():
+            wait_rotated_q_row(traits, q_refs, slot)
+
+        finish = finished.finish
+        start_q_row(traits, q_refs, finish.base_head, finish.q_tok, slot)
+        wait_rotated_q_row(traits, q_refs, slot)
+        return slot
+
+    def return_q_slot(self, prefetch: QPrefetch, slot: jax.Array) -> None:
+        """Start the next row's Q prefetch again into slot, the one
+        borrow_q_slot took, so dma.advance's next step waits for it as
+        before."""
+        traits, schedule = self.traits, self.schedule
+
+        @pl.when(prefetch.is_started)
+        def _restart_prefetch():
+            _, _, ctx = schedule.row_interval(prefetch.si)
+            start_q_row(
+                traits,
+                self.q_refs,
+                prefetch.group * traits.group_heads,
+                schedule.q_token(ctx),
+                slot,
+            )
+
+    def replayed_row(
+        self, finished: FinishedRow, q_slot: jax.Array
+    ) -> PagedRow:
+        """finished's row as a replay runs it, its Q in staging slot q_slot."""
         finish = finished.finish
         lo, hi, ctx = self.schedule.row_interval(finish.si)
         return PagedRow(
@@ -1115,202 +1223,245 @@ class PagedMxuLoop:
             lo=lo,
             hi=hi,
             ctx=ctx,
-            q_slot=finished.q_slot,
+            q_slot=q_slot,
             q_tok=finish.q_tok,
             parity=finish.parity,
             num_tiles=self.num_row_tiles(lo, hi, ctx),
-            num_unmasked=jnp.int32(0),
+            num_unmasked=self.num_unmasked_tiles(lo, hi, ctx),
             first_tile=jnp.int32(0),
             kv_head=self.kv_head(finished.group),
             next_kv_head=self.kv_head(finished.group),
         )
 
     def stage_replay_tile(
-        self, row: PagedRow, tile_number: jax.Array | int
+        self, row: PagedRow, tile_number: jax.Array
     ) -> TileSource:
         """The source of a replayed row's tile tile_number, staged
-        synchronously into a replay slot."""
-        slot = MXU_STREAM_SLOTS + lax.rem(tile_number, MXU_REPLAY_SLOTS)
+        synchronously into MXU_REPLAY_SLOT, apart from the stream's
+        prefetches in flight."""
         self.start_tile_dmas(
             row.ctx.page_base,
             row.kv_head,
             self.key_start(row, tile_number),
-            slot,
+            MXU_REPLAY_SLOT,
         )
-        self.wait_tile_dmas(slot)
+        self.wait_tile_dmas(MXU_REPLAY_SLOT)
         return self.row_tile(row, tile_number, is_masked=True)._replace(
-            slot=slot
+            slot=MXU_REPLAY_SLOT
         )
 
-    def replay_row(
-        self, finished: FinishedRow, scratch_parity: jax.Array | int
+    def replay_tiles(
+        self,
+        row: PagedRow,
+        first_unit: jax.Array | int,
+        end_tile: jax.Array,
+        slots: tuple[jax.Array, ...],
+        checkpoint_unit: jax.Array | None = None,
     ) -> None:
-        """Recompute finished's row on the drained pipeline with the exact
-        rebasing softmax, staging its tiles into the replay slots one at a
-        time; the row sums at scratch_parity hold the rescale factors. Leaves
-        the row's lane partial sums for the finish."""
-        row = self.replayed_row(finished)
-        rescale = self.row_sum.at[scratch_parity]
-        stage = partial(self.stage_replay_tile, row)
+        """Recompute row's tiles from check unit first_unit's first to
+        end_tile into its row state with the exact rebasing softmax, between
+        two segments: from the row start at unit 0, else from the unit's
+        checkpoint. Each tile is staged again (stage_replay_tile) and every
+        fragment meets it bounds-masked on QK_MXU through slots
+        (replay_fragment), leaving lane partial sums. Check unit
+        checkpoint_unit's checkpoint is written again as its first tile
+        starts, and rebased at the end to the anchor the tiles after it
+        raised (rebase_checkpoint), so a checkpoint always holds the row
+        state on the row's current anchor."""
+        num_fragments = self.traits.group_bq // FRAGMENT_ROWS
+        checkpoints = self.row_checkpoints(row.parity)
 
-        def _ops(tiles, tile_numbers):
-            return self.masked_ops(row, tiles, tile_numbers, rescale)
+        @pl.when(first_unit > 0)
+        def _restore():
+            checkpoints.copy_checkpoint(first_unit, is_restore=True)
 
-        items = self.tile_items()
-        start_tiles = range(ROW_START_TILES)
-        start = self.pipeline.advance(
-            self.pipeline.idle_state(),
-            self.start_items(),
-            _ops(tuple(map(stage, start_tiles)), tuple(start_tiles)),
-        )
+        def _replay_tile(tile_number, carry):
+            if checkpoint_unit is not None:
 
-        def _body(tile_number, probs):
-            assumed = self.pipeline.tail_of(items, _ops((), (tile_number - 1,)))
-            state = self.pipeline.advance(
-                PipelineState(probs=probs, tail=assumed),
-                items,
-                _ops((stage(tile_number),), (tile_number,)),
+                @pl.when(tile_number == checkpoint_unit * UNIT_TILES)
+                def _checkpoint():
+                    checkpoints.copy_checkpoint(
+                        checkpoint_unit, is_restore=False
+                    )
+                    checkpoints.save_anchor(first_unit)
+
+            ops = self.masked_ops(
+                row, (self.stage_replay_tile(row, tile_number),), (tile_number,)
             )
-            self.pipeline.check_loop_tail(state.tail, assumed)
-            return state.probs
 
-        self.pipeline.check_loop_tail(
-            start.tail, self.pipeline.tail_of(items, start.tail.ops)
-        )
-        probs = lax.fori_loop(
-            ROW_START_TILES, row.num_tiles, _body, start.probs
-        )
-        last_tile = jnp.maximum(row.num_tiles, ROW_START_TILES) - 1
-        self.pipeline.drain(
-            PipelineState(
-                probs=probs,
-                tail=self.pipeline.tail_of(items, _ops((), (last_tile,))),
-            )
-        )
+            def _replay_fragment(fragment, fragment_carry):
+                self.replay_fragment(ops, fragment, tile_number == 0, slots)
+                return fragment_carry
 
-    def flagged_row(
-        self, group: jax.Array, si: jax.Array, ctx: ScheduleRow
-    ) -> FinishedRow:
-        """Row si of group as a replay finishes it: Q in staging slot 0, row
-        state at parity 0 and output stage slot 0."""
-        q_tok = self.schedule.q_token(ctx)
-        zero = jnp.int32(0)
-        return FinishedRow(
-            finish=RowFinish(
-                is_live=jnp.int32(1),
-                si=si,
-                q_tok=q_tok,
-                base_head=group * self.traits.group_heads,
-                num_blend_rows=zero,
-                prev_out_tok=q_tok,
-                out_count=zero,
-                parity=0,
-            ),
-            group=group,
-            q_slot=zero,
-            kv_frontier=ctx.kv_frontier,
-            bottom_right_offset=ctx.bottom_right_offset,
-            last_key_start=zero,
+            return lax.fori_loop(0, num_fragments, _replay_fragment, carry)
+
+        lax.fori_loop(first_unit * UNIT_TILES, end_tile, _replay_tile, None)
+        if checkpoint_unit is not None:
+            checkpoints.rebase_checkpoint(checkpoint_unit, first_unit)
+
+    def row_checkpoints(self, parity: jax.Array) -> RowCheckpoints:
+        """The checkpoints of the check units of the row at parity."""
+        return RowCheckpoints(
+            checkpoint_sum=self.checkpoint_sum,
+            checkpoint_o=self.checkpoint_o,
+            row_sum=self.row_sum,
+            o=self.o,
+            parity=parity,
+            row_anchor=lambda rows: self.row_max[parity, rows, :],
         )
 
-    def replay_flagged_rows(self) -> None:
-        """Replay the rows the guard flagged, once the grid's pipeline has
-        drained and its outputs have landed: each runs again with the exact
-        rebasing softmax (replay_row) at parity 0 and rewrites the rows it
-        owns (write_owned_rows)."""
-        traits, schedule = self.traits, self.schedule
-        group_heads = traits.group_heads
-
-        def _replay(index, carry):
-            group, si = self.grid_row(self.replay_rows[index])
-            _, _, ctx = schedule.row_interval(si)
-            q_tok = schedule.q_token(ctx)
-            start_q_row(traits, self.q_refs, group * group_heads, q_tok, 0)
-            wait_rotated_q_row(traits, self.q_refs, 0)
-            finished = self.flagged_row(group, si, ctx)
-            self.replay_row(finished, scratch_parity=1)
-            self.stage_row_finish(finished.finish)
-            self.write_owned_rows(finished, ctx)
-            return carry
-
-        lax.fori_loop(0, self.replay_count[0], _replay, None)
-
-    def write_owned_rows(self, finished: FinishedRow, ctx: ScheduleRow) -> None:
-        """Write the rows finished's q block owns from output stage slot 0
-        (and lse stage slot 0): its window's other rows, which neighbouring
-        blocks own, keep what HBM holds, read back into slot 1."""
-        traits, out_refs = self.traits, self.out_refs
-        finish = finished.finish
-        owned_start = jnp.maximum(ctx.q_start, finish.q_tok) - finish.q_tok
-        owned_end = (
-            jnp.minimum(
-                finish.q_tok + traits.bq,
-                ctx.kv_used_end - ctx.bottom_right_offset,
-            )
-            - finish.q_tok
+    def replay_fragment(
+        self,
+        ops: PagedFragmentOps,
+        fragment: jax.Array,
+        is_row_start: jax.Array,
+        slots: tuple[jax.Array, ...],
+    ) -> None:
+        """Fold fragment fragment against the one tile of ops into its rows of
+        the row state with the exact rebasing softmax
+        (fwd_mxu.fold_replayed_fragment), both matmuls on QK_MXU through
+        slots, the (scores, probs @ V) result slots."""
+        score_slot, value_slot = slots
+        item = WorkItem(fragment=fragment, tile=0)
+        scores = replay_matmul(
+            score_slot, ops.q_fragment(item), ops.k_tile(0), transpose=True
         )
-        o_window = hbm_window(
-            out_refs.o_hbm,
-            finish.base_head,
-            finish.q_tok,
-            traits.bq,
-            width=traits.width_v,
-            heads_per_row=traits.q_heads_per_row,
-            layout=traits.o_layout,
-            token_major=traits.token_major,
-            fold=traits.group_heads,
+        rows = fragment_rows(fragment)
+        fold_replayed_fragment(
+            ops.row_max.at[rows],
+            ops.row_sum.at[rows],
+            ops.o.at[rows],
+            ops.masked_scores(item, scores),
+            is_row_start,
+            value_slot,
+            partial(ops.v_tile, 0),
         )
-        windows = [(out_refs.o_stage, o_window, SEM_OUT)]
-        if self.variant.return_lse:
-            lse_window = out_refs.lse_hbm.at[
-                finished.group, pl.ds(finish.q_tok, traits.bq), :
-            ]
-            windows.append((out_refs.lse_stage, lse_window, SEM_LSE))
-        for stage, window, sem_plane in windows:
-            read_back = pltpu.make_async_copy(
-                window, stage.at[1], out_refs.sems.at[sem_plane, 1]
-            )
-            read_back.start()
-            read_back.wait()
-            merge_owned_rows(stage, owned_start, owned_end)
-            write = pltpu.make_async_copy(
-                stage.at[0], window, out_refs.sems.at[sem_plane, 0]
-            )
-            write.start()
-            write.wait()
 
     def unmasked_tiles(
         self, probs: tuple[jax.Array, ...], row: PagedRow
     ) -> tuple[jax.Array, ...]:
-        """Run row's unmasked tiles after its first two in rolled bodies of
+        """Run row's unmasked tiles after its first two: its check units
+        (checked_unit), up to the first body of the unit after its final
+        unit, then rolled bodies of LOOP_BODY_TILES tiles."""
+        first_tile = ROW_START_TILES
+        if self.has_checked_units:
+            final_unit = self.final_unit(row.num_unmasked)
+            num_units = jnp.where(final_unit > 0, final_unit + 1, 0)
+            self.unit_guard[0] = jnp.int32(0)
+            probs = lax.fori_loop(
+                0,
+                num_units,
+                partial(self.checked_unit, row=row, final_unit=final_unit),
+                probs,
+            )
+            first_tile = num_units * UNIT_TILES + LOOP_BODY_TILES
+        return self.plain_bodies(probs, row, first_tile, row.num_unmasked)
+
+    def plain_bodies(
+        self,
+        probs: tuple[jax.Array, ...],
+        row: PagedRow,
+        first_tile: jax.Array | int,
+        end_tile: jax.Array | int,
+    ) -> tuple[jax.Array, ...]:
+        """Run row's unmasked tiles [first_tile, end_tile) in rolled bodies of
         LOOP_BODY_TILES tiles."""
-        items = self.tile_items(LOOP_BODY_TILES)
-        num_bodies = (
-            jnp.maximum(row.num_unmasked - ROW_START_TILES, 0)
-            // LOOP_BODY_TILES
-        )
+        num_bodies = jnp.maximum(end_tile - first_tile, 0) // LOOP_BODY_TILES
 
         def _body(index, probs):
-            first = ROW_START_TILES + index * LOOP_BODY_TILES
-            tiles = tuple(
-                self.row_tile(row, first + tile, is_masked=False)
-                for tile in range(LOOP_BODY_TILES)
-            )
-            for tile in range(1, LOOP_BODY_TILES):
-                self.wait_tile(row.first_tile + first + tile)
-            next_tile = self.next_row_tile(row, first + LOOP_BODY_TILES)
-            ops = self.ops(row.q_slot, row.q_tok, row.parity, tiles)
-            assumed = self.pipeline.tail_of(items, ops, has_staged_next_k=True)
-            state = self.pipeline.advance(
-                PipelineState(probs=probs, tail=assumed),
-                items,
-                self.with_prefetch(ops, items, num_tiles=LOOP_BODY_TILES),
-                next_k_tile=self.staged_k(next_tile),
-            )
-            self.pipeline.check_loop_tail(state.tail, assumed)
-            return state.probs
+            first = first_tile + index * LOOP_BODY_TILES
+            return self.body(probs, row, first, self.row_ops).probs
 
         return lax.fori_loop(0, num_bodies, _body, probs)
+
+    def body(
+        self,
+        probs: tuple[jax.Array, ...],
+        row: PagedRow,
+        first: jax.Array | int,
+        ops_of: Callable[..., PagedFragmentOps],
+        tail_ops: FlaggedTailOps | PagedFragmentOps | None = None,
+    ) -> PipelineState:
+        """Run row's LOOP_BODY_TILES unmasked tiles from first in one segment
+        that stages the next tile's K, with ops_of(row, tiles)'s ops; tail_ops
+        (the segment's own ops when None) finishes the segment before."""
+        items = self.tile_items(LOOP_BODY_TILES)
+        tiles = tuple(
+            self.row_tile(row, first + tile, is_masked=False)
+            for tile in range(LOOP_BODY_TILES)
+        )
+        for tile in range(1, LOOP_BODY_TILES):
+            self.wait_tile(row.first_tile + first + tile)
+        next_tile = self.next_row_tile(row, first + LOOP_BODY_TILES)
+        ops = ops_of(row, tiles)
+        assumed = self.pipeline.tail_of(
+            items, ops if tail_ops is None else tail_ops, has_staged_next_k=True
+        )
+        state = self.pipeline.advance(
+            PipelineState(probs=probs, tail=assumed),
+            items,
+            self.with_prefetch(ops, items, num_tiles=LOOP_BODY_TILES),
+            next_k_tile=self.staged_k(next_tile),
+        )
+        self.pipeline.check_loop_tail(state.tail, assumed)
+        return state
+
+    def checked_unit(
+        self,
+        unit: jax.Array,
+        probs: tuple[jax.Array, ...],
+        *,
+        row: PagedRow,
+        final_unit: jax.Array,
+    ) -> tuple[jax.Array, ...]:
+        """Run row's check unit unit's last body, whose last tile also writes
+        the next unit's entry state into that unit's checkpoint and collects
+        its row sums (unit_end_ops), then the next unit's first body, which
+        finishes that tile: its row sums flag unit, and a unit before
+        final_unit replays at the first body's end (replay_tiles), through
+        the first body's tiles. The last body adds nothing for the items of
+        the first body before it that a replay redid (FlaggedTailOps)."""
+        next_unit = unit + 1
+        largest = LargestSums()
+        unit_end_ops = partial(
+            self.unit_end_ops,
+            slot=lax.rem(next_unit, NUM_CHECKPOINTS),
+            largest=largest,
+        )
+        flagged_tail = FlaggedTailOps(
+            ops=self.row_ops(row),
+            is_flagged=self.unit_guard[0] > 0,
+            plain_mode=False,
+        )
+        probs = self.body(
+            probs,
+            row,
+            unit * UNIT_TILES + LOOP_BODY_TILES,
+            lambda row, tiles: unit_end_ops(self.row_ops(row, tiles)),
+            flagged_tail,
+        ).probs
+        state = self.body(
+            probs,
+            row,
+            next_unit * UNIT_TILES,
+            self.row_ops,
+            unit_end_ops(self.row_ops(row)),
+        )
+        self.unit_guard[0] = jnp.where(
+            unit < final_unit, guard_flag(self.traits, largest.value), 0
+        )
+
+        @pl.when(self.unit_guard[0] > 0)
+        def _replay():
+            self.replay_tiles(
+                row,
+                unit,
+                next_unit * UNIT_TILES + LOOP_BODY_TILES,
+                self.pipeline.free_slots(state.tail, REPLAY_RESULT_SLOTS),
+                checkpoint_unit=next_unit,
+            )
+
+        return state.probs
 
     @property
     def half_tile_items(self) -> tuple[WorkItem, ...]:
@@ -1411,10 +1562,13 @@ class PagedMxuLoop:
         probs: tuple[jax.Array, ...],
         finished: FinishedRow,
         row: PagedRow,
+        prefetch: QPrefetch,
     ) -> tuple[jax.Array, ...]:
-        """Run row's tiles, finishing finished's row in row's first two."""
+        """Run row's tiles, finishing finished's row in row's first two and
+        completing it after them (complete_row); prefetch is the Q stream
+        after row's step."""
         probs = self.start_row(probs, finished, row)
-        self.write_previous_row(finished)
+        self.complete_row(finished, prefetch)
         probs = self.unmasked_tiles(probs, row)
         return self.masked_tiles(probs, row)
 
@@ -1538,10 +1692,7 @@ class PagedMxuLoop:
         """The row of carry over its schedule row interval (lo, hi, ctx),
         the drain row's single tile past the grid's last."""
         lo, hi, ctx = interval
-        num_unmasked = (
-            jnp.clip(ctx.mask_from - lo, 0, hi - lo + 1)
-            * self.traits.num_k_compute_tiles
-        )
+        num_unmasked = self.num_unmasked_tiles(lo, hi, ctx)
         return PagedRow(
             group=carry.group,
             si=carry.si,
@@ -1579,7 +1730,14 @@ class PagedMxuLoop:
         row = self.grid_mxu_row(
             carry, interval, q_tok, q_slot, is_drain_row, next_group
         )
-        probs = self.run_row(carry.probs, carry.finished, row)
+        probs = self.run_row(
+            carry.probs,
+            carry.finished,
+            row,
+            QPrefetch(
+                q_slot=q_slot, inflight=q_inflight, group=next_group, si=next_si
+            ),
+        )
         is_live = jnp.logical_not(is_drain_row).astype(jnp.int32)
         return PagedRowCarry(
             q_loaded=q_loaded,
@@ -1617,8 +1775,7 @@ class PagedMxuLoop:
 
     def finish_grid(self, last: PagedRowCarry) -> None:
         """After the drain row, whose carry is last: empty the pipeline, wait
-        out the output copies, replay the rows the guard flagged and fill
-        the packed padding rows."""
+        out the output copies and fill the packed padding rows."""
         traits, schedule = self.traits, self.schedule
         self.empty(
             last.tile,
@@ -1630,7 +1787,6 @@ class PagedMxuLoop:
             traits.num_stages,
             lambda slot: o_copy(traits, self.out_refs, 0, 0, slot).wait(),
         )
-        self.replay_flagged_rows()
         fill_packed_tail(
             traits,
             self.variant,
@@ -1650,19 +1806,24 @@ def paged_mxu_fwd_body(
     is_causal: bool,
 ) -> None:
     """paged_fwd_body on the explicit MXU pipeline: every row of the grid,
-    then a drain row, then the replay of the rows the guard flagged. The
-    arguments are paged_fwd_body's; is_causal is the schedule's right
-    bound."""
+    then a drain row. The arguments are paged_fwd_body's; is_causal is the
+    schedule's right bound."""
     variant.check_operands(operands)
     assert schedule.q_token is not None and schedule.kv_page is not None
     assert not (traits.rotary_dim and traits.rotary_k), traits
     if variant.return_lse:
         lse_stage = paged_refs.out_refs.lse_stage
         lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
-    row_max, row_sum, o, replay_rows, replay_count, stream_state, guard = (
-        paged_refs.row_refs
-    )
-    replay_count[0] = 0
+    (
+        row_max,
+        row_sum,
+        o,
+        checkpoint_sum,
+        checkpoint_o,
+        stream_state,
+        guard,
+        unit_guard,
+    ) = paged_refs.row_refs
     loop = PagedMxuLoop(
         traits=traits,
         variant=variant,
@@ -1675,10 +1836,11 @@ def paged_mxu_fwd_body(
         row_max=row_max,
         row_sum=row_sum,
         o=o,
-        replay_rows=replay_rows,
-        replay_count=replay_count,
+        checkpoint_sum=checkpoint_sum,
+        checkpoint_o=checkpoint_o,
         stream_state=stream_state,
         guard=guard,
+        unit_guard=unit_guard,
         is_causal=is_causal,
     )
     last = lax.fori_loop(0, loop.num_grid_rows + 1, loop.row_step, loop.fill())

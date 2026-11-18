@@ -96,6 +96,7 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     rotary_fields,
 )
 from flywheel_tpu.softmax_attention.fwd_mxu import (
+    NUM_CHECKPOINTS,
     NUM_ROW_PARITIES,
     mxu_block_sizes,
 )
@@ -1061,13 +1062,11 @@ def paged_scratch_shapes(
     gqa_fold: int,
     kv_dtype: jnp.dtype,
     uses_mxu_pipeline: bool,
-    num_grid_rows: int,
 ) -> list[pl.MemoryRef]:
     """Every scratch buffer of one paged build, in the order the kernel
     unpacks them: Q stage, (K, V) word staging, K and V planes, bounds rows
     per kv compute tile, Q rotary coefficients, out stage, the row state
-    (paged_row_state_buffers, whose replay list holds num_grid_rows), the
-    DMA semaphores and the lse stage.
+    (paged_row_state_buffers), the DMA semaphores and the lse stage.
 
     The kernel allocates them all, and estimate_vmem_bytes sums the VMEM
     ones. The Q, out, plane and pending V buffers are bf16, q's dtype
@@ -1132,7 +1131,6 @@ def paged_scratch_shapes(
             head_dim=head_dim,
             gqa_fold=gqa_fold,
             uses_mxu_pipeline=uses_mxu_pipeline,
-            num_grid_rows=num_grid_rows,
         ),
         pltpu.SemaphoreType.DMA(
             (NUM_SEMS + num_rotary_streams, max(num_stages, num_kv_stages))
@@ -1147,15 +1145,14 @@ def paged_row_state_buffers(
     head_dim: int,
     gqa_fold: int,
     uses_mxu_pipeline: bool,
-    num_grid_rows: int,
 ) -> list[pl.MemoryRef]:
     """The row state scratch of a paged build. The dot_general loop keeps row
     max, the row sum pair, the f32 accumulator's NUM_O_SLOTS slots, pending
     probs, pending V tile, and SMEM guard flags, block parity and pending-PV
     fields. An explicit MXU build keeps row max, row sum and accumulator in
-    NUM_ROW_PARITIES slots, and in SMEM the flat grid rows the guard flags (one
-    per grid row at most), their count, the kv tile stream and the guard
-    flag."""
+    NUM_ROW_PARITIES slots, the entry row sum and accumulator of
+    NUM_CHECKPOINTS check units, and in SMEM the kv tile stream, the row's
+    guard flag and the check unit's guard flag."""
     group_bq = gqa_fold * block_sizes.block_q
     bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
     vmem, smem = pltpu.VMEM, pltpu.SMEM
@@ -1164,10 +1161,11 @@ def paged_row_state_buffers(
             vmem((NUM_ROW_PARITIES, group_bq, NUM_LANES), f32),
             vmem((NUM_ROW_PARITIES, group_bq, NUM_LANES), f32),
             vmem((NUM_ROW_PARITIES, group_bq, head_dim), f32),
-            smem((num_grid_rows,), jnp.int32),
-            smem((1,), jnp.int32),
+            vmem((NUM_CHECKPOINTS, group_bq, NUM_LANES), f32),
+            vmem((NUM_CHECKPOINTS, group_bq, head_dim), f32),
             smem((STREAM_STATE_WORDS,), jnp.int32),
             smem((PAGED_HEAD_FOLD,), jnp.int32),
+            smem((1,), jnp.int32),
         ]
     bkv_compute = block_sizes.block_kv_compute
     return [
@@ -1205,8 +1203,6 @@ def estimate_vmem_bytes(
             gqa_fold=gqa_fold,
             kv_dtype=kv_dtype,
             uses_mxu_pipeline=uses_mxu_pipeline,
-            # The SMEM replay list's length leaves the VMEM bytes unchanged.
-            num_grid_rows=1,
         )
         if buffer.memory_space == pltpu.VMEM
     )
@@ -1355,7 +1351,6 @@ def paged_pallas_call(
         gqa_fold=traits.gqa_fold,
         kv_dtype=kv_cache.dtype,
         uses_mxu_pipeline=traits.uses_mxu_pipeline,
-        num_grid_rows=traits.num_head_groups * layout.num_rows,
     )
     # Note (david): the pool is pinned to HBM because memory space
     # assignment otherwise moves a pool that fits its VMEM budget there and

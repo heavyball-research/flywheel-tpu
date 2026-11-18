@@ -21,8 +21,19 @@ of one kv head, which share every K and V tile, and a row's segments run its
 live kv tiles in order: the row's start segment (its first live tile and the
 next), then LOOP_BODY_TILES tiles a loop step. Each row leaves its last tile
 in flight to the next row's start segment, and finishes right after it; rows
-alternate between NUM_ROW_PARITIES parities. A row the overflow guard flags
-replays before its output is written (VarlenMxuLoop.replay_row).
+alternate between NUM_ROW_PARITIES parities.
+
+The overflow guard checks a row's tiles by check units of UNIT_TILES tiles,
+two loop bodies that may cross kv blocks (VarlenMxuLoop.checked_unit). A
+unit's last tile also writes the row state it leaves into a checkpoint, the
+next unit's entry state, and collects the row sums it writes. The next
+unit's first body finishes that tile's softmaxes in its first qk_pop ticks,
+and at its end those row sums decide whether the unit replays: from its own
+checkpoint, through the first body's tiles. The next body adds nothing for
+the items the replay redid. A row's final unit, from the unit after its last
+checked one to its last tile, replays when the row's own sums flag it,
+before its output is written (VarlenMxuLoop.complete_row). The row state
+stays in place at the row's parity.
 """
 
 import dataclasses
@@ -73,15 +84,25 @@ from flywheel_tpu.softmax_attention.fwd_call import staged_shape
 from flywheel_tpu.softmax_attention.fwd_mxu import (
     ENTRY_PARITY,
     LOOP_BODY_TILES,
+    NUM_CHECKPOINTS,
     NUM_ROW_PARITIES,
+    REPLAY_RESULT_SLOTS,
     ROW_START_TILES,
+    UNIT_TILES,
+    FlaggedTailOps,
+    LargestSums,
+    RowCheckpoints,
+    UnitCheckpoint,
     accumulate_fragment,
-    across_lanes,
     aligned_rows,
-    anchored_probs,
+    first_final_unit,
     fold_fragment_scores,
+    fold_replayed_fragment,
+    fold_unit_end_scores,
     fragment_rows,
+    guard_flag,
     mxu_pipeline_applies,
+    replay_matmul,
     row_finish_state,
     scaled_logits,
     stage_row_finish,
@@ -89,8 +110,7 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
 from flywheel_tpu.softmax_attention.inputs import pad_axis
 from flywheel_tpu.softmax_attention.mxu_pipeline import (
     FRAGMENT_ROWS,
-    QK_MXU,
-    STAGING_REGISTER,
+    FragmentOps,
     MxuPipeline,
     PipelineState,
     Tail,
@@ -118,11 +138,6 @@ FINISH_STEP_ROWS = 256
 # anchor and starts its sums, every other tile reads them.
 ROW_START = "row_start"
 ROW_TILE = "row_tile"
-# The guard replay pushes into the staging register the pipeline leaves empty
-# and pops the two result slots no segment's tail holds.
-REPLAY_STAGING_REGISTER = 1 - STAGING_REGISTER
-REPLAY_SCORE_SLOT = 0
-REPLAY_VALUE_SLOT = 1
 # A key index past every packed kv axis: a tile from it hides every key.
 DEAD_KEY = 1 << 30
 
@@ -358,7 +373,8 @@ class TileRef(NamedTuple):
 class VarlenFragmentOps:
     """The FragmentOps of a segment of the row of ctx: q fragments from the
     row's Q slot, K and V tiles as tiles places the segment's tile keys, and
-    the bounds-masked softmax into the row state of parity's rows."""
+    the bounds-masked softmax into the row state of parity's rows; unit_end
+    names a check unit's last tile (UnitCheckpoint)."""
 
     traits: FwdTraits
     variant: Variant
@@ -372,6 +388,7 @@ class VarlenFragmentOps:
     row_sum: jax.Array
     o: jax.Array
     tiles: tuple[TileRef, ...]
+    unit_end: UnitCheckpoint | None = None
 
     def _tile_rows(self, tile: int) -> tuple[jax.Array, pl.Slice]:
         ref = self.tiles[tile]
@@ -406,27 +423,44 @@ class VarlenFragmentOps:
             return bounds, row_ids
         return tuple(tile - row_ids for tile in bounds), None
 
-    def softmax(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+    def rows(self, item: WorkItem) -> pl.Slice:
+        """The row-state rows of item's fragment."""
         chunk, head = item.fragment
+        return chunk_rows(self.traits, chunk, head)
+
+    def masked_scores(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+        """item's raw scores as masked log2-unit logits (mask_fragment)."""
+        chunk, _ = item.fragment
         bounds, row_ids = self.masks
-        masked = mask_fragment(
+        return mask_fragment(
             self.variant, bounds[item.tile], row_ids, chunk, scores
         )
-        return fold_fragment_scores(
-            self.row_max,
-            self.row_sum,
-            chunk_rows(self.traits, chunk, head),
-            masked,
-            is_row_start=item.mode == ROW_START,
+
+    def is_unit_end(self, item: WorkItem) -> bool:
+        return self.unit_end is not None and item.tile == self.unit_end.tile
+
+    def softmax(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+        rows, masked = self.rows(item), self.masked_scores(item, scores)
+        if not self.is_unit_end(item):
+            return fold_fragment_scores(
+                self.row_max,
+                self.row_sum,
+                rows,
+                masked,
+                is_row_start=item.mode == ROW_START,
+            )
+        assert item.mode == ROW_TILE, item
+        return fold_unit_end_scores(
+            self.row_max, self.row_sum, rows, masked, self.unit_end
         )
 
     def accumulate(self, item: WorkItem, weighted_values: jax.Array) -> None:
-        chunk, head = item.fragment
         accumulate_fragment(
             self.o,
-            chunk_rows(self.traits, chunk, head),
+            self.rows(item),
             weighted_values,
             is_row_start=item.mode == ROW_START,
+            checkpoint_o=self.unit_end.o if self.is_unit_end(item) else None,
         )
 
 
@@ -508,11 +542,28 @@ class ReplayRefs:
     kv_refs: KVRefs
 
 
+class ReplayedRow(NamedTuple):
+    """A row as a replay recomputes it: its staged Q (slot q_slot of q_buf),
+    its row-state parity, its first kv block and first live tile in it, its
+    schedule row and its kv head."""
+
+    q_buf: jax.Array
+    q_slot: jax.Array | int
+    parity: jax.Array
+    lo: jax.Array
+    first_tile: jax.Array
+    ctx: ScheduleRow
+    kv_head: jax.Array
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class VarlenMxuLoop:
     """The explicit loop's static context: the build, the schedule and every
     ref the loop's steps read. The row state holds NUM_ROW_PARITIES slots of
-    anchors, lane partial sums and output accumulators."""
+    anchors, lane partial sums and output accumulators, and checkpoint_sum
+    and checkpoint_o a check unit's entry state (UnitCheckpoint). In SMEM,
+    guard holds the flag finish_row_sums sets for a row and unit_guard the
+    flag of a check unit (checked_unit)."""
 
     traits: FwdTraits
     variant: Variant
@@ -526,7 +577,10 @@ class VarlenMxuLoop:
     row_max: jax.Array
     row_sum: jax.Array
     o: jax.Array
+    checkpoint_sum: jax.Array
+    checkpoint_o: jax.Array
     guard: jax.Array
+    unit_guard: jax.Array
     replay: ReplayRefs
 
     @property
@@ -725,7 +779,9 @@ class VarlenMxuLoop:
         )
         run = RowRun(q_slot, parity, span, row, ahead)
         probs, last_mask = self.start_row(carry, run, stream, is_last_half)
-        self.complete_row(prev_finish)
+        self.complete_row(
+            prev_finish, self.tile_tail(q_slot, parity, row.ctx, last_mask)
+        )
         probs, stream, last_mask = self.run_tiles(
             (probs, stream, last_mask), run, is_last_half
         )
@@ -797,20 +853,27 @@ class VarlenMxuLoop:
         first_next_desc, second_next_desc, (next_lo, _, next_ctx) = (
             blocks.first_two_blocks(next_g, next_si)
         )
-        num_tiles = (
-            (hi - lo) * self.num_block_tiles
-            + schedule.num_live_tiles(hi, ctx)
-            - schedule.first_live_tile(hi, ctx)
-        )
         span = RowSpan(
             lo,
-            schedule.first_live_tile(lo, ctx),
-            num_tiles,
+            *self.live_tiles(lo, hi, ctx),
             schedule.first_live_tile(next_lo, next_ctx),
         )
         row = GridRow(g * traits.group_heads, hi, ctx, schedule.q_token(ctx))
         ahead = (first_next_desc, second_next_desc)
         return span, row, ahead, (next_g, next_si, schedule.q_token(next_ctx))
+
+    def live_tiles(
+        self, lo: jax.Array, hi: jax.Array, ctx: ScheduleRow
+    ) -> tuple[jax.Array, jax.Array]:
+        """(first live tile in block lo, live tiles) of the row of ctx over
+        kv blocks lo..hi."""
+        schedule = self.schedule
+        num_tiles = (
+            (hi - lo) * self.num_block_tiles
+            + schedule.num_live_tiles(hi, ctx)
+            - schedule.first_live_tile(hi, ctx)
+        )
+        return schedule.first_live_tile(lo, ctx), num_tiles
 
     def start_row(
         self,
@@ -899,7 +962,7 @@ class VarlenMxuLoop:
             pipeline.check_loop_tail(
                 state.tail, self.tile_tail(q_slot, parity, ctx, tiles[1].mask)
             )
-            self.stage_row_finish(prev_finish, reduces_sums=True)
+            self.stage_row_finish(prev_finish)
             return state.probs
 
         if not self.has_half_tiles:
@@ -938,9 +1001,35 @@ class VarlenMxuLoop:
         is_half: bool,
         steps_block: bool,
     ) -> TileCarry:
+        """advance_tiles's segment with the row's own ops, as a loop step."""
+        state, stream, last_mask = self.advance_tiles(
+            index,
+            tile_carry,
+            run,
+            num_segment_tiles=num_segment_tiles,
+            is_half=is_half,
+            steps_block=steps_block,
+        )
+        return state.probs, stream, last_mask
+
+    def advance_tiles(
+        self,
+        index: jax.Array,
+        tile_carry: TileCarry,
+        run: RowRun,
+        *,
+        num_segment_tiles: int,
+        is_half: bool,
+        steps_block: bool,
+        ops_of: Callable[[VarlenFragmentOps], VarlenFragmentOps] | None = None,
+        tail_ops_of: Callable[[VarlenFragmentOps], FragmentOps] | None = None,
+    ) -> tuple[PipelineState, KVStream, TileMask]:
         """The segment of num_segment_tiles live tiles of the row from tile
         index on, all in one block, the last a half tile when is_half; under
-        steps_block it first steps the block when the segment opens it."""
+        steps_block it first steps the block when the segment opens it.
+        ops_of maps the segment's ops, tail_ops_of the ops that finish the
+        segment before. Returns the pipeline state, the kv stream and the
+        mask of the segment's last tile."""
         pipeline = self.pipeline
         lo, first_tile, num_tiles, next_row_tile = run.span
         ctx = run.row.ctx
@@ -958,11 +1047,15 @@ class VarlenMxuLoop:
             )
             for offset in range(num_segment_tiles)
         )
+        ops = self.ops(run.q_slot, run.parity, ctx, tiles)
         assumed = self.tile_tail(run.q_slot, run.parity, ctx, prev_mask)
+        tail = assumed
+        if tail_ops_of is not None:
+            tail = dataclasses.replace(assumed, ops=tail_ops_of(assumed.ops))
         state = pipeline.advance(
-            PipelineState(probs=probs, tail=assumed),
+            PipelineState(probs=probs, tail=tail),
             self.segment_items(num_segment_tiles, is_half=is_half),
-            self.ops(run.q_slot, run.parity, ctx, tiles),
+            ops if ops_of is None else ops_of(ops),
             next_k_tile=self.next_k_tile(
                 stream,
                 tile + num_segment_tiles,
@@ -971,7 +1064,7 @@ class VarlenMxuLoop:
             ),
         )
         pipeline.check_loop_tail(state.tail, assumed)
-        return state.probs, stream, tiles[-1].mask
+        return state, stream, tiles[-1].mask
 
     def run_tiles(
         self,
@@ -979,9 +1072,10 @@ class VarlenMxuLoop:
         run: RowRun,
         is_last_half: jax.Array | bool,
     ) -> TileCarry:
-        """The row's live tiles after its start segment: run_whole_tiles's,
-        then the one whole tile they leave over, then the last tile as a half
-        tile when is_last_half."""
+        """The row's live tiles after its start segment: its check units
+        (checked_units), run_whole_tiles's from the tile after them, then the
+        one whole tile they leave over, then the last tile as a half tile when
+        is_last_half."""
         num_tiles = run.span.num_tiles
         has_half_last = jnp.logical_and(
             is_last_half, num_tiles > ROW_START_TILES
@@ -989,7 +1083,12 @@ class VarlenMxuLoop:
         whole_end = jnp.maximum(
             num_tiles - has_half_last.astype(jnp.int32), ROW_START_TILES
         )
-        tile_carry = self.run_whole_tiles(tile_carry, run, whole_end)
+        first_whole = ROW_START_TILES
+        if self.has_checked_units:
+            tile_carry, first_whole = self.checked_units(tile_carry, run)
+        tile_carry = self.run_whole_tiles(
+            tile_carry, run, first_whole, whole_end
+        )
         tile_carry = self.tile_segment_where(
             (whole_end - ROW_START_TILES) % LOOP_BODY_TILES > 0,
             whole_end - 1,
@@ -1004,14 +1103,17 @@ class VarlenMxuLoop:
         return tile_carry
 
     def run_whole_tiles(
-        self, tile_carry: TileCarry, run: RowRun, whole_end: jax.Array
+        self,
+        tile_carry: TileCarry,
+        run: RowRun,
+        first: jax.Array | int,
+        whole_end: jax.Array,
     ) -> TileCarry:
-        """The row's whole tiles from ROW_START_TILES up to whole_end,
-        LOOP_BODY_TILES a step: per kv block its step, then an inner loop
-        whose body is the segment alone. Every block but the last holds an
-        even count of them (a row that spans blocks starts at its first
-        block's tile 0, and a block holds an even count of tiles), so at most
-        one is left over."""
+        """The row's whole tiles from first up to whole_end, LOOP_BODY_TILES
+        a step: per kv block its step, then an inner loop whose body is the
+        segment alone. Every block but the last holds an even count of them
+        (a row that spans blocks starts at its first block's tile 0, and a
+        block holds an even count of tiles), so at most one is left over."""
         row, ahead = run.row, run.ahead
         lo, first_tile = run.span.lo, run.span.first_tile
         tiles_a_block = self.num_block_tiles
@@ -1020,11 +1122,14 @@ class VarlenMxuLoop:
             return lo + (index + first_tile) // tiles_a_block
 
         def _run_block(kv, tile_carry):
-            # The row's first block stepped before its start segment.
+            # A block that opens before first stepped with the segment that
+            # opened it (the start segment or a check unit's).
             probs, stream, prev_mask = tile_carry
-            stream = self.step_block(stream, kv > lo, row, kv, ahead)
             block_first = (kv - lo) * tiles_a_block - first_tile
-            begin = jnp.maximum(block_first, ROW_START_TILES)
+            stream = self.step_block(
+                stream, block_first >= first, row, kv, ahead
+            )
+            begin = jnp.maximum(block_first, first)
             end = jnp.minimum(block_first + tiles_a_block, whole_end)
             return lax.fori_loop(
                 0,
@@ -1041,13 +1146,125 @@ class VarlenMxuLoop:
             )
 
         return lax.fori_loop(
-            _block_of(ROW_START_TILES),
-            jnp.where(
-                whole_end > ROW_START_TILES, _block_of(whole_end - 1) + 1, lo
-            ),
+            _block_of(first),
+            jnp.where(whole_end > first, _block_of(whole_end - 1) + 1, lo),
             _run_block,
             tile_carry,
         )
+
+    def final_unit(self, num_tiles: jax.Array | int) -> jax.Array | int:
+        """The first check unit of a row's final unit, given its live tiles:
+        the units before it are checked (checked_unit), and the loop step of
+        its own last body, whose first body is the row's last and checks
+        nothing, ends at least two whole tiles before the row's last tile; 0
+        when the row has no checked unit."""
+        return first_final_unit(num_tiles // UNIT_TILES)
+
+    @property
+    def has_checked_units(self) -> bool:
+        """Whether a row over the whole packed kv axis can hold a checked
+        unit."""
+        max_row_tiles = self.schedule.num_kv_blocks * self.num_block_tiles
+        return self.final_unit(max_row_tiles) > 0
+
+    def unit_end_ops(
+        self,
+        ops: VarlenFragmentOps,
+        *,
+        slot: jax.Array,
+        largest: LargestSums,
+        tile: int,
+    ) -> VarlenFragmentOps:
+        """ops whose items of tile key tile, a check unit's last tile, also
+        write the row state they leave into checkpoint slot slot and fold
+        their row sums into largest (UnitCheckpoint)."""
+        unit_end = UnitCheckpoint(
+            tile=tile,
+            row_sum=self.checkpoint_sum.at[slot],
+            o=self.checkpoint_o.at[slot],
+            largest=largest,
+        )
+        return dataclasses.replace(ops, unit_end=unit_end)
+
+    def checked_units(
+        self, tile_carry: TileCarry, run: RowRun
+    ) -> tuple[TileCarry, jax.Array]:
+        """Run the row's check units after its start segment (checked_unit),
+        up to the first body of the unit after its final unit; returns the
+        carry and the live tile after them."""
+        final_unit = self.final_unit(run.span.num_tiles)
+        num_units = jnp.where(final_unit > 0, final_unit + 1, 0)
+        self.unit_guard[0] = jnp.int32(0)
+        tile_carry = lax.fori_loop(
+            0,
+            num_units,
+            partial(self.checked_unit, run=run, final_unit=final_unit),
+            tile_carry,
+        )
+        return tile_carry, num_units * UNIT_TILES + LOOP_BODY_TILES
+
+    def checked_unit(
+        self,
+        unit: jax.Array,
+        tile_carry: TileCarry,
+        *,
+        run: RowRun,
+        final_unit: jax.Array,
+    ) -> TileCarry:
+        """Run the row's check unit unit's last body, whose last tile also
+        writes the next unit's entry state into that unit's checkpoint and
+        collects its row sums (unit_end_ops), then the next unit's first
+        body, which finishes that tile: its row sums flag unit, and a unit
+        before final_unit replays at the first body's end (replay_tiles),
+        through the first body's tiles. The last body adds nothing for the
+        items of the first body before it that a replay redid
+        (FlaggedTailOps). A first body may open a kv block; a last body opens
+        one only when a block holds one body."""
+        next_unit = unit + 1
+        largest = LargestSums()
+        unit_end_ops = partial(
+            self.unit_end_ops,
+            slot=lax.rem(next_unit, NUM_CHECKPOINTS),
+            largest=largest,
+        )
+        state, stream, last_mask = self.advance_tiles(
+            unit * UNIT_TILES + LOOP_BODY_TILES,
+            tile_carry,
+            run,
+            num_segment_tiles=LOOP_BODY_TILES,
+            is_half=False,
+            steps_block=self.num_block_tiles == LOOP_BODY_TILES,
+            ops_of=partial(unit_end_ops, tile=LOOP_BODY_TILES - 1),
+            tail_ops_of=partial(
+                FlaggedTailOps,
+                is_flagged=self.unit_guard[0] > 0,
+                plain_mode=ROW_TILE,
+            ),
+        )
+        state, stream, last_mask = self.advance_tiles(
+            next_unit * UNIT_TILES,
+            (state.probs, stream, last_mask),
+            run,
+            num_segment_tiles=LOOP_BODY_TILES,
+            is_half=False,
+            steps_block=True,
+            tail_ops_of=partial(unit_end_ops, tile=0),
+        )
+        self.unit_guard[0] = jnp.where(
+            unit < final_unit, guard_flag(self.traits, largest.value), 0
+        )
+
+        @pl.when(self.unit_guard[0] > 0)
+        def _replay():
+            self.replay_tiles(
+                self.replayed_row(run),
+                unit,
+                next_unit * UNIT_TILES + LOOP_BODY_TILES,
+                self.pipeline.free_slots(state.tail, REPLAY_RESULT_SLOTS),
+                checkpoint_unit=next_unit,
+            )
+
+        return state.probs, stream, last_mask
 
     def tile_segment_where(
         self,
@@ -1075,15 +1292,18 @@ class VarlenMxuLoop:
             tile_carry,
         )
 
-    def complete_row(self, finish: RowFinish) -> None:
-        """A row's finish after stage_row_finish: the replay and a second
-        staging if the guard flagged the row, then the writes, if the row is
+    def complete_row(self, finish: RowFinish, tail: Tail) -> None:
+        """A row's finish after stage_row_finish: if the guard flagged the
+        row, the replay of its final unit (replay_row_end) behind tail, the
+        pipeline's tail, and a second staging; then the writes, if the row is
         one."""
 
         @pl.when(self.guard[0] > 0)
         def _replay():
-            self.replay_row(finish)
-            self.stage_row_finish(finish, reduces_sums=False)
+            self.replay_row_end(
+                finish, self.pipeline.free_slots(tail, REPLAY_RESULT_SLOTS)
+            )
+            self.stage_row_finish(finish)
 
         @pl.when(finish.is_live > 0)
         def _write_row():
@@ -1107,14 +1327,11 @@ class VarlenMxuLoop:
                     fill_padding_tiles,
                 )
 
-    def stage_row_finish(
-        self, finish: RowFinish, *, reduces_sums: bool
-    ) -> None:
+    def stage_row_finish(self, finish: RowFinish) -> None:
         """Stage the row's lse and normalized output from its row state at
         finish.parity, once its last softmax has run and its output stage slot
-        is free (wait_row_out_slot), after reducing its lane partial sums (and
-        setting its guard flag) when reduces_sums; the replay leaves whole row
-        sums."""
+        is free (wait_row_out_slot): its lane partial sums reduce first,
+        setting its guard flag."""
         stage_row_finish(
             self.traits,
             self.variant,
@@ -1124,164 +1341,184 @@ class VarlenMxuLoop:
             ),
             self.out_refs,
             finish,
-            reduces_sums=reduces_sums,
+            reduces_sums=True,
         )
 
-    def replay_row(self, finish: RowFinish) -> None:
-        """Recompute a row the guard flagged with the exact rebasing softmax
-        into its row state at finish.parity, rolled. Each block is staged
-        again into the replay's buffers, and each fragment meets each tile on
-        MXU 0 through a staging register and result slots that no segment's
-        tail holds, so the items in flight stay untouched."""
-        traits, schedule = self.traits, self.schedule
-        replay = self.replay
-        lo, hi, ctx = schedule.row_interval(finish.si)
+    def replay_row_end(
+        self, finish: RowFinish, slots: tuple[jax.Array, ...]
+    ) -> None:
+        """Replay finish's final unit (final_unit) into its row state at
+        finish.parity from the unit's checkpoint, or from the row start,
+        through QK result slots slots, between the next row's start segment
+        and its next segment, which writes no checkpoint. The row's Q is
+        staged again into the replay's own Q buffer."""
+        traits, replay = self.traits, self.replay
+        lo, hi, ctx = self.schedule.row_interval(finish.si)
         start_q_row(traits, replay.q_refs, finish.base_head, finish.q_tok, 0)
         wait_rotated_q_row(traits, replay.q_refs, 0)
-        kv_head = finish.base_head // traits.q_heads_per_kv_head
+        first_tile, num_tiles = self.live_tiles(lo, hi, ctx)
+        row = ReplayedRow(
+            q_buf=replay.q_refs.buf,
+            q_slot=0,
+            parity=finish.parity,
+            lo=lo,
+            first_tile=first_tile,
+            ctx=ctx,
+            kv_head=finish.base_head // traits.q_heads_per_kv_head,
+        )
+        self.replay_tiles(row, self.final_unit(num_tiles), num_tiles, slots)
 
-        def _replay_block(kv, carry):
-            kv_tok = schedule.kv_token(kv, ctx)
-            start_kv_block(traits, replay.kv_refs, kv_head, kv_tok, 0)
-            wait_rotated_kv_block(traits, replay.kv_refs, 0)
+    def replayed_row(self, run: RowRun) -> ReplayedRow:
+        """The running row as a replay between two of its segments
+        recomputes it, from its Q in the Q stream."""
+        return ReplayedRow(
+            q_buf=self.q_refs.buf,
+            q_slot=run.q_slot,
+            parity=run.parity,
+            lo=run.span.lo,
+            first_tile=run.span.first_tile,
+            ctx=run.row.ctx,
+            kv_head=run.row.base_head // self.traits.q_heads_per_kv_head,
+        )
+
+    def replay_tiles(
+        self,
+        row: ReplayedRow,
+        first_unit: jax.Array,
+        end_tile: jax.Array,
+        slots: tuple[jax.Array, ...],
+        checkpoint_unit: jax.Array | None = None,
+    ) -> None:
+        """Recompute row's live tiles from check unit first_unit's first to
+        end_tile into its row state with the exact rebasing softmax, between
+        two segments: from the row start at unit 0, else from the unit's
+        checkpoint. Each kv block is staged again into the replay's buffer
+        and every fragment meets each of its tiles (replay_tile). Check unit
+        checkpoint_unit's checkpoint is written again as its first tile
+        starts, and rebased at the end to the anchor the tiles after it
+        raised (rebase_checkpoint), so a checkpoint always holds the row
+        state on the row's current anchor."""
+        traits, kv_refs = self.traits, self.replay.kv_refs
+        tiles_a_block = self.num_block_tiles
+        first = first_unit * UNIT_TILES + row.first_tile
+        end = end_tile + row.first_tile
+        checkpoints = self.row_checkpoints(row.parity)
+
+        @pl.when(first_unit > 0)
+        def _restore():
+            checkpoints.copy_checkpoint(first_unit, is_restore=True)
+
+        def _replay_block(block, carry):
+            kv = row.lo + block
+            kv_tok = self.schedule.kv_token(kv, row.ctx)
+            start_kv_block(traits, kv_refs, row.kv_head, kv_tok, 0)
+            wait_rotated_kv_block(traits, kv_refs, 0)
+            block_first = block * tiles_a_block
 
             def _replay_tile(tile, tile_carry):
-                bounds = tile_bounds(
-                    schedule, ctx, self.tile_mask(ctx, kv, tile)
-                )
-                lax.fori_loop(
-                    0,
-                    traits.group_bq // FRAGMENT_ROWS,
-                    lambda index, fragment_carry: self.replay_fragment(
-                        finish.parity, index, (tile, bounds), kv == lo
-                    ),
-                    None,
-                    unroll=traits.guard_replay_unroll,
-                )
+                tile_number = block_first + tile - row.first_tile
+                if checkpoint_unit is not None:
+
+                    @pl.when(tile_number == checkpoint_unit * UNIT_TILES)
+                    def _checkpoint():
+                        checkpoints.copy_checkpoint(
+                            checkpoint_unit, is_restore=False
+                        )
+                        checkpoints.save_anchor(first_unit)
+
+                self.replay_tile(row, kv, tile, tile_number == 0, slots)
                 return tile_carry
 
-            lax.fori_loop(
-                0, schedule.num_live_tiles(kv, ctx), _replay_tile, None
+            return lax.fori_loop(
+                jnp.maximum(first - block_first, 0),
+                jnp.minimum(end - block_first, tiles_a_block),
+                _replay_tile,
+                carry,
             )
-            return carry
 
-        lax.fori_loop(lo, hi + 1, _replay_block, None)
+        lax.fori_loop(
+            first // tiles_a_block,
+            (end - 1) // tiles_a_block + 1,
+            _replay_block,
+            None,
+        )
+        if checkpoint_unit is not None:
+            checkpoints.rebase_checkpoint(checkpoint_unit, first_unit)
+
+    def replay_tile(
+        self,
+        row: ReplayedRow,
+        kv: jax.Array,
+        tile: jax.Array,
+        is_row_start: jax.Array,
+        slots: tuple[jax.Array, ...],
+    ) -> None:
+        """Fold every fragment of row against tile tile of kv block kv,
+        staged in the replay's buffer, rolled by guard_replay_unroll."""
+        traits = self.traits
+        bounds = tile_bounds(
+            self.schedule, row.ctx, self.tile_mask(row.ctx, kv, tile)
+        )
+        lax.fori_loop(
+            0,
+            traits.group_bq // FRAGMENT_ROWS,
+            lambda index, carry: self.replay_fragment(
+                row, index, (tile, bounds), is_row_start, slots
+            ),
+            None,
+            unroll=traits.guard_replay_unroll,
+        )
 
     def replay_fragment(
         self,
-        parity: jax.Array,
+        row: ReplayedRow,
         index: jax.Array,
         tile_and_bounds: tuple[jax.Array, jax.Array],
-        is_first_block: jax.Array,
+        is_row_start: jax.Array,
+        slots: tuple[jax.Array, ...],
     ) -> None:
-        """Fold fragment index (chunk-major) against a replay tile, (its
-        index in the block, its bounds), into the row state at parity with
-        the exact rebasing softmax."""
-        traits = self.traits
+        """Fold fragment index (chunk-major) of row against a tile of the
+        replay's staged block, (its index in the block, its bounds), into
+        the row state with the exact rebasing softmax
+        (fwd_mxu.fold_replayed_fragment), both matmuls on QK_MXU through
+        slots, the (scores, probs @ V) result slots."""
+        traits, kv_refs = self.traits, self.replay.kv_refs
+        score_slot, value_slot = slots
         tile, bounds = tile_and_bounds
         chunk, head = index // traits.gqa_fold, index % traits.gqa_fold
         rows = chunk_rows(traits, chunk, head)
-        row_max, row_sum, o = (
-            ref.at[parity] for ref in (self.row_max, self.row_sum, self.o)
-        )
-        tokens = fragment_rows(chunk)
         keys = pl.ds(
             pl.multiple_of(tile * MXU_COLUMNS, MXU_COLUMNS), MXU_COLUMNS
         )
-        scores = self.replay_scores((chunk, head), tokens, keys, bounds)
-        is_row_start = jnp.logical_and(is_first_block, tile == 0)
-        probs, rescale = rebase_fragment(
-            row_max.at[rows], row_sum.at[rows], scores, is_row_start
-        )
-        weighted_values = self.replay_weighted_values(probs, keys)
-        lane_tiles = MXU_COLUMNS // NUM_LANES
-        o[rows, :] = jnp.where(
-            is_row_start,
-            weighted_values,
-            jnp.tile(rescale, (1, lane_tiles)) * o[rows, :] + weighted_values,
-        )
-
-    def replay_scores(
-        self,
-        fragment: tuple[jax.Array, jax.Array],
-        tokens: pl.Slice,
-        keys: pl.Slice,
-        bounds: jax.Array,
-    ) -> jax.Array:
-        """The masked logits of fragment, (q chunk, folded head), whose
-        tokens meet the keys of the replay's staged block."""
-        chunk, head = fragment
-        replay, slots = self.replay, self.pipeline.qk_slots
-        pltpu.matmul_push_rhs(
-            replay.kv_refs.k_buf[0, keys, :],
-            staging_register=REPLAY_STAGING_REGISTER,
-            mxu_index=QK_MXU,
+        q_ref = staged_q_head(traits, row.q_buf.at[row.q_slot], head)
+        scores = replay_matmul(
+            score_slot,
+            q_ref[fragment_rows(chunk), :],
+            kv_refs.k_buf[0, keys, :],
             transpose=True,
         )
-        q_ref = staged_q_head(self.traits, replay.q_refs.buf.at[0], head)
-        pltpu.matmul_acc_lhs(
-            slots[REPLAY_SCORE_SLOT], q_ref[tokens, :], REPLAY_STAGING_REGISTER
+        fold_replayed_fragment(
+            self.row_max.at[row.parity, rows],
+            self.row_sum.at[row.parity, rows],
+            self.o.at[row.parity, rows],
+            mask_fragment(
+                self.variant, bounds, fragment_row_ids(), chunk, scores
+            ),
+            is_row_start,
+            value_slot,
+            lambda: kv_refs.v_buf[0, keys, :],
         )
-        return mask_fragment(
-            self.variant,
-            bounds,
-            fragment_row_ids(),
-            chunk,
-            pltpu.matmul_pop(slots[REPLAY_SCORE_SLOT]),
+
+    def row_checkpoints(self, parity: jax.Array) -> RowCheckpoints:
+        """The checkpoints of the check units of the row at parity."""
+        return RowCheckpoints(
+            checkpoint_sum=self.checkpoint_sum,
+            checkpoint_o=self.checkpoint_o,
+            row_sum=self.row_sum,
+            o=self.o,
+            parity=parity,
+            row_anchor=lambda rows: self.row_max[parity, rows, :],
         )
-
-    def replay_weighted_values(
-        self, probs: jax.Array, keys: pl.Slice
-    ) -> jax.Array:
-        """A fragment's f32 probs @ V over the keys of the replay's staged
-        block."""
-        replay, slots = self.replay, self.pipeline.qk_slots
-        pltpu.matmul_push_rhs(
-            replay.kv_refs.v_buf[0, keys, :],
-            staging_register=REPLAY_STAGING_REGISTER,
-            mxu_index=QK_MXU,
-        )
-        pltpu.matmul_acc_lhs(
-            slots[REPLAY_VALUE_SLOT],
-            probs.astype(jnp.bfloat16),
-            REPLAY_STAGING_REGISTER,
-        )
-        return pltpu.matmul_pop(slots[REPLAY_VALUE_SLOT])
-
-
-def rebase_fragment(
-    row_max_ref: jax.Array,
-    row_sum_ref: jax.Array,
-    scores: jax.Array,
-    is_row_start: jax.Array,
-) -> tuple[jax.Array, jax.Array]:
-    """The exact rebasing softmax of one fragment's masked scores: raise the
-    rows' running maximum in row_max_ref to cover them (or start it at a row
-    start), rescale row_sum_ref's whole row sums to it and add the
-    fragment's. Returns the f32 probabilities and the accumulator's
-    rescale."""
-    tile_max = across_lanes(scores.max(axis=-1))
-    prev_max = row_max_ref[...]
-    new_max = jnp.where(is_row_start, tile_max, jnp.maximum(prev_max, tile_max))
-    probs = anchored_probs(scores, new_max)
-    rescale = jnp.exp2(prev_max - new_max)
-    tile_sum = across_lanes(probs.sum(axis=-1))
-    row_sum_ref[...] = jnp.where(
-        is_row_start, tile_sum, rescale * row_sum_ref[...] + tile_sum
-    )
-    row_max_ref[...] = new_max
-    return probs, rescale
-
-
-def check_replay_slots(pipeline: MxuPipeline) -> None:
-    """Assert that the replay's result slots are free between segments: a
-    tail of whole slot rings holds its last qk_pop QK results in the ring's
-    last slots."""
-    in_flight = range(
-        pipeline.num_slots - pipeline.delays.qk_pop, pipeline.num_slots
-    )
-    assert REPLAY_SCORE_SLOT not in in_flight, in_flight
-    assert REPLAY_VALUE_SLOT not in in_flight, in_flight
 
 
 def varlen_mxu_fwd_body(
@@ -1311,7 +1548,6 @@ def varlen_mxu_fwd_body(
     loop, carry = make_mxu_loop(
         traits, variant, schedule, q_hbm, k_hbm, v_hbm, refs, operands
     )
-    check_replay_slots(loop.pipeline)
     carry = run_entry_tile(loop, carry)
     carry = lax.fori_loop(
         0,
@@ -1385,8 +1621,8 @@ def finish_last_row(loop: VarlenMxuLoop, carry: VarlenRowCarry) -> None:
     wait_row_out_slot(
         traits, loop.out_refs, last_finish, row_out_slot(traits, last_finish)
     )
-    loop.stage_row_finish(last_finish, reduces_sums=True)
-    loop.complete_row(last_finish)
+    loop.stage_row_finish(last_finish)
+    loop.complete_row(last_finish, exit_state.tail)
 
     @pl.when(stream.is_ahead_fresh > 0)
     def _wait_ahead():
@@ -1422,7 +1658,15 @@ def make_mxu_loop(
     q_refs, kv_refs, out_refs, state, replay = split_mxu_refs(
         traits, variant, (q_hbm, k_hbm, v_hbm), refs
     )
-    row_max, row_sum, o_scratch, guard_smem = state
+    (
+        row_max,
+        row_sum,
+        o_scratch,
+        checkpoint_sum,
+        checkpoint_o,
+        guard_smem,
+        unit_guard,
+    ) = state
     loop = VarlenMxuLoop(
         traits=traits,
         variant=variant,
@@ -1438,7 +1682,10 @@ def make_mxu_loop(
         row_max=row_max,
         row_sum=row_sum,
         o=o_scratch,
+        checkpoint_sum=checkpoint_sum,
+        checkpoint_o=checkpoint_o,
         guard=guard_smem,
+        unit_guard=unit_guard,
         replay=replay,
     )
     if variant.return_lse:
@@ -1474,7 +1721,8 @@ def split_mxu_refs(
     """The explicit loop's refs from the kernel's Q, K and V operands and its
     other refs (operands, then varlen_mxu_scratch_shapes's order): the Q and
     kv streams, the output refs, the row state (row max, lane partial sums,
-    accumulator, guard flags) and the replay's refs."""
+    accumulator, check unit checkpoints of row sums and accumulator, the row's
+    and the check unit's guard flags) and the replay's refs."""
     q_hbm, k_hbm, v_hbm = hbm_refs
     rest = list(refs)
     rotary_q_hbm = rest.pop(0) if traits.rotary_dim else None
@@ -1486,9 +1734,17 @@ def split_mxu_refs(
     (q_buf, k_buf, v_buf, rotary_q_buf, rotary_k_buf), rest = split_stages(
         rest, traits
     )
-    o_stage, row_max, row_sum, o_scratch, *rest = rest
+    (
+        o_stage,
+        row_max,
+        row_sum,
+        o_scratch,
+        checkpoint_sum,
+        checkpoint_o,
+        *rest,
+    ) = rest
     replay_stages, rest = split_stages(rest, traits)
-    guard_smem, sems, replay_sems, *rest = rest
+    guard_smem, unit_guard, sems, replay_sems, *rest = rest
     lse_stage = rest.pop(0) if variant.return_lse else None
     assert not rest, rest
     q_refs = QRefs(
@@ -1514,7 +1770,15 @@ def split_mxu_refs(
         lse_stage=lse_stage,
         sems=sems,
     )
-    state = (row_max, row_sum, o_scratch, guard_smem)
+    state = (
+        row_max,
+        row_sum,
+        o_scratch,
+        checkpoint_sum,
+        checkpoint_o,
+        guard_smem,
+        unit_guard,
+    )
     replay = replay_refs(q_refs, kv_refs, replay_stages, replay_sems)
     return q_refs, kv_refs, out_refs, state, replay
 
@@ -1595,9 +1859,10 @@ def varlen_mxu_scratch_shapes(
     """Every scratch buffer of one explicit varlen build, in the order
     split_mxu_refs unpacks them: Q (all folded heads), K and V stages, Q and
     (under rotary_k) K rotary coefficients, out stage, row max, lane partial
-    sums and f32 accumulator per parity, the replay's Q, K and V (and
-    coefficients), the SMEM guard flag, the DMA semaphores of the streams and
-    of the replay, and the lse stage."""
+    sums and f32 accumulator per parity, the lane partial sums and
+    accumulator of NUM_CHECKPOINTS check units, the replay's Q, K and V (and
+    coefficients), the SMEM guard flags of a row and of a check unit, the DMA
+    semaphores of the streams and of the replay, and the lse stage."""
     bq, bkv = traits.bq, traits.bkv
     num_stages = traits.num_stages
     head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
@@ -1629,11 +1894,14 @@ def varlen_mxu_scratch_shapes(
         vmem((NUM_ROW_PARITIES, group_bq, NUM_LANES), jnp.float32),
         vmem((NUM_ROW_PARITIES, group_bq, NUM_LANES), jnp.float32),
         vmem((NUM_ROW_PARITIES, group_bq, head_dim_v), jnp.float32),
+        vmem((NUM_CHECKPOINTS, group_bq, NUM_LANES), jnp.float32),
+        vmem((NUM_CHECKPOINTS, group_bq, head_dim_v), jnp.float32),
         vmem(staged_shape(traits, bq, head_dim_qk, layout, 1), q_dtype),
         vmem((1, bkv, head_dim_qk), k_dtype),
         vmem((1, bkv, head_dim_v), v_dtype),
         *_rotary_buffers(1, 1),
         pltpu.SMEM((traits.head_fold,), jnp.int32),
+        pltpu.SMEM((1,), jnp.int32),
         pltpu.SemaphoreType.DMA(
             (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
         ),

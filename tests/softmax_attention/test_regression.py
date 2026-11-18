@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.softmax_attention import fwd_blocks
-from flywheel_tpu.softmax_attention.config import next_pow2
+from flywheel_tpu.softmax_attention import dispatch, fwd_blocks
+from flywheel_tpu.softmax_attention.config import BlockSizes, next_pow2
 from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
     get_kernel,
@@ -34,6 +34,9 @@ from flywheel_tpu.softmax_attention.dispatch import (
 )
 from flywheel_tpu.softmax_attention.inputs import make_variant, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels import fwd_varlen
+from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    dense_has_checked_units,
+)
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import (
     HAS_MXU_ACCUMULATORS,
@@ -1494,6 +1497,258 @@ def test_dense_mxu_guard_replay(causal, seqlen, nheads_k, scaled_quarter):
     assert_lse_close(lse, q, k, v, causal=causal, sinks=sinks)
 
 
+# A dense guard case runs 2048-token blocks, one check unit each: the last q
+# block of a 12288-token causal grid visits its diagonal block (unit 0), then
+# blocks 0 to 4 (units 1 to 5). Units 0 to 3 are checked at the end of the next
+# block's first body; units 4 and 5 make the row's final unit.
+GUARD_SEQLEN = 12288
+GUARD_BLOCK = 2048
+GUARD_TILE_KEYS = 256
+# A spiked key's score in nats against rows that score 0 everywhere else.
+OVERFLOW_SCORE = 200.0
+LAST_Q_BLOCK = slice(GUARD_SEQLEN - GUARD_BLOCK, GUARD_SEQLEN)
+# The last fragment's rows of the last q block: 16 rows.
+DENSE_LAST_FRAGMENT_ROWS = slice(GUARD_SEQLEN - 16, GUARD_SEQLEN)
+# Note (david): 2^-64 flags every check unit and every row.
+FORCED_GUARD_THRESHOLD = -64.0
+
+
+def guard_qkv(spikes, rows, *, seqlen=GUARD_SEQLEN, nheads=4, nheads_k=2):
+    """random_qkv's (1, seqlen, heads, d) arrays where the q rows rows point
+    along one direction and every other q row is zero: every key scores 0
+    against them but those of each (start, stop, score) of spikes, which
+    score score nats."""
+    q, k, v = random_qkv(0, 1, seqlen, nheads, nheads_k, MXU_HEAD_DIM)
+    scale = MXU_HEAD_DIM**-0.5
+    magnitude = math.sqrt(OVERFLOW_SCORE / scale)
+    q, k = (np.array(x, np.float32) for x in (q, k))
+    q[:] = 0.0
+    q[:, rows, :, 0] = magnitude
+    k[..., 0] = 0.0
+    for start, stop, score in spikes:
+        k[:, start:stop, :, 0] = score / (magnitude * scale)
+    return jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), v
+
+
+def dense_unit_keys(
+    unit, first_tile, end_tile, *, seqlen=GUARD_SEQLEN, block=GUARD_BLOCK
+):
+    """(start, stop) of the keys of tiles [first_tile, end_tile) of check
+    unit unit of the last q block's row of a causal grid: unit 0 is its
+    diagonal block, unit u its kv block u - 1."""
+    block_index = seqlen // block - 1 if unit == 0 else unit - 1
+    first_key = block_index * block
+    return (
+        first_key + first_tile * GUARD_TILE_KEYS,
+        first_key + end_tile * GUARD_TILE_KEYS,
+    )
+
+
+def assert_checked_build(nheads, nheads_k, seqlen, causal):
+    """Assert that flash_attn_func's build of the shape runs the explicit MXU
+    loop with checked units."""
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = get_kernel(
+        nheads,
+        nheads_k,
+        seqlen,
+        seqlen,
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    traits = kernel.keywords["traits"]
+    assert traits.uses_mxu_pipeline
+    assert dense_has_checked_units(seqlen // traits.bkv)
+
+
+def explicit_dense_attn(q, k, v, *, block_q, block_kv, causal):
+    """make_flash_attn_mha's dense build of block_q x block_kv blocks on
+    (1, seqlen, nheads, d) arrays; the build must run the explicit MXU loop
+    with checked units."""
+    _, seqlen, nheads, head_dim = q.shape
+    variant = make_variant(
+        head_dim**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = make_flash_attn_mha(
+        nheads,
+        seqlen,
+        seqlen,
+        variant=variant,
+        block_sizes=BlockSizes(block_q=block_q, block_kv=block_kv),
+        head_dim=head_dim,
+        num_kv_heads=k.shape[2],
+        interpret=INTERPRET,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+    assert dense_has_checked_units(seqlen // block_kv)
+    out = kernel(*(x[0].swapaxes(0, 1) for x in (q, k, v)))
+    return out.swapaxes(0, 1)[None]
+
+
+DENSE_GUARD_CASES = [
+    pytest.param(
+        dict(spikes=[(*dense_unit_keys(0, 0, 1), OVERFLOW_SCORE)]),
+        id="unit0",
+    ),
+    pytest.param(
+        dict(spikes=[(*dense_unit_keys(2, 1, 2), OVERFLOW_SCORE)]),
+        id="middle-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[(*dense_unit_keys(1, 7, 8), OVERFLOW_SCORE)],
+            rows=DENSE_LAST_FRAGMENT_ROWS,
+        ),
+        id="last-fragments",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(4, 3, 4), OVERFLOW_SCORE),
+                (*dense_unit_keys(5, 1, 2), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="final-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*dense_unit_keys(3, 2, 3), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="two-units",
+    ),
+    # Unit 1's replay runs through unit 2's first body, whose keys raise the
+    # anchor past the one unit 2's checkpoint was written on; unit 2's last
+    # tile then flags unit 2, which replays from that checkpoint.
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*dense_unit_keys(2, 0, 1), 2 * OVERFLOW_SCORE),
+                (*dense_unit_keys(2, 7, 8), 3 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="anchor-raised-by-replay",
+    ),
+]
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spec", DENSE_GUARD_CASES)
+def test_dense_mxu_guard_replays_flagged_units(spec):
+    # Note (david): the spiked keys score ~200 nats against rows anchored at
+    # 0, so only a replay keeps those rows finite.
+    assert_checked_build(4, 2, GUARD_SEQLEN, causal=True)
+    q, k, v = guard_qkv(spec["spikes"], spec.get("rows", LAST_Q_BLOCK))
+    out = dense_attn(q, k, v, causal=True)
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=True)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_a_middle_unit_with_sinks():
+    spikes = [(*dense_unit_keys(2, 1, 2), OVERFLOW_SCORE)]
+    q, k, v = guard_qkv(spikes, LAST_Q_BLOCK)
+    sinks = random_sinks(4)
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)),
+        causal=True,
+        learnable_sink=sinks,
+        return_softmax_lse=True,
+        interpret=INTERPRET,
+    )
+    assert_output_close(to_head_major(out), q, k, v, causal=True, sinks=sinks)
+    assert_lse_close(lse, q, k, v, causal=True, sinks=sinks)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_full_row_units():
+    # Note (david): full rows anchor on block 0's first tile; blocks 0 and 1
+    # of the four are checked units, the first replaying from the row start.
+    seqlen = 8192
+    assert_checked_build(4, 2, seqlen, causal=False)
+    spikes = [
+        (2 * GUARD_TILE_KEYS, 3 * GUARD_TILE_KEYS, OVERFLOW_SCORE),
+        (
+            GUARD_BLOCK + 5 * GUARD_TILE_KEYS,
+            GUARD_BLOCK + 6 * GUARD_TILE_KEYS,
+            2 * OVERFLOW_SCORE,
+        ),
+    ]
+    q, k, v = guard_qkv(spikes, slice(0, seqlen), seqlen=seqlen)
+    out = dense_attn(q, k, v, causal=False)
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=False)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_after_a_short_diagonal_tile():
+    # Note (david): 1024-token blocks run their first interior body as its own
+    # segment after the diagonal block, which checks unit 0 there.
+    seqlen, block = 6144, 1024
+    spikes = [
+        (*dense_unit_keys(0, 0, 1, seqlen=seqlen, block=block), OVERFLOW_SCORE),
+        (
+            *dense_unit_keys(2, 1, 2, seqlen=seqlen, block=block),
+            2 * OVERFLOW_SCORE,
+        ),
+        (
+            *dense_unit_keys(5, 3, 4, seqlen=seqlen, block=block),
+            3 * OVERFLOW_SCORE,
+        ),
+    ]
+    q, k, v = guard_qkv(spikes, slice(seqlen - block, seqlen), seqlen=seqlen)
+    out = explicit_dense_attn(
+        q, k, v, block_q=block, block_kv=block, causal=True
+    )
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=True)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "causal,seqlen,block_q,block_kv",
+    [
+        pytest.param(True, 8192, 2048, 2048, id="causal"),
+        pytest.param(True, 4096, 1024, 1024, id="causal-short-diagonal"),
+        pytest.param(False, 8192, 2048, 2048, id="full"),
+        pytest.param(False, 6144, 1024, 2048, id="full-two-body-q"),
+    ],
+)
+def test_dense_mxu_forced_guard_replays_units(
+    causal, seqlen, block_q, block_kv, monkeypatch
+):
+    # Note (david): every check unit and every row is flagged: each checked
+    # unit replays at the end of the next block's first body, and each row's
+    # final unit after the row's drain.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda kv_seq_len: FORCED_GUARD_THRESHOLD,
+    )
+    q, k, v = random_qkv(0, 1, seqlen, 4, 2, MXU_HEAD_DIM)
+    out = explicit_dense_attn(
+        q, k, v, block_q=block_q, block_kv=block_kv, causal=causal
+    )
+    assert_output_close(out, q, k, v, causal=causal)
+
+
 skip_interpret = pytest.mark.skipif(
     INTERPRET, reason="interpret mode affords short sequences only"
 )
@@ -1689,3 +1944,220 @@ def test_varlen_mxu_guard_replay(causal):
     out, lse = outs[0]
     assert_segments_close(out, segments, cu, lse, causal=causal)
     assert jnp.array_equal(outs[1][0], out)
+
+
+# A chunk after a long prefix, its 512-token q blocks against kv blocks of 4
+# tiles: the chunk's two rows run 26 and 28 live tiles, whose check units 0 to
+# 3 and 0 to 4 are checked at the end of the next unit's first body; the rest
+# replay with the row.
+GUARD_PREFIX = 6144
+GUARD_CHUNK = 1024
+GUARD_BLOCK_SIZES = (512, 1024, 128, 128)
+MXU_TILE_KEYS = 256
+GUARD_UNIT_KEYS = 4 * MXU_TILE_KEYS
+
+
+@pytest.fixture(name="explicit_varlen_builds")
+def fixture_explicit_varlen_builds(monkeypatch):
+    """The traits of the packed builds traced on the explicit MXU pipeline
+    while the test runs; the kernel caches are cleared around it, so every
+    call builds and traces its kernel."""
+    builds = []
+    mxu_body = fwd_varlen.varlen_mxu_fwd_body
+
+    def recorded_body(traits, *args, **kwargs):
+        builds.append(traits)
+        return mxu_body(traits, *args, **kwargs)
+
+    monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", recorded_body)
+    get_kernel.cache_clear()
+    jax.clear_caches()
+    yield builds
+    get_kernel.cache_clear()
+    jax.clear_caches()
+
+
+def guard_case(nheads, nheads_k, spikes, *, rows=None):
+    """(q, k, v, segments) of one GUARD_CHUNK-token chunk whose keys are a
+    GUARD_PREFIX-token prefix and itself; its q rows (all when None) point
+    along one direction, against which every key scores 0 but those of each
+    (start, stop, score) of spikes, which score score nats."""
+    seqlen_k = GUARD_PREFIX + GUARD_CHUNK
+    q, k, v, _ = unequal_packed_qkv(
+        [GUARD_CHUNK], [seqlen_k], nheads, nheads_k, MXU_HEAD_DIM
+    )
+    scale = MXU_HEAD_DIM**-0.5
+    magnitude = math.sqrt(OVERFLOW_SCORE / scale)
+    q = np.zeros(q.shape, np.float32)
+    q[slice(None) if rows is None else rows, :, 0] = magnitude
+    k = np.array(k, np.float32)
+    k[..., 0] = 0.0
+    for start, stop, score in spikes:
+        k[start:stop, :, 0] = score / (magnitude * scale)
+    q, k = (jnp.asarray(x, jnp.bfloat16) for x in (q, k))
+    return q, k, v, [(q[None], k[None], v[None])]
+
+
+def run_guard_case(q, k, v, **kwargs):
+    """varlen_attn on a guard_case chunk, with GUARD_BLOCK_SIZES."""
+    return varlen_attn(
+        q,
+        k,
+        v,
+        cu_seqlens_of([GUARD_CHUNK]),
+        cu_seqlens_of([GUARD_PREFIX + GUARD_CHUNK]),
+        GUARD_CHUNK,
+        GUARD_PREFIX + GUARD_CHUNK,
+        causal=True,
+        return_softmax_lse=True,
+        block_sizes=GUARD_BLOCK_SIZES,
+        **kwargs,
+    )
+
+
+def varlen_unit_keys(unit, first_tile, end_tile):
+    """(start, stop) of the keys of tiles [first_tile, end_tile) of check
+    unit unit of a guard_case row."""
+    return (
+        unit * GUARD_UNIT_KEYS + first_tile * MXU_TILE_KEYS,
+        unit * GUARD_UNIT_KEYS + end_tile * MXU_TILE_KEYS,
+    )
+
+
+# The last fragments of a fold-4 512-token q block's tile: its last token chunk
+# of 16 rows for every folded head.
+VARLEN_LAST_FRAGMENT_ROWS = np.concatenate(
+    [np.arange(496, 512), np.arange(1008, 1024)]
+)
+VARLEN_GUARD_CASES = [
+    pytest.param(
+        dict(spikes=[(*varlen_unit_keys(0, 2, 3), OVERFLOW_SCORE)]), id="unit0"
+    ),
+    pytest.param(
+        dict(spikes=[(*varlen_unit_keys(2, 1, 2), OVERFLOW_SCORE)]),
+        id="middle-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[(*varlen_unit_keys(1, 3, 4), OVERFLOW_SCORE)],
+            rows=VARLEN_LAST_FRAGMENT_ROWS,
+        ),
+        id="last-fragments",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(5, 1, 2), OVERFLOW_SCORE),
+                (GUARD_PREFIX, GUARD_PREFIX + 57, OVERFLOW_SCORE),
+            ]
+        ),
+        id="final-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*varlen_unit_keys(3, 2, 3), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="two-units",
+    ),
+    # Unit 1's replay runs through unit 2's first tiles, whose keys raise the
+    # anchor past the one unit 2's checkpoint was written on; unit 2's last
+    # tile then flags unit 2, which replays from that checkpoint.
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*varlen_unit_keys(2, 0, 1), 2 * OVERFLOW_SCORE),
+                (*varlen_unit_keys(2, 3, 4), 3 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="anchor-raised-by-replay",
+    ),
+]
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spec", VARLEN_GUARD_CASES)
+def test_varlen_mxu_guard_replays_flagged_units(spec, explicit_varlen_builds):
+    # Note (david): the spiked keys score ~200 nats against rows that anchor on
+    # their first kv tile at 0, so only a replay keeps those rows finite.
+    q, k, v, segments = guard_case(8, 2, **spec)
+    out, lse = run_guard_case(q, k, v)
+    assert {
+        traits.num_k_compute_tiles for traits in explicit_varlen_builds
+    } == {GUARD_BLOCK_SIZES[1] // MXU_TILE_KEYS}
+    assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
+    assert_segments_close(
+        out, segments, cu_seqlens_of([GUARD_CHUNK]), lse, causal=True
+    )
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
+def test_varlen_mxu_guard_replays_a_middle_unit_with_sinks(
+    nheads, nheads_k, explicit_varlen_builds
+):
+    q, k, v, segments = guard_case(
+        nheads, nheads_k, [(*varlen_unit_keys(2, 1, 2), OVERFLOW_SCORE)]
+    )
+    sinks = random_sinks(nheads)
+    out, lse = run_guard_case(q, k, v, learnable_sink=sinks)
+    assert explicit_varlen_builds
+    assert_segments_close(
+        out,
+        segments,
+        cu_seqlens_of([GUARD_CHUNK]),
+        lse,
+        causal=True,
+        sinks=sinks,
+    )
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "nheads,nheads_k,block_kv",
+    [
+        pytest.param(8, 2, 512, id="fold4-block2"),
+        pytest.param(8, 2, 1024, id="fold4-block4"),
+        pytest.param(8, 2, 2048, id="fold4-block8"),
+        pytest.param(4, 4, 1024, id="fold1-block4"),
+    ],
+)
+def test_varlen_mxu_forced_guard_replays_units(
+    nheads, nheads_k, block_kv, monkeypatch, explicit_varlen_builds
+):
+    # Note (david): every check unit and every row is flagged: each checked
+    # unit replays at the end of the next unit's first body, and each row's
+    # final unit as the row is completed, while the next row runs; the
+    # 2500-token sequence's rows hold no checked unit and replay whole.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda seqlen_kv: FORCED_GUARD_THRESHOLD,
+    )
+    seqlens_q, seqlens_k = [1024, 200, 2500], [6024, 3201, 2500]
+    q, k, v, segments = unequal_packed_qkv(
+        seqlens_q, seqlens_k, nheads, nheads_k, MXU_HEAD_DIM
+    )
+    cu_q, cu_k = cu_seqlens_of(seqlens_q), cu_seqlens_of(seqlens_k)
+    out, lse = varlen_attn(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=True,
+        return_softmax_lse=True,
+        block_sizes=(512, block_kv, 128, 128),
+    )
+    assert {
+        traits.num_k_compute_tiles for traits in explicit_varlen_builds
+    } == {block_kv // MXU_TILE_KEYS}
+    assert_segments_close(out, segments, cu_q, lse, causal=True)
