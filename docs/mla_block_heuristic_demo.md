@@ -7,6 +7,7 @@
 逐 cell 分档表：`docs/mla_block_heuristic_fit_table.md`
 逐 cell 分档表 2（decode / verify 分支版）：`docs/mla_block_heuristic_fit_table2.md`
 逐 cell 分档表 3（scenario × dtype 分支版）：`docs/mla_block_heuristic_fit_table3.md`
+逐 cell 分档表 4（只分 scenario，按 VMEM / HBM 行为重写公式）：`docs/mla_block_heuristic_fit_table4.md`
 
 ## 0. 先给结论
 
