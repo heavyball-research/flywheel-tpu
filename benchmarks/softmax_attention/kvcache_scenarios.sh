@@ -15,8 +15,9 @@
 
 # Time attention over a paged KV cache in serving scenarios, chunked prefill,
 # decode and speculative verify, for flywheel, RPA v3 and vllm-torchtpu's
-# batched RPA, and MLA chunked prefill, decode and verify for flywheel_mla and
-# MLA v2, with a profiler trace per cell.
+# batched RPA, MLA chunked prefill, decode and verify for flywheel_mla and
+# MLA v2, and DeepSeek sparse attention (DSA) decode and chunked prefill for
+# flywheel_dsa and vllm-torchtpu's DSA, with a profiler trace per cell.
 #
 # MLA decode and verify: for each MLA_HEADS x MLA_KV_DTYPES, the core cell
 # decodes MLA_CORE_BATCH sequences of MLA_CORE_SEQ tokens of equal length, and
@@ -75,6 +76,17 @@
 #                     64:64:9216:2")
 #     MLA_DECODE_STEPS  decode steps per timed call (default 64); verify
 #                     runs VERIFY_STEPS
+#     DSA_IMPLS       DSA layer impls, e.g. "flywheel_dsa torchtpu_dsa
+#                     torchtpu_dsa_masked_dense" (default: none); the torchtpu
+#                     ones need TORCHTPU_SOURCE, and torchtpu_dsa_masked_dense
+#                     runs glm52 only
+#     TORCHTPU_PYTHON interpreter of the torchtpu DSA impls (default: PYTHON)
+#     DSA_GEOMETRIES  default "v32 glm52"
+#     DSA_DECODE_SEQS default "8192 32768 131072"
+#     DSA_DECODE_BATCHES default "1 32 128"
+#     DSA_DECODE_STEPS decode steps per timed call (default 16)
+#     DSA_PREFILL_SEQS default "32768 131072"
+#     DSA_CHUNK       chunked prefill tokens per call (default 4096)
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."
@@ -84,9 +96,14 @@ PYTHON=${PYTHON:-.venv/bin/python}
 OUT=${1:-results/benchmark/kvcache_scenarios/$(date +%Y%m%d_%H%M%S)}
 IMPLS=${IMPLS-"flywheel rpa"}
 TORCHTPU_SOURCE=${TORCHTPU_SOURCE:-}
+DSA_IMPLS=${DSA_IMPLS:-}
 if [[ " $IMPLS " == *" batched_rpa "* && -z $TORCHTPU_SOURCE ]]; then
   echo "IMPLS has batched_rpa: set TORCHTPU_SOURCE to a vllm-torchtpu" \
        "checkout." >&2
+  exit 1
+elif [[ " $DSA_IMPLS " == *" torchtpu_dsa"* && -z $TORCHTPU_SOURCE ]]; then
+  echo "DSA_IMPLS has a torchtpu impl: set TORCHTPU_SOURCE to a" \
+       "vllm-torchtpu checkout." >&2
   exit 1
 fi
 HEADS_K=${HEADS_K:-"4 32"}
@@ -113,17 +130,28 @@ MLA_PATTERNS=${MLA_PATTERNS-"spiky longtail"}
 MLA_VERIFY_TOKENS=${MLA_VERIFY_TOKENS-"1 2 3 4"}
 MLA_TUNED=${MLA_TUNED-"128:8:3072:1 64:64:9216:1 64:64:9216:2"}
 MLA_DECODE_STEPS=${MLA_DECODE_STEPS:-64}
+TORCHTPU_PYTHON=${TORCHTPU_PYTHON:-$PYTHON}
+DSA_GEOMETRIES=${DSA_GEOMETRIES:-"v32 glm52"}
+DSA_DECODE_SEQS=${DSA_DECODE_SEQS:-"8192 32768 131072"}
+DSA_DECODE_BATCHES=${DSA_DECODE_BATCHES:-"1 32 128"}
+DSA_DECODE_STEPS=${DSA_DECODE_STEPS:-16}
+DSA_PREFILL_SEQS=${DSA_PREFILL_SEQS:-"32768 131072"}
+DSA_CHUNK=${DSA_CHUNK:-4096}
 mkdir -p "$OUT"
 
 has_scenario() { [[ " $SCENARIOS " == *" $1 "* ]]; }
 
 note() { echo "$*" | tee -a "$OUT/benchmark.log"; }
 
+# Masked-dense routing admits glm52 only.
+dsa_admits() { [[ $1 != torchtpu_dsa_masked_dense || $2 == glm52 ]]; }
+
 run() {
-  local source_flags=()
+  local source_flags=() python=$PYTHON
   [[ -n $TORCHTPU_SOURCE ]] \
     && source_flags=(--torchtpu-source "$TORCHTPU_SOURCE")
-  $PYTHON benchmarks/softmax_attention/kvcache_scenarios.py "$@" \
+  [[ " $* " == *" --impl torchtpu_dsa"* ]] && python=$TORCHTPU_PYTHON
+  $python benchmarks/softmax_attention/kvcache_scenarios.py "$@" \
       "${source_flags[@]}" \
       --output "$OUT/benchmark.jsonl" --trace "$OUT/traces" \
       >> "$OUT/benchmark.log" 2>&1 \
@@ -147,6 +175,13 @@ if [[ -n $MLA_IMPLS ]]; then
   note "            mla decode batches [$MLA_DECODE_BATCHES]" \
        "seqs [$MLA_DECODE_SEQS] patterns [$MLA_PATTERNS]"
   note "            mla verify tokens [$MLA_VERIFY_TOKENS] tuned [$MLA_TUNED]"
+fi
+if [[ -n $DSA_IMPLS ]]; then
+  note "            dsa impls [$DSA_IMPLS] geometries [$DSA_GEOMETRIES]"
+  note "            dsa decode seqs [$DSA_DECODE_SEQS] batches" \
+       "[$DSA_DECODE_BATCHES] steps $DSA_DECODE_STEPS"
+  note "            dsa prefill seqs [$DSA_PREFILL_SEQS] chunk $DSA_CHUNK"
+  note "            torchtpu python: $TORCHTPU_PYTHON"
 fi
 note "start $(date -u +%FT%TZ)"
 
@@ -255,6 +290,30 @@ for spec in $MLA_TUNED; do
   else
     has_scenario verify && run_mla verify "$tokens" "${cell[@]}"
   fi
+done
+
+for geometry in $DSA_GEOMETRIES; do
+  has_scenario chunked_prefill || break
+  for seq in $DSA_PREFILL_SEQS; do
+    for impl in $DSA_IMPLS; do
+      dsa_admits "$impl" "$geometry" || continue
+      run --impl "$impl" --scenario chunked_prefill \
+          --dsa-geometry "$geometry" --seq "$seq" --chunk "$DSA_CHUNK"
+    done
+  done
+done
+
+for geometry in $DSA_GEOMETRIES; do
+  has_scenario decode || break
+  for seq in $DSA_DECODE_SEQS; do
+    for batch in $DSA_DECODE_BATCHES; do
+      for impl in $DSA_IMPLS; do
+        dsa_admits "$impl" "$geometry" || continue
+        run --impl "$impl" --scenario decode --dsa-geometry "$geometry" \
+            --seq "$seq" --batch "$batch" --decode-tokens "$DSA_DECODE_STEPS"
+      done
+    done
+  done
 done
 
 note "ALL DONE $(date -u +%FT%TZ)"
