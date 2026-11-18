@@ -1,5 +1,6 @@
 # The lint set follows tokamax: pyink formats, pylint checks against the
 # Google Python style guide (.pylintrc), and zizmor audits the workflows.
+# license-header requires the Apache-2.0 header on every Python and shell file.
 # .github/workflows/lint.yml runs these same hooks on every file.
 #
 #   uv run pre-commit install           # run on each commit
@@ -21,3 +22,15 @@ repos:
     rev: v1.31.1
     hooks:
       - id: zizmor
+  - repo: local
+    hooks:
+      # After an optional shebang: "# Copyright <year> <holder>", an optional
+      # "# Modifications copyright <year> heavyball-research", "#", then the
+      # Apache-2.0 notice. Copy the header of any file in flywheel_tpu/.
+      - id: license-header
+        name: license header
+        language: pygrep
+        entry: '\A(#![^\n]*\n)?# Copyright \d{4} [^\n]+\n(# Modifications copyright \d{4} heavyball-research\n)?#\n# Licensed under the Apache License, Version 2\.0 '
+        args: [--multiline, --negate]
+        types_or: [python, shell]
+        exclude: ^benchmarks/linear_attention/baseline_kernel/
