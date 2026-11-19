@@ -21,6 +21,17 @@ is one pipeline, from its first tile to its drain, so nothing ping-pongs
 between its kv blocks, and a causal row visits its diagonal block first: its
 diagonal items start the fragments' rows, and every later tile is one
 unmasked loop body, the first row's diagonal-only row included.
+
+The overflow guard checks a row's kv blocks by check units of one block each
+(DenseMxuLoop.checked_body). A unit's last tile also writes the row state it
+leaves into a checkpoint, the next unit's entry state. The next block's first
+body finishes that tile in its first qk_pop ticks; the row sums its own first
+tile writes bound the unit's, and at its end they decide whether the unit
+replays: from its checkpoint, through the first body's tiles. The next body
+adds nothing for the items the replay redid. A row's final unit, its last
+FINAL_UNIT_SPAN blocks, replays after the drain when the row's own sums
+flag it (DenseMxuLoop.finish_row). The row state stays in place at
+MXU_ROW_PARITY.
 """
 
 import dataclasses
@@ -33,7 +44,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
-from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tpu import MXU_COLUMNS
 from flywheel_tpu.softmax_attention.block_stream import (
@@ -44,42 +54,45 @@ from flywheel_tpu.softmax_attention.block_stream import (
 from flywheel_tpu.softmax_attention.config import BlockSizes
 from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
-    Fragment,
-    KVBlock,
     KVRefs,
     OutRefs,
     QRefs,
     RowFinish,
     RowStateRefs,
     ScoreMask,
-    SoftmaxPass,
     advance_dense_q_row,
     finish_row_lse,
     finish_row_lse_and_sinks,
     head_sinks,
     o_copy,
-    online_softmax,
     row_out_slot,
-    tile_parity,
     wait_rotated_kv_block,
     wait_rotated_q_row,
     wait_row_out_slot,
 )
 from flywheel_tpu.softmax_attention.fwd_mxu import (
+    FINAL_UNIT_SPAN,
     LOOP_BODY_TILES,
+    NUM_CHECKPOINTS,
+    REPLAY_RESULT_SLOTS,
+    FlaggedTailOps,
+    LargestSums,
+    RowCheckpoints,
+    UnitCheckpoint,
     accumulate_fragment,
     across_lanes,
+    finish_row_sums,
+    first_final_unit,
     fold_fragment_scores,
+    fold_replayed_fragment,
     fragment_rows,
     guard_flag,
     mxu_pipeline_applies,
+    replay_matmul,
     scaled_logits,
 )
 from flywheel_tpu.softmax_attention.mxu_pipeline import (
     FRAGMENT_ROWS,
-    PV_MXU,
-    QK_MXU,
-    STAGING_REGISTER,
     MxuPipeline,
     PipelineState,
     Tail,
@@ -96,6 +109,9 @@ MIN_MXU_BLOCK = 1024
 MXU_ROW_PARITY = 0
 # The fragments that meet one kv tile of the diagonal on it.
 FRAGMENTS_PER_TILE = MXU_COLUMNS // FRAGMENT_ROWS
+# A checked block's first body checks the unit before, and its body
+# SECOND_BODY finishes the first one's items (DenseMxuLoop.run_second_body).
+SECOND_BODY = 1
 
 
 def dense_uses_mxu_pipeline(
@@ -138,6 +154,12 @@ def dense_uses_mxu_pipeline(
             group_rows=block_q,
         )
     )
+
+
+def dense_has_checked_units(num_kv_blocks: int) -> bool:
+    """Whether a dense build whose rows visit at most num_kv_blocks kv blocks
+    has rows with a check unit before their final unit."""
+    return num_kv_blocks > FINAL_UNIT_SPAN
 
 
 class FragmentMode(NamedTuple):
@@ -235,31 +257,14 @@ def diagonal_items(
     return head, _items(0, ends_row)
 
 
-def replay_matmul(
-    pipeline: MxuPipeline, mxu_index: int, lhs: jax.Array, rhs: jax.Array
-) -> jax.Array:
-    """lhs @ rhs^T on QK_MXU, or lhs @ rhs on PV_MXU, of a drained pipeline:
-    rhs is one (MXU_COLUMNS, MXU_COLUMNS) tile staged once, and lhs streams
-    one fragment a result slot. Serial, for the rare guard replay; a kernel
-    with explicit MXU ops cannot also run dot_general."""
-    is_qk = mxu_index == QK_MXU
-    slots = pipeline.qk_slots if is_qk else pipeline.pv_slots
-    pltpu.matmul_push_rhs(
-        rhs,
-        staging_register=STAGING_REGISTER,
-        mxu_index=mxu_index,
-        transpose=is_qk,
-    )
-    num_fragments = lhs.shape[0] // FRAGMENT_ROWS
-    for fragment in range(num_fragments):
-        pltpu.matmul_acc_lhs(
-            slots[fragment],
-            lhs[fragment * FRAGMENT_ROWS : (fragment + 1) * FRAGMENT_ROWS],
-            STAGING_REGISTER if fragment == 0 else None,
-        )
-    return jnp.concatenate(
-        [pltpu.matmul_pop(slots[fragment]) for fragment in range(num_fragments)]
-    )
+class CheckRefs(NamedTuple):
+    """The scratch of a build's check units: the entry row sums and
+    accumulators of NUM_CHECKPOINTS units, (NUM_CHECKPOINTS, bq, ...), and
+    the SMEM (1,) flag of the unit a first body checks."""
+
+    checkpoint_sum: jax.Array
+    checkpoint_o: jax.Array
+    unit_guard: jax.Array
 
 
 @dataclasses.dataclass(eq=False)
@@ -280,7 +285,9 @@ class DenseFragmentOps:
     the row's Q staging slot q_slot, K and V tiles of the kv block at kv_slot
     counted from first_tile, and the row state at MXU_ROW_PARITY. A row-end
     item reduces its fragment's row sums and writes its normalized output
-    rows into o_stage at row_end's slot.
+    rows into o_stage at row_end's slot. unit_end names a check unit's last
+    tile (UnitCheckpoint), and largest collects the row sums the items of
+    tile key 0 write, when given.
 
     A fold only reads the row state, so ops without a block (kv_slot None)
     finish a tail: the items a segment leaves in flight push no tile.
@@ -297,6 +304,8 @@ class DenseFragmentOps:
     kv_slot: jax.Array | None = None
     first_tile: jax.Array | int = 0
     row_end: RowEnd | None = None
+    unit_end: UnitCheckpoint | None = None
+    largest: LargestSums | None = None
 
     def with_tiles(
         self,
@@ -326,7 +335,20 @@ class DenseFragmentOps:
     def q_fragment(self, item: WorkItem) -> jax.Array:
         return self.q_refs.buf[self.q_slot, fragment_rows(item.fragment), :]
 
-    def softmax(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+    @property
+    def row_max(self) -> jax.Array:
+        return self.state.row_max
+
+    @property
+    def row_sum(self) -> jax.Array:
+        return self.state.row_sum.at[MXU_ROW_PARITY]
+
+    def rows(self, item: WorkItem) -> pl.Slice:
+        """The row-state rows of item's fragment."""
+        return fragment_rows(item.fragment)
+
+    def masked_scores(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+        """item's raw scores as log2-unit logits, a diagonal item's masked."""
         logits = scaled_logits(self.variant, scores)
         if item.mode.is_diagonal:
             # A diagonal item's tile is static and counted from the block's
@@ -337,13 +359,30 @@ class DenseFragmentOps:
                 item.tile * MXU_COLUMNS,
                 logits.shape,
             )
-        row_sum_ref = self.state.row_sum.at[MXU_ROW_PARITY]
+        return logits
+
+    def is_unit_end(self, item: WorkItem) -> bool:
+        return self.unit_end is not None and item.tile == self.unit_end.tile
+
+    def softmax(self, item: WorkItem, scores: jax.Array) -> jax.Array:
+        logits = self.masked_scores(item, scores)
+        if self.is_unit_end(item):
+            return fold_fragment_scores(
+                self.row_max,
+                self.row_sum,
+                self.rows(item),
+                logits,
+                is_row_start=item.mode.is_row_start,
+                checkpoint_sum=self.unit_end.row_sum,
+            )
+        row_sum_ref = self.row_sum
         probs = fold_fragment_scores(
-            self.state.row_max,
+            self.row_max,
             row_sum_ref,
             fragment_rows(item.fragment),
             logits,
             is_row_start=item.mode.is_row_start,
+            largest=self.largest if item.tile == 0 else None,
         )
         if item.mode.is_row_end:
             # The fragment's last lane partial sums reduce to its row sums,
@@ -360,12 +399,14 @@ class DenseFragmentOps:
         return probs
 
     def accumulate(self, item: WorkItem, weighted_values: jax.Array) -> None:
-        if not item.mode.is_row_end:
+        is_unit_end = self.is_unit_end(item)
+        if is_unit_end or not item.mode.is_row_end:
             accumulate_fragment(
                 self.state.o.at[MXU_ROW_PARITY],
-                fragment_rows(item.fragment),
+                self.rows(item),
                 weighted_values,
                 is_row_start=item.mode.is_row_start,
+                checkpoint_o=self.unit_end.o if is_unit_end else None,
             )
             return
         # A row-end item's output rows are final: they go to the stage
@@ -417,7 +458,9 @@ class DenseMxuLoop:
     """The rows of a dense build on the explicit MXU pipeline, over the
     refs of dense_fwd_body. A row keeps its row state at MXU_ROW_PARITY;
     under blocks.is_diagonal_first (a causal build) it visits its last kv
-    block, the one that holds the diagonal, first."""
+    block, the one that holds the diagonal, first. check_refs holds the
+    scratch of the check units of a build with checked units
+    (dense_has_checked_units), else None."""
 
     traits: FwdTraits
     variant: Variant
@@ -430,10 +473,15 @@ class DenseMxuLoop:
     out_refs: OutRefs
     state: RowStateRefs
     mask: ScoreMask
+    check_refs: CheckRefs | None
 
     def __post_init__(self) -> None:
         traits, schedule = self.traits, self.schedule
         assert traits.head_fold == 1, traits.head_fold
+        assert (self.check_refs is not None) == self.has_checked_units
+        # A first body's checkpointed items, its first tile's, never sit in
+        # the tail the next body finishes.
+        assert self.num_fragments >= self.pipeline.delays.pv_pop
         if not self.blocks.is_diagonal_first:
             return
         bq, bkv = traits.bq, traits.bkv
@@ -450,6 +498,22 @@ class DenseMxuLoop:
     @property
     def bodies_per_block(self) -> int:
         return self.traits.num_k_compute_tiles // LOOP_BODY_TILES
+
+    @property
+    def num_fragments(self) -> int:
+        return self.traits.bq // FRAGMENT_ROWS
+
+    @property
+    def has_checked_units(self) -> bool:
+        return dense_has_checked_units(self.schedule.num_kv_blocks)
+
+    def final_unit(self, num_visits: jax.Array) -> jax.Array | int:
+        """The first visit of a row's final unit: the check units before it
+        are checked (checked_body), and the row's own sums check it after the
+        drain (replay_row_end); 0 in a build without checked units."""
+        if not self.has_checked_units:
+            return 0
+        return first_final_unit(num_visits)
 
     @functools.cached_property
     def loop_items(self) -> tuple[WorkItem, ...]:
@@ -477,8 +541,26 @@ class DenseMxuLoop:
         the block two visits ahead; ahead holds the descriptors of the next
         row's first two visits. Returns the shifted carry and the slots of
         this visit's block and the next one's."""
+        kv_slot, next_slot = kv_carry[:2]
+        ahead_block = self.ahead_block(
+            si, visit, num_visits, ahead, base_head, kv_carry
+        )
+        self.wait_next_block(kv_carry)
+        return self.start_ahead_block(kv_carry, ahead_block), kv_slot, next_slot
+
+    def ahead_block(
+        self,
+        si: jax.Array,
+        visit: jax.Array | int,
+        num_visits: jax.Array,
+        ahead: tuple[BlockDesc, BlockDesc],
+        base_head: jax.Array,
+        kv_carry: tuple,
+    ) -> tuple[BlockDesc, jax.Array, jax.Array]:
+        """The descriptor, ring slot and freshness of the block two visits
+        after row si's visit visit (step_block)."""
         blocks = self.blocks
-        kv_slot, next_slot, _, is_next_fresh, _, next_desc = kv_carry
+        _, next_slot, _, _, _, next_desc = kv_carry
         first_next_row_desc, second_next_row_desc = ahead
         ahead_desc = select_desc(
             visit + 2 < num_visits,
@@ -495,16 +577,31 @@ class DenseMxuLoop:
         ahead_slot = jnp.where(
             is_ahead_fresh > 0, lax.rem(next_slot + 1, NUM_KV_STAGES), next_slot
         )
+        return ahead_desc, ahead_slot, is_ahead_fresh
+
+    def wait_next_block(self, kv_carry: tuple) -> None:
+        """Wait for the next visit's block, when it is fresh."""
+        _, next_slot, _, is_next_fresh, _, _ = kv_carry
 
         @pl.when(is_next_fresh > 0)
         def _wait_next_block():
             wait_rotated_kv_block(self.traits, self.kv_refs, next_slot)
 
+    def start_ahead_block(
+        self,
+        kv_carry: tuple,
+        ahead_block: tuple[BlockDesc, jax.Array, jax.Array],
+    ) -> tuple:
+        """Start ahead_block (ahead_block's value) when it is fresh; returns
+        the kv carry one visit on."""
+        _, next_slot, _, is_next_fresh, _, next_desc = kv_carry
+        ahead_desc, ahead_slot, is_ahead_fresh = ahead_block
+
         @pl.when(is_ahead_fresh > 0)
         def _start_ahead_block():
-            blocks.start(ahead_desc, ahead_slot)
+            self.blocks.start(ahead_desc, ahead_slot)
 
-        stepped = (
+        return (
             next_slot,
             ahead_slot,
             is_next_fresh,
@@ -512,7 +609,6 @@ class DenseMxuLoop:
             next_desc,
             ahead_desc,
         )
-        return stepped, kv_slot, next_slot
 
     def run_body(
         self,
@@ -580,33 +676,18 @@ class DenseMxuLoop:
         the slot of the block the first segments ran. Returns the kv carry,
         the last visit's slot and the row's guard flag."""
         traits, pipeline = self.traits, self.pipeline
-        bodies_per_block = self.bodies_per_block
-        num_visits, base_head, ops, kv_carry, row_end = row
-        state_before, first_visit, first_visit_body = entry
+        num_visits, _, ops, kv_carry, row_end = row
+        state_before, first_visit, _ = entry
         assumed = self.loop_tail(ops, state_before)
         pipeline.check_loop_tail(state_before.tail, assumed)
-
-        def _visit(visit, carry):
-            kv_carry, probs, _ = carry
-            kv_carry, slot, next_slot = self.step_block(
-                si, visit, num_visits, ahead, base_head, kv_carry
-            )
-            probs = lax.fori_loop(
-                jnp.where(visit == first_visit, first_visit_body, 0),
-                jnp.where(
-                    visit == num_visits - 1,
-                    bodies_per_block - 1,
-                    bodies_per_block,
-                ),
-                partial(self.run_body, ops, assumed, slot, next_slot),
-                probs,
-            )
-            return kv_carry, probs, slot
-
+        if self.has_checked_units:
+            run_visit = self.run_checked_visit
+        else:
+            run_visit = self.run_visit
         kv_carry, probs, last_slot = lax.fori_loop(
             first_visit,
             num_visits,
-            _visit,
+            partial(run_visit, si, row, ahead, entry, assumed),
             (kv_carry, state_before.probs, slot),
         )
         end_ops = ops.with_tiles(
@@ -623,6 +704,203 @@ class DenseMxuLoop:
             last_slot,
             guard_flag(traits, end_ops.row_end.largest_sum),
         )
+
+    def run_visit(
+        self,
+        si: jax.Array,
+        row: DenseRow,
+        ahead: tuple[BlockDesc, BlockDesc],
+        entry: LoopEntry,
+        assumed: Tail,
+        visit: jax.Array,
+        carry: tuple,
+    ) -> tuple:
+        """Row si's visit visit in a build without checked units: the block
+        step, then its bodies after those the row's first segments ran; the
+        last visit leaves its last body to the row's end. carry is the visit
+        loop's (kv carry, probs, slot of the visit before)."""
+        num_visits, base_head, ops, _, _ = row
+        _, first_visit, first_visit_body = entry
+        kv_carry, probs, _ = carry
+        kv_carry, slot, next_slot = self.step_block(
+            si, visit, num_visits, ahead, base_head, kv_carry
+        )
+        probs = lax.fori_loop(
+            jnp.where(visit == first_visit, first_visit_body, 0),
+            jnp.where(
+                visit == num_visits - 1,
+                self.bodies_per_block - 1,
+                self.bodies_per_block,
+            ),
+            partial(self.run_body, ops, assumed, slot, next_slot),
+            probs,
+        )
+        return kv_carry, probs, slot
+
+    def run_checked_visit(
+        self,
+        si: jax.Array,
+        row: DenseRow,
+        ahead: tuple[BlockDesc, BlockDesc],
+        entry: LoopEntry,
+        assumed: Tail,
+        visit: jax.Array,
+        carry: tuple,
+    ) -> tuple:
+        """Row si's visit visit in a build with checked units, as run_visit:
+        its first body checks the unit before (checked_body) unless the row's
+        first segments ran it, finishing that unit's last tile, which writes
+        the visit's checkpoint (unit_end_ops); the block two visits ahead
+        starts once that unit's block can no longer replay from its slot;
+        the second body finishes the first one's items (run_second_body);
+        the block's last body writes the next unit's checkpoint on its last
+        tile, and so do the bodies between, the last visit's included."""
+        num_visits, base_head, ops, _, _ = row
+        _, first_visit, first_visit_body = entry
+        kv_carry, probs, prev_slot = carry
+        slot, next_slot = kv_carry[:2]
+        self.wait_next_block(kv_carry)
+        unit_end_tail = dataclasses.replace(
+            assumed,
+            ops=self.unit_end_ops(ops, visit, LOOP_BODY_TILES - 1),
+        )
+
+        def _checked(probs):
+            state = self.checked_body(
+                row,
+                visit,
+                prev_slot,
+                slot,
+                PipelineState(probs=probs, tail=unit_end_tail),
+            )
+            self.pipeline.check_loop_tail(state.tail, assumed)
+            return state.probs
+
+        if first_visit_body == 0:
+            probs = _checked(probs)
+        else:
+            probs = lax.cond(
+                visit == first_visit, lambda probs: probs, _checked, probs
+            )
+        kv_carry = self.start_ahead_block(
+            kv_carry,
+            self.ahead_block(si, visit, num_visits, ahead, base_head, kv_carry),
+        )
+        second_body = partial(
+            self.run_second_body, ops, assumed, (slot, next_slot)
+        )
+        is_last_visit = visit == num_visits - 1
+        # The last visit writes over the checkpoint of its own unit, which the
+        # row's final unit does not read.
+        writing_ops = self.unit_end_ops(
+            ops,
+            visit + jnp.logical_not(is_last_visit).astype(jnp.int32),
+            LOOP_BODY_TILES - 1,
+        )
+        if self.bodies_per_block == SECOND_BODY + 1:
+            # The second body is the block's last; the last visit's ends the
+            # row's fragments.
+            return (
+                kv_carry,
+                lax.cond(
+                    is_last_visit,
+                    lambda probs: probs,
+                    partial(second_body, writing_ops),
+                    probs,
+                ),
+                slot,
+            )
+        # Note (david): the second body is its own segment, not a loop body,
+        # so the ahead block's DMA start joins its basic block.
+        probs = lax.fori_loop(
+            SECOND_BODY + 1,
+            jnp.where(
+                is_last_visit,
+                self.bodies_per_block - 1,
+                self.bodies_per_block,
+            ),
+            partial(self.run_body, writing_ops, assumed, slot, next_slot),
+            second_body(ops, probs),
+        )
+        return kv_carry, probs, slot
+
+    def run_second_body(
+        self,
+        ops: DenseFragmentOps,
+        assumed: Tail,
+        slots: tuple[jax.Array, jax.Array],
+        body_ops: DenseFragmentOps,
+        probs: tuple[jax.Array, ...],
+    ) -> tuple[jax.Array, ...]:
+        """Body SECOND_BODY of a checked visit whose block and the next one
+        sit at slots, its items with body_ops; it finishes the first body's
+        items with ops (FlaggedTailOps): once a replay redid them, they add
+        nothing."""
+        slot, next_slot = slots
+        tail = dataclasses.replace(
+            assumed,
+            ops=FlaggedTailOps(ops, self.check_refs.unit_guard[0] > 0, PLAIN),
+        )
+        return self.run_body(
+            body_ops, tail, slot, next_slot, SECOND_BODY, probs
+        )
+
+    def unit_end_ops(
+        self, ops: DenseFragmentOps, unit: jax.Array | int, tile: int
+    ) -> DenseFragmentOps:
+        """ops whose items of tile key tile, the last tile of check unit
+        unit - 1, also write the row state they leave into unit's checkpoint
+        (UnitCheckpoint)."""
+        index = lax.rem(unit, NUM_CHECKPOINTS)
+        unit_end = UnitCheckpoint(
+            tile=tile,
+            row_sum=self.check_refs.checkpoint_sum.at[index],
+            o=self.check_refs.checkpoint_o.at[index],
+        )
+        return dataclasses.replace(ops, unit_end=unit_end)
+
+    def checked_body(
+        self,
+        row: DenseRow,
+        visit: jax.Array | int,
+        prev_slot: jax.Array,
+        slot: jax.Array,
+        state_before: PipelineState,
+    ) -> PipelineState:
+        """Run visit visit's first body, of the block at slot, after
+        state_before. The row sums its first tile's items write bound the
+        final sums of check unit visit - 1, the block at prev_slot, which
+        replays through the body's tiles at its end (replay_unit) when they
+        flag it, unless it is in the row's final unit. Returns the body's
+        pipeline state."""
+        pipeline, check_refs = self.pipeline, self.check_refs
+        num_visits, _, ops, _, _ = row
+        largest = LargestSums()
+        next_ops = ops.with_tiles(slot, LOOP_BODY_TILES)
+        state = pipeline.advance(
+            state_before,
+            self.loop_items,
+            dataclasses.replace(ops.with_tiles(slot, 0), largest=largest),
+            next_k_tile=lambda: next_ops.k_tile(0),
+        )
+        unit = visit - 1
+        check_refs.unit_guard[0] = jnp.where(
+            unit < self.final_unit(num_visits),
+            guard_flag(self.traits, largest.value),
+            0,
+        )
+
+        @pl.when(check_refs.unit_guard[0] > 0)
+        def _replay():
+            self.replay_unit(
+                ops.q_slot,
+                visit,
+                prev_slot,
+                slot,
+                pipeline.free_slots(state.tail, REPLAY_RESULT_SLOTS),
+            )
+
+        return state
 
     def run_causal_row(
         self, si: jax.Array, row: DenseRow, ahead: tuple[BlockDesc, BlockDesc]
@@ -649,7 +927,7 @@ class DenseMxuLoop:
             diagonal_state = pipeline.advance(
                 head_state,
                 last_tile,
-                diagonal_ops,
+                self.last_diagonal_tile_ops(diagonal_ops),
                 next_k_tile=lambda: next_ops.k_tile(0),
             )
             if self.is_loop_tail(diagonal_state, ops):
@@ -662,12 +940,7 @@ class DenseMxuLoop:
                 )
             # A diagonal tile shorter than a body's tail holds row-start items
             # in its tail, so the first interior body runs as its own segment.
-            bridge_state = pipeline.advance(
-                diagonal_state,
-                self.loop_items,
-                next_ops,
-                next_k_tile=lambda: next_ops.k_tile(LOOP_BODY_TILES),
-            )
+            bridge_state = self.run_bridge(row, slot, next_slot, diagonal_state)
             return self.run_rest_of_row(
                 si, row_with_carry, ahead, LoopEntry(bridge_state, 1, 1), slot
             )
@@ -689,12 +962,46 @@ class DenseMxuLoop:
             num_visits > 1, _with_interior, _diagonal_only, kv_carry
         )
 
+    def last_diagonal_tile_ops(
+        self, diagonal_ops: DenseFragmentOps
+    ) -> DenseFragmentOps:
+        """The ops of a causal row's diagonal tile 0, the last tile of its
+        diagonal block, check unit 0, which writes unit 1's checkpoint in a
+        build with checked units."""
+        if not self.has_checked_units:
+            return diagonal_ops
+        return self.unit_end_ops(diagonal_ops, unit=1, tile=0)
+
+    def run_bridge(
+        self,
+        row: DenseRow,
+        slot: jax.Array,
+        next_slot: jax.Array,
+        diagonal_state: PipelineState,
+    ) -> PipelineState:
+        """A causal row's first interior body, of the block at next_slot, as
+        its own segment after its diagonal block (at slot), which left
+        diagonal_state; it checks unit 0 in a build with checked units."""
+        if self.has_checked_units:
+            return self.checked_body(row, 1, slot, next_slot, diagonal_state)
+        next_ops = row.ops.with_tiles(next_slot, 0)
+        return self.pipeline.advance(
+            diagonal_state,
+            self.loop_items,
+            next_ops,
+            next_k_tile=lambda: next_ops.k_tile(LOOP_BODY_TILES),
+        )
+
     def run_full_row(
         self, si: jax.Array, row: DenseRow, ahead: tuple[BlockDesc, BlockDesc]
     ) -> tuple[tuple, jax.Array, jax.Array]:
         """A row without a mask: its row-start segment, then the loop.
         Returns run_rest_of_row's values."""
         pipeline = self.pipeline
+        if self.has_checked_units:
+            # The first visit's first body is the row-start segment, which
+            # checks nothing.
+            self.check_refs.unit_guard[0] = jnp.int32(0)
         slot = row.kv_carry[0]
         start_ops = row.ops.with_tiles(slot, 0)
         start_state = pipeline.advance(
@@ -707,103 +1014,167 @@ class DenseMxuLoop:
             si, row, ahead, LoopEntry(start_state, 0, 1), slot
         )
 
-    def replay_row(
+    def replay_unit(
+        self,
+        q_slot: jax.Array,
+        visit: jax.Array | int,
+        prev_slot: jax.Array,
+        slot: jax.Array,
+        result_slots: tuple[jax.Array, ...],
+    ) -> None:
+        """Recompute check unit visit - 1, the block at prev_slot, and the
+        first body of visit visit, at slot, into the row state with the exact
+        rebasing softmax, between that body and the next: from the unit's
+        checkpoint, or from the row start at unit 0. Visit visit's checkpoint
+        is written again as its first tile starts and rebased at the end to
+        the anchor its tiles raised (rebase_checkpoint), so a checkpoint
+        always holds the row state on the row's current anchor."""
+        unit = visit - 1
+        checkpoints = self.row_checkpoints
+
+        @pl.when(unit > 0)
+        def _restore():
+            checkpoints.copy_checkpoint(unit, is_restore=True)
+
+        self.replay_block(
+            q_slot,
+            prev_slot,
+            self.traits.num_k_compute_tiles,
+            unit == 0,
+            result_slots,
+        )
+        checkpoints.copy_checkpoint(visit, is_restore=False)
+        checkpoints.save_anchor(unit)
+        self.replay_block(q_slot, slot, LOOP_BODY_TILES, False, result_slots)
+        checkpoints.rebase_checkpoint(visit, unit)
+
+    def replay_block(
+        self,
+        q_slot: jax.Array,
+        kv_slot: jax.Array,
+        num_tiles: int,
+        starts_row: jax.Array | bool,
+        result_slots: tuple[jax.Array, ...],
+    ) -> None:
+        """Recompute the first num_tiles tiles of the kv block at kv_slot into
+        the row state, every fragment against each tile on QK_MXU through
+        result_slots (replay_fragment), leaving lane partial sums. starts_row
+        marks the row's first block: its tile 0 starts every fragment's row,
+        and in a causal build it is the diagonal block, whose tile t meets
+        the fragments from FRAGMENTS_PER_TILE * t on and masks them."""
+        is_diagonal = jnp.logical_and(self.blocks.is_diagonal_first, starts_row)
+        ops = self.row_ops(q_slot)
+
+        def _replay_tile(tile, carry):
+            tile_ops = ops.with_tiles(kv_slot, tile)
+            is_row_start = jnp.logical_and(starts_row, tile == 0)
+
+            def _replay_fragment(fragment, fragment_carry):
+                self.replay_fragment(
+                    tile_ops, fragment, is_row_start, is_diagonal, result_slots
+                )
+                return fragment_carry
+
+            return lax.fori_loop(
+                jnp.where(is_diagonal, tile * FRAGMENTS_PER_TILE, 0),
+                self.num_fragments,
+                _replay_fragment,
+                carry,
+            )
+
+        lax.fori_loop(0, num_tiles, _replay_tile, None)
+
+    def replay_fragment(
+        self,
+        ops: DenseFragmentOps,
+        fragment: jax.Array,
+        is_row_start: jax.Array,
+        is_diagonal: jax.Array,
+        result_slots: tuple[jax.Array, ...],
+    ) -> None:
+        """Fold fragment fragment against tile key 0 of ops into its rows of
+        the row state with the exact rebasing softmax
+        (fwd_mxu.fold_replayed_fragment), both matmuls on QK_MXU through
+        result_slots, the (scores, probs @ V) slots; is_diagonal masks the
+        scores as a diagonal block's."""
+        variant, state = self.variant, self.state
+        score_slot, value_slot = result_slots
+        item = WorkItem(fragment=fragment, tile=0)
+        logits = scaled_logits(
+            variant,
+            replay_matmul(
+                score_slot, ops.q_fragment(item), ops.k_tile(0), transpose=True
+            ),
+        )
+        if self.blocks.is_diagonal_first:
+            masked = variant.mask_logits(
+                logits,
+                fragment * FRAGMENT_ROWS,
+                ops.first_tile * MXU_COLUMNS,
+                logits.shape,
+            )
+            logits = jnp.where(is_diagonal, masked, logits)
+        rows = fragment_rows(fragment)
+        fold_replayed_fragment(
+            state.row_max.at[rows],
+            state.row_sum.at[MXU_ROW_PARITY, rows],
+            state.o.at[MXU_ROW_PARITY, rows],
+            logits,
+            is_row_start,
+            value_slot,
+            partial(ops.v_tile, 0),
+        )
+
+    @property
+    def row_checkpoints(self) -> RowCheckpoints:
+        """The checkpoints of a row's check units (check_refs)."""
+        return RowCheckpoints(
+            checkpoint_sum=self.check_refs.checkpoint_sum,
+            checkpoint_o=self.check_refs.checkpoint_o,
+            row_sum=self.state.row_sum,
+            o=self.state.o,
+            parity=MXU_ROW_PARITY,
+            row_anchor=lambda rows: self.state.row_max[rows, :],
+        )
+
+    def replay_row_end(
         self,
         finish: RowFinish,
         num_visits: jax.Array,
         q_slot: jax.Array,
         slot: jax.Array,
     ) -> None:
-        """Replay the row of finish with the exact rebasing softmax, its
-        blocks in visit order, each staged again into slot, the row's last
-        block's slot, which the last visit leaves as it found it. The replay
-        ends at MXU_ROW_PARITY."""
-        traits, schedule, blocks = self.traits, self.schedule, self.blocks
-        si = finish.si
+        """Recompute the final unit (final_unit) of the row of finish after
+        its drain, from the unit's checkpoint or the row start, its blocks in
+        visit order, each staged again into slot, the row's last block's
+        slot, which the last visit leaves as it found it."""
+        final_visit = self.final_unit(num_visits)
+        # A drained pipeline holds no result.
+        result_slots = self.pipeline.qk_slots[:REPLAY_RESULT_SLOTS]
+        if self.has_checked_units:
+
+            @pl.when(final_visit > 0)
+            def _restore():
+                self.row_checkpoints.copy_checkpoint(
+                    final_visit, is_restore=True
+                )
 
         def _replay_visit(visit, carry):
-            kv = self.visit_block(si, visit)
-            desc = blocks.desc(finish.base_head, kv)
-            blocks.start(desc, slot)
-            wait_rotated_kv_block(traits, self.kv_refs, slot)
-            self.state.parity[0] = lax.rem(
-                MXU_ROW_PARITY + num_visits - 1 - visit, 2
+            desc = self.blocks.desc(
+                finish.base_head, self.visit_block(finish.si, visit)
             )
-            is_partial, _ = schedule.block_flags(si, kv, None)
-            block = KVBlock(
-                q_slot=q_slot,
-                q_tok=finish.q_tok,
-                kv_slot=slot,
-                kv_tok=kv * traits.bkv,
-                is_first=visit == 0,
+            self.blocks.start(desc, slot)
+            wait_rotated_kv_block(self.traits, self.kv_refs, slot)
+            self.replay_block(
+                q_slot,
+                slot,
+                self.traits.num_k_compute_tiles,
+                visit == 0,
+                result_slots,
             )
-            softmax_pass = SoftmaxPass(
-                needs_mask=is_partial,
-                guard_recovery=True,
-                apply_bounds=False,
-                last_kv_tile=None,
-            )
-            return lax.fori_loop(
-                0,
-                traits.num_compute_tiles,
-                partial(self.replay_fragment, block, softmax_pass),
-                carry,
-            )
+            return carry
 
-        lax.fori_loop(0, num_visits, _replay_visit, None)
-
-    def replay_fragment(
-        self,
-        block: KVBlock,
-        softmax_pass: SoftmaxPass,
-        index: jax.Array,
-        carry: None,
-    ) -> None:
-        """One (q compute tile, kv compute tile) fragment of the replay, kv
-        tile major: its QK and PV on the drained pipeline's MXUs, around
-        online_softmax's rebasing pass."""
-        traits, variant, state = self.traits, self.variant, self.state
-        q_refs, kv_refs, pipeline = self.q_refs, self.kv_refs, self.pipeline
-        bq_compute, bkv_compute = traits.bq_compute, traits.bkv_compute
-        num_q_compute_tiles = traits.num_q_compute_tiles
-        frag = Fragment(
-            0, index // num_q_compute_tiles, index % num_q_compute_tiles
-        )
-        q_rows = pl.ds(
-            pl.multiple_of(frag.q_tile * bq_compute, bq_compute), bq_compute
-        )
-        tile_keys = pl.ds(
-            pl.multiple_of(frag.kv_tile * bkv_compute, bkv_compute), bkv_compute
-        )
-        logits = scaled_logits(
-            variant,
-            replay_matmul(
-                pipeline,
-                QK_MXU,
-                q_refs.buf[block.q_slot, q_rows, :],
-                kv_refs.k_buf[block.kv_slot, tile_keys, :],
-            ),
-        )
-        frag_pv = online_softmax(
-            traits, variant, state, self.mask, block, frag, logits, softmax_pass
-        )
-        weighted_values = replay_matmul(
-            pipeline,
-            PV_MXU,
-            frag_pv.probs.astype(jnp.bfloat16),
-            kv_refs.v_buf[block.kv_slot, tile_keys, :],
-        )
-        new_parity, old_parity = state.block_parities()
-        o_read = state.o[
-            tile_parity(frag.kv_tile, None, new_parity, old_parity), q_rows, :
-        ]
-        rescale = jnp.tile(frag_pv.rescale, (1, traits.head_dim_v_repeats))
-        state.o[new_parity, q_rows, :] = jnp.where(
-            frag_pv.is_row_start,
-            weighted_values,
-            rescale * o_read + weighted_values,
-        )
-        return carry
+        lax.fori_loop(final_visit, num_visits, _replay_visit, None)
 
     def normalize_row_out(self, out_slot: jax.Array) -> None:
         """Normalize a replayed row's output into its stage slot, as
@@ -932,8 +1303,9 @@ class DenseMxuLoop:
         q_slot: jax.Array,
         last_slot: jax.Array,
     ) -> None:
-        """What a row's last items leave to do: its lse, the replay of a row
-        whose guard flag row_guard is set, with its own lse, sinks and output,
+        """What a row's last items leave to do: its lse, the replay of the
+        final unit of a row whose guard flag row_guard is set (replay_row_end),
+        whose lane partial sums reduce before its own lse, sinks and output,
         and the output copy. q_slot and last_slot hold the row's Q and its
         last block."""
         traits, variant = self.traits, self.variant
@@ -952,7 +1324,8 @@ class DenseMxuLoop:
 
         @pl.when(row_guard > 0)
         def _replay():
-            self.replay_row(finish, num_visits, q_slot, last_slot)
+            self.replay_row_end(finish, num_visits, q_slot, last_slot)
+            finish_row_sums(traits, self.state, MXU_ROW_PARITY)
             finish_row_lse_and_sinks(
                 traits,
                 variant,

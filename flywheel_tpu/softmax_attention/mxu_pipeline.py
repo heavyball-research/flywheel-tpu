@@ -335,6 +335,15 @@ class MxuPipeline:
         probs = self._emit(state, new_tail, len(items), next_k_tile)
         return PipelineState(probs=probs, tail=new_tail)
 
+    def free_slots(self, tail: Tail, count: int) -> tuple[jax.Array, ...]:
+        """count QK result slots that hold no result between the segment
+        that left tail and the next one: the next items' own."""
+        first = tail.end_slot(self.num_slots)
+        return tuple(
+            self.qk_slots[(first + offset) % self.num_slots]
+            for offset in range(count)
+        )
+
     def drain(self, state: PipelineState) -> None:
         """Finish everything in flight; emits pv_pop ticks."""
         assert (

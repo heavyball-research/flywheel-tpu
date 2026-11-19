@@ -75,7 +75,12 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     rotary_fields,
     staged_shape,
 )
-from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import DenseMxuLoop
+from flywheel_tpu.softmax_attention.fwd_mxu import NUM_CHECKPOINTS
+from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    CheckRefs,
+    DenseMxuLoop,
+    dense_has_checked_units,
+)
 from flywheel_tpu.softmax_attention.mxu_pipeline import MxuPipeline
 from flywheel_tpu.softmax_attention.schedule import (
     DenseFwdParams,
@@ -175,6 +180,13 @@ def dense_fwd_body(
         *pipeline_refs, lse_stage = remaining_refs
     else:
         pipeline_refs, lse_stage = remaining_refs, None
+    if traits.uses_mxu_pipeline and dense_has_checked_units(
+        schedule.num_kv_blocks
+    ):
+        *pipeline_refs, checkpoint_sum, checkpoint_o, unit_guard = pipeline_refs
+        check_refs = CheckRefs(checkpoint_sum, checkpoint_o, unit_guard)
+    else:
+        check_refs = None
     # Note (david): the exact unpack pins this variable-arity tail against
     # dense_scratch_shapes's scratch list; a silent mismatch would shift every
     # ref.
@@ -667,6 +679,7 @@ def dense_fwd_body(
             out_refs=out_refs,
             state=state,
             mask=mask,
+            check_refs=check_refs,
         ).run_row
     else:
         row_body = _row_body
@@ -748,12 +761,15 @@ def dense_scratch_shapes(
     v_dtype: jnp.dtype,
     rotary_dtype: jnp.dtype | None,
     return_lse: bool,
+    num_kv_blocks: int,
 ) -> list[pl.MemoryRef]:
     """Every scratch buffer of one dense build, in the order dense_fwd_body
     unpacks them: Q, K and V stages, Q and (under rotary_k) K rotary
     coefficients, out stage, row max, row sum, f32 accumulator, pending
     probs, pending V tile, the SMEM guard flags, block parity and pending-PV
-    fields, the DMA semaphores and the lse rows of each folded head.
+    fields, the DMA semaphores, an explicit MXU build's check unit scratch
+    (fwd_dense_mxu.CheckRefs) when its rows of up to num_kv_blocks blocks
+    hold checked units, and the lse rows of each folded head.
 
     Q, K, V, their rotary coefficients and the pending V tile are staged in
     traits.qkv_layout, the out stage and the accumulator in traits.o_layout.
@@ -821,6 +837,12 @@ def dense_scratch_shapes(
             (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
         ),
     ]
+    if traits.uses_mxu_pipeline and dense_has_checked_units(num_kv_blocks):
+        scratch_shapes += [
+            vmem((NUM_CHECKPOINTS, bq, NUM_LANES), jnp.float32),
+            vmem((NUM_CHECKPOINTS, bq, head_dim_v), jnp.float32),
+            pltpu.SMEM((1,), jnp.int32),
+        ]
     if return_lse:
         scratch_shapes.append(vmem((head_fold, bq), jnp.float32))
     return scratch_shapes
@@ -876,6 +898,7 @@ def dense_pallas_call(
         v_dtype=v.dtype,
         rotary_dtype=rotary_dtype,
         return_lse=return_lse,
+        num_kv_blocks=kv_seq_len // bkv,
     )
 
     if qkv_layout == QKVLayout.SEQ_MINOR:

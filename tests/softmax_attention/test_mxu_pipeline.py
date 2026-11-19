@@ -308,6 +308,29 @@ def test_row_start_tile_cannot_precede_a_loop_body(mxus):
     check(attention, mxus, lambda fragment: range(num_tiles))
 
 
+def test_free_slots_hold_no_result_between_segments(mxus):
+    """The slots a replay between two segments may use: a matmul through
+    them leaves every result in flight where it was."""
+    num_fragments = 64
+    attention = Attention(num_fragments, 2)
+    pipeline = make_pipeline()
+    ops = attention.ops()
+    state = pipeline.advance(
+        pipeline.idle_state(),
+        tile_items(num_fragments),
+        ops,
+        next_k_tile=lambda: ops.k_tile(1),
+    )
+    in_flight = set(mxus.results)
+    for slot in pipeline.free_slots(state.tail, 2):
+        assert slot not in in_flight
+        mxus.results[slot] = None
+        mxus.pop(slot)
+    state = pipeline.advance(state, tile_items(num_fragments, 1), ops)
+    pipeline.drain(state)
+    check(attention, mxus, lambda fragment: range(2))
+
+
 def test_short_segment_is_rejected(mxus):
     del mxus
     pipeline = make_pipeline()
