@@ -1238,6 +1238,14 @@ def test_paged_fp8_attention_sinks(dtype, entry, heads, kv_heads, window_left):
     assert np.abs(sink_out - out * keep.T[:, :, None]).max() < 2e-2
 
 
+# Note (david): an explicit build runs 1024 rows per kv head group, so one q
+# head per kv head takes 1024-token q blocks; the cases' longest chunk is
+# long enough for dispatch to pick them.
+MXU_FOLDS = [
+    pytest.param(4, 4, id="fold1"),
+    pytest.param(16, 4, id="fold4"),
+    pytest.param(16, 2, id="fold8"),
+]
 # Note (david): 2^-64 flags every live row.
 FORCED_GUARD_THRESHOLD = -64.0
 

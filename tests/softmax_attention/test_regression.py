@@ -1663,6 +1663,19 @@ def assert_segments_close(out, segments, cu_q, lse=None, **mask_kwargs):
             assert_lse_close(lse[None, :, rows], *segment, **mask_kwargs)
 
 
+def unequal_packed_qkv(seqlens_q, seqlens_k, nheads, nheads_k, d):
+    """packed_qkv with each sequence's own q and kv lengths."""
+    segments = [
+        random_qkv(index, 1, seqlen_q, nheads, nheads_k, d, seqlen_k=seqlen_k)
+        for index, (seqlen_q, seqlen_k) in enumerate(zip(seqlens_q, seqlens_k))
+    ]
+    q, k, v = (
+        jnp.concatenate([segment[axis][0] for segment in segments])
+        for axis in range(3)
+    )
+    return q, k, v, segments
+
+
 def test_varlen_mxu_takes_the_explicit_path(monkeypatch):
     explicit_bodies = []
     explicit_body = fwd_varlen.varlen_mxu_fwd_body
