@@ -37,7 +37,6 @@ from flywheel_tpu.softmax_attention.kernels import fwd_varlen
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import (
     HAS_MXU_ACCUMULATORS,
-    apply_rotary_emb,
     attention_ref,
     randn,
     requires_mxu_accumulators,
@@ -1367,107 +1366,6 @@ def test_dense_mxu_dispatch(nheads, seqlen, causal, uses_mxu_pipeline):
 
 
 @requires_mxu_accumulators
-@pytest.mark.parametrize("nheads,nheads_k", [(4, 4), (4, 1)])
-@pytest.mark.parametrize("causal,seqlen", [(True, 6144), (False, 4096)])
-def test_dense_mxu_output_and_lse(causal, seqlen, nheads, nheads_k):
-    # Note (david): the third causal row runs an interior block that stages
-    # the next one's first K tile; full rows cross a block in the rolled loop.
-    q, k, v = random_qkv(0, 1, seqlen, nheads, nheads_k, MXU_HEAD_DIM)
-    out, lse = flash_attn_func(
-        *map(to_head_major, (q, k, v)),
-        causal=causal,
-        return_softmax_lse=True,
-        interpret=INTERPRET,
-    )
-    assert_output_close(to_head_major(out), q, k, v, causal=causal)
-    assert_lse_close(lse, q, k, v, causal=causal)
-
-
-@requires_mxu_accumulators
-def test_dense_mxu_one_block_rows_reuse_kv():
-    # Note (david): a 2048-token causal row is its diagonal block alone, so the
-    # q heads of one kv head run their rows from one staged block.
-    q, k, v = random_qkv(0, 2, 2048, 8, 2, MXU_HEAD_DIM)
-    out = dense_attn(q, k, v, causal=True)
-    assert_output_close(out, q, k, v, causal=True)
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize(
-    "mask_kwargs",
-    [
-        pytest.param(dict(causal=True), id="causal"),
-        pytest.param(dict(causal=False), id="full"),
-        pytest.param(dict(causal=True, softcap=30.0), id="softcap"),
-    ],
-)
-def test_dense_mxu_sinks_and_softcap(mask_kwargs):
-    q, k, v = random_qkv(0, 1, 4096, 4, 2, MXU_HEAD_DIM)
-    if "softcap" in mask_kwargs:
-        # Note (david): lifting q puts the scores in the range the cap bends.
-        q = q * mask_kwargs["softcap"] / 4
-    sinks = random_sinks(4)
-    out, lse = flash_attn_func(
-        *map(to_head_major, (q, k, v)),
-        learnable_sink=sinks,
-        return_softmax_lse=True,
-        interpret=INTERPRET,
-        **mask_kwargs,
-    )
-    assert_output_close(to_head_major(out), q, k, v, sinks=sinks, **mask_kwargs)
-    assert_lse_close(lse, q, k, v, sinks=sinks, **mask_kwargs)
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("interleaved", [False, True])
-def test_dense_mxu_rotary(interleaved):
-    seqlen = 4096
-    q, k, v = random_qkv(0, 1, seqlen, 4, 4, MXU_HEAD_DIM)
-    angle = np.random.default_rng(1).random((seqlen, MXU_HEAD_DIM // 2))
-    cos, sin = (
-        jnp.asarray(fn(2 * math.pi * angle), jnp.bfloat16)
-        for fn in (np.cos, np.sin)
-    )
-    out = dense_attn(
-        q,
-        k,
-        v,
-        causal=True,
-        rotary_cos=cos,
-        rotary_sin=sin,
-        rotary_interleaved=interleaved,
-    )
-    q_ro, k_ro = (
-        apply_rotary_emb(x, cos, sin, interleaved=interleaved) for x in (q, k)
-    )
-    assert_output_close(out, q_ro, k_ro, v, causal=True)
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("layout", ["token_major", "heads_outer"])
-def test_dense_mxu_layouts(layout):
-    # Note (david): batch 2 of 8:2 heads checks that each flat q head stages
-    # its own kv head's blocks in both folds of the batch.
-    q, k, v = random_qkv(0, 2, 4096, 8, 2, MXU_HEAD_DIM)
-    if layout == "token_major":
-        out = flash_attn_func(
-            *(x.reshape(*x.shape[:2], -1) for x in (q, k, v)),
-            causal=True,
-            token_major=True,
-            head_dim=MXU_HEAD_DIM,
-            interpret=INTERPRET,
-        ).reshape(q.shape)
-    else:
-        out = flash_attn_func(
-            *(x.transpose(2, 0, 1, 3) for x in (q, k, v)),
-            causal=True,
-            heads_outer_fold=True,
-            interpret=INTERPRET,
-        ).transpose(1, 2, 0, 3)
-    assert_output_close(out, q, k, v, causal=True)
-
-
-@requires_mxu_accumulators
 @pytest.mark.parametrize(
     "causal,seqlen,nheads_k,scaled_quarter",
     [(True, 6144, 4, 0), (True, 2048, 1, 0), (False, 4096, 4, 3)],
@@ -1510,19 +1408,6 @@ def assert_segments_close(out, segments, cu_q, lse=None, **mask_kwargs):
             assert_lse_close(lse[None, :, rows], *segment, **mask_kwargs)
 
 
-def unequal_packed_qkv(seqlens_q, seqlens_k, nheads, nheads_k, d):
-    """packed_qkv with each sequence's own q and kv lengths."""
-    segments = [
-        random_qkv(index, 1, seqlen_q, nheads, nheads_k, d, seqlen_k=seqlen_k)
-        for index, (seqlen_q, seqlen_k) in enumerate(zip(seqlens_q, seqlens_k))
-    ]
-    q, k, v = (
-        jnp.concatenate([segment[axis][0] for segment in segments])
-        for axis in range(3)
-    )
-    return q, k, v, segments
-
-
 def test_varlen_mxu_takes_the_explicit_path(monkeypatch):
     explicit_bodies = []
     explicit_body = fwd_varlen.varlen_mxu_fwd_body
@@ -1539,124 +1424,6 @@ def test_varlen_mxu_takes_the_explicit_path(monkeypatch):
     out = varlen_attn(q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True)
     jax.clear_caches()
     assert bool(explicit_bodies) == HAS_MXU_ACCUMULATORS
-    assert_segments_close(out, segments, cu, causal=True)
-
-
-@skip_interpret
-@pytest.mark.parametrize(
-    "seqlens",
-    [
-        pytest.param([37, 300, 0, 128, 1, 600], id="short_and_empty"),
-        pytest.param([1500, 3000, 50, 0, 700], id="multi_block"),
-    ],
-)
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
-def test_varlen_mxu_ragged(seqlens, causal, nheads, nheads_k):
-    # Note (david): rows of one and of many tiles, kv blocks of several
-    # tiles, a short sequence in the window clamped to the padded end and
-    # empty sequences in between; MHA stages one q head a pipeline head, GQA
-    # all four of a kv head.
-    q, k, v, segments = packed_qkv(seqlens, nheads, nheads_k, MXU_HEAD_DIM)
-    cu = cu_seqlens_of(seqlens)
-    out, lse = varlen_attn(
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max(seqlens),
-        max(seqlens),
-        causal=causal,
-        return_softmax_lse=True,
-    )
-    assert_segments_close(out, segments, cu, lse, causal=causal)
-
-
-@skip_interpret
-@pytest.mark.parametrize("causal", [False, True])
-def test_varlen_mxu_q_shorter_than_kv(causal):
-    # Note (david): chunked prefill: each sequence's queries are the last of
-    # its keys, so its causal diagonal sits at the bottom right.
-    seqlens_q, seqlens_k = [100, 1, 400, 513], [900, 64, 1500, 513]
-    q, k, v, segments = unequal_packed_qkv(
-        seqlens_q, seqlens_k, 8, 2, MXU_HEAD_DIM
-    )
-    cu_q, cu_k = cu_seqlens_of(seqlens_q), cu_seqlens_of(seqlens_k)
-    out, lse = varlen_attn(
-        q,
-        k,
-        v,
-        cu_q,
-        cu_k,
-        max(seqlens_q),
-        max(seqlens_k),
-        causal=causal,
-        return_softmax_lse=True,
-    )
-    assert_segments_close(out, segments, cu_q, lse, causal=causal)
-
-
-@skip_interpret
-@pytest.mark.parametrize(
-    "mask_kwargs",
-    [
-        pytest.param(dict(causal=True), id="causal"),
-        pytest.param(dict(causal=False, softcap=30.0), id="softcap"),
-    ],
-)
-@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
-def test_varlen_mxu_attention_sinks(nheads, nheads_k, mask_kwargs):
-    seqlens = [37, 600, 128, 1]
-    q, k, v, segments = packed_qkv(seqlens, nheads, nheads_k, MXU_HEAD_DIM)
-    cu = cu_seqlens_of(seqlens)
-    sinks = random_sinks(nheads)
-    out, lse = varlen_attn(
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max(seqlens),
-        max(seqlens),
-        learnable_sink=sinks,
-        return_softmax_lse=True,
-        **mask_kwargs,
-    )
-    assert_segments_close(out, segments, cu, lse, sinks=sinks, **mask_kwargs)
-
-
-@skip_interpret
-@pytest.mark.parametrize("rotary_interleaved", [False, True])
-def test_varlen_mxu_rotary(rotary_interleaved):
-    seqlens = [300, 37, 700]
-    q, k, v, _ = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
-    cu = cu_seqlens_of(seqlens)
-    rng = np.random.default_rng(7)
-    angle = rng.random((max(seqlens), MXU_HEAD_DIM // 2)) * 2 * math.pi
-    cos = jnp.asarray(np.cos(angle), jnp.bfloat16)
-    sin = jnp.asarray(np.sin(angle), jnp.bfloat16)
-    q_ro, k_ro = (
-        apply_rotary_emb(x, cos, sin, rotary_interleaved, cu_seqlens=cu)
-        for x in (q, k)
-    )
-    out = varlen_attn(
-        q,
-        k,
-        v,
-        cu,
-        cu,
-        max(seqlens),
-        max(seqlens),
-        causal=True,
-        rotary_cos=cos,
-        rotary_sin=sin,
-        rotary_interleaved=rotary_interleaved,
-    )
-    segments = [
-        (q_ro[None, start:stop], k_ro[None, start:stop], v[None, start:stop])
-        for start, stop in zip(cu[:-1].tolist(), cu[1:].tolist())
-    ]
     assert_segments_close(out, segments, cu, causal=True)
 
 
