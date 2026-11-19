@@ -537,9 +537,9 @@ KV_DTYPES = [jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2]
 FP8_K_DESCALE, FP8_V_DESCALE = 2.0**-3, 2.0**-2
 
 
-def kvcache_cases(seqlens):
+def kvcache_cases(seqlens, d):
     """(seqlen_q, seqlen_k, page_size, has_batch_idx, varlen_q, mha_type,
-    kv_dtype) the TPU caches support.
+    kv_dtype, d) the TPU caches support at head width d.
 
     The contiguous cache (page_size None) serves single-token decode only and
     packs two bf16 KV heads per u32 lane, so gqa's 3 KV heads need the paged
@@ -566,7 +566,7 @@ def kvcache_cases(seqlens):
         else:
             supported = seqlen_k % page_size == 0 and not has_batch_idx
         if supported:
-            cases.append((seqlen_q, seqlen_k, *case))
+            cases.append((seqlen_q, seqlen_k, *case, d))
     return on_backend(cases)
 
 
@@ -576,19 +576,24 @@ def kvcache_cases(seqlens):
     "causal,local", [(False, False), (True, False), (False, True)]
 )
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("d", [128])
 # Note (david): every cache layout holds whole 128-token tiles, so the
 # capacities are multiples of 128; cache_seqlens draws unaligned lengths.
 @pytest.mark.parametrize(
-    "seqlen_q,seqlen_k,page_size,has_batch_idx,varlen_q,mha_type,kv_dtype",
-    kvcache_cases([
-        (1, 128),
-        (3, 1024),
-        (64, 256),
-        (64, 2048),
-        (128, 128),
-        (256, 512),  # an append spanning more than one page
-    ]),
+    "seqlen_q,seqlen_k,page_size,has_batch_idx,varlen_q,mha_type,kv_dtype,d",
+    kvcache_cases(
+        [
+            (1, 128),
+            (3, 1024),
+            (64, 256),
+            (64, 2048),
+            (128, 128),
+            (256, 512),  # an append spanning more than one page
+        ],
+        d=128,
+    )
+    # Note (david): chunks long enough for the paged build to run the explicit
+    # MXU loop (kernels/fwd_paged_mxu.py) on a chip with MXU accumulators.
+    + kvcache_cases([(1024, 2048)], d=256),
 )
 def test_flash_attn_kvcache(
     seqlen_q,

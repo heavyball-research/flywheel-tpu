@@ -29,7 +29,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.softmax_attention.dispatch import resolve_paged_tiles
+from flywheel_tpu.softmax_attention.inputs import make_variant
 from flywheel_tpu.softmax_attention.kernels import fwd_paged
+from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    paged_uses_mxu_pipeline,
+)
 from tests.softmax_attention.util import (
     apply_rotary_emb,
     requires_mxu_accumulators,
@@ -1233,14 +1238,6 @@ def test_paged_fp8_attention_sinks(dtype, entry, heads, kv_heads, window_left):
     assert np.abs(sink_out - out * keep.T[:, :, None]).max() < 2e-2
 
 
-# Note (david): an explicit build runs 1024 rows per kv head group, so one q
-# head per kv head takes 1024-token q blocks; the cases' longest chunk is
-# long enough for dispatch to pick them.
-MXU_FOLDS = [
-    pytest.param(4, 4, id="fold1"),
-    pytest.param(16, 4, id="fold4"),
-    pytest.param(16, 2, id="fold8"),
-]
 # Note (david): 2^-64 flags every live row.
 FORCED_GUARD_THRESHOLD = -64.0
 
@@ -1281,169 +1278,40 @@ def mxu_ragged_case(heads, kv_heads):
 
 @requires_mxu_accumulators
 @pytest.mark.parametrize(
-    "causal,return_lse", [(False, True), (True, True), (True, False)]
+    "page_size,uses_mxu_pipeline", [(128, True), (768, False)]
 )
-@pytest.mark.parametrize("heads,kv_heads", MXU_FOLDS)
-def test_paged_mxu_ragged_batch(
-    heads, kv_heads, causal, return_lse, explicit_builds
-):
-    case = mxu_ragged_case(heads, kv_heads)
-    expected = ragged_reference(*case, causal=causal)
-    actual = run_paged(*case, causal=causal, return_lse=return_lse)
-    assert explicit_builds
-    assert_extend_matches(actual, expected, case[5], case[6])
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("page_size", [128, 512])
-@pytest.mark.parametrize(
-    "heads,kv_heads",
-    [
-        pytest.param(4, 4, id="fold1"),
-        pytest.param(8, 2, id="fold4"),
-        pytest.param(8, 1, id="fold8"),
-    ],
-)
-def test_paged_mxu_chunks_over_long_cache(
-    heads, kv_heads, page_size, explicit_builds
-):
-    # Note (david): a 1024-token chunk after a 5000-token prefix runs about
-    # twenty unmasked kv tiles per q block before the masked ones; the
-    # 200-token chunk starts and ends inside pages.
-    case = random_ragged_case(
-        lengths=(1024, 200),
-        prefixes=(5000, 3001),
-        heads=heads,
-        kv_heads=kv_heads,
-        head_dim=256,
+def test_paged_mxu_dispatch(page_size, uses_mxu_pipeline):
+    # Note (david): a 768-token page gives kv blocks of three MXU tiles, which
+    # do not split into the explicit loop's bodies.
+    head_dim, gqa_fold = 256, 4
+    variant = make_variant(
+        head_dim**-0.5,
+        softcap=0.0,
+        causal=True,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    block_sizes = resolve_paged_tiles(
+        max_seqlen_q_bucket=1024,
+        max_seqlen_k_bucket=8192,
         page_size=page_size,
-        capacity=6144,
-        padding=0,
+        head_dim=head_dim,
+        rotary_dtype=None,
+        gqa_fold=gqa_fold,
+        variant=variant,
+        kv_dtype=jnp.dtype(jnp.bfloat16),
     )
-    expected = ragged_reference(*case, causal=True)
-    actual = run_paged(*case, causal=True)
-    assert explicit_builds
-    assert_extend_matches(actual, expected, case[5], case[6])
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("dtype", [jnp.float8_e4m3fn, jnp.float8_e5m2])
-@pytest.mark.parametrize("heads,kv_heads", [(16, 4), (16, 2)])
-def test_paged_mxu_fp8_pool_descales(dtype, heads, kv_heads, explicit_builds):
-    # Note (david): flash_attn_with_kvcache appends the fp8 rows to the fp8
-    # pool, whose words hold a pair of kv heads; the reference reads the same
-    # fp8 values with the descales folded into K and V.
-    q, kc, vc, k, v, cu, lengths, table = mxu_ragged_case(heads, kv_heads)
-    kc, vc, k, v = (x.astype(dtype) for x in (kc, vc, k, v))
-    k_descale, v_descale = 0.5, 2.0
-    scaled_k, scaled_kc = (
-        np.asarray(x, np.float32) * k_descale for x in (k, kc)
+    assert (
+        paged_uses_mxu_pipeline(
+            variant=variant,
+            block_sizes=block_sizes,
+            head_dim=head_dim,
+            gqa_fold=gqa_fold,
+            page_size=page_size,
+        )
+        == uses_mxu_pipeline
     )
-    scaled_v, scaled_vc = (
-        np.asarray(x, np.float32) * v_descale for x in (v, vc)
-    )
-    out, lse, *_ = ragged_reference(
-        q,
-        scaled_kc,
-        scaled_vc,
-        scaled_k,
-        scaled_v,
-        cu,
-        lengths,
-        table,
-        causal=True,
-    )
-    expected = (out, lse, *append_to_pages(kc, vc, k, v, cu, lengths, table))
-    actual = run_extend(
-        q,
-        kc,
-        vc,
-        k,
-        v,
-        cu,
-        lengths,
-        table,
-        causal=True,
-        k_descale=k_descale,
-        v_descale=v_descale,
-    )
-    assert explicit_builds
-    assert_extend_matches(actual, expected, cu, lengths)
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("entry", ["varlen", "kvcache"])
-@pytest.mark.parametrize("softcap", [0.0, 30.0])
-def test_paged_mxu_attention_sinks_and_softcap(entry, softcap, explicit_builds):
-    case = random_ragged_case(
-        lengths=(700, 17, 0),
-        prefixes=(123, 900, 64),
-        heads=16,
-        kv_heads=4,
-        head_dim=256,
-        capacity=1024,
-        padding=5,
-    )
-    sinks = jnp.asarray(
-        np.random.default_rng(3).uniform(-2.0, 8.0, 16), jnp.float32
-    )
-    expected = ragged_reference(
-        *case, causal=True, softcap=softcap, sinks=sinks
-    )
-    run = run_paged if entry == "varlen" else run_extend
-    actual = run(*case, causal=True, softcap=softcap, learnable_sink=sinks)
-    assert explicit_builds
-    assert_extend_matches(actual, expected, case[5], case[6])
-
-
-@requires_mxu_accumulators
-@pytest.mark.parametrize("rotary_interleaved", [False, True])
-@pytest.mark.parametrize("causal", [False, True])
-def test_paged_mxu_rotary_q(causal, rotary_interleaved, explicit_builds):
-    q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
-        lengths=(3, 1, 700),
-        prefixes=(127, 0, 1300),
-        heads=16,
-        kv_heads=4,
-        head_dim=256,
-        capacity=2048,
-    )
-    seqlen_ro, head_dim = table.shape[1] * kc.shape[1], q.shape[-1]
-    angle = (
-        np.random.default_rng(23).random((seqlen_ro, head_dim // 2))
-        * 2
-        * math.pi
-    )
-    cos = jnp.asarray(np.cos(angle), jnp.float32)
-    sin = jnp.asarray(np.sin(angle), jnp.float32)
-    q_ro = apply_rotary_emb(
-        q,
-        cos,
-        sin,
-        interleaved=rotary_interleaved,
-        seqlen_offsets=lengths,
-        cu_seqlens=cu,
-    )
-    expected = ragged_reference(
-        q_ro, kc, vc, k, v, cu, lengths, table, causal=causal
-    )
-    actual = run_paged(
-        q,
-        kc,
-        vc,
-        k,
-        v,
-        cu,
-        lengths,
-        table,
-        causal=causal,
-        rotary_cos=cos,
-        rotary_sin=sin,
-        rotary_interleaved=rotary_interleaved,
-        rotary_k=False,
-    )
-    assert explicit_builds
-    assert_extend_matches(actual, expected, cu, lengths)
 
 
 @requires_mxu_accumulators
