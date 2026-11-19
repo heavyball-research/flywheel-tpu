@@ -28,6 +28,11 @@ PAGE_SIZE_MULTIPLE = 128
 # Kernels on v6e's 128 MiB cores are built against 100 MiB of VMEM; a core with
 # less is built against all of it (64 MiB on v7x).
 MAX_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+# A kernel's scalar prefetches (its schedule and block table) live in the
+# core's 1 MiB SMEM. On v6e a step whose arrays take 58.6% of it runs at the
+# normal cost and one at 63.5% runs about 20x slower, so the limit is scoped
+# to the measured 1 MiB even on a core with more.
+MAX_SMEM_LIMIT_BYTES = 1024 * 1024
 
 
 @functools.cache
@@ -41,6 +46,17 @@ def vmem_limit_bytes() -> int:
     if jax.default_backend() != "tpu":
         return MAX_VMEM_LIMIT_BYTES
     return min(MAX_VMEM_LIMIT_BYTES, pltpu.get_tpu_info().vmem_capacity_bytes)
+
+
+@functools.cache
+def smem_limit_bytes() -> int:
+    """The scoped SMEM limit kernels are planned and compiled against.
+
+    Asked on first use, not at import, for the reason vmem_limit_bytes gives.
+    """
+    if jax.default_backend() != "tpu":
+        return MAX_SMEM_LIMIT_BYTES
+    return min(MAX_SMEM_LIMIT_BYTES, pltpu.get_tpu_info().smem_capacity_bytes)
 
 
 @functools.cache
