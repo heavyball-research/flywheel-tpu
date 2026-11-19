@@ -29,7 +29,12 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
+from flywheel_tpu.softmax_attention.dispatch import resolve_paged_tiles
+from flywheel_tpu.softmax_attention.inputs import make_variant
 from flywheel_tpu.softmax_attention.kernels import fwd_paged
+from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    paged_uses_mxu_pipeline,
+)
 from tests.softmax_attention.util import (
     apply_rotary_emb,
     requires_mxu_accumulators,
@@ -1444,6 +1449,44 @@ def test_paged_mxu_rotary_q(causal, rotary_interleaved, explicit_builds):
     )
     assert explicit_builds
     assert_extend_matches(actual, expected, cu, lengths)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "page_size,uses_mxu_pipeline", [(128, True), (768, False)]
+)
+def test_paged_mxu_dispatch(page_size, uses_mxu_pipeline):
+    # Note (david): a 768-token page gives kv blocks of three MXU tiles, which
+    # do not split into the explicit loop's bodies.
+    head_dim, gqa_fold = 256, 4
+    variant = make_variant(
+        head_dim**-0.5,
+        softcap=0.0,
+        causal=True,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    block_sizes = resolve_paged_tiles(
+        max_seqlen_q_bucket=1024,
+        max_seqlen_k_bucket=8192,
+        page_size=page_size,
+        head_dim=head_dim,
+        rotary_dtype=None,
+        gqa_fold=gqa_fold,
+        variant=variant,
+        kv_dtype=jnp.dtype(jnp.bfloat16),
+    )
+    assert (
+        paged_uses_mxu_pipeline(
+            variant=variant,
+            block_sizes=block_sizes,
+            head_dim=head_dim,
+            gqa_fold=gqa_fold,
+            page_size=page_size,
+        )
+        == uses_mxu_pipeline
+    )
 
 
 @requires_mxu_accumulators

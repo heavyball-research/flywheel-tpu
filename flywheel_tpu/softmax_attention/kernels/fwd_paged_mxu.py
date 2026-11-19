@@ -136,7 +136,8 @@ def paged_uses_mxu_pipeline(
     (fwd_mxu.mxu_pipeline_applies, plus what paged_mxu_fwd_body needs).
 
     A row starts with its first block's first ROW_START_TILES tiles, so a
-    block holds at least that many; a rolled body of one tile keeps the result
+    block holds at least that many, and its unmasked blocks run in whole loop
+    bodies of LOOP_BODY_TILES tiles; a rolled body of one tile keeps the result
     slot ring's phase, so a tile's items (gqa_fold * block_q / FRAGMENT_ROWS)
     fill whole rings; a fragment's rows lie in one q compute tile; and a kv
     tile's DMAs move whole pages or whole tiles of one page.
@@ -153,6 +154,7 @@ def paged_uses_mxu_pipeline(
         return False
     return (
         block_sizes.block_kv // MXU_COLUMNS >= ROW_START_TILES
+        and block_sizes.block_kv % (LOOP_BODY_TILES * MXU_COLUMNS) == 0
         and group_rows % slot_ring_rows() == 0
         and block_sizes.block_q_compute % FRAGMENT_ROWS == 0
         and (MXU_COLUMNS % page_size == 0 or page_size % MXU_COLUMNS == 0)
