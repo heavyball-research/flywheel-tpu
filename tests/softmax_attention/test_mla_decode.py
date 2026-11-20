@@ -254,10 +254,18 @@ def straddle_param(
         boundary = kv_block_tokens(
             page_size, is_fp8, s_q, h_q, LONG_REQUEST_TOKENS, len(splits)
         )
-        kv_lens = tuple(boundary + split for split in splits)
-        cell_block = kv_block_tokens(
-            page_size, is_fp8, s_q, h_q, kv_lens[-1], len(kv_lens)
-        )
+        # Note: the planning bound and the cell it becomes can take
+        # different rules (the calibrated model, the tuned table), so the
+        # boundary snaps to the block the cell itself gets; a straddle only
+        # means something on a block edge of its own cell.
+        for _ in range(3):
+            kv_lens = tuple(boundary + split for split in splits)
+            cell_block = kv_block_tokens(
+                page_size, is_fp8, s_q, h_q, kv_lens[-1], len(kv_lens)
+            )
+            if boundary % cell_block == 0:
+                break
+            boundary = cell_block
         assert boundary % cell_block == 0, (boundary, cell_block)
     else:
         kv_lens = tuple(boundary + split for split in splits)
@@ -526,7 +534,9 @@ def test_default_mla_config_at_large_batch(page_size, batch, s_q, h_q):
 @pytest.mark.parametrize("page_size", [16, 1024])
 def test_default_mla_config_rejects_vmem_overflow(page_size):
     """A shape that fits no block raises the VMEM error."""
-    with pytest.raises(ValueError, match="VMEM limit at one 128-token item"):
+    with pytest.raises(
+        ValueError, match="VMEM limit.*at one 128-token item"
+    ):
         default_mla_config(
             batch=16384,
             page_size=page_size,

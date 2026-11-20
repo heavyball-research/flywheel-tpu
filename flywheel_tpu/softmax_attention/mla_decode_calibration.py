@@ -300,7 +300,36 @@ def config_cost(
 
 
 # Filled by the calibration script; empty while the feature is dormant.
-CALIBRATION: dict[str, dict[str, MlaDecodeCostConstants]] = {}
+# v3: fitted 2026-11-19 from 211 cells on TPU v6e -- the uniform 16k/32k
+# grid (batch 32/128), the short 512-2048 grid (batch 32/128), and the
+# block x length floor grid (batch 64, valid lengths 64-8192, 128-page
+# table). R^2 0.982, MAPE 12.3%. block_floor is the measured per-item
+# work floor at each block.
+CALIBRATION: dict[str, dict[str, MlaDecodeCostConstants]] = {
+    "TPU v6e": {
+        "bfloat16": MlaDecodeCostConstants(
+            r_item=0.0,
+            r_step=263.712,
+            block_efficiency=(
+                (128, 1.0),
+                (256, 0.787104),
+                (512, 0.755948),
+                (1024, 0.742238),
+                (2048, 0.756332),
+            ),
+            max_block_kv=2048,
+            vmem_fraction=0.75,
+            calibrated_on="TPU v6e, JAX 0.11.0, 2026-11-19",
+            block_floor=(
+                (128, 0.920766),
+                (256, 0.881365),
+                (512, 0.802515),
+                (1024, 0.702709),
+                (2048, 0.626567),
+            ),
+        ),
+    },
+}
 _WARNED: set[tuple[str, str]] = set()
 
 
@@ -311,7 +340,8 @@ def _warn_once(chip: str, cache_dtype: str) -> None:
     _WARNED.add(key)
     warnings.warn(
         f"MLA decode has no calibrated cost constants for {chip}"
-        f" / {cache_dtype}; the max_seqlen-based rule picks the block."
+        f" / {cache_dtype}; the tuned table or the max_seqlen-based rule"
+        " picks the block."
         " Run benchmarks/softmax_attention/calibrate_mla_decode_config.py"
         " on this device to add an entry.",
         stacklevel=3,

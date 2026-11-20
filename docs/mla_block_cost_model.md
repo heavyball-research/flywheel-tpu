@@ -1,6 +1,6 @@
 # MLA decode 的块代价模型
 
-`default_mla_config` 用这个模型选 `(block_kv, items_per_step)`。它只在标定路径上使用；`CALIBRATION` 为空时走原来的 `max_seqlen` 规则。
+`default_mla_config` 用这个模型选 `(block_kv, items_per_step)`。TPU v6e + bfloat16 cache 已启用，**优先于旧的 `tuned_configs.json` 调优表**；没有标定条目的 chip / dtype 先查旧调优表，再退回 `max_seqlen` 规则（并警告一次）。
 
 ## 公式
 
@@ -50,6 +50,6 @@ PYTHONPATH=. python benchmarks/softmax_attention/refit_mla_floor.py
 
 ## 当前状态
 
-- `CALIBRATION` 保持为空，路由没有改。
-- 新的常数在 `benchmarks/softmax_attention/results/mla_calibration_v3/constants.py`。
-- 验证结果：随机抽样、64k/128k 长上下文、四种验证 pattern 的 regret 都是 0–0.44%。
+- `CALIBRATION` 已填入 TPU v6e / bfloat16 的 v3 常数，位于 `mla_decode_calibration.py`；默认路径已切到新启发式。
+- 标定常数优先于 `tuned_configs.json` 的旧调优表；旧表只在没有标定条目的 dtype/chip 上使用（例如 fp8 cache）。
+- 验证结果：20 个可评组里，所选配置与实测最优的差距平均 0.05%、最大 0.44%（旧模型平均 4.9%、最大 29%）。
