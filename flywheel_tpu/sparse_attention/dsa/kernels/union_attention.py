@@ -383,7 +383,7 @@ class UnionAttentionKernel:
                 block_q=self.params.union_tokens,
                 block_kv=PERIOD_KEYS,
                 num_slabs=self.params.num_slabs,
-                bitmap_rows=self.params.bitmap_rows,
+                rows_per_token=self.params.bitmap_rows,
             )
             lane = lax.broadcasted_iota(jnp.int32, is_selected.shape, 1)
             return jnp.where(

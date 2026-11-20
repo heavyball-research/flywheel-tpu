@@ -476,17 +476,17 @@ def selected_keys(
     block_q: int,
     block_kv: int,
     num_slabs: int,
-    bitmap_rows: int,
+    rows_per_token: int,
 ) -> jax.Array:
     """(block_kv, NUM_LANES) bool: whether each token's bitmap in
-    bitmap_words (block_q tokens' bitmap_rows rows) selects each key of the
+    bitmap_words (block_q tokens' rows_per_token rows) selects each key of the
     kv block from first_key, token t in lane ROPE_LANES + t."""
     slab = lax.shift_right_logical(first_key, SLAB_SHIFT)
     words = jnp.zeros((block_q, NUM_LANES), jnp.int32)
     for slab_row in range(num_slabs):
         words = jnp.where(
             slab == slab_row,
-            bitmap_words[pl.ds(slab_row, block_q, stride=bitmap_rows)],
+            bitmap_words[pl.ds(slab_row, block_q, stride=rows_per_token)],
             words,
         )
     # Note (david): key k's flag is bit (k // NUM_LANES) % WORD_BITS of its
@@ -728,7 +728,7 @@ class MaskedDenseKernel:
                 block_q=self.block_q,
                 block_kv=self.block_kv,
                 num_slabs=self.params.num_slabs,
-                bitmap_rows=self.params.bitmap_rows,
+                rows_per_token=self.params.bitmap_rows,
             )
             mask = jnp.where(
                 jnp.logical_and(

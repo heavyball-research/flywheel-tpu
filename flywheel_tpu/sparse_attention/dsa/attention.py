@@ -68,7 +68,6 @@ from flywheel_tpu.sparse_attention.dsa.masked_dense import (
     selection_bitmap,
 )
 from flywheel_tpu.sparse_attention.dsa.routing import (
-    MAX_MASKED_DENSE_KV_LEN,
     MIN_MASKED_DENSE_Q_LEN,
     MIN_UNION_Q_LEN,
     MODE_MASKED_DENSE,
@@ -76,6 +75,7 @@ from flywheel_tpu.sparse_attention.dsa.routing import (
     MODE_UNION,
     causal_indices,
     cumulative_lens,
+    masked_dense_kv_len_bound,
     request_modes,
     request_q_lens,
 )
@@ -602,13 +602,14 @@ def routed_indices(
 class RoutePlan(NamedTuple):
     """A call's static route: the modes its requests may take, the mode
     every request takes when the route is pinned, else None, the most
-    unions the union mode builds, and the fewest tokens of a union
-    request."""
+    unions the union mode builds, the fewest tokens of a union request, and
+    the most positions of a masked-dense request."""
 
     modes: tuple[int, ...]
     pinned_mode: int | None
     num_unions: int
     min_union_q_len: int = MIN_UNION_Q_LEN
+    max_masked_dense_kv_len: int = 0
 
     @property
     def is_sparse_only(self) -> bool:
@@ -627,7 +628,10 @@ class RoutePlan(NamedTuple):
         """(B,) int32 mode of each request: the pinned one, or the rule's."""
         if self.pinned_mode is None:
             return request_modes(
-                cu_q_lens, kv_lens, has_union=MODE_UNION in self.modes
+                cu_q_lens,
+                kv_lens,
+                max_masked_dense_kv_len=self.max_masked_dense_kv_len,
+                has_union=MODE_UNION in self.modes,
             )
         else:
             return jnp.full(kv_lens.shape, self.pinned_mode, jnp.int32)
@@ -649,12 +653,18 @@ def route_plan(
     MIN_ROUTED_TOKENS tokens or when max_seqlen_q leaves no other mode; it
     adds masked-dense from MIN_MASKED_DENSE_Q_LEN at the heads it takes, and
     the union mode at UNION_HEADS heads without lse within the union
-    kernel's VMEM."""
+    kernel's VMEM. Without the union mode, masked-dense takes requests of
+    more positions."""
     if route == ROUTE_SPARSE:
         return RoutePlan((MODE_SPARSE,), MODE_SPARSE, 0)
     elif route == ROUTE_MASKED_DENSE:
         check_masked_dense_heads(num_heads)
-        return RoutePlan((MODE_MASKED_DENSE,), MODE_MASKED_DENSE, 0)
+        return RoutePlan(
+            (MODE_MASKED_DENSE,),
+            MODE_MASKED_DENSE,
+            0,
+            max_masked_dense_kv_len=max_seqlen_k,
+        )
     elif route == ROUTE_UNION:
         num_unions = max_unions(num_tokens, batch, PINNED_UNION_Q_LEN)
         check_union(num_heads, return_lse, num_unions, top_k, max_seqlen_k)
@@ -681,7 +691,14 @@ def route_plan(
     if num_tokens < MIN_ROUTED_TOKENS or modes == (MODE_SPARSE,):
         return RoutePlan((MODE_SPARSE,), None, 0)
     else:
-        return RoutePlan(modes, None, num_unions if has_union else 0)
+        return RoutePlan(
+            modes,
+            None,
+            num_unions if has_union else 0,
+            max_masked_dense_kv_len=masked_dense_kv_len_bound(
+                num_heads, has_union
+            ),
+        )
 
 
 class RoutedOperands(NamedTuple):
@@ -987,10 +1004,6 @@ def attend_routed(
         (modes == mode) & (q_lens > 0)
         for mode in (MODE_MASKED_DENSE, MODE_UNION, MODE_SPARSE)
     )
-    if plan.pinned_mode is None:
-        masked_seqlen_k = min(max_seqlen_k, MAX_MASKED_DENSE_KV_LEN)
-    else:
-        masked_seqlen_k = max_seqlen_k
     route = RouteContext(
         q_nope=q_nope,
         q_pe=q_pe,
@@ -1005,7 +1018,7 @@ def attend_routed(
         is_sparse=is_sparse,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        masked_seqlen_k=masked_seqlen_k,
+        masked_seqlen_k=min(max_seqlen_k, plan.max_masked_dense_kv_len),
         sm_scale=sm_scale,
         kv_scale=kv_scale,
         return_lse=return_lse,
@@ -1200,18 +1213,18 @@ def call_route(
     kv_lens: jax.Array,
     num_tokens: int,
     sparse: Callable[[], object],
-    routed: Callable[[bool], object],
+    dense: Callable[[bool], object],
 ) -> object:
-    """sparse() for a plan of the sparse MLA alone, routed(with_union) for
+    """sparse() for a plan of the sparse MLA alone, dense(with_union) for
     a pinned dense mode; under the rule, one picked on device: sparse()
     where every request attends sparse and the padding rows fill no chunk
     of the sparse MLA, which the routed sparse pass skips, else
-    routed(with_union) by whether a request takes the union mode."""
+    dense(with_union) by whether a request takes the union mode."""
     has_union = MODE_UNION in plan.modes
     if plan.is_sparse_only:
         return sparse()
     elif plan.pinned_mode is not None:
-        return routed(has_union)
+        return dense(has_union)
     modes = plan.request_modes(cu_q_lens, kv_lens)
     q_lens = request_q_lens(cu_q_lens)
     padded_tokens = whole_steps(num_tokens)
@@ -1219,9 +1232,9 @@ def call_route(
     takes_sparse = jnp.all((modes == MODE_SPARSE) | (q_lens == 0)) & (
         num_padding < sparse_mla_chunk_tokens(padded_tokens)
     )
-    branches = [sparse, functools.partial(routed, False)]
+    branches = [sparse, functools.partial(dense, False)]
     if has_union:
-        branches.append(functools.partial(routed, True))
+        branches.append(functools.partial(dense, True))
         is_union = (modes == MODE_UNION) & (q_lens > 0)
         index = jnp.where(takes_sparse, 0, jnp.where(jnp.any(is_union), 2, 1))
     else:
@@ -1438,7 +1451,8 @@ def dsa_attention_from_indices(
     its q_len and kv_len: sparse, masked-dense over the paged cache, or in
     unions (union_attention.py). Where the union mode does not serve the
     call (other than UNION_HEADS heads, return_lse, or a union kernel past
-    the SparseCore's VMEM), sparse takes its place. One call serves
+    the SparseCore's VMEM), sparse takes its place and masked-dense takes
+    requests of more positions, by the heads. One call serves
     requests of every mode in any order, a mode's pass skipped when no
     request takes it; a step whose requests all attend sparse takes the
     sparse MLA alone. Calls under MIN_ROUTED_TOKENS tokens compile the

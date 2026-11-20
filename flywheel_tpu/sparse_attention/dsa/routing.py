@@ -16,7 +16,7 @@
 
 A request takes a mode by a static rule on its q_len and kv_len alone: few
 tokens attend sparse (each token's own gathered rows); more attend in unions
-(union_attention.py); many, up to MAX_MASKED_DENSE_KV_LEN positions, attend
+(union_attention.py); many, up to masked_dense_kv_len_bound positions, attend
 masked-dense over the paged cache. The rule is a pure function of the step's
 lengths, so the layers of a step share it.
 """
@@ -31,12 +31,23 @@ MODE_MASKED_DENSE = 1
 MODE_UNION = 2
 # Note (david): a union costs about one kernel item a request and a sparse
 # token one gathered selection, so requests under MIN_UNION_Q_LEN tokens attend
-# sparse. Masked-dense pays a whole q block a request and reads every position
-# up to the token, so it takes requests of at least MIN_MASKED_DENSE_Q_LEN
-# tokens within MAX_MASKED_DENSE_KV_LEN positions.
+# sparse. Masked-dense pays a whole q block a request and scores every position
+# up to the token at every head, so it takes requests of at least
+# MIN_MASKED_DENSE_Q_LEN tokens within a bound of positions: next to the union
+# mode, MAX_MASKED_DENSE_KV_LEN_WITH_UNION; next to sparse alone, more, by the
+# heads.
 MIN_UNION_Q_LEN = 5
 MIN_MASKED_DENSE_Q_LEN = 64
-MAX_MASKED_DENSE_KV_LEN = 3072
+MAX_MASKED_DENSE_KV_LEN_WITH_UNION = 3072
+MAX_MASKED_DENSE_KV_LEN_BY_HEADS = {16: 24576, 32: 15360, 64: 8192, 128: 4096}
+
+
+def masked_dense_kv_len_bound(num_heads: int, has_union: bool) -> int:
+    """The most positions of a request that attends masked-dense."""
+    if has_union:
+        return MAX_MASKED_DENSE_KV_LEN_WITH_UNION
+    else:
+        return MAX_MASKED_DENSE_KV_LEN_BY_HEADS[num_heads]
 
 
 def request_q_lens(cu_q_lens: jax.Array) -> jax.Array:
@@ -49,17 +60,22 @@ def cumulative_lens(lens: jax.Array) -> jax.Array:
 
 
 def request_modes(
-    cu_q_lens: jax.Array, kv_lens: jax.Array, *, has_union: bool
+    cu_q_lens: jax.Array,
+    kv_lens: jax.Array,
+    *,
+    max_masked_dense_kv_len: int,
+    has_union: bool,
 ) -> jax.Array:
-    """(B,) int32 mode of each request by the rule; without has_union, the
-    requests the rule gives the union mode attend sparse."""
+    """(B,) int32 mode of each request by the rule, masked-dense within
+    max_masked_dense_kv_len positions; without has_union, the requests the
+    rule gives the union mode attend sparse."""
     q_lens = request_q_lens(cu_q_lens)
     if has_union:
         union_mode = MODE_UNION
     else:
         union_mode = MODE_SPARSE
     is_masked = (q_lens >= MIN_MASKED_DENSE_Q_LEN) & (
-        kv_lens <= MAX_MASKED_DENSE_KV_LEN
+        kv_lens <= max_masked_dense_kv_len
     )
     return jnp.where(
         is_masked,
