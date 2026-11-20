@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tiling import round_up, vmem_buffer_bytes
 from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
 
 # Note (david): Mosaic requires every DMA offset and size along a tiled
@@ -330,3 +330,11 @@ class KDAConfig:
             "carry_recurrent_scratch_ref": carry_recurrent_scratch,
             "sems": pltpu.SemaphoreType.DMA((NUM_STREAMS, slots)),
         }
+
+    def scratch_vmem_bytes(self) -> int:
+        """VMEM bytes of the scratch buffers, padded to Mosaic's tiles."""
+        return sum(
+            vmem_buffer_bytes(ref.shape, ref.dtype)
+            for ref in self.get_scratch_shape_dict().values()
+            if ref is not None and ref.memory_space == pltpu.VMEM
+        )
