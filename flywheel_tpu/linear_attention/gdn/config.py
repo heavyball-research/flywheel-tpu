@@ -171,10 +171,12 @@ class GDNConfig:
 
     @property
     def qkv_block_rows(self) -> int:
-        # Note (david): a sequence may start at any token, so its DMA widens to
-        # the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
-        # early and rounded up to whole tiles.
-        widened_rows = self.chunk_size + SUBLANE_ALIGN - 1
+        # Note: a tile's records are consecutive batch rows (see
+        # memory_ref.out_window), so the tile fetches them as one DMA, widened
+        # to the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
+        # early and rounded up to whole tiles. A BATCHED decode tile of 4
+        # sequences reads 8 or 16 rows instead of 8 per sequence.
+        widened_rows = self.seq_tile_size * self.chunk_size + SUBLANE_ALIGN - 1
         return round_up(widened_rows, SUBLANE_ALIGN)
 
     @property
@@ -309,7 +311,7 @@ class GDNConfig:
 
         return {
             "qkv_buf": pltpu.VMEM(
-                (slots, tile_seqs, self.qkv_block_rows, self.dim_size),
+                (slots, 1, self.qkv_block_rows, self.dim_size),
                 self.dtypes.act_in,
             ),
             "b_buf": pltpu.VMEM(ba_shape, jnp.float32),
