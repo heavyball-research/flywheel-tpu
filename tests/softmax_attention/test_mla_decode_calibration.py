@@ -314,18 +314,34 @@ def test_single_request_many_rows_skips_calibration(monkeypatch):
     assert (config.block_kv, config.items_per_step) == (1024, 1)
 
 
-def test_a_tuned_entry_skips_calibration(monkeypatch):
+def test_calibration_wins_over_a_tuned_entry(monkeypatch):
+    """The calibrated model replaces the tuned table where constants exist."""
+    kernel, jnp = kernel_and_jnp()
+    monkeypatch.setattr(
+        kernel, "get_mla_cost_constants", lambda chip, dtype: constants()
+    )
+    monkeypatch.setattr(
+        kernel, "config_cost", lambda block, items_per_step, **kwargs: block
+    )
+
+    def fail(**kwargs):
+        raise AssertionError("calibration must win over the tuned table")
+
+    monkeypatch.setattr(kernel, "get_tuned_mla_config", fail)
+    config = kernel.default_mla_config(**shape(jnp))
+    assert (config.block_kv, config.items_per_step) == (128, 1)
+
+
+def test_a_tuned_entry_serves_an_uncalibrated_dtype(monkeypatch):
     kernel, jnp = kernel_and_jnp()
     monkeypatch.setattr(
         kernel, "get_tuned_mla_config", lambda **kwargs: (1024, 8)
     )
-
-    def fail(chip, dtype):
-        raise AssertionError("a tuned entry must not consult calibration")
-
-    monkeypatch.setattr(kernel, "get_mla_cost_constants", fail)
+    monkeypatch.setattr(
+        kernel, "get_mla_cost_constants", lambda chip, dtype: None
+    )
     config = kernel.default_mla_config(**shape(jnp))
-    assert config.block_kv % kernel.NUM_LANES == 0
+    assert config.block_kv == 1024
 
 
 def test_uncalibrated_dtype_warns_once(monkeypatch):

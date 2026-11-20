@@ -3,6 +3,7 @@
 import enum
 import functools
 import math
+import warnings
 from typing import NamedTuple
 
 import jax
@@ -363,7 +364,7 @@ def _calibrated_default_mla_config(
     query_tokens: int,
     cache_dtype: jnp.dtype,
     return_lse: bool,
-) -> MlaDecodeConfig:
+) -> MlaDecodeConfig | None:
     """The config the chip's cost constants and the length prior make
     average-optimal.
 
@@ -372,7 +373,9 @@ def _calibrated_default_mla_config(
     lane-tile block up to the constants' maximum, and every power-of-two items
     a step up to the step budgets, is priced; the least cost that fits the
     constants' VMEM fraction and the SMEM budget wins, and a tie takes the
-    longer block.
+    longer block. A call whose table outgrows SMEM at every candidate (a
+    planning bound past what the chip can hold) returns None, and the caller
+    falls back to the tuned table and the max_seqlen rule, with a warning.
     """
     capacity = pages_per_seq * page_size
     shape = {
@@ -387,7 +390,7 @@ def _calibrated_default_mla_config(
     max_target = min(
         constants.max_block_kv, max(NUM_LANES, next_pow2(capacity))
     )
-    candidates = []
+    priced = []
     seen_blocks = set()
     target_block_kv = NUM_LANES
     while target_block_kv <= max_target:
@@ -403,18 +406,17 @@ def _calibrated_default_mla_config(
             items_per_step = 1
             while items_per_step <= max_items:
                 config = MlaDecodeConfig(block_kv, items_per_step)
-                fits_vmem = mla_vmem_bytes(config, **shape) <= vmem_budget
-                fits_smem = (
-                    mla_smem_bytes(
-                        config,
-                        batch=batch,
-                        page_size=page_size,
-                        pages_per_seq=pages_per_seq,
+                if mla_vmem_bytes(config, **shape) <= vmem_budget:
+                    fits_smem = (
+                        mla_smem_bytes(
+                            config,
+                            batch=batch,
+                            page_size=page_size,
+                            pages_per_seq=pages_per_seq,
+                        )
+                        <= smem_budget
                     )
-                    <= smem_budget
-                )
-                if fits_vmem and fits_smem:
-                    candidates.append(
+                    priced.append(
                         (
                             config_cost(
                                 block_kv,
@@ -426,20 +428,36 @@ def _calibrated_default_mla_config(
                             -block_kv,
                             items_per_step,
                             config,
+                            fits_smem,
                         )
                     )
                 items_per_step *= 2
         target_block_kv *= 2
+    candidates = [entry for entry in priced if entry[4]]
     if not candidates:
-        raise ValueError(
-            f"flash_mla_decode needs more than {constants.vmem_fraction} of"
-            f" the {vmem_limit_bytes()}-byte VMEM limit, or more than"
-            f" {SMEM_BUDGET_FRACTION} of the {smem_limit_bytes()}-byte SMEM"
-            f" limit for its schedule and block table, at one"
-            f" {NUM_LANES}-token item a step (batch {batch},"
-            f" {num_query_rows} query rows, {pages_per_seq} pages a"
-            " request)."
+        if not priced:
+            raise ValueError(
+                f"flash_mla_decode fits no block in"
+                f" {constants.vmem_fraction} of the"
+                f" {vmem_limit_bytes()}-byte VMEM limit at one"
+                f" {NUM_LANES}-token item a step (batch {batch},"
+                f" {num_query_rows} query rows, {pages_per_seq} pages a"
+                " request)."
+            )
+        # Note: every VMEM-feasible candidate outgrows SMEM (a planning
+        # bound far past the table the chip can hold), so the calibrated
+        # model has nothing to offer; the caller keeps the pre-calibration
+        # rule, and the warning says what that costs past the cliff.
+        warnings.warn(
+            f"flash_mla_decode finds no block inside"
+            f" {SMEM_BUDGET_FRACTION:.0%} of the"
+            f" {smem_limit_bytes()}-byte SMEM budget at batch {batch},"
+            f" {pages_per_seq} pages a request; the tuned table and the"
+            " max_seqlen rule pick the block, which past the SMEM cliff"
+            " can run about 20x slower.",
+            stacklevel=3,
         )
+        return None
     return min(candidates, key=lambda candidate: candidate[:3])[3]
 
 
@@ -527,48 +545,49 @@ def default_mla_config(
     return_lse: bool,
     max_seqlen_k: int,
 ) -> MlaDecodeConfig:
-    """The config of one build: the target block and items cap of its
-    tuned_configs.json entry, else the block that the chip's calibrated cost
+    """The config of one build: the block that the chip's calibrated cost
     constants and the workload length prior make average-optimal, else the
+    target block and items cap of its tuned_configs.json entry, else the
     chip's block for max_seqlen_k, the call's bound on kv_lens.
 
     A batch's lengths are runtime data, so with calibrated constants the
     choice minimizes the prior's weighted average cost over them instead of
     one length's cost; the block is fitted to the pages and the constants'
-    VMEM fraction. A single-request many-row decode keeps the rule measured
-    for it, and a chip or dtype with no calibrated constants takes the
-    max_seqlen-based rule unchanged.
+    VMEM fraction. The tuned table serves only a chip or dtype with no
+    calibrated constants, where it still beats the max_seqlen rule. A
+    single-request many-row decode keeps the rule measured for it.
     """
+    bound = max(MIN_BLOCK_KV, next_pow2(max_seqlen_k))
+    # Note: a row-bound single-request decode keeps the rule measured for
+    # it, and never consults (or warns about) the cost calibration.
+    if not _single_request_many_rows(
+        batch=batch,
+        query_tokens=query_tokens,
+        num_query_rows=num_query_rows,
+        bound=bound,
+    ):
+        constants = get_mla_cost_constants(
+            _default_chip(), jnp.dtype(cache_dtype).name
+        )
+        if constants is not None:
+            config = _calibrated_default_mla_config(
+                constants,
+                batch=batch,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                num_query_rows=num_query_rows,
+                query_tokens=query_tokens,
+                cache_dtype=cache_dtype,
+                return_lse=return_lse,
+            )
+            if config is not None:
+                return config
     tuned = get_tuned_mla_config(
         cache_dtype=cache_dtype,
         num_query_rows=num_query_rows,
         batch=batch,
         max_seqlen_k=max_seqlen_k,
     )
-    if tuned is None:
-        bound = max(MIN_BLOCK_KV, next_pow2(max_seqlen_k))
-        # Note: a row-bound single-request decode keeps the rule measured for
-        # it, and never consults (or warns about) the cost calibration.
-        if not _single_request_many_rows(
-            batch=batch,
-            query_tokens=query_tokens,
-            num_query_rows=num_query_rows,
-            bound=bound,
-        ):
-            constants = get_mla_cost_constants(
-                _default_chip(), jnp.dtype(cache_dtype).name
-            )
-            if constants is not None:
-                return _calibrated_default_mla_config(
-                    constants,
-                    batch=batch,
-                    page_size=page_size,
-                    pages_per_seq=pages_per_seq,
-                    num_query_rows=num_query_rows,
-                    query_tokens=query_tokens,
-                    cache_dtype=cache_dtype,
-                    return_lse=return_lse,
-                )
     return _legacy_default_mla_config(
         batch=batch,
         page_size=page_size,
