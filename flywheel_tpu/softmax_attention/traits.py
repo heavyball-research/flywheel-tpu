@@ -30,7 +30,12 @@ import math
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.core.tpu import (
+    BF16_TILE_ROWS,
+    MXU_COLUMNS,
+    NUM_LANES,
+    NUM_SUBLANES,
+)
 from flywheel_tpu.softmax_attention.config import (
     BlockSizes,
     KVCacheConfig,
@@ -163,7 +168,9 @@ class FwdTraits(QKVTraits):
     build's kv length. rotary_dim 0 means no fused RoPE; otherwise
     rotary_batch is the coefficient planes' batch, and rotary_k False means K
     arrives rotated. guard_replay_unroll is the unroll factor of a varlen
-    build's overflow replay loop; 1 keeps it rolled.
+    build's overflow replay loop; 1 keeps it rolled. uses_mxu_pipeline runs the
+    fragments on explicit MXU ops (mxu_pipeline.py, fwd_mxu.py), which only a
+    chip with MXU accumulators has; its kv compute tile is one MXU tile.
     """
 
     transposed_pv: bool
@@ -174,6 +181,7 @@ class FwdTraits(QKVTraits):
     rotary_interleaved: bool = False
     rotary_k: bool = True
     guard_replay_unroll: int = 1
+    uses_mxu_pipeline: bool = False
     # A dense or varlen build reads separate K and V operands and stages one q
     # head per pipeline head; PagedFwdTraits sets both fields.
     paged: PagedKVInfo | None = dataclasses.field(default=None, init=False)
@@ -248,6 +256,13 @@ class FwdTraits(QKVTraits):
                 raise ValueError(
                     "rotary batch must match token-major batch or be shared."
                 )
+        # The explicit MXU pipeline streams head-dim-minor K and V tiles of
+        # MXU_COLUMNS keys by MXU_COLUMNS dims.
+        assert not self.uses_mxu_pipeline or (
+            head_dim_qk == head_dim_v == bkv_compute == MXU_COLUMNS
+            and self.is_head_dim_minor
+            and not self.transposed_pv
+        ), (head_dim_qk, head_dim_v, bkv_compute, self.qkv_layout)
         # A per-seq schedule indexes its kv compute tiles at runtime, which
         # only a sublane token axis allows (see the live-tile copy of
         # kernels/fwd_varlen.py's varlen_fwd_body).

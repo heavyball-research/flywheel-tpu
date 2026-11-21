@@ -31,6 +31,7 @@ reads, so a loop hands over its scratch rather than a helper closing over it:
 - RowStateRefs: row max, row sum, o accumulator, block parity, guard flags.
 - PendingPVRefs: the PV a block leaves to the next one.
 - OutRefs: the o and lse operands, their stages and the DMA semaphores.
+- PagedRefs: the groups of a paged body, with its row-state refs.
 
 More frozen groups carry values rather than refs: ScoreMask, how a build
 masks its scores, KVBlock, the kv block a fragment belongs to, and
@@ -43,6 +44,7 @@ kernel's driver.
 """
 
 import dataclasses
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -59,7 +61,7 @@ from flywheel_tpu.softmax_attention.config import (
     QKVLayout,
     hbm_bf16_tile_rows,
 )
-from flywheel_tpu.softmax_attention.dma import fold_row, hbm_window
+from flywheel_tpu.softmax_attention.dma import advance, fold_row, hbm_window
 from flywheel_tpu.softmax_attention.kv_layout import (
     kv_heads_per_word,
     kv_word_rows,
@@ -116,6 +118,16 @@ class RowFinish(NamedTuple):
     prev_out_tok: jax.Array
     out_count: jax.Array
     parity: jax.Array
+
+
+def carried_finish(finish: RowFinish) -> RowFinish:
+    """finish as a loop carry returns it, its q_tok back on the output grid."""
+    # Note (david): a loop carry drops q_token's pl.multiple_of, and the
+    # output DMA window must start on the hbm_bf16_tile_rows() grid, where
+    # q_token put it.
+    return finish._replace(
+        q_tok=pl.multiple_of(finish.q_tok, hbm_bf16_tile_rows())
+    )
 
 
 def fold_lane(
@@ -322,15 +334,10 @@ def start_q_row(
             dma.start()
 
 
-def wait_q_row(
-    traits: FwdTraits,
-    variant: Variant,
-    operands: VariantOperands,
-    q_refs: QRefs,
-    slot: jax.Array | int,
+def wait_rotated_q_row(
+    traits: FwdTraits, q_refs: QRefs, slot: jax.Array | int
 ) -> None:
-    """Wait for staging slot slot's Q row, then rotate and scale it in
-    place."""
+    """Wait for staging slot slot's Q row, then rotate it in place."""
     q_copy(traits, q_refs, 0, 0, slot).wait()
     if traits.rotary_dim:
         for dma in rotary_copies(
@@ -343,12 +350,55 @@ def wait_q_row(
             rotate_staged(
                 traits, q_refs.buf, q_refs.rotary_buf, slot, traits.bq
             )
+
+
+def wait_q_row(
+    traits: FwdTraits,
+    variant: Variant,
+    operands: VariantOperands,
+    q_refs: QRefs,
+    slot: jax.Array | int,
+) -> None:
+    """Wait for staging slot slot's Q row, then rotate and scale it in
+    place."""
+    wait_rotated_q_row(traits, q_refs, slot)
     # Note (david): each staged Q tile is waited on exactly once per
     # row, so scaling it here replaces an HBM pre-scaled Q copy with the
     # same f32 multiply and cast, leaving the logits unchanged.
     if variant.scales_q(operands):
         q_ref = q_refs.buf.at[slot]
         q_ref[...] = variant.transform_q(q_ref[...], operands)
+
+
+def advance_dense_q_row(
+    traits: FwdTraits,
+    schedule: FwdSchedule,
+    q_refs: QRefs,
+    wait: Callable[[jax.Array], None],
+    row: tuple[jax.Array, jax.Array],
+    next_row: tuple[jax.Array, jax.Array],
+    q_carry: tuple[jax.Array, jax.Array, jax.Array],
+) -> tuple[tuple[jax.Array, jax.Array], tuple[jax.Array, jax.Array, jax.Array]]:
+    """Wait for the Q of a dense grid's row, prefetching next_row's. A row is
+    (head group, row), wait takes the staging slot (wait_q_row or
+    wait_rotated_q_row) and q_carry is the Q ring's (loaded, inflight, slot).
+    Returns the row's (base_head, q_tok) and the ring's new state."""
+    (g, si), (next_g, next_si) = row, next_row
+    group_heads, bq = traits.group_heads, traits.bq
+    base_head = g * group_heads
+    next_head = next_g * group_heads
+    q_tok = (schedule.first_row + si) * bq
+    next_q_tok = (schedule.first_row + next_si) * bq
+    q_carry = advance(
+        g * schedule.num_rows + si,
+        next_g * schedule.num_rows + next_si,
+        lambda slot: start_q_row(traits, q_refs, base_head, q_tok, slot),
+        lambda slot: start_q_row(traits, q_refs, next_head, next_q_tok, slot),
+        wait,
+        *q_carry,
+        traits.num_stages,
+    )
+    return (base_head, q_tok), q_carry
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -474,6 +524,18 @@ def wait_kv_block(
             dma.wait()
 
 
+def wait_rotated_kv_block(
+    traits: FwdTraits, kv_refs: KVRefs, slot: jax.Array | int
+) -> None:
+    """Wait for staging slot slot's kv block, then rotate its K in place
+    under rotary_k."""
+    wait_kv_block(traits, kv_refs, slot)
+    if traits.rotary_dim and traits.rotary_k:
+        rotate_staged(
+            traits, kv_refs.k_buf, kv_refs.rotary_buf, slot, traits.bkv
+        )
+
+
 # Note (david): a paged group is the gqa_fold q heads of one kv head, which
 # read its (K, V) rows; those of one page are the u32 word window of the
 # interleaved cache's head axis that holds them, one DMA: a bf16 head's
@@ -527,6 +589,37 @@ def paged_fragment(
     bkv_compute = traits.bkv_compute
     tile_start = pl.multiple_of(kv_compute_index * bkv_compute, NUM_LANES)
     return kv_refs.planes[kv_part, pl.ds(tile_start, bkv_compute), :]
+
+
+def paged_buffer_tile(
+    kv_refs: PagedKVRefs,
+    slot: jax.Array | int,
+    token_start: int,
+    num_tokens: jax.Array | int,
+) -> jax.Array:
+    """Rows [token_start, token_start + num_tokens) of staging slot slot."""
+    return kv_refs.pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
+
+
+def paged_kv_source(
+    kv_refs: PagedKVRefs,
+    physical_page: jax.Array,
+    num_tokens: jax.Array,
+    kv_head: jax.Array,
+    first_token: jax.Array | int = 0,
+) -> jax.Array:
+    """The word rows of kv_head in num_tokens tokens of a cache page from
+    first_token on."""
+    word_rows = kv_refs.word_rows
+    head_row = pl.multiple_of(
+        kv_head // kv_refs.heads_per_word * word_rows, word_rows
+    )
+    return kv_refs.cache_hbm.at[
+        physical_page,
+        pl.ds(first_token, num_tokens),
+        pl.ds(head_row, word_rows),
+        :,
+    ]
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -1173,6 +1266,20 @@ class OutRefs:
     sems: jax.Array
 
 
+class PagedRefs(NamedTuple):
+    """A paged body's refs as kernels/fwd_paged.py's split_paged_refs groups
+    them: the Q, kv and output streams, the bounds rows (None on an explicit
+    MXU build), and the row-state refs between the output stage and the
+    semaphores, which differ between the dot_general and the explicit MXU
+    builds."""
+
+    q_refs: QRefs
+    kv_refs: PagedKVRefs
+    out_refs: OutRefs
+    bounds_buf: jax.Array | None
+    row_refs: list[jax.Array]
+
+
 def o_copy(
     traits: FwdTraits,
     out_refs: OutRefs,
@@ -1337,20 +1444,50 @@ def finish_row_out(
     write; its last PV has run, and its final o and row_sum sit at
     finish.parity. packed_q_end is a per-seq build's cu_seqlens_q[-1], None
     on a dense one."""
-    num_stages = traits.num_stages
+    out_slot = row_out_slot(traits, finish)
+    wait_row_out_slot(traits, out_refs, finish, out_slot)
+    stage_row_out(traits, variant, operands, state, out_refs, finish, out_slot)
+    copy_row_out(traits, out_refs, finish, out_slot, packed_q_end)
+
+
+def row_out_slot(traits: FwdTraits, finish: RowFinish) -> jax.Array:
+    """The output stage slot of the row of finish."""
+    return lax.rem(finish.out_count, traits.num_stages)
+
+
+def wait_row_out_slot(
+    traits: FwdTraits,
+    out_refs: OutRefs,
+    finish: RowFinish,
+    out_slot: jax.Array,
+) -> None:
+    """Wait out the previous write of the row's output stage slot out_slot
+    (row_out_slot)."""
+
+    # Note (david): o_stage is one output ring shared by the whole fold
+    # group, so wait out the slot's previous DMA before any head writes into
+    # it.
+    @pl.when(finish.out_count >= traits.num_stages)
+    def _wait_prev_out():
+        o_copy(traits, out_refs, 0, 0, out_slot).wait()
+
+
+def stage_row_out(
+    traits: FwdTraits,
+    variant: Variant,
+    operands: VariantOperands,
+    state: RowStateRefs,
+    out_refs: OutRefs,
+    finish: RowFinish,
+    out_slot: jax.Array,
+) -> None:
+    """Normalize the row's output into its output stage slot out_slot, whose
+    previous write has landed (wait_row_out_slot)."""
     group_bq, frag_rows = traits.group_bq, traits.frag_rows
     bq_compute, gqa_fold = traits.bq_compute, traits.gqa_fold
     transposed_pv = traits.transposed_pv
     lane_width_v = traits.lane_width_v
     o_scratch, o_stage = state.o, out_refs.o_stage
-    out_slot = lax.rem(finish.out_count, num_stages)
-
-    # Note (david): o_stage is one output ring shared by the whole fold
-    # group, so wait out the slot's previous DMA before any head writes into
-    # it.
-    @pl.when(finish.out_count >= num_stages)
-    def _wait_prev_out():
-        o_copy(traits, out_refs, 0, 0, out_slot).wait()
 
     def _finalize_head(g):
         head_rows = pl.ds(g * group_bq, group_bq)
@@ -1424,9 +1561,22 @@ def finish_row_out(
     for g in range(traits.head_fold):
         _finalize_head(g)
 
+
+def copy_row_out(
+    traits: FwdTraits,
+    out_refs: OutRefs,
+    finish: RowFinish,
+    out_slot: jax.Array,
+    packed_q_end: jax.Array | None,
+    fill_padding: Callable[..., None] = fill_packed_padding,
+) -> None:
+    """Start the write of the row's output staged in slot out_slot;
+    packed_q_end as in finish_row_out. fill_padding takes
+    fill_packed_padding's arguments."""
+    o_stage = out_refs.o_stage
     if traits.is_per_seq:
         blend_stage_rows(traits, o_stage, finish)
-        fill_packed_padding(traits, packed_q_end, o_stage, finish, 0.0)
+        fill_padding(traits, packed_q_end, o_stage, finish, 0.0)
     # Note (david): the output copy starts only after the boundary blend has
     # repaired the rows shared with the previous block.
     o_copy(traits, out_refs, finish.base_head, finish.q_tok, out_slot).start()
@@ -1509,13 +1659,75 @@ def finish_row_lse(
     """Stage and write the lse of head group group's row; its last softmax
     has run, and its final row_sum sits at finish.parity. sinks is
     head_sinks's list, or None; packed_q_end as in finish_row_out."""
-    bq, bq_compute = traits.bq, traits.bq_compute
+    out_slot = row_out_slot(traits, finish)
+    stage_row_lse(traits, variant, state, out_refs, finish, out_slot, sinks)
+    copy_row_lse(traits, out_refs, group, finish, out_slot, packed_q_end)
+
+
+def finish_row_lse_and_sinks(
+    traits: FwdTraits,
+    variant: Variant,
+    operands: VariantOperands,
+    schedule: FwdSchedule,
+    state: RowStateRefs,
+    out_refs: OutRefs,
+    group: jax.Array,
+    finish: RowFinish,
+) -> None:
+    """The lse of head group group's row (finish_row_lse), then its sinks
+    folded into its final row_sum (fold_out_sinks)."""
+    sinks = (
+        head_sinks(
+            traits,
+            operands.sinks_ref,
+            schedule.heads_outer_batch,
+            finish.base_head,
+        )
+        if variant.has_sinks
+        else None
+    )
+    if variant.return_lse:
+        finish_row_lse(
+            traits,
+            variant,
+            state,
+            out_refs,
+            group,
+            finish,
+            sinks,
+            schedule.packed_q_end,
+        )
+    if sinks is not None:
+        fold_out_sinks(traits, variant, state, finish, sinks)
+
+
+def select_head_lanes(tile_lse: jax.Array, lane_ids: jax.Array) -> jax.Array:
+    """The (rows, NUM_LANES) tile whose lane h holds folded head h's rows of
+    tile_lse, a (gqa_fold, rows, NUM_LANES) tile; lane_ids is each element's
+    lane."""
+    head_lanes = tile_lse[0]
+    for h in range(1, tile_lse.shape[0]):
+        head_lanes = jnp.where(lane_ids == h, tile_lse[h], head_lanes)
+    return head_lanes
+
+
+def stage_row_lse(
+    traits: FwdTraits,
+    variant: Variant,
+    state: RowStateRefs,
+    out_refs: OutRefs,
+    finish: RowFinish,
+    out_slot: jax.Array,
+    sinks: list[jax.Array] | None,
+) -> None:
+    """Stage the lse of the row in slot out_slot (row_out_slot); the other
+    arguments are finish_row_lse's."""
+    bq_compute = traits.bq_compute
     head_fold, gqa_fold = traits.head_fold, traits.gqa_fold
     group_bq, frag_rows = traits.group_bq, traits.frag_rows
     is_per_seq = traits.is_per_seq
     row_max_scratch = state.row_max
-    lse_hbm, lse_stage = out_refs.lse_hbm, out_refs.lse_stage
-    out_slot = lax.rem(finish.out_count, traits.num_stages)
+    lse_stage = out_refs.lse_stage
     for g in range(head_fold):
         head_rows = pl.ds(g * group_bq, group_bq)
         row_sum_ref = state.row_sum.at[finish.parity, head_rows]
@@ -1535,16 +1747,11 @@ def finish_row_lse(
                 tile_lse = variant.lse(row_max, row_sum, sink).reshape(
                     gqa_fold, bq_compute, NUM_LANES
                 )
-                head_lanes = tile_lse[0]
-                for h in range(1, gqa_fold):
-                    head_lanes = jnp.where(
-                        lane_ids == h, tile_lse[h], head_lanes
-                    )
                 lse_stage[
                     out_slot,
                     pl.ds(q_compute_index * bq_compute, bq_compute),
                     :,
-                ] = head_lanes
+                ] = select_head_lanes(tile_lse, lane_ids)
         else:
             row_max = row_max_scratch.at[head_rows][:, 0:1]
             row_sum = row_sum_ref[:, 0:1]
@@ -1554,9 +1761,23 @@ def finish_row_lse(
             else:
                 lse_stage[g, :] = lse_row[:, 0]
 
-    if is_per_seq:
+
+def copy_row_lse(
+    traits: FwdTraits,
+    out_refs: OutRefs,
+    group: jax.Array,
+    finish: RowFinish,
+    out_slot: jax.Array,
+    packed_q_end: jax.Array | None,
+    fill_padding: Callable[..., None] = fill_packed_padding,
+) -> None:
+    """Write the row's lse staged in slot out_slot; the other arguments are
+    finish_row_lse's, and fill_padding copy_row_out's."""
+    bq, head_fold = traits.bq, traits.head_fold
+    lse_hbm, lse_stage = out_refs.lse_hbm, out_refs.lse_stage
+    if traits.is_per_seq:
         blend_stage_rows(traits, lse_stage, finish)
-        fill_packed_padding(traits, packed_q_end, lse_stage, finish, -jnp.inf)
+        fill_padding(traits, packed_q_end, lse_stage, finish, -jnp.inf)
         # Note (david): the head group is a leading untiled axis and its
         # 128-lane minor axis is copied whole, avoiding the rejected dynamic
         # minor-axis slice at the head offset.

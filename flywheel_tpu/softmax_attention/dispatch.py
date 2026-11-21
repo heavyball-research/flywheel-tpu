@@ -69,6 +69,7 @@ from flywheel_tpu.softmax_attention.config import (
     pick_tile,
     vmem_limit_bytes,
 )
+from flywheel_tpu.softmax_attention.fwd_mxu import mxu_block_sizes
 from flywheel_tpu.softmax_attention.kernels.decode import (
     kvcache_config_vmem_bytes,
     validate_kvcache_config,
@@ -77,11 +78,22 @@ from flywheel_tpu.softmax_attention.kernels.fwd_dense import (
     flash_attn_forward,
     flash_attn_forward_runtime_offset,
 )
+from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    dense_uses_mxu_pipeline,
+)
 from flywheel_tpu.softmax_attention.kernels.fwd_paged import estimate_vmem_bytes
+from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    paged_uses_mxu_pipeline,
+)
 from flywheel_tpu.softmax_attention.kernels.fwd_varlen import (
     flash_attn_forward_varlen,
 )
+from flywheel_tpu.softmax_attention.kernels.fwd_varlen_mxu import (
+    varlen_mxu_block_sizes,
+    varlen_uses_mxu_pipeline,
+)
 from flywheel_tpu.softmax_attention.kv_layout import MIN_BLOCK_KV
+from flywheel_tpu.softmax_attention.mxu_pipeline import slot_ring_rows
 from flywheel_tpu.softmax_attention.schedule import (
     VarlenSchedule,
     dense_fwd_params,
@@ -830,6 +842,45 @@ def default_block_sizes(
     )
 
 
+def _resolve_mxu_pipeline(
+    *,
+    is_varlen: bool,
+    variant: Variant,
+    block_sizes: BlockSizes,
+    head_dim: int,
+    head_dim_v: int,
+    head_fold: int,
+    transposed_pv: bool,
+    token_major: TokenMajorInfo | None,
+    q_heads_per_kv_head: int,
+) -> tuple[bool, BlockSizes]:
+    """Whether a dense or varlen build runs its fragments on the explicit MXU
+    pipeline, and the block sizes it builds with: the pipeline's when it
+    does, block_sizes otherwise."""
+    if is_varlen:
+        if not varlen_uses_mxu_pipeline(
+            variant=variant,
+            block_sizes=block_sizes,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            head_fold=head_fold,
+            transposed_pv=transposed_pv,
+            token_major=token_major,
+        ):
+            return False, block_sizes
+        return True, varlen_mxu_block_sizes(block_sizes, q_heads_per_kv_head)
+    if not dense_uses_mxu_pipeline(
+        variant=variant,
+        block_sizes=block_sizes,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+    ):
+        return False, block_sizes
+    return True, mxu_block_sizes(block_sizes)
+
+
 def make_flash_attn_mha(
     num_heads: int,
     seqlen_q: int,
@@ -1078,6 +1129,17 @@ def make_flash_attn_mha(
             " would be applied on top of it. Pass causal_offset=0."
         )
     left, right = variant.window
+    uses_mxu_pipeline, block_sizes = _resolve_mxu_pipeline(
+        is_varlen=is_varlen,
+        variant=variant,
+        block_sizes=block_sizes,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        head_fold=head_fold,
+        transposed_pv=transposed_pv,
+        token_major=token_major,
+        q_heads_per_kv_head=q_heads_per_kv_head,
+    )
     traits = FwdTraits(
         block_sizes=block_sizes,
         num_q_heads=num_q_heads,
@@ -1090,6 +1152,7 @@ def make_flash_attn_mha(
         is_per_seq=is_varlen,
         guard_threshold=guard_threshold,
         guard_replay_unroll=guard_replay_unroll,
+        uses_mxu_pipeline=uses_mxu_pipeline,
     )
 
     if is_varlen:
@@ -1285,10 +1348,9 @@ def resolve_paged_tiles(
     max_seqlen_k_bucket: int,
     page_size: int,
     head_dim: int,
-    return_lse: bool,
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
-    has_window: bool,
+    variant: Variant,
     kv_dtype: jnp.dtype,
     block_sizes: BlockSizes | None = None,
 ) -> BlockSizes:
@@ -1300,10 +1362,15 @@ def resolve_paged_tiles(
     target; with none at most a target, the smallest above it. The q target is
     the longest sequence's bucket, at most PAGED_MAX_BLOCK_Q; the kv target is
     PAGED_KV_PER_Q_BLOCK q blocks, at most PAGED_MAX_BLOCK_KV. The q compute
-    tile keeps a fragment within MAX_FRAGMENT_ROWS rows. has_window caps both
-    blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less than one page.
-    A pinned block_sizes is only checked against the budget.
+    tile keeps a fragment within MAX_FRAGMENT_ROWS rows. A left window bound
+    caps both blocks at PAGED_WINDOW_BLOCK tokens, and block_kv at no less
+    than one page. A build the explicit MXU pipeline runs
+    (paged_uses_mxu_pipeline) takes fwd_mxu.mxu_block_sizes's kv compute
+    tile, and its q target is at least the tokens of slot_ring_rows() rows,
+    the fewest it runs. A pinned block_sizes is only checked against the
+    budget.
     """
+    has_window = variant.window[0] is not None
     target_q = min(max(max_seqlen_q_bucket, FWD_BLOCKS[-1]), PAGED_MAX_BLOCK_Q)
     target_kv = min(PAGED_KV_PER_Q_BLOCK * target_q, PAGED_MAX_BLOCK_KV)
     if block_sizes is not None:
@@ -1350,16 +1417,32 @@ def resolve_paged_tiles(
             for block_kv in kv_blocks
             if gqa_fold * block_q * block_kv <= MAX_PAGED_BLOCK_AREA
         ]
+
+    def _as_built(blocks):
+        """(blocks as the kernel builds them, whether on explicit MXU ops)."""
+        uses_mxu_pipeline = paged_uses_mxu_pipeline(
+            variant=variant,
+            block_sizes=blocks,
+            head_dim=head_dim,
+            gqa_fold=gqa_fold,
+            page_size=page_size,
+        )
+        if uses_mxu_pipeline:
+            return mxu_block_sizes(blocks), uses_mxu_pipeline
+        return blocks, uses_mxu_pipeline
+
+    is_explicit = dict(map(_as_built, candidate_blocks))
     estimates = {
         blocks: estimate_vmem_bytes(
             blocks,
             head_dim=head_dim,
-            return_lse=return_lse,
+            return_lse=variant.return_lse,
             rotary_dtype=rotary_dtype,
             gqa_fold=gqa_fold,
             kv_dtype=kv_dtype,
+            uses_mxu_pipeline=uses_mxu_pipeline,
         )
-        for blocks in candidate_blocks
+        for blocks, uses_mxu_pipeline in is_explicit.items()
     }
     fitting = [
         blocks
@@ -1380,11 +1463,16 @@ def resolve_paged_tiles(
     def _nearest_below(size, target):
         return (size <= target, size if size <= target else -size)
 
+    def _target_q(blocks):
+        if is_explicit[blocks]:
+            return max(target_q, slot_ring_rows() // gqa_fold)
+        return target_q
+
     return max(
         fitting,
         key=lambda blocks: (
             _nearest_below(blocks.block_kv, target_kv),
-            _nearest_below(blocks.block_q, target_q),
+            _nearest_below(blocks.block_q, _target_q(blocks)),
         ),
     )
 
@@ -1426,10 +1514,9 @@ def resolve_paged_block_sizes(
         max_seqlen_k_bucket=min(next_pow2(max_seqlen_k), capacity),
         page_size=page_size,
         head_dim=head_dim,
-        return_lse=variant.return_lse,
         rotary_dtype=rotary_dtype,
         gqa_fold=num_q_heads // num_kv_heads,
-        has_window=variant.window[0] is not None,
+        variant=variant,
         block_sizes=block_sizes,
         kv_dtype=kv_cache.dtype,
     )

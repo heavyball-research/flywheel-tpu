@@ -29,12 +29,18 @@ from flywheel_tpu.softmax_attention import fwd_blocks
 from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
+    get_kernel,
     make_flash_attn_mha,
 )
-from flywheel_tpu.softmax_attention.inputs import pad_seqlen
+from flywheel_tpu.softmax_attention.inputs import make_variant, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels import fwd_varlen
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
-from tests.softmax_attention.util import attention_ref, randn
+from tests.softmax_attention.util import (
+    HAS_MXU_ACCUMULATORS,
+    attention_ref,
+    randn,
+    requires_mxu_accumulators,
+)
 
 INTERPRET = jax.default_backend() != "tpu"
 
@@ -1315,3 +1321,138 @@ def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
     ]
     np.testing.assert_array_equal(slot_kv[..., 0::2, :], k[:, 0])
     np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
+
+
+# Note (david): the head width whose dense and packed varlen builds run the
+# explicit MXU loops (kernels/fwd_dense_mxu.py, kernels/fwd_varlen_mxu.py) on
+# a chip with MXU accumulators; everywhere else these shapes take the
+# dot_general loops that test_prefill.py's grid covers.
+MXU_HEAD_DIM = 256
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "nheads,seqlen,causal,uses_mxu_pipeline",
+    [
+        (4, 4096, False, True),
+        (4, 4096, True, True),
+        (4, 1024, True, True),
+        (32, 1024, True, False),
+        (4, 512, True, False),
+    ],
+)
+def test_dense_mxu_dispatch(nheads, seqlen, causal, uses_mxu_pipeline):
+    # Note (david): the tuned 32-head 1024-token causal build folds 4 heads a
+    # block, and 512-token blocks are below the explicit loop's smallest.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = get_kernel(
+        nheads,
+        nheads,
+        seqlen,
+        seqlen,
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline == uses_mxu_pipeline
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "causal,seqlen,nheads_k,scaled_quarter",
+    [(True, 6144, 4, 0), (True, 2048, 1, 0), (False, 4096, 4, 3)],
+)
+def test_dense_mxu_guard_replay(causal, seqlen, nheads_k, scaled_quarter):
+    # Note (david): keys scaled far up in a block a row visits after the one
+    # its anchors come from push its row sums past the guard, so the row
+    # replays: a causal row anchors on its diagonal block and meets block 0
+    # later, a full row anchors on block 0. The sinks and lse read the
+    # replayed state; the one-block MQA rows run from one staged block.
+    q, k, v = random_qkv(0, 1, seqlen, 4, nheads_k, MXU_HEAD_DIM)
+    quarter = seqlen // 4
+    keys = slice(scaled_quarter * quarter, (scaled_quarter + 1) * quarter)
+    k = k.at[:, keys].multiply(40.0)
+    sinks = jnp.array([0.0, 30.0, 300.0, -5.0], jnp.float32)
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)),
+        causal=causal,
+        learnable_sink=sinks,
+        return_softmax_lse=True,
+        interpret=INTERPRET,
+    )
+    assert_output_close(to_head_major(out), q, k, v, causal=causal, sinks=sinks)
+    assert_lse_close(lse, q, k, v, causal=causal, sinks=sinks)
+
+
+skip_interpret = pytest.mark.skipif(
+    INTERPRET, reason="interpret mode affords short sequences only"
+)
+
+
+def assert_segments_close(out, segments, cu_q, lse=None, **mask_kwargs):
+    """Each packed sequence's out (and lse) against its own reference."""
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu_q[index]), int(cu_q[index + 1]))
+        if rows.start == rows.stop:
+            continue
+        assert_output_close(out[rows][None], *segment, **mask_kwargs)
+        if lse is not None:
+            assert_lse_close(lse[None, :, rows], *segment, **mask_kwargs)
+
+
+def test_varlen_mxu_takes_the_explicit_path(monkeypatch):
+    explicit_bodies = []
+    explicit_body = fwd_varlen.varlen_mxu_fwd_body
+
+    def counted_body(*args, **kwargs):
+        explicit_bodies.append(args[0])
+        return explicit_body(*args, **kwargs)
+
+    monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", counted_body)
+    jax.clear_caches()
+    seqlens = [300, 37]
+    q, k, v, segments = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
+    cu = cu_seqlens_of(seqlens)
+    out = varlen_attn(q, k, v, cu, cu, max(seqlens), max(seqlens), causal=True)
+    jax.clear_caches()
+    assert bool(explicit_bodies) == HAS_MXU_ACCUMULATORS
+    assert_segments_close(out, segments, cu, causal=True)
+
+
+@skip_interpret
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_mxu_guard_replay(causal):
+    # Note (david): the second sequence's last keys score far above its rows'
+    # first-tile anchors, so its rows replay; the replay loop's unroll factor
+    # leaves the output as it is.
+    seqlens = [384, 2048, 100]
+    q, k, v, segments = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
+    k = k.at[384 + 1536 : 384 + 2048].multiply(40.0)
+    segments[1] = (segments[1][0], k[None, 384 : 384 + 2048], segments[1][2])
+    cu = cu_seqlens_of(seqlens)
+    outs = [
+        varlen_attn(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=causal,
+            return_softmax_lse=True,
+            guard_replay_unroll=unroll,
+        )
+        for unroll in (1, 2)
+    ]
+    out, lse = outs[0]
+    assert_segments_close(out, segments, cu, lse, causal=causal)
+    assert jnp.array_equal(outs[1][0], out)
