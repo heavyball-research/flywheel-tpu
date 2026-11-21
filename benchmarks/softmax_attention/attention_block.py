@@ -95,7 +95,13 @@ TRACE_CALLS = 3
 
 @dataclasses.dataclass(frozen=True)
 class Cell:
-    """One benchmark point: an attention implementation on one prefill shape."""
+    """One benchmark point: an attention implementation on one prefill shape.
+
+    The queries are the last q_len tokens of the seq, bottom-right aligned on
+    the keys; window is flash_attn's window_size. The runtime_offset mask is
+    causal with the queries' offset as a device scalar (flywheel's PCP
+    entry). Only flywheel takes a window, a shorter q_len or a runtime
+    offset."""
 
     impl: str
     heads: int
@@ -104,21 +110,45 @@ class Cell:
     mask: str
     batch: int
     seq: int
+    q_len: int
+    window: tuple[int, int] = (-1, -1)
 
     @property
     def causal(self):
-        return self.mask == "causal"
+        return self.mask in ("causal", "runtime_offset")
 
     @property
     def d_model(self):
         return self.heads * self.head_dim
 
     @property
+    def is_square_self_attention(self):
+        return self.q_len == self.seq and self.window == (-1, -1)
+
+    @property
     def key(self):
-        return (
+        key = (
             f"{self.impl}-h{self.heads}-k{self.heads_k}-d{self.head_dim}"
             f"-{self.mask}-b{self.batch}-s{self.seq}"
         )
+        if self.q_len != self.seq:
+            key += f"-q{self.q_len}"
+        if self.window != (-1, -1):
+            key += f"-w{self.window[0]}_{self.window[1]}"
+        return key
+
+    def visible_pairs(self):
+        """The (query, key) pairs the mask keeps, per sequence and head."""
+        left, right = self.window
+        right = 0 if self.causal else right
+        rows = np.arange(self.q_len) + self.seq - self.q_len
+        first = np.zeros_like(rows) if left < 0 else np.maximum(rows - left, 0)
+        last = (
+            np.full_like(rows, self.seq - 1)
+            if right < 0
+            else np.minimum(rows + right, self.seq - 1)
+        )
+        return int(np.maximum(last - first + 1, 0).sum())
 
 
 def tuned_table(impl, device_kind):
@@ -192,14 +222,25 @@ def build_flywheel(cell, w, args):
     import jax.numpy as jnp
 
     from flywheel_tpu import flash_attn_func
+    from flywheel_tpu.softmax_attention.prefill import (
+        _flash_attn_func_pcp_causal_offset,
+    )
+
+    def attend(q, k, v):
+        if cell.mask == "runtime_offset":
+            offset = jnp.int32(cell.seq - cell.q_len)
+            return _flash_attn_func_pcp_causal_offset(q, k, v, offset)
+        return flash_attn_func(
+            q, k, v, causal=cell.causal, window_size=cell.window
+        )
 
     def block(x, wq, wk, wv, wo):
         with jax.named_scope("qkv_proj"):
-            q = jnp.einsum("btd,dnh->bnth", x, wq)
+            q = jnp.einsum("btd,dnh->bnth", x[:, -cell.q_len :], wq)
             k = jnp.einsum("btd,dnh->bnth", x, wk)
             v = jnp.einsum("btd,dnh->bnth", x, wv)
         with jax.named_scope("attn"):
-            out = flash_attn_func(q, k, v, causal=cell.causal)
+            out = attend(q, k, v)
         with jax.named_scope("out_proj"):
             return jnp.einsum("bnth,nhd->btd", out, wo)
 
@@ -390,9 +431,12 @@ def trace_cell(cell, step, state, directory):
 
 
 def run(cell, args):
-    pair_count = cell.batch * cell.seq * cell.seq
-    if cell.causal:
-        pair_count //= 2
+    if cell.is_square_self_attention and cell.mask != "runtime_offset":
+        pair_count = cell.batch * cell.seq * cell.seq
+        if cell.causal:
+            pair_count //= 2
+    else:
+        pair_count = cell.batch * cell.visible_pairs()
     attn_flops = 4 * pair_count * cell.heads * cell.head_dim
     proj_flops = (
         2
@@ -454,7 +498,15 @@ def main(argv=None):
         args.mask,
         args.batch,
         args.seq,
+        args.seq if args.q_len is None else args.q_len,
+        tuple(args.window),
     )
+    if cell.impl != "flywheel" and (
+        not cell.is_square_self_attention or cell.mask == "runtime_offset"
+    ):
+        raise ValueError(
+            "only flywheel takes --window, --q-len or the runtime_offset mask."
+        )
     if not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded, skipped", flush=True)
         return 0
@@ -500,9 +552,24 @@ def parse_args(argv=None):
     parser.add_argument("--heads", type=int, default=32)
     parser.add_argument("--heads-k", type=int, default=32)
     parser.add_argument("--head-dim", type=int, default=256)
-    parser.add_argument("--mask", choices=("causal", "full"), default="causal")
+    parser.add_argument(
+        "--mask", choices=("causal", "full", "runtime_offset"), default="causal"
+    )
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--seq", type=int, default=16384)
+    parser.add_argument(
+        "--q-len",
+        type=int,
+        help="query tokens, the seq's last ones (default: the whole seq)",
+    )
+    parser.add_argument(
+        "--window",
+        type=int,
+        nargs=2,
+        default=(-1, -1),
+        metavar=("LEFT", "RIGHT"),
+        help="flash_attn window_size (default: -1 -1, none)",
+    )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
         "--trace",

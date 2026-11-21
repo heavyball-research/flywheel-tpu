@@ -43,7 +43,9 @@ FlashAttention, over a cache that already holds the batch's K/V, with
 max_seqlen the longest sequence and flywheel_tpu's own block sizes. Every
 impl takes q and returns out token-major, (total, heads, head_dim), as a
 server holds them; flywheel's paged kernel is head-major, so its call also
-transposes q in and out back. rpa runs
+transposes q in and out back. flywheel_packed runs the same call on the
+batch's packed K/V (cu_seqlens_k), no cache. --sliding-window W limits each
+query of a flywheel impl to its last W keys. rpa runs
 RPA v3's ragged_paged_attention with every sequence mixed and its blocks from
 rpa_tuned_<chip>.json at the next_pow2(max_seqlen) bucket, else its formula.
 batched_rpa runs vllm-torchtpu's batched RPA (--torchtpu-source) with its
@@ -134,7 +136,14 @@ from flywheel_tpu import flash_attn_varlen_func
 from flywheel_tpu.softmax_attention.config import next_pow2
 from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
 
-IMPLS = ("flywheel", "rpa", "batched_rpa", *MLA_PREFILL_IMPLS, *DSA_IMPLS)
+IMPLS = (
+    "flywheel",
+    "flywheel_packed",
+    "rpa",
+    "batched_rpa",
+    *MLA_PREFILL_IMPLS,
+    *DSA_IMPLS,
+)
 
 Step = Callable[[jax.Array], tuple[jax.Array, jax.Array]]
 BuildInfo = dict[str, str | int | list[int]]
@@ -155,6 +164,7 @@ class Cell:
     kv_dtype: str = "bfloat16"
     # A DSA cell's DSA_GEOMETRIES entry.
     dsa_geometry: str | None = None
+    sliding_window: int | None = None
 
     @property
     def is_mla(self) -> bool:
@@ -173,9 +183,30 @@ class Cell:
         else:
             heads_tag = f"h{self.heads}-k{self.heads_k}-d{self.head_dim}"
         kv_tag = "" if self.kv_dtype == "bfloat16" else f"-kv{self.kv_dtype}"
+        window_tag = (
+            "" if self.sliding_window is None else f"-w{self.sliding_window}"
+        )
         return (
             f"{self.impl}-{heads_tag}-{self.pattern}-b{self.batch}"
-            f"-t{self.budget}-p{self.page_size}{kv_tag}"
+            f"-t{self.budget}-p{self.page_size}{kv_tag}{window_tag}"
+        )
+
+    @property
+    def window_size(self) -> tuple[int, int]:
+        """flash_attn's window_size: a sliding window of W keys is (W - 1,
+        0)."""
+        if self.sliding_window is None:
+            return (-1, -1)
+        return (self.sliding_window - 1, 0)
+
+    @property
+    def attention_pairs(self) -> int:
+        """The causal (query, key) pairs, at most sliding_window keys a
+        query."""
+        window = self.sliding_window
+        return sum(
+            sum(min(row + 1, window or row + 1) for row in range(length))
+            for length in self.lengths
         )
 
     @property
@@ -429,6 +460,7 @@ def build_flywheel(
             max_seqlen,
             max_seqlen,
             causal=True,
+            window_size=cell.window_size,
             block_table=block_table,
             seqused_k=kv_lens,
             nheads_k=cell.heads_k,
@@ -440,6 +472,36 @@ def build_flywheel(
     return (
         (lambda cache: (kernel(cache, *operands), cache)),
         (lambda: cache),
+        {},
+    )
+
+
+def build_flywheel_packed(
+    cell: Cell, inputs: Inputs, args: argparse.Namespace
+) -> tuple[Step, Callable[[], jax.Array], BuildInfo]:
+    """(step, fresh_state, info) running flash_attn_varlen_func on the
+    batch's packed K/V (cu_seqlens_k), token-major q and out as the paged
+    call takes them."""
+    del args  # Unused.
+    max_seqlen = max(cell.lengths)
+
+    def call(q, k, v, cu_q_lens):
+        out = flash_attn_varlen_func(
+            *(jnp.transpose(x, (1, 0, 2)) for x in (q, k, v)),
+            cu_q_lens,
+            cu_q_lens,
+            max_seqlen,
+            max_seqlen,
+            causal=True,
+            window_size=cell.window_size,
+        )
+        return jnp.transpose(out, (1, 0, 2))
+
+    kernel = jax.jit(call)
+    operands = (inputs.q, inputs.k, inputs.v, inputs.cu_q_lens)
+    return (
+        (lambda state: (kernel(*operands), state)),
+        (lambda: None),
         {},
     )
 
@@ -586,6 +648,7 @@ def build_batched_rpa(
 
 BUILDERS = {
     "flywheel": build_flywheel,
+    "flywheel_packed": build_flywheel_packed,
     "rpa": build_rpa,
     "batched_rpa": build_batched_rpa,
 }
@@ -593,7 +656,7 @@ BUILDERS = {
 
 def run(cell: Cell, args: argparse.Namespace) -> dict[str, object]:
     lengths = cell.lengths
-    pairs = sum(length * (length + 1) // 2 for length in lengths)
+    pairs = cell.attention_pairs
     if cell.is_mla:
         # Note (david): QK over the latent and the rope, P @ V over the latent.
         attn_flops = 2 * pairs * cell.heads * (2 * LATENT_DIM + ROPE_DIM)
@@ -686,12 +749,18 @@ def make_cell(args: argparse.Namespace) -> Cell:
         page_size,
         DSA_KV_DTYPE if is_dsa else args.kv_dtype,
         args.dsa_geometry,
+        args.sliding_window,
     )
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     cell = make_cell(args)
+    if args.sliding_window is not None and cell.impl not in (
+        "flywheel",
+        "flywheel_packed",
+    ):
+        raise ValueError("only the flywheel impls take --sliding-window.")
     if args.output and not args.trace and recorded(args.output, cell.key):
         print(f"{cell.key}: already recorded in {args.output}")
         return 0
@@ -768,6 +837,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--dsa-geometry",
         choices=tuple(DSA_GEOMETRIES),
         help="a DSA impl's model geometry",
+    )
+    parser.add_argument(
+        "--sliding-window",
+        type=int,
+        help=(
+            "flywheel impls: keys a query sees, window_size (W - 1, 0);"
+            " default: full causal"
+        ),
     )
     parser.add_argument("--output", type=pathlib.Path)
     parser.add_argument(
