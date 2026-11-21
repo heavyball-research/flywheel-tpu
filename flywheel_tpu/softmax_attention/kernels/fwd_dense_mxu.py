@@ -87,6 +87,7 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     masked_logits,
     mxu_pipeline_applies,
     replay_matmul,
+    row_tiles,
     scaled_logits,
     tile_bounds,
     zeroes_row_start,
@@ -98,6 +99,7 @@ from flywheel_tpu.softmax_attention.mxu_pipeline import (
     PipelineState,
     Tail,
     WorkItem,
+    tile_starts,
 )
 from flywheel_tpu.softmax_attention.schedule import FwdSchedule
 from flywheel_tpu.softmax_attention.traits import FwdTraits
@@ -107,9 +109,9 @@ from flywheel_tpu.softmax_attention.variant import Variant, VariantOperands
 MXU_ROW_PARITY = 0
 # The body of a checked block that finishes its first body's items.
 SECOND_BODY = 1
-# The fewest rows and keys of a block under a mask that runs masked loop bodies
-# or edge segments.
-MIN_MASKED_BLOCK = 1024
+# The fewest loop bodies of a kv block: a row's first body precedes the body
+# that ends it.
+MIN_BLOCK_BODIES = SECOND_BODY + 1
 # A segment before a block step ends on a tile of at least this many items: its
 # V push then runs before the step's DMA may overwrite the block it reads.
 MIN_LAST_TILE_ITEMS = (
@@ -135,30 +137,67 @@ def dense_uses_mxu_pipeline(
     )
 
 
-def dense_mxu_runs_blocks(variant: Variant, block_sizes: BlockSizes) -> bool:
-    """Whether the explicit dense loop runs a build of block_sizes. Any mask but
-    none or a static causal one of whole square blocks needs whole loop bodies
-    per kv block and blocks of at least MIN_MASKED_BLOCK rows and keys."""
-    block_q, block_kv = block_sizes.block_q, block_sizes.block_kv
-    is_static_causal = (
+def dense_body_tiles(num_fragments: int) -> int:
+    """The kv tiles of a loop body of rows of num_fragments fragments: whole
+    slot ring laps of items (fwd_mxu.row_tiles)."""
+    return row_tiles(num_fragments).body_tiles
+
+
+def has_static_causal_blocks(variant: Variant, block_sizes: BlockSizes) -> bool:
+    """Whether a build's mask is a static causal one of whole square blocks,
+    which the static plan lists."""
+    return (
         variant.window == (None, 0)
         and not variant.runtime_causal_offset
-        and block_q == block_kv
-        and variant.causal_offset % block_kv == 0
+        and block_sizes.block_q == block_sizes.block_kv
+        and variant.causal_offset % block_sizes.block_kv == 0
     )
-    if variant.window == (None, None) or is_static_causal:
-        return True
+
+
+def holds_masked_bodies(block_sizes: BlockSizes) -> bool:
+    """Whether blocks of block_sizes run masked loop bodies or edge segments:
+    kv blocks of whole loop bodies, at least MIN_BLOCK_BODIES."""
+    block_q, block_kv = block_sizes.block_q, block_sizes.block_kv
+    body_keys = dense_body_tiles(block_q // FRAGMENT_ROWS) * MXU_COLUMNS
     return (
-        min(block_q, block_kv) >= MIN_MASKED_BLOCK
-        and block_kv % (LOOP_BODY_TILES * MXU_COLUMNS) == 0
+        block_kv % body_keys == 0 and block_kv >= MIN_BLOCK_BODIES * body_keys
     )
+
+
+def masks_single_block_rows(
+    variant: Variant, block_sizes: BlockSizes, num_kv_blocks: int
+) -> bool:
+    """Whether every row of a build runs the kv axis's one block as one segment
+    that masks its items: under a mask without a static causal plan."""
+    return (
+        num_kv_blocks == 1
+        and variant.window != (None, None)
+        and not has_static_causal_blocks(variant, block_sizes)
+    )
+
+
+def dense_mxu_runs_blocks(
+    variant: Variant, block_sizes: BlockSizes, num_kv_blocks: int
+) -> bool:
+    """Whether the explicit dense loop runs a build of block_sizes over
+    num_kv_blocks kv blocks: any without a mask or under a static causal one of
+    whole square blocks; under another mask, blocks that hold masked loop
+    bodies, or a kv axis of one block."""
+    if variant.window == (None, None) or has_static_causal_blocks(
+        variant, block_sizes
+    ):
+        return True
+    return holds_masked_bodies(block_sizes) or num_kv_blocks == 1
 
 
 def dense_has_checked_units(num_kv_blocks: int, num_fragments: int) -> bool:
     """Whether rows of up to num_kv_blocks kv blocks and num_fragments fragments
-    have a check unit before their final unit."""
-    return num_kv_blocks > FINAL_UNIT_SPAN and not zeroes_row_start(
-        num_fragments
+    have a check unit before their final unit: none does unless loop bodies are
+    LOOP_BODY_TILES tiles."""
+    return (
+        num_kv_blocks > FINAL_UNIT_SPAN
+        and not zeroes_row_start(num_fragments)
+        and dense_body_tiles(num_fragments) == LOOP_BODY_TILES
     )
 
 
@@ -196,19 +235,21 @@ def body_items(
     last_tile_mode: FragmentMode = PLAIN,
     masked_tiles: frozenset[int] = frozenset(),
 ) -> tuple[WorkItem, ...]:
-    """A loop body's items: every fragment against LOOP_BODY_TILES tiles, the
-    last tile's with last_tile_mode, those of masked_tiles masked."""
+    """A loop body's items: every fragment against the body's tiles
+    (dense_body_tiles), the last tile's with last_tile_mode, those of
+    masked_tiles masked."""
     fragments = range(traits.bq // FRAGMENT_ROWS)
+    num_tiles = dense_body_tiles(len(fragments))
     return sum(
         (
             tile_items(
                 fragments,
                 tile,
-                (
-                    last_tile_mode if tile == LOOP_BODY_TILES - 1 else PLAIN
-                )._replace(is_masked=tile in masked_tiles),
+                (last_tile_mode if tile == num_tiles - 1 else PLAIN)._replace(
+                    is_masked=tile in masked_tiles
+                ),
             )
-            for tile in range(LOOP_BODY_TILES)
+            for tile in range(num_tiles)
         ),
         (),
     )
@@ -237,11 +278,67 @@ def single_block_items(
     )
 
 
+def masked_block_items(
+    traits: FwdTraits, geometry: MaskGeometry, q_blocks: range
+) -> tuple[WorkItem, ...]:
+    """A row of one kv block as one segment under a static geometry: the items
+    through which a row of some q block of q_blocks sees a key. A fragment's
+    first item starts its rows and its last one ends them; an item is masked
+    unless every q block's rows see all of its keys and take no anchor in it."""
+    classes = {
+        (fragment, tile): [
+            item_class(
+                geometry,
+                q_block * traits.bq + fragment * FRAGMENT_ROWS,
+                tile * MXU_COLUMNS,
+            )
+            for q_block in q_blocks
+        ]
+        for fragment in range(traits.bq // FRAGMENT_ROWS)
+        for tile in range(traits.num_k_compute_tiles)
+    }
+    live = sorted(
+        (tile, fragment)
+        for (fragment, tile), item_classes in classes.items()
+        if any(pair_class.is_live for pair_class in item_classes)
+    )
+    first_tile, last_tile = {}, {}
+    for tile, fragment in live:
+        first_tile.setdefault(fragment, tile)
+        last_tile[fragment] = tile
+
+    def _is_masked(fragment, tile):
+        return not all(
+            pair_class.is_interior
+            and not (geometry.has_deferred_anchors and pair_class.has_anchor)
+            for pair_class in classes[fragment, tile]
+        )
+
+    return tuple(
+        WorkItem(
+            fragment=fragment,
+            tile=tile,
+            mode=FragmentMode(
+                is_row_start=tile == first_tile[fragment],
+                is_masked=_is_masked(fragment, tile),
+                is_row_end=tile == last_tile[fragment],
+            ),
+        )
+        for tile, fragment in live
+    )
+
+
 def row_start_items(traits: FwdTraits) -> tuple[WorkItem, ...]:
-    """A row's first segment: the tile that starts the row, then the plain tile
-    a loop body needs before it."""
+    """A row's first segment, one loop body long: the tile that starts the row,
+    then the plain tiles a loop body needs before it."""
     fragments = range(traits.bq // FRAGMENT_ROWS)
-    return tile_items(fragments, 0, ROW_START) + tile_items(fragments, 1)
+    return tile_items(fragments, 0, ROW_START) + sum(
+        (
+            tile_items(fragments, tile)
+            for tile in range(1, dense_body_tiles(len(fragments)))
+        ),
+        (),
+    )
 
 
 class BlockSegment(NamedTuple):
@@ -387,10 +484,11 @@ def edge_regions(
         return range(0), range(first_right, last + 1), None
     first = (geometry.shift - left) // bkv
     # The first interior body after the left blocks is masked, so the first
-    # interior block may hold anchors on its first LOOP_BODY_TILES tiles.
+    # interior block may hold anchors on that body's tiles.
+    body_tiles = dense_body_tiles(bq // FRAGMENT_ROWS)
     interior = []
     for block in range(first + 1, last + 1):
-        anchor_tiles = 0 if interior else LOOP_BODY_TILES
+        anchor_tiles = 0 if interior else body_tiles
         if not is_interior_block(
             geometry, traits, block, anchor_tiles=anchor_tiles
         ):
@@ -680,12 +778,15 @@ class RowEnd:
 
 
 class StagedBlocks(NamedTuple):
-    """The kv ring slots and first keys of a visit's block and the next's."""
+    """The kv ring slots and first keys of a visit's block and the next's, and
+    whether the next's is a block of its own, in flight until it is waited
+    for."""
 
     slot: jax.Array
     next_slot: jax.Array
     key: jax.Array
     next_key: jax.Array
+    is_next_fresh: jax.Array
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -1012,7 +1113,8 @@ def dense_row_layout(
     num_valid_keys: int | None = None,
 ) -> DenseRowLayout:
     """The row layout of a dense build: the static plan where its offset is
-    static, else the runtime one. num_valid_keys ends the mask's kv axis."""
+    static and its rows are no single masked segments, else the runtime one.
+    num_valid_keys ends the mask's kv axis."""
     left, right = variant.window
     num_axis_keys = schedule.num_kv_blocks * traits.bkv
     geometry = MaskGeometry(
@@ -1022,7 +1124,9 @@ def dense_row_layout(
         key_end=num_axis_keys if num_valid_keys is None else num_valid_keys,
     )
     plan = None
-    if isinstance(causal_offset, int):
+    if isinstance(causal_offset, int) and not masks_single_block_rows(
+        variant, traits.block_sizes, schedule.num_kv_blocks
+    ):
         rows = PlanRows(
             first_row=schedule.first_row,
             last_row=schedule.first_row + schedule.num_rows - 1,
@@ -1069,15 +1173,20 @@ class DenseMxuLoop:
             return
         # A row's first body precedes the body that ends it, and a body
         # finishes items of the body before it alone.
-        assert traits.num_k_compute_tiles % LOOP_BODY_TILES == 0, traits
+        assert traits.num_k_compute_tiles % self.body_tiles == 0, traits
         assert (
-            min(self.bodies_per_block, self.last_block_bodies) > SECOND_BODY
+            min(self.bodies_per_block, self.last_block_bodies)
+            >= MIN_BLOCK_BODIES
         ), (self.bodies_per_block, self.last_block_bodies)
-        assert LOOP_BODY_TILES * self.num_fragments >= delays.pv_pop, traits
+        assert self.body_tiles * self.num_fragments >= delays.pv_pop, traits
+
+    @functools.cached_property
+    def body_tiles(self) -> int:
+        return dense_body_tiles(self.num_fragments)
 
     @property
     def bodies_per_block(self) -> int:
-        return self.traits.num_k_compute_tiles // LOOP_BODY_TILES
+        return self.traits.num_k_compute_tiles // self.body_tiles
 
     @property
     def last_block_keys(self) -> int | None:
@@ -1100,7 +1209,7 @@ class DenseMxuLoop:
     @property
     def last_block_bodies(self) -> int:
         """The bodies of the kv axis's last block that hold a valid key."""
-        return -(-self.last_block_tiles // LOOP_BODY_TILES)
+        return -(-self.last_block_tiles // self.body_tiles)
 
     def last_visit_bodies(self, row: DenseRow) -> jax.Array | int:
         """The bodies of row's last visit: last_block_bodies when it is the kv
@@ -1139,12 +1248,35 @@ class DenseMxuLoop:
         )
 
     @property
-    def is_single_block_row(self) -> bool:
-        """Whether a row is one segment: no mask, a kv axis of one block."""
-        return (
-            self.variant.window == (None, None)
-            and self.schedule.num_kv_blocks == 1
+    def masks_single_block_rows(self) -> bool:
+        return masks_single_block_rows(
+            self.variant, self.traits.block_sizes, self.schedule.num_kv_blocks
         )
+
+    @property
+    def is_single_block_row(self) -> bool:
+        """Whether a row is one segment over a kv axis of one block: without a
+        mask, or under one whose items the segment masks."""
+        return self.schedule.num_kv_blocks == 1 and (
+            self.variant.window == (None, None) or self.masks_single_block_rows
+        )
+
+    @functools.cached_property
+    def single_block_row_items(self) -> tuple[WorkItem, ...]:
+        """The one segment of a single-block row. Without a mask it masks the
+        tiles that hold a padded key; under a static mask it runs the items
+        that see a key, masked where the mask cuts them; under a runtime
+        offset it masks every item."""
+        traits, schedule = self.traits, self.schedule
+        num_tiles = traits.num_k_compute_tiles
+        if not self.masks_single_block_rows:
+            return single_block_items(traits, self.padded_tiles(0, num_tiles))
+        if not isinstance(self.geometry.shift, int):
+            return single_block_items(traits, frozenset(range(num_tiles)))
+        q_blocks = range(
+            schedule.first_row, schedule.first_row + schedule.num_rows
+        )
+        return masked_block_items(traits, self.geometry, q_blocks)
 
     @property
     def runs_loop_bodies(self) -> bool:
@@ -1189,32 +1321,29 @@ class DenseMxuLoop:
         base_head: jax.Array,
         kv_carry: tuple,
     ) -> tuple[tuple, StagedBlocks]:
-        """Step the kv ring at the top of visit visit: wait for the next visit's
-        block and start the block two visits ahead; ahead is the next row's
-        first two descriptors."""
-        kv_slot, next_slot = kv_carry[:2]
+        """Step the kv ring at the top of visit visit: start the block two
+        visits ahead; ahead is the next row's first two descriptors. The visit
+        waits for the next visit's block where it first reads it."""
         ahead_block = self.ahead_block(
             visit, visits, ahead, base_head, kv_carry
         )
-        self.wait_next_block(kv_carry)
         return self.start_ahead_block(
             kv_carry, ahead_block
-        ), self.staged_blocks(visits, visit, kv_slot, next_slot)
+        ), self.staged_blocks(visits, visit, kv_carry)
 
     def staged_blocks(
-        self,
-        visits: RowVisits,
-        visit: jax.Array | int,
-        slot: jax.Array,
-        next_slot: jax.Array,
+        self, visits: RowVisits, visit: jax.Array | int, kv_carry: tuple
     ) -> StagedBlocks:
-        """Visit visit's block at slot and the next visit's at next_slot."""
+        """Visit visit's block and the next visit's, by the kv carry at the
+        visit's top."""
+        slot, next_slot, _, is_next_fresh, _, _ = kv_carry
         bkv = self.traits.bkv
         return StagedBlocks(
             slot=slot,
             next_slot=next_slot,
             key=visits.block_of(visit) * bkv,
             next_key=visits.block_of(visit + 1) * bkv,
+            is_next_fresh=is_next_fresh,
         )
 
     def ahead_block(
@@ -1246,13 +1375,27 @@ class DenseMxuLoop:
         )
         return ahead_desc, ahead_slot, is_ahead_fresh
 
-    def wait_next_block(self, kv_carry: tuple) -> None:
-        """Wait for the next visit's block, when it is fresh."""
-        _, next_slot, _, is_next_fresh, _, _ = kv_carry
+    def wait_next_block(
+        self, staged: StagedBlocks, is_due: jax.Array | bool = True
+    ) -> None:
+        """Wait for the block of the visit after staged's where is_due, when it
+        is fresh: before the visit's last tile, which stages that block's first
+        K tile."""
+        if is_due is False:
+            return
 
-        @pl.when(is_next_fresh > 0)
+        @pl.when(jnp.logical_and(is_due, staged.is_next_fresh > 0))
         def _wait_next_block():
-            wait_rotated_kv_block(self.traits, self.kv_refs, next_slot)
+            wait_rotated_kv_block(self.traits, self.kv_refs, staged.next_slot)
+
+    def wait_row_block(self, kv_carry: tuple) -> None:
+        """Wait for the next row's first block, which a row's last visit leaves
+        in flight; kv_carry is the carry that visit's step returned."""
+        slot, _, is_fresh, _, _, _ = kv_carry
+
+        @pl.when(is_fresh > 0)
+        def _wait_row_block():
+            wait_rotated_kv_block(self.traits, self.kv_refs, slot)
 
     def start_ahead_block(
         self,
@@ -1284,16 +1427,17 @@ class DenseMxuLoop:
         body: jax.Array,
         probs: tuple[jax.Array, ...],
     ) -> tuple[jax.Array, ...]:
-        """One loop body: LOOP_BODY_TILES tiles from tile body * LOOP_BODY_TILES
-        of staged's block. It stages the next body's first K tile, the next
-        block's after the block's last body."""
+        """One loop body: body_tiles tiles from tile body * body_tiles of
+        staged's block. It stages the next body's first K tile, the next
+        block's after the block's last body, which waits for that block."""
         pipeline = self.pipeline
-        first_tile = body * LOOP_BODY_TILES
+        first_tile = body * self.body_tiles
         is_block_end = body == self.bodies_per_block - 1
+        self.wait_next_block(staged, is_block_end)
         next_ops = ops.with_tiles(
             jnp.where(is_block_end, staged.next_slot, staged.slot),
             jnp.where(is_block_end, staged.next_key, staged.key),
-            jnp.where(is_block_end, 0, first_tile + LOOP_BODY_TILES),
+            jnp.where(is_block_end, 0, first_tile + self.body_tiles),
         )
         body_state = pipeline.advance(
             PipelineState(probs=probs, tail=assumed),
@@ -1392,8 +1536,8 @@ class DenseMxuLoop:
             jnp.where(is_first, prev.key, staged.key),
             jnp.where(
                 is_first,
-                self.traits.num_k_compute_tiles - LOOP_BODY_TILES,
-                (body - 1) * LOOP_BODY_TILES,
+                self.traits.num_k_compute_tiles - self.body_tiles,
+                (body - 1) * self.body_tiles,
             ),
         )
         return assumed.with_ops(ops)
@@ -1442,8 +1586,7 @@ class DenseMxuLoop:
         checks the unit before; the block two visits ahead starts after it, once
         that unit's block can no longer replay from its slot."""
         kv_carry, probs, prev = carry
-        staged = self.staged_blocks(row.visits, visit, *kv_carry[:2])
-        self.wait_next_block(kv_carry)
+        staged = self.staged_blocks(row.visits, visit, kv_carry)
         blocks = (prev, staged)
         probs = self.run_first_body(row, entry, assumed, visit, blocks, probs)
         kv_carry = self.start_ahead_block(
@@ -1467,7 +1610,7 @@ class DenseMxuLoop:
         writes the visit's checkpoint."""
         unit_end_tail = self.loop_body_tail(assumed, blocks, 0)
         unit_end_tail = unit_end_tail.with_ops(
-            self.unit_end_ops(unit_end_tail.ops, visit, LOOP_BODY_TILES - 1)
+            self.unit_end_ops(unit_end_tail.ops, visit, self.body_tiles - 1)
         )
 
         def _checked(probs):
@@ -1508,7 +1651,7 @@ class DenseMxuLoop:
         writing_ops = self.unit_end_ops(
             loop_ops,
             visit + jnp.logical_not(is_last_visit).astype(jnp.int32),
-            LOOP_BODY_TILES - 1,
+            self.body_tiles - 1,
         )
         second_body = partial(self.run_second_body, assumed, staged)
 
@@ -1602,7 +1745,7 @@ class DenseMxuLoop:
         _, staged = blocks
         largest = LargestSums()
         ops = loop_ops.with_tiles(staged.slot, staged.key, 0)
-        next_ops = loop_ops.with_tiles(staged.slot, staged.key, LOOP_BODY_TILES)
+        next_ops = loop_ops.with_tiles(staged.slot, staged.key, self.body_tiles)
         state = self.pipeline.advance(
             state_before,
             self.loop_items,
@@ -1625,8 +1768,9 @@ class DenseMxuLoop:
     ) -> tuple[tuple, PipelineState, StagedBlocks]:
         """Run static segments, one a visit from first_visit on, each after its
         block's step; carry is (kv carry, pipeline state). The last stages the
-        next visit's first K tile when stages_next. writes_checkpoints makes
-        each a check unit in a build with checked units."""
+        next visit's first K tile when stages_next, else it ends the row.
+        writes_checkpoints makes each a check unit in a build with checked
+        units."""
         kv_carry, state = carry
         prev = None
         for index, segment in enumerate(segments):
@@ -1635,8 +1779,7 @@ class DenseMxuLoop:
             ahead_block = self.ahead_block(
                 visit, row.visits, ahead, row.base_head, kv_carry
             )
-            staged = self.staged_blocks(row.visits, visit, *kv_carry[:2])
-            self.wait_next_block(kv_carry)
+            staged = self.staged_blocks(row.visits, visit, kv_carry)
             ops = row.ops.with_tiles(
                 staged.slot, staged.key, 0, row_end=row.row_end
             )
@@ -1660,19 +1803,47 @@ class DenseMxuLoop:
                 )
             prev = staged
             if ends_row:
-                next_k_tile = None
-            else:
-                next_ops = row.ops.with_tiles(
-                    staged.next_slot, staged.next_key, 0
-                )
-                next_tile = 0
-                if has_next_segment:
-                    next_tile = segments[index + 1].items[0].tile
-                next_k_tile = partial(next_ops.k_tile, next_tile)
-            state = self.pipeline.advance(
-                state, segment.items, ops, next_k_tile=next_k_tile
+                state = self.pipeline.advance(state, segment.items, ops)
+                continue
+            next_ops = row.ops.with_tiles(staged.next_slot, staged.next_key, 0)
+            next_tile = 0
+            if has_next_segment:
+                next_tile = segments[index + 1].items[0].tile
+            state = self.run_staging_segment(
+                state,
+                segment.items,
+                ops,
+                staged,
+                partial(next_ops.k_tile, next_tile),
             )
         return kv_carry, state, staged
+
+    def run_staging_segment(
+        self,
+        state: PipelineState,
+        items: tuple[WorkItem, ...],
+        ops: DenseFragmentOps,
+        staged: StagedBlocks,
+        next_k_tile: Callable[[], jax.Array],
+    ) -> PipelineState:
+        """Run a segment that stages next_k_tile, of the block after staged's:
+        the wait for that block comes before the segment's last tile."""
+        last_tile = max(
+            index
+            for index, is_start in enumerate(tile_starts(items))
+            if is_start
+        )
+        if last_tile > 0:
+            state = self.pipeline.advance(
+                state,
+                items[:last_tile],
+                ops,
+                next_k_tile=partial(ops.k_tile, items[last_tile].tile),
+            )
+        self.wait_next_block(staged)
+        return self.pipeline.advance(
+            state, items[last_tile:], ops, next_k_tile=next_k_tile
+        )
 
     def run_checked_segment(
         self,
@@ -1741,8 +1912,9 @@ class DenseMxuLoop:
         visit, in the kv ring's current slot. At visit 0 it starts the row;
         after left segments, whose last block prev holds, it checks their last
         unit."""
-        slot, visit = row.kv_carry[0], row.interior_start
-        staged = self.staged_blocks(row.visits, visit, slot, slot)
+        visit = row.interior_start
+        staged = self.staged_blocks(row.visits, visit, row.kv_carry)
+        slot = staged.slot
         ops = row.ops.with_tiles(slot, staged.key, 0)
         if is_masked:
             ops = ops.masked()
@@ -1755,7 +1927,7 @@ class DenseMxuLoop:
         largest = LargestSums()
         if is_checked:
             ops = dataclasses.replace(ops, largest=largest)
-        next_ops = row.ops.with_tiles(slot, staged.key, LOOP_BODY_TILES)
+        next_ops = row.ops.with_tiles(slot, staged.key, self.body_tiles)
         start_state = self.pipeline.advance(
             row.start_state,
             items,
@@ -1781,7 +1953,7 @@ class DenseMxuLoop:
         the runtime layout; under the static one only the tiles that hold a
         padded key."""
         last_body = self.last_visit_bodies(row) - 1
-        first_tile = last_body * LOOP_BODY_TILES
+        first_tile = last_body * self.body_tiles
         end_ops = row.ops.with_tiles(
             staged.slot, staged.key, first_tile, row.row_end
         )
@@ -1789,7 +1961,7 @@ class DenseMxuLoop:
         if self.layout.plan is None:
             end_ops = end_ops.masked()
         else:
-            masked_tiles = self.padded_tiles(first_tile, LOOP_BODY_TILES)
+            masked_tiles = self.padded_tiles(first_tile, self.body_tiles)
         last_state = self.pipeline.advance(
             PipelineState(
                 probs=probs,
@@ -1808,18 +1980,13 @@ class DenseMxuLoop:
     def run_single_block_row(
         self, row: DenseRow, ahead: tuple[BlockDesc, BlockDesc]
     ) -> tuple[tuple, StagedBlocks]:
-        """A row without a mask over a kv axis of one block: one segment, the
-        tiles that hold a padded key masked, then the drain."""
-        traits = self.traits
+        """A row over a kv axis of one block: one segment, then the drain."""
         kv_carry, staged = self.step_block(
             0, row.visits, ahead, row.base_head, row.kv_carry
         )
-        items = single_block_items(
-            traits, self.padded_tiles(0, traits.num_k_compute_tiles)
-        )
         state = self.pipeline.advance(
             row.start_state,
-            items,
+            self.single_block_row_items,
             row.ops.with_tiles(staged.slot, staged.key, 0, row.row_end),
         )
         self.drain_row(row, state)
@@ -1971,7 +2138,7 @@ class DenseMxuLoop:
         checkpoints.copy_checkpoint(visit, is_restore=False)
         checkpoints.save_anchor(unit)
         self.replay_block(
-            ops, (staged.slot, staged.key), LOOP_BODY_TILES, False, result_slots
+            ops, (staged.slot, staged.key), self.body_tiles, False, result_slots
         )
         checkpoints.rebase_checkpoint(visit, unit)
 
@@ -2171,6 +2338,7 @@ class DenseMxuLoop:
             run = self.run_static_row
         kv_carry, last = run(row, (first_next_desc, second_next_desc))
         self.finish_row(g, row, finish, sink, last.slot)
+        self.wait_row_block(kv_carry)
         return q_loaded, q_inflight, q_slot, kv_carry, num_out_copies + 1
 
     def dense_row(

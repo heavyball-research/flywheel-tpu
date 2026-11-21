@@ -1123,46 +1123,64 @@ def dense_mxu_blocks(
     kv_tile: int,
     kv_unit: int,
     min_kv_block: int,
-    q_unit: int,
     min_q_block: int,
 ) -> tuple[int, int] | None:
     """(block_q, block_kv) of a dense explicit MXU build, which groups
     dispatch's blocks so its loop's segments hold whole units of work; both
-    axes pad to whole blocks. None when a causal mask allows no pair.
+    axes pad to whole blocks. None when a causal mask whose offset is no whole
+    number of blocks spans several kv blocks.
 
     A kv axis split in several blocks takes blocks of whole kv_unit keys, at
-    least min_kv_block and dispatch's block_kv: the one that pads the axis
-    least, then the smallest. Without a causal mask the last block holds
-    more than one unit of the axis's keys, and a q block holds whole units
-    of q_unit rows, at least min_q_block. causal_offset (None: no causal
-    mask) keeps the blocks square and the offset a whole number of blocks.
-    With no such kv block the axis, padded to whole kv tiles, is one block
-    and q keeps dispatch's block.
+    least min_kv_block. Without a causal mask they hold at least dispatch's
+    block_kv, the one that pads the kv axis least, then the smallest, wins,
+    the last block holds more than one unit of the axis's keys, and a q block
+    holds at least min_q_block rows. causal_offset (None: no causal mask)
+    keeps the blocks square and the offset a whole number of blocks: they
+    start at dispatch's block_kv or the q axis, whichever is smaller, and
+    the one that pads both axes least wins.
+    With no such kv block the axis, padded to whole kv tiles, is one block:
+    a causal build whose q axis fills it and whose offset is 0 takes one
+    square block, any other splits the q axis evenly into as many blocks as
+    dispatch's block_q gives it.
     """
-    q_axis = -(-seqlen_q // kv_tile) * kv_tile
-    kv_axis = -(-seqlen_kv // kv_tile) * kv_tile
-    first = max(min_kv_block, -(-block_kv // kv_unit) * kv_unit)
 
-    def _padded_axis(size):
-        return -(-seqlen_kv // size) * size
+    def _padded(length, size):
+        return -(-length // size) * size
+
+    kv_axis = _padded(seqlen_kv, kv_tile)
+    first = max(min_kv_block, _padded(block_kv, kv_unit))
 
     def _fits(size):
         if causal_offset is not None:
             return causal_offset % size == 0
-        return seqlen_kv - (_padded_axis(size) - size) > kv_unit
+        return seqlen_kv - (_padded(seqlen_kv, size) - size) > kv_unit
 
-    candidates = [
-        size for size in range(first, kv_axis, kv_unit) if _fits(size)
-    ]
-    if candidates:
-        size = min(candidates, key=lambda size: (_padded_axis(size), size))
-        if causal_offset is not None:
-            return size, size
-        return max(-(-block_q // q_unit) * q_unit, min_q_block), size
     if causal_offset is None:
-        return block_q, kv_axis
-    if q_axis == kv_axis and causal_offset == 0:
-        return q_axis, kv_axis
+        start = first
+    else:
+        start = max(min_kv_block, min(first, _padded(seqlen_q, kv_unit)))
+    candidates = [
+        size for size in range(start, kv_axis, kv_unit) if _fits(size)
+    ]
+    if candidates and causal_offset is not None:
+        size = min(
+            candidates,
+            key=lambda size: (
+                _padded(seqlen_q, size) * _padded(seqlen_kv, size),
+                size,
+            ),
+        )
+        return size, size
+    if candidates:
+        size = min(
+            candidates, key=lambda size: (_padded(seqlen_kv, size), size)
+        )
+        return max(block_q, min_q_block), size
+    if causal_offset == 0 and seqlen_q == kv_axis:
+        return kv_axis, kv_axis
+    if causal_offset is None or kv_axis <= first:
+        num_q_blocks = -(-seqlen_q // block_q)
+        return -(-seqlen_q // num_q_blocks), kv_axis
     return None
 
 

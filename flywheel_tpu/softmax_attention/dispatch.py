@@ -83,6 +83,8 @@ from flywheel_tpu.softmax_attention.kernels.fwd_dense import (
     flash_attn_forward_runtime_offset,
 )
 from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    MIN_BLOCK_BODIES,
+    dense_body_tiles,
     dense_mxu_runs_blocks,
     dense_uses_mxu_pipeline,
 )
@@ -197,13 +199,10 @@ PAGED_MAX_BLOCK_KV = 1024
 PAGED_WINDOW_BLOCK = 512
 DEFAULT_NUM_KV_STAGES = 2
 # A dense explicit MXU build groups dispatch's blocks (dense_mxu_blocks): its
-# kv blocks hold whole loop bodies, at least two; its q blocks of several kv
-# blocks hold whole half slot ring laps of fragments, at least two, so a
-# tile finishes the softmaxes of the tile before it.
-DENSE_MXU_KV_UNIT = LOOP_BODY_TILES * MXU_COLUMNS
-DENSE_MXU_MIN_KV_BLOCK = 2 * DENSE_MXU_KV_UNIT
-DENSE_MXU_Q_UNIT = NUM_SLOTS // 2 * FRAGMENT_ROWS
-DENSE_MXU_MIN_Q_BLOCK = 2 * DENSE_MXU_Q_UNIT
+# kv blocks hold whole loop bodies, at least MIN_BLOCK_BODIES; its q blocks of
+# several kv blocks hold at least a slot ring lap of fragments, so a tile
+# finishes the softmaxes of the tile before it.
+DENSE_MXU_MIN_Q_BLOCK = NUM_SLOTS * FRAGMENT_ROWS
 # An explicit MXU build streams each kv tile once per row, so its q target is
 # at least this many rows of all stacked heads. A varlen row's state and
 # stages take VMEM by its rows, so its q block keeps at most
@@ -925,6 +924,15 @@ def _resolve_mxu_pipeline(
     ):
         return False, block_sizes
     padded = mxu_block_sizes(block_sizes)
+    if variant.causal:
+        # Square blocks of whole kv units: their rows fill slot laps in
+        # LOOP_BODY_TILES tiles.
+        body_tiles = LOOP_BODY_TILES
+    else:
+        body_tiles = dense_body_tiles(
+            max(padded.block_q, DENSE_MXU_MIN_Q_BLOCK) // FRAGMENT_ROWS
+        )
+    kv_unit = body_tiles * MXU_COLUMNS
     blocks = dense_mxu_blocks(
         seqlen_q=seqlen_q,
         seqlen_kv=seqlen_kv,
@@ -932,9 +940,8 @@ def _resolve_mxu_pipeline(
         block_kv=padded.block_kv,
         causal_offset=variant.causal_offset if variant.causal else None,
         kv_tile=MXU_COLUMNS,
-        kv_unit=DENSE_MXU_KV_UNIT,
-        min_kv_block=DENSE_MXU_MIN_KV_BLOCK,
-        q_unit=DENSE_MXU_Q_UNIT,
+        kv_unit=kv_unit,
+        min_kv_block=MIN_BLOCK_BODIES * kv_unit,
         min_q_block=DENSE_MXU_MIN_Q_BLOCK,
     )
     if blocks is None:
@@ -943,7 +950,8 @@ def _resolve_mxu_pipeline(
     grouped = mxu_block_sizes(
         dataclasses.replace(padded, block_q=block_q, block_kv=block_kv)
     )
-    if not dense_mxu_runs_blocks(variant, grouped):
+    num_kv_blocks = round_up(seqlen_kv, grouped.block_kv) // grouped.block_kv
+    if not dense_mxu_runs_blocks(variant, grouped, num_kv_blocks):
         return False, block_sizes
     return True, grouped
 

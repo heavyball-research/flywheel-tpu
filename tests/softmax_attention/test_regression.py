@@ -1419,6 +1419,117 @@ def test_dense_mxu_small_blocks(block_q, block_kv, seqlen, causal):
 
 @requires_mxu_accumulators
 @pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,window_size",
+    [
+        (1280, 2048, (-1, -1)),
+        (1792, 1024, (-1, -1)),
+        (1200, 4096, (-1, -1)),
+        (640, 4096, (-1, -1)),
+        (1152, 8192, (-1, -1)),
+        (1040, 2048, (256, 256)),
+        (1664, 8192, (1024, -1)),
+        (1040, 1024, (256, -1)),
+    ],
+)
+def test_dense_mxu_q_blocks_of_any_fragment_count(
+    seqlen_q, seqlen_k, window_size
+):
+    # Note (david): a q block whose kv tile's items fill no whole slot lap in
+    # LOOP_BODY_TILES tiles runs longer loop bodies; a masked build whose kv
+    # block holds fewer than two of them keeps the dot_general loop.
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, window_size=window_size)
+    assert_output_close(out, q, k, v, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,causal,window_size",
+    [
+        (64, 128, True, (-1, -1)),
+        (113, 203, True, (-1, -1)),
+        (640, 128, True, (-1, -1)),
+        (1023, 1024, True, (-1, -1)),
+        (1024, 1023, True, (-1, -1)),
+        (256, 256, False, (174, 14)),
+        (512, 256, False, (44, 255)),
+        (128, 256, False, (76, 0)),
+    ],
+)
+def test_dense_mxu_masked_single_block(seqlen_q, seqlen_k, causal, window_size):
+    # Note (david): a mask without a static causal plan, over blocks too small
+    # for masked loop bodies: a kv axis of one block runs every row as one
+    # segment with every item masked.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+        causal_offset=seqlen_k - seqlen_q,
+    )
+    kernel = get_kernel(
+        4,
+        4,
+        pad_seqlen(seqlen_q),
+        pad_seqlen(seqlen_k),
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, causal=causal, window_size=window_size)
+    assert_output_close(out, q, k, v, causal=causal, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,window_size",
+    [
+        (4224, 4224, (429, 3167)),
+        (4224, 4224, (512, 512)),
+        (2176, 4224, (686, 2555)),
+        (128, 4224, (512, 512)),
+    ],
+)
+def test_dense_mxu_masked_blocks_of_one_slot_lap(
+    seqlen_q, seqlen_k, window_size
+):
+    # Note (david): a window over several kv blocks runs masked loop bodies
+    # and edge segments in q blocks of one slot lap of fragments, fewer than
+    # the pipeline holds in flight.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=False,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+        causal_offset=seqlen_k - seqlen_q,
+    )
+    kernel = get_kernel(
+        4,
+        4,
+        pad_seqlen(seqlen_q),
+        pad_seqlen(seqlen_k),
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    traits = kernel.keywords["traits"]
+    assert traits.uses_mxu_pipeline
+    assert traits.bq == dispatch.DENSE_MXU_MIN_Q_BLOCK
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, window_size=window_size)
+    assert_output_close(out, q, k, v, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
     "seqlens,nheads_k,blocks",
     [
         ([300, 37], 8, (128, 256, 16, 256)),
@@ -1518,16 +1629,26 @@ def test_dense_mxu_dispatch_takes_a_runtime_offset():
 
 @requires_mxu_accumulators
 @pytest.mark.parametrize(
-    "causal,seqlen,nheads_k,scaled_quarter",
-    [(True, 6144, 4, 0), (True, 2048, 1, 0), (False, 4096, 4, 3)],
+    "causal,seqlen_q,seqlen,nheads_k,scaled_quarter",
+    [
+        (True, 6144, 6144, 4, 0),
+        (True, 2048, 2048, 1, 0),
+        (False, 4096, 4096, 4, 3),
+        (False, 1152, 8192, 4, 3),
+    ],
 )
-def test_dense_mxu_guard_replay(causal, seqlen, nheads_k, scaled_quarter):
+def test_dense_mxu_guard_replay(
+    causal, seqlen_q, seqlen, nheads_k, scaled_quarter
+):
     # Note (david): keys scaled far up in a block a row visits after the one
     # its anchors come from push its row sums past the guard, so the row
     # replays: a causal row anchors on its diagonal block and meets block 0
     # later, a full row anchors on block 0. The sinks and lse read the
-    # replayed state; the one-block MQA rows run from one staged block.
-    q, k, v = random_qkv(0, 1, seqlen, 4, nheads_k, MXU_HEAD_DIM)
+    # replayed state; the one-block MQA rows run from one staged block, and
+    # the 1152-row q block's longer loop bodies leave no check unit.
+    q, k, v = random_qkv(
+        0, 1, seqlen_q, 4, nheads_k, MXU_HEAD_DIM, seqlen_k=seqlen
+    )
     quarter = seqlen // 4
     keys = slice(scaled_quarter * quarter, (scaled_quarter + 1) * quarter)
     k = k.at[:, keys].multiply(40.0)

@@ -699,7 +699,7 @@ def dense_fwd_body(
         _start_block_data(second_desc, second_slot)
 
     if traits.uses_mxu_pipeline:
-        # An explicit block step waits for the block after its own.
+        # An explicit row starts with its first block staged.
         wait_rotated_kv_block(traits, kv_refs, 0)
     minus_one = jnp.int32(-1)
     zero = jnp.int32(0)
@@ -737,7 +737,7 @@ def dense_fwd_body(
         after_last_desc,
     ) = kv_carry
 
-    # An explicit build's last step already waited for the block after it.
+    # An explicit build's last row already waited for the block after it.
     if not traits.uses_mxu_pipeline:
 
         @pl.when(is_last_fresh > 0)
