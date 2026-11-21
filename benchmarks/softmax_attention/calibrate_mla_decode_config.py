@@ -26,6 +26,15 @@ its g, so e(B) stays the full-block cost. --validate times held-out length
 patterns and reports the model's regret and rank correlation against the
 measurements.
 
+The block candidates are the kernel's full lattice at --page-size, not a
+power-of-two subset: every lane multiple that is a whole multiple or whole
+fraction of a page. Validation times every legal (block, items) cell, so its
+oracle is the measured best over the lattice rather than over the heuristic's
+own pruned grid, and reports the heuristic's regret per length pattern plus
+the mean and maximum. --page-size defaults to the deployment page 1024; page
+128 exposes the full lattice (every lane multiple up to 2048), and page 512
+adds block 1536 to what page 1024 can hold.
+
 A cell whose schedule and block table outgrow the SMEM budget is skipped: past
 about 60% of the 1 MiB SMEM the compiled step runs about 20x slower, so the
 cell says nothing about the fast regime the constants describe. The skipped
@@ -34,7 +43,8 @@ cells and their SMEM fraction are printed and recorded.
 Usage, on the TPU:
   cd ~/flywheel-tpu-new && PYTHONPATH=. ~/venv-flywheel-tpu/bin/python \
       benchmarks/softmax_attention/calibrate_mla_decode_config.py \
-      --out benchmarks/softmax_attention/results/mla_calibration --validate
+      --out benchmarks/softmax_attention/results/mla_calibration \
+      --page-size 1024 --floor-scan --validate
 """
 
 from __future__ import annotations
@@ -49,10 +59,14 @@ import numpy as np
 
 from flywheel_tpu.softmax_attention.mla_decode_calibration import (
     item_work_fraction,
+    legal_block_kv,
 )
 
-BLOCKS = (128, 256, 512, 1024, 2048)
-ITEMS = (1, 2, 4, 8)
+# The default block lattice is every block the kernel accepts at --page-size,
+# not a power-of-two subset: whole lane tiles that are a whole multiple or a
+# whole fraction of a page. --blocks overrides it.
+MAX_BLOCK_KV = 2048
+ITEMS = tuple(range(1, 9))
 # The calls run for milliseconds, so a call's dispatch overhead is a small
 # part of what is timed; a batch of 8 at 2048 tokens runs for tens of
 # microseconds, where it is not. Lengths are multiples of every block and of
@@ -61,9 +75,12 @@ BATCHES = (32, 128)
 # Two lengths make the item count vary at a fixed block, which separates the
 # per-item and per-step costs more sharply than ips alone, and widen the
 # block table from 128 to 256 pages, which checks that a table that still fits
-# SMEM has no cost of its own.
+# SMEM has no cost of its own. A length is snapped down to the block's
+# multiple, so a non-power-of-two block sees the same token budget.
 LENGTHS = (16384, 32768)
-PAGE_SIZE = 128
+# 1024 is the deployment page. 128 exposes the full block lattice (every
+# lane multiple up to 2048); 512 adds block 1536 to what 1024 can hold.
+PAGE_SIZE = 1024
 HEADS = 128
 REF_BLOCK = 128
 VMEM_FRACTION = 0.75
@@ -99,13 +116,14 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--blocks",
-        default=",".join(map(str, BLOCKS)),
-        help="comma-separated block_kv candidates.",
+        default=None,
+        help="comma-separated block_kv candidates; default: every block the"
+        " kernel accepts at --page-size up to 2048.",
     )
     parser.add_argument(
         "--items",
         default=",".join(map(str, ITEMS)),
-        help="comma-separated items_per_step candidates.",
+        help="comma-separated items_per_step candidates (default 1..8).",
     )
     parser.add_argument(
         "--batches",
@@ -118,7 +136,12 @@ def parse_args(argv=None):
         help="comma-separated uniform lengths of the fit.",
     )
     parser.add_argument("--heads", type=int, default=HEADS)
-    parser.add_argument("--page-size", type=int, default=PAGE_SIZE)
+    parser.add_argument(
+        "--page-size",
+        type=int,
+        default=PAGE_SIZE,
+        help="cache page size in tokens (default 1024, the deployment page).",
+    )
     parser.add_argument(
         "--dtype", default="bfloat16", help="cache dtype name."
     )
@@ -167,22 +190,34 @@ def ints(text: str) -> tuple[int, ...]:
     return tuple(int(part) for part in text.split(","))
 
 
+def snapped_length(length: int, block: int) -> int:
+    """The largest whole-block length at or below length.
+
+    Uniform lengths 16384 and 32768 are not multiples of every legal block
+    (384, 640, ...), so each (length, block) cell snaps the length down to a
+    whole number of blocks. The cell then still has full-block work, and the
+    token budget stays within one block of the nominal length.
+    """
+    return (length // block) * block
+
+
 def plan_points(blocks, items, batches, lengths):
-    """The fit's cells: uniform lengths that block and items both divide."""
+    """The fit's cells: uniform lengths snapped to whole blocks."""
     points = []
     for batch in batches:
         for length in lengths:
             for block in blocks:
-                if block > length or length % block:
+                length_block = snapped_length(length, block)
+                if length_block < block:
                     continue
-                per_block = batch * length // block
+                per_block = batch * length_block // block
                 for step_items in items:
                     if per_block % step_items:
                         continue
                     points.append(
                         {
                             "batch": batch,
-                            "length": length,
+                            "length": length_block,
                             "block": block,
                             "items": step_items,
                         }
@@ -225,18 +260,29 @@ def plan_regime_points(widths):
 
 
 def plan_floor_points(blocks):
-    """The block x length grid that identifies the floor fraction."""
-    return [
-        {
-            "batch": FLOOR_BATCH,
-            "length": length,
-            "block": block,
-            "items": FLOOR_ITEMS,
-            "table_pages": FLOOR_TABLE_PAGES,
-        }
-        for block in blocks
-        for length in FLOOR_LENGTHS
-    ]
+    """The block x length grid that identifies the floor fraction.
+
+    Each block gets every fixed length at or below half a block (where the
+    ramp is flat) plus one full-block length. Non-power-of-two blocks have no
+    fixed full-block length in FLOOR_LENGTHS, so the full point is the block
+    itself.
+    """
+    points = []
+    for block in blocks:
+        lengths = [length for length in FLOOR_LENGTHS if length <= block // 2]
+        if not lengths:
+            lengths = [block // 2]
+        for length in lengths + [block]:
+            points.append(
+                {
+                    "batch": FLOOR_BATCH,
+                    "length": length,
+                    "block": block,
+                    "items": FLOOR_ITEMS,
+                    "table_pages": FLOOR_TABLE_PAGES,
+                }
+            )
+    return points
 
 
 def cell_work_fraction(length, block, floor_fraction):
@@ -502,12 +548,16 @@ def r_squared(design, times, solution):
     )
 
 
-def fit_constants(records, reference_block, *, floor=()):
+def fit_constants(
+    records, reference_block, *, floor=(), page_size=None
+):
     """k(B) and step_ms from the ok records, then the constants in columns.
 
     Each cell's slots are multiplied by its items' work fraction g, so the
     fitted per-item cost stays the full-block one. floor is a sequence of
-    (block, fraction) pairs; a block not listed is fully charged.
+    (block, fraction) pairs; a block not listed is fully charged. page_size
+    is the page every cell was measured on, recorded so the fit can be merged
+    with fits on other pages.
     """
     floor_by_block = {int(block): value for block, value in floor}
     ok = [record for record in records if record["status"] == "ok"]
@@ -592,6 +642,7 @@ def fit_constants(records, reference_block, *, floor=()):
         ],
         "max_block_kv": max(blocks),
         "vmem_fraction": VMEM_FRACTION,
+        "page_size": page_size,
         "r_squared": r_squared(design, times, solution),
         "mape": mape,
         "r_squared_by_group": by_group,
@@ -624,10 +675,44 @@ def correlation(left, right):
     return float(np.corrcoef(left, right)[0, 1])
 
 
+def constants_from_fit(fit, page_size):
+    """The fitted constants as the heuristic consumes them.
+
+    A per-page calibration run fits one table on its own page, so that page
+    is the base page and no overrides are needed.
+    """
+    from flywheel_tpu.softmax_attention.mla_decode_calibration import (
+        MlaDecodeCostConstants,
+    )
+
+    return MlaDecodeCostConstants(
+        r_item=fit["r_item"],
+        r_step=fit["r_step"],
+        block_efficiency=tuple(
+            (int(block), value) for block, value in fit["block_efficiency"]
+        ),
+        max_block_kv=fit["max_block_kv"],
+        vmem_fraction=fit["vmem_fraction"],
+        calibrated_on="validation fit",
+        block_floor=tuple(
+            (int(block), value) for block, value in fit.get("block_floor", ())
+        ),
+        base_page=page_size,
+    )
+
+
 def validate(
     harness, fit, blocks, items, max_cells=None, *, include_slow=False
 ):
-    """Measured vs predicted on held-out length patterns."""
+    """Measured vs predicted on held-out length patterns.
+
+    Every (legal block, items) cell is timed, so the oracle is the measured
+    best over the whole lattice rather than over the heuristic's own pruned
+    grid. The heuristic's choice is then scored against that oracle; its
+    regret is the gap between the two. Returns the cell records (the shape
+    analyze_mla_prior reads) and a per-pattern summary with the mean and
+    maximum regret.
+    """
     from benchmarks.common.lengths import split_budget
     from benchmarks.common.timing import time_call
 
@@ -635,13 +720,16 @@ def validate(
         int(block): value
         for block, value in fit["per_item_ms"].items()
     }
-    blocks = [block for block in blocks if block in per_item]
     step_ms = fit["step_ms"]
     floor_by_block = {
         int(block): value for block, value in fit.get("block_floor", ())
     }
+    constants = constants_from_fit(fit, harness.page_size)
     results = []
+    groups = []
     cells = 0
+    # Note: every legal block stays in the oracle even when the fit has no
+    # per-item entry for it; only the prediction (and so the MAPE) needs one.
     for pattern in VALIDATE_PATTERNS:
         lengths = np.asarray(
             split_budget(
@@ -652,12 +740,12 @@ def validate(
         )
         measured = {}
         predicted_of = {}
+        pages_per_seq = -(-int(lengths.max()) // harness.page_size)
         for block in blocks:
             for step_items in items:
                 if max_cells is not None and cells >= max_cells:
                     break
                 cells += 1
-                pages_per_seq = -(-int(lengths.max()) // harness.page_size)
                 smem_fraction = harness.smem_fraction(
                     int(lengths.shape[0]), pages_per_seq, block, step_items
                 )
@@ -673,13 +761,15 @@ def validate(
                 item_count, steps = model_counts(
                     lengths, block, step_items
                 )
-                work = lengths_work_fraction(
-                    lengths, block, floor_by_block.get(block, 1.0)
-                )
-                predicted = (
-                    steps * step_items * per_item[block] * work
-                    + steps * step_ms
-                )
+                predicted = None
+                if block in per_item:
+                    work = lengths_work_fraction(
+                        lengths, block, floor_by_block.get(block, 1.0)
+                    )
+                    predicted = (
+                        steps * step_items * per_item[block] * work
+                        + steps * step_ms
+                    )
                 try:
                     step, cache = harness.build(
                         lengths, block, step_items
@@ -694,7 +784,8 @@ def validate(
                 finally:
                     harness.jax.clear_caches()
                 measured[(block, step_items)] = timing["median_ms"]
-                predicted_of[(block, step_items)] = predicted
+                if predicted is not None:
+                    predicted_of[(block, step_items)] = predicted
                 results.append(
                     {
                         "pattern": pattern,
@@ -713,29 +804,99 @@ def validate(
         if not measured:
             continue
         best_measured = min(measured, key=measured.get)
-        best_predicted = min(measured, key=predicted_of.get)
-        regret = measured[best_predicted] / measured[best_measured] - 1.0
-        rho = correlation(
-            list(predicted_of.values()), list(measured.values())
+        # pylint: disable=protected-access
+        chosen = harness.kernel._calibrated_default_mla_config(
+            constants,
+            batch=int(lengths.shape[0]),
+            page_size=harness.page_size,
+            pages_per_seq=pages_per_seq,
+            num_query_rows=harness.heads,
+            query_tokens=1,
+            cache_dtype=harness.dtype,
+            return_lse=False,
         )
-        worst_cell = max(
-            measured,
-            key=lambda cell: abs(measured[cell] / predicted_of[cell] - 1.0),
+        choice = None if chosen is None else tuple(chosen)
+        chosen_ms = measured.get(choice)
+        regret = (
+            None
+            if chosen_ms is None
+            else chosen_ms / measured[best_measured] - 1.0
         )
-        worst = abs(measured[worst_cell] / predicted_of[worst_cell] - 1.0)
-        mape = sum(
-            abs(measured[cell] / predicted_of[cell] - 1.0)
-            for cell in measured
-        ) / len(measured)
+        predicted_cells = [
+            cell for cell in measured if cell in predicted_of
+        ]
+        if predicted_cells:
+            rho = correlation(
+                [predicted_of[cell] for cell in predicted_cells],
+                [measured[cell] for cell in predicted_cells],
+            )
+            worst_cell = max(
+                predicted_cells,
+                key=lambda cell: abs(
+                    measured[cell] / predicted_of[cell] - 1.0
+                ),
+            )
+            worst = abs(
+                measured[worst_cell] / predicted_of[worst_cell] - 1.0
+            )
+            mape = sum(
+                abs(measured[cell] / predicted_of[cell] - 1.0)
+                for cell in predicted_cells
+            ) / len(predicted_cells)
+        else:
+            rho, worst_cell, worst, mape = float("nan"), None, 0.0, float(
+                "nan"
+            )
+        groups.append(
+            {
+                "pattern": pattern,
+                "cells": len(measured),
+                "best_measured": list(best_measured),
+                "best_measured_ms": measured[best_measured],
+                "heuristic_choice": (
+                    None if choice is None else list(choice)
+                ),
+                "heuristic_ms": chosen_ms,
+                "regret": regret,
+                "rank_rho": rho,
+                "mape": mape,
+            }
+        )
         print(
             f"  {pattern}: best measured {best_measured}"
-            f" ({measured[best_measured]:.4f} ms), model {best_predicted}"
-            f" ({predicted_of[best_predicted]:.4f} ms), regret"
-            f" {regret * 100:.1f}%, rank rho {rho:.3f}, MAPE"
-            f" {mape * 100:.1f}%, worst cell {worst_cell} off"
-            f" {worst * 100:.0f}%"
+            f" ({measured[best_measured]:.4f} ms), heuristic {choice}"
+            + (
+                f" ({chosen_ms:.4f} ms, regret {regret * 100:.1f}%)"
+                if regret is not None
+                else " (not measured; no regret)"
+            )
+            + (
+                f", rank rho {rho:.3f}, MAPE {mape * 100:.1f}%,"
+                f" worst cell {worst_cell} off {worst * 100:.0f}%"
+                if worst_cell is not None
+                else " (no fitted prediction for its blocks)"
+            )
         )
-    return results
+    scored = [
+        group["regret"] for group in groups if group["regret"] is not None
+    ]
+    if scored:
+        print(
+            f"  regret over {len(scored)}/{len(groups)} groups:"
+            f" mean {100 * sum(scored) / len(scored):.2f}%,"
+            f" max {100 * max(scored):.2f}%"
+        )
+    unscored = len(groups) - len(scored)
+    if unscored:
+        print(f"  {unscored} group(s) had no measured heuristic choice")
+    return results, {
+        "groups": groups,
+        "mean_regret": (
+            sum(scored) / len(scored) if scored else None
+        ),
+        "max_regret": max(scored) if scored else None,
+        "unscored_groups": unscored,
+    }
 
 
 def constant_snippet(device, dtype_name, fit, calibrated_on):
@@ -773,8 +934,18 @@ def main(argv=None):
     )
 
     args.out.mkdir(parents=True, exist_ok=True)
-    blocks = ints(args.blocks)
+    blocks = (
+        ints(args.blocks)
+        if args.blocks
+        else legal_block_kv(args.page_size, MAX_BLOCK_KV)
+    )
+    if not blocks:
+        raise SystemExit(
+            f"page size {args.page_size} has no legal block up to"
+            f" {MAX_BLOCK_KV}; pass --blocks."
+        )
     items = ints(args.items)
+    print(f"page {args.page_size}, blocks {list(blocks)}, items {list(items)}")
     (args.out / "measurements.jsonl").write_text("")
     harness = Harness(args.heads, args.page_size, args.dtype)
     budget = VMEM_FRACTION * harness.kernel.vmem_limit_bytes()
@@ -829,7 +1000,12 @@ def main(argv=None):
             for block, value in floor:
                 print(f"  floor({block}) = {value:.6g}")
             records = records + floor_records
-        fit = fit_constants(records, args.reference_block, floor=floor)
+        fit = fit_constants(
+            records,
+            args.reference_block,
+            floor=floor,
+            page_size=args.page_size,
+        )
         print(
             f"fit: column {fit['column_ms']:.6g} ms, step"
             f" {fit['step_ms']:.6g} ms, r_step"
@@ -851,7 +1027,7 @@ def main(argv=None):
             result["floor_records"] = floor_records
         if args.validate:
             print("validation:")
-            result["validation"] = validate(
+            validation, validation_summary = validate(
                 harness,
                 fit,
                 blocks,
@@ -859,6 +1035,8 @@ def main(argv=None):
                 args.max_validate_cells,
                 include_slow=args.include_slow,
             )
+            result["validation"] = validation
+            result["validation_summary"] = validation_summary
         if args.regime_scan:
             print("regime scan:")
             widths = ints(args.regime_widths)
