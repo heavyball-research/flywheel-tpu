@@ -38,6 +38,7 @@ from tests.softmax_attention.mla_reference import (
     MlaParam,
     check_is_allclose,
     check_kv_cache,
+    high_memory_marks,
     logical_cache,
     make_case,
     pages_per_seq,
@@ -99,7 +100,7 @@ def param_id(param: MlaParam) -> str:
 def grid(params):
     """params at every s_dtype as (param, s_dtype) pytest params, the big,
     the drawn-length s_q > 1 or fp8, and the bf16-score cells marked for the
-    --subset sample."""
+    --subset sample, and the high-memory cells marked high_memory."""
     cells = []
     for param in params:
         for s_dtype in S_DTYPES:
@@ -113,10 +114,11 @@ def grid(params):
                     stride *= SUBSET_STRIDE
             if s_dtype != "f32":
                 stride *= SUBSET_STRIDE
+            marks = high_memory_marks(
+                param.b * param.s_k, param.b * param.s_q * param.h_q
+            )
             if stride > 1:
-                marks = [pytest.mark.subset_sample(stride)]
-            else:
-                marks = []
+                marks.append(pytest.mark.subset_sample(stride))
             cells.append(
                 pytest.param(
                     param,

@@ -52,6 +52,7 @@ if jax.config.jax_compilation_cache_dir is None:
     )
 
 SUBSET_MARKER = "subset_sample"
+HIGH_MEMORY_MARKER = "high_memory"
 
 
 def pytest_addoption(parser):
@@ -75,6 +76,11 @@ def pytest_configure(config):
         "markers",
         f"{SUBSET_MARKER}(stride): under --subset keep one test in `stride`,"
         " picked by a CRC32 of the test name and its parametrization id.",
+    )
+    config.addinivalue_line(
+        "markers",
+        f"{HIGH_MEMORY_MARKER}: holds several GB in the Pallas interpreter;"
+        " CI runs these tests one at a time.",
     )
 
 
