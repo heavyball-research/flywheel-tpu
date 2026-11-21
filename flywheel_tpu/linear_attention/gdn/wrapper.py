@@ -25,7 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tiling import round_up
-from flywheel_tpu.core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, F32_BYTES
 from flywheel_tpu.linear_attention.gdn import (
     compute_conv1d,
     compute_gdn,
@@ -1660,31 +1660,6 @@ def launch_fused_conv1d_gdn(
             > vmem_limit
         ):
             decode_tile_size -= 1
-    elif num_spec_tokens > 0:
-        # Note (david): a verify window keeps one state checkpoint per position
-        # and sequence in VMEM, multiplying the per-sequence footprint by the
-        # window size. The tile shrinks so the double-buffered windows fit in
-        # about half the scoped VMEM budget; weights, activation scratch and
-        # compiler temporaries take the rest.
-        verify_window_size = num_spec_tokens + 1
-        recurrent_ckpt_bytes = n_v * d_k * d_v * F32_BYTES
-        conv_ckpt_bytes = (kernel_size - 1) * dim * F32_BYTES
-        activation_bytes = (
-            dim * F32_BYTES
-            + 2 * aligned_num_v_heads * F32_BYTES
-            + n_v * d_v * BF16_BYTES
-        )
-        bytes_per_seq = verify_window_size * (
-            recurrent_ckpt_bytes + conv_ckpt_bytes + activation_bytes
-        )
-        vmem_budget = int(WINDOWED_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        spec_tile_budget = (vmem_budget // 2) // config.NUM_BUFFERS
-        decode_tile_size = max(
-            1,
-            min(
-                decode_tile_size, num_tokens, spec_tile_budget // bytes_per_seq
-            ),
-        )
     else:
         decode_tile_size = min(decode_tile_size, num_tokens)
         # Note: every state ring slot holds each sequence's initial state and
@@ -1694,7 +1669,17 @@ def launch_fused_conv1d_gdn(
         # the compiler's temporaries, fits the scoped VMEM limit. On v7x the
         # temporaries of tiles 3 and 4 measure 1.4-1.65 states per sequence
         # (KDA 32/32 and 16/16, GDN 16/48 and 16/32, limit bisected).
-        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
+        # A verify window keeps one checkpoint per position, which the scratch
+        # counts; with it, tiles of 2-4 sequences still measure at most 1.65
+        # states of temporaries per sequence (v6e and v7x, the same shapes,
+        # windows 2-4), so a windowed tile shrinks against the same 1.7 states
+        # and the windowed limit.
+        vmem_fraction = (
+            WINDOWED_VMEM_FRACTION
+            if num_spec_tokens > 0
+            else DEFAULT_VMEM_FRACTION
+        )
+        vmem_limit = int(vmem_fraction * tpu_info.vmem_capacity_bytes)
         state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
         while decode_tile_size > 1 and (
             _kernel_config(
