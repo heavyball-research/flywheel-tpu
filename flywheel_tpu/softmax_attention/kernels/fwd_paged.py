@@ -22,7 +22,6 @@ head, which stages only the u32 word rows of each page that hold its K and
 V, and whose q heads are stacked over the rows of every score fragment.
 """
 
-import math
 from collections.abc import Sequence
 from functools import partial
 
@@ -32,7 +31,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tiling import round_up, vmem_buffer_bytes
 from flywheel_tpu.core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
 from flywheel_tpu.softmax_attention.config import (
     MIN_Q_TILES_PER_BLOCK,
@@ -40,7 +39,6 @@ from flywheel_tpu.softmax_attention.config import (
     BlockSizes,
     PagedKVInfo,
     hbm_bf16_tile_rows,
-    next_pow2,
     vmem_limit_bytes,
 )
 from flywheel_tpu.softmax_attention.dma import advance, drain
@@ -1016,28 +1014,6 @@ def paged_fwd_body(
 
     fill_packed_tail(
         traits, variant, out_refs, schedule.packed_q_end, num_head_groups
-    )
-
-
-def vmem_buffer_bytes(shape: tuple[int, ...], dtype: jnp.dtype) -> int:
-    """Bytes of one VMEM scratch buffer under Mosaic's v6 memref tiling.
-
-    A second-minor axis shorter than one large tile pads only to a power of two,
-    so a (2, head_dim) bf16 head pair costs no pad.
-    """
-    itemsize = jnp.dtype(dtype).itemsize
-    *leading, rows, lanes = shape
-    packing = F32_BYTES // itemsize
-    large_tile_rows = NUM_SUBLANES * packing
-    if rows >= large_tile_rows:
-        tile_rows = large_tile_rows
-    else:
-        tile_rows = max(packing, next_pow2(min(rows, NUM_SUBLANES)))
-    return (
-        math.prod(leading)
-        * round_up(rows, tile_rows)
-        * round_up(lanes, NUM_LANES)
-        * itemsize
     )
 
 
