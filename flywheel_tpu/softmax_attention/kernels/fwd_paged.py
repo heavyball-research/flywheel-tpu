@@ -20,6 +20,9 @@ page_size, cache_heads, head_dim) pool whose token rows interleave the kv
 heads' K and V rows in kv_layout's merged order. Every head group is one kv
 head, which stages only the u32 word rows of each page that hold its K and
 V, and whose q heads are stacked over the rows of every score fragment.
+
+On a chip with MXU accumulators a head_dim 256 build runs its fragments on
+the explicit MXU pipeline instead (kernels/fwd_paged_mxu.py).
 """
 
 from collections.abc import Sequence
@@ -32,13 +35,17 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tiling import round_up, vmem_buffer_bytes
-from flywheel_tpu.core.tpu import F32_BYTES, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.core.tpu import (
+    F32_BYTES,
+    MXU_COLUMNS,
+    NUM_LANES,
+    NUM_SUBLANES,
+)
 from flywheel_tpu.softmax_attention.config import (
     MIN_Q_TILES_PER_BLOCK,
     PAGE_SIZE_MULTIPLE,
     BlockSizes,
     PagedKVInfo,
-    hbm_bf16_tile_rows,
     vmem_limit_bytes,
 )
 from flywheel_tpu.softmax_attention.dma import advance, drain
@@ -54,6 +61,7 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     KVBlock,
     OutRefs,
     PagedKVRefs,
+    PagedRefs,
     PendingPVRefs,
     QRefs,
     RowFinish,
@@ -61,6 +69,7 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     ScoreMask,
     SoftmaxPass,
     cancel_pending_pv,
+    carried_finish,
     carry_out_pv,
     fill_packed_tail,
     finish_row_lse,
@@ -72,6 +81,8 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     issue_pending_pv,
     o_copy,
     online_softmax,
+    paged_buffer_tile,
+    paged_kv_source,
     pending_fragment,
     qk,
     stage_bounds,
@@ -82,6 +93,18 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     check_rotary_operands,
     rotary_fields,
 )
+from flywheel_tpu.softmax_attention.fwd_mxu import (
+    NUM_CHECKPOINTS,
+    mxu_row_layout,
+    num_row_states,
+    pivot_kept_rows,
+)
+from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    paged_mxu_block_sizes,
+    paged_mxu_fwd_body,
+    paged_uses_mxu_pipeline,
+    tile_stream,
+)
 from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_halves,
     kv_word_rows,
@@ -89,6 +112,7 @@ from flywheel_tpu.softmax_attention.kv_layout import (
     resolve_merged_kv_heads,
     staged_words,
 )
+from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
     ScheduleTableLayout,
@@ -143,46 +167,19 @@ def flash_fwd_varlen_paged_kernel(
     # descales arrive in SMEM, so a new descale value compiles no new kernel.
     q_scale = variant.descaled_q_scale(kv_scales_ref[0])
     v_scale = kv_scales_ref[1]
+    operands = VariantOperands(
+        q_scale=q_scale, v_scale=v_scale, sinks_ref=sinks_ref
+    )
+    body = paged_mxu_fwd_body if traits.uses_mxu_pipeline else paged_fwd_body
     # The schedule masks each sequence around its own diagonal, so the loop
     # runs without the Variant's static mask.
-    paged_fwd_body(
+    body(
         traits,
         variant.without_mask(),
         schedule,
-        q_hbm,
-        kv_hbm,
-        refs,
-        operands=VariantOperands(
-            q_scale=q_scale, v_scale=v_scale, sinks_ref=sinks_ref
-        ),
+        split_paged_refs(traits, variant.return_lse, q_hbm, kv_hbm, refs),
+        operands=operands,
     )
-
-
-def paged_buffer_tile(
-    kv_refs: PagedKVRefs,
-    slot: jax.Array | int,
-    token_start: int,
-    num_tokens: jax.Array | int,
-) -> jax.Array:
-    """Rows [token_start, token_start + num_tokens) of staging slot slot."""
-    return kv_refs.pair_buf.at[slot, pl.ds(token_start, num_tokens), 0, :, :]
-
-
-def paged_kv_source(
-    kv_refs: PagedKVRefs,
-    physical_page: jax.Array,
-    num_tokens: jax.Array,
-    kv_head: jax.Array,
-) -> jax.Array:
-    """The word rows of kv_head in the first num_tokens tokens of a cache
-    page."""
-    word_rows = kv_refs.word_rows
-    head_row = pl.multiple_of(
-        kv_head // kv_refs.heads_per_word * word_rows, word_rows
-    )
-    return kv_refs.cache_hbm.at[
-        physical_page, pl.ds(0, num_tokens), pl.ds(head_row, word_rows), :
-    ]
 
 
 def paged_page_rows(
@@ -326,24 +323,74 @@ def unpack_paged_block(
             planes[kv_part, tile_rows, :] = plane_rows.astype(planes.dtype)
 
 
+def split_paged_refs(
+    traits: PagedFwdTraits,
+    return_lse: bool,
+    q_hbm: jax.Array,
+    cache_hbm: jax.Array,
+    refs: Sequence[jax.Array],
+) -> PagedRefs:
+    """Split a paged body's refs: the rotary Q operand, the outputs and the
+    scratch, in paged_scratch_shapes's order."""
+    rotary_dim = traits.rotary_dim
+    remaining_refs = list(refs)
+    rotary_q_hbm = remaining_refs.pop(0) if rotary_dim else None
+    o_hbm = remaining_refs.pop(0)
+    lse_hbm = remaining_refs.pop(0) if return_lse else None
+    q_buf, kv_pair_buf, *remaining_refs = remaining_refs
+    if traits.uses_mxu_pipeline:
+        kv_planes = bounds_buf = None
+    else:
+        # Note (david): a paged block stages its kv head's K and V rows as a
+        # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into
+        # dense K and V planes, so every q tile of the block reads plain
+        # tiles.
+        kv_planes, bounds_buf, *remaining_refs = remaining_refs
+    rotary_q_buf = remaining_refs.pop(0) if rotary_dim else None
+    lse_stage = remaining_refs.pop() if return_lse else None
+    o_stage, *row_refs, sems = remaining_refs
+    return PagedRefs(
+        q_refs=QRefs(
+            hbm=q_hbm,
+            buf=q_buf,
+            rotary_hbm=rotary_q_hbm,
+            rotary_buf=rotary_q_buf,
+            sems=sems,
+        ),
+        kv_refs=PagedKVRefs(
+            cache_hbm=cache_hbm,
+            pair_buf=kv_pair_buf,
+            planes=kv_planes,
+            sems=sems,
+        ),
+        out_refs=OutRefs(
+            o_hbm=o_hbm,
+            o_stage=o_stage,
+            lse_hbm=lse_hbm,
+            lse_stage=lse_stage,
+            sems=sems,
+        ),
+        bounds_buf=bounds_buf,
+        row_refs=row_refs,
+    )
+
+
 def paged_fwd_body(
     traits: PagedFwdTraits,
     variant: Variant,
     schedule: FwdSchedule,
-    q_hbm: jax.Array,
-    cache_hbm: jax.Array,
-    refs: Sequence[jax.Array],
+    paged_refs: PagedRefs,
     *,
     operands: VariantOperands,
 ) -> None:
     """Run the paged fragment pipeline over every block the schedule yields.
 
     traits is the build's static configuration, variant its elementwise math
-    and operands the variant's traced values, and refs are the rotary Q
-    operand, the outputs and the scratch, in paged_scratch_shapes's order. The
+    and operands the variant's traced values, and paged_refs are the rotary Q
+    operand, the outputs and the scratch as split_paged_refs groups them. The
     logits run in log2 units: Q reaches the QK matmul pre-multiplied by
-    log2(e). K and V come from the one merged interleaved cache operand
-    cache_hbm. The per-seq schedule writes the packed padding rows past
+    log2(e). K and V come from the one merged interleaved cache operand. The
+    per-seq schedule writes the packed padding rows past
     schedule.packed_q_end as out = 0, lse = -inf, and applies the mask
     itself, so its variant has none.
 
@@ -376,26 +423,15 @@ def paged_fwd_body(
     return_lse = variant.return_lse
     sinks_ref = operands.sinks_ref
 
-    remaining_refs = list(refs)
-    rotary_q_hbm = remaining_refs.pop(0) if rotary_dim else None
-    o_hbm = remaining_refs.pop(0)
-    lse_hbm = remaining_refs.pop(0) if return_lse else None
-    q_buf = remaining_refs.pop(0)
-    # Note (david): a paged block stages its kv head's K and V rows as a
-    # (bkv, 1, kv_word_rows, head_dim) block and unpacks it once into dense
-    # K and V planes, so every q tile of the block reads plain tiles.
-    kv_pair_buf, kv_planes = remaining_refs.pop(0), remaining_refs.pop(0)
-    bounds_buf = remaining_refs.pop(0)
-    rotary_q_buf = remaining_refs.pop(0) if rotary_dim else None
+    q_refs, kv_refs = paged_refs.q_refs, paged_refs.kv_refs
+    out_refs, bounds_buf = paged_refs.out_refs, paged_refs.bounds_buf
     if return_lse:
-        *pipeline_refs, lse_stage = remaining_refs
-    else:
-        pipeline_refs, lse_stage = remaining_refs, None
+        lse_stage = out_refs.lse_stage
+        lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
     # Note (david): the exact unpack pins this variable-arity tail against
     # paged_scratch_shapes's scratch list; a silent mismatch would shift every
     # ref.
     (
-        o_stage,
         row_max_scratch,
         row_sum_scratch,
         o_scratch,
@@ -404,8 +440,7 @@ def paged_fwd_body(
         guard_smem,
         parity_smem,
         pending_smem,
-        sems,
-    ) = pipeline_refs
+    ) = paged_refs.row_refs
     state = RowStateRefs(
         row_max=row_max_scratch,
         row_sum=row_sum_scratch,
@@ -416,25 +451,6 @@ def paged_fwd_body(
     pending = PendingPVRefs(
         probs=pending_probs, v=pending_v, fields=pending_smem
     )
-    out_refs = OutRefs(
-        o_hbm=o_hbm,
-        o_stage=o_stage,
-        lse_hbm=lse_hbm,
-        lse_stage=lse_stage,
-        sems=sems,
-    )
-    q_refs = QRefs(
-        hbm=q_hbm,
-        buf=q_buf,
-        rotary_hbm=rotary_q_hbm,
-        rotary_buf=rotary_q_buf,
-        sems=sems,
-    )
-    kv_refs = PagedKVRefs(
-        cache_hbm=cache_hbm, pair_buf=kv_pair_buf, planes=kv_planes, sems=sems
-    )
-    if return_lse:
-        lse_stage[...] = jnp.zeros(lse_stage.shape, jnp.float32)
 
     num_head_groups = schedule.num_head_groups
     num_rows = schedule.num_rows
@@ -857,13 +873,8 @@ def paged_fwd_body(
         return first_desc, second_desc, (lo, hi, ctx)
 
     def _carried_finish(row_state):
-        # Note (david): a loop carry drops q_token's pl.multiple_of, and the
-        # output DMA window must start on the hbm_bf16_tile_rows() grid, where
-        # q_token put it.
         row_parity, finish = row_state
-        return row_parity, finish._replace(
-            q_tok=pl.multiple_of(finish.q_tok, hbm_bf16_tile_rows())
-        )
+        return row_parity, carried_finish(finish)
 
     def _row_body(g, si, carry):
         """carry ends with the row's first block's new parity and the previous
@@ -1025,26 +1036,31 @@ def paged_scratch_shapes(
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
     kv_dtype: jnp.dtype,
+    uses_mxu_pipeline: bool,
 ) -> list[pl.MemoryRef]:
     """Every scratch buffer of one paged build, in the order the kernel
     unpacks them: Q stage, (K, V) word staging, K and V planes, bounds rows
-    per kv compute tile, Q rotary coefficients, out stage, row max, row sum,
-    f32 accumulator, pending probs, pending V tile, the SMEM guard flags, block
-    parity and pending-PV fields, the DMA semaphores and the lse stage.
+    per kv compute tile, Q rotary coefficients, out stage, the row state
+    (paged_row_state_buffers), the DMA semaphores and the lse stage.
 
     The kernel allocates them all, and estimate_vmem_bytes sums the VMEM
     ones. The Q, out, plane and pending V buffers are bf16, q's dtype
-    (check_paged_inputs)."""
+    (check_paged_inputs). An explicit MXU build stages kv in tile_stream's
+    slots of one tile, has no planes and no bounds rows, and stages a
+    replayed row's Q in one more Q slot."""
     bq, bkv = block_sizes.block_q, block_sizes.block_kv
     bkv_compute = block_sizes.block_kv_compute
     num_stages = block_sizes.num_stages
-    bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
-    vmem, smem = pltpu.VMEM, pltpu.SMEM
-    if gqa_fold > 1:
-        stage_shape = (num_stages, gqa_fold, bq, head_dim)
+    if uses_mxu_pipeline:
+        num_kv_stages = tile_stream(gqa_fold * bq).num_staging_slots
+        staged_rows = MXU_COLUMNS
+        num_q_slots = num_stages + 1
     else:
-        stage_shape = (num_stages, bq, head_dim)
-    group_bq = gqa_fold * bq
+        num_kv_stages, staged_rows = NUM_KV_STAGES, bkv
+        num_q_slots = num_stages
+    bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
+    vmem = pltpu.VMEM
+    head_shape = (gqa_fold, bq, head_dim) if gqa_fold > 1 else (bq, head_dim)
     if rotary_dtype is None:
         num_rotary_streams = 0
         rotary_buffers = []
@@ -1053,7 +1069,7 @@ def paged_scratch_shapes(
         # Note (david): prepare_rotary's one batch plane is shared by every
         # head, so one Q coefficient group is staged.
         rotary_buffers = [
-            vmem((num_stages, 1, bq, head_dim), jnp.dtype(rotary_dtype))
+            vmem((num_q_slots, 1, bq, head_dim), jnp.dtype(rotary_dtype))
         ]
     if return_lse:
         lse_buffers = [vmem((num_stages, bq, NUM_LANES), f32)]
@@ -1063,24 +1079,71 @@ def paged_scratch_shapes(
     # head's K and V, then unpacks them into one bf16 K and one bf16 V
     # plane; a word's (kv_word_rows, head_dim) rows pad to nothing, so the
     # staging costs what two dense planes of the cache dtype would.
-    kv_word_buffers = [
-        vmem(
-            (NUM_KV_STAGES, bkv, 1, kv_word_rows(kv_dtype), head_dim), kv_dtype
-        ),
-        vmem((2, bkv, head_dim), bf16),
-    ]
-    # Note (david): the per-seq kernel synthesizes its bounds rows (the q
-    # lower bound, plus the span under a left window) once per block
-    # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
-    # rows share one (8, 128) int32 tile, so the span row costs no extra
-    # VMEM.
-    bounds_buffer = vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32)
+    word_buffer = vmem(
+        (num_kv_stages, staged_rows, 1, kv_word_rows(kv_dtype), head_dim),
+        kv_dtype,
+    )
+    if uses_mxu_pipeline:
+        unpack_buffers = []
+    else:
+        # Note (david): the per-seq kernel synthesizes its bounds rows (the q
+        # lower bound, plus the span under a left window) once per block
+        # in-kernel, so it needs one block's rows, not a kv-stream ring. Both
+        # rows share one (8, 128) int32 tile, so the span row costs no extra
+        # VMEM.
+        unpack_buffers = [
+            vmem((2, bkv, head_dim), bf16),
+            vmem((bkv // bkv_compute, 2, bkv_compute), jnp.int32),
+        ]
     return [
-        vmem(stage_shape, bf16),
-        *kv_word_buffers,
-        bounds_buffer,
+        vmem((num_q_slots, *head_shape), bf16),
+        word_buffer,
+        *unpack_buffers,
         *rotary_buffers,
-        vmem(stage_shape, bf16),
+        vmem((num_stages, *head_shape), bf16),
+        *paged_row_state_buffers(
+            block_sizes,
+            head_dim=head_dim,
+            gqa_fold=gqa_fold,
+            uses_mxu_pipeline=uses_mxu_pipeline,
+        ),
+        pltpu.SemaphoreType.DMA(
+            (NUM_SEMS + num_rotary_streams, max(num_q_slots, num_kv_stages))
+        ),
+        *lse_buffers,
+    ]
+
+
+def paged_row_state_buffers(
+    block_sizes: BlockSizes,
+    *,
+    head_dim: int,
+    gqa_fold: int,
+    uses_mxu_pipeline: bool,
+) -> list[pl.MemoryRef]:
+    """The row state scratch of a paged build. The dot_general loop keeps row
+    max, the row sum pair, the f32 accumulator's NUM_O_SLOTS slots, pending
+    probs, pending V tile, and SMEM guard flags, block parity and pending-PV
+    fields. An explicit MXU build keeps num_row_states row states, the entry
+    state of NUM_CHECKPOINTS check units, and in SMEM the kv tile stream and
+    the guard flags of a row and of a check unit."""
+    group_bq = gqa_fold * block_sizes.block_q
+    bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
+    vmem, smem = pltpu.VMEM, pltpu.SMEM
+    if uses_mxu_pipeline:
+        num_states = num_row_states(group_bq // FRAGMENT_ROWS)
+        return [
+            vmem((num_states, group_bq, NUM_LANES), f32),
+            vmem((num_states, group_bq, NUM_LANES), f32),
+            vmem((num_states, group_bq, head_dim), f32),
+            vmem((NUM_CHECKPOINTS, group_bq, NUM_LANES), f32),
+            vmem((NUM_CHECKPOINTS, group_bq, head_dim), f32),
+            smem((tile_stream(group_bq).num_state_words,), jnp.int32),
+            smem((PAGED_HEAD_FOLD,), jnp.int32),
+            smem((1,), jnp.int32),
+        ]
+    bkv_compute = block_sizes.block_kv_compute
+    return [
         vmem((group_bq, NUM_LANES), f32),
         vmem((2, group_bq, NUM_LANES), f32),
         vmem((NUM_O_SLOTS, group_bq, head_dim), f32),
@@ -1089,10 +1152,6 @@ def paged_scratch_shapes(
         smem((PAGED_HEAD_FOLD,), jnp.int32),
         smem((1,), jnp.int32),
         smem((NUM_PENDING_FIELDS,), jnp.int32),
-        pltpu.SemaphoreType.DMA(
-            (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
-        ),
-        *lse_buffers,
     ]
 
 
@@ -1104,9 +1163,10 @@ def estimate_vmem_bytes(
     rotary_dtype: jnp.dtype | None,
     gqa_fold: int,
     kv_dtype: jnp.dtype,
+    uses_mxu_pipeline: bool,
 ) -> int:
-    """Scoped VMEM bytes of one paged build: its VMEM scratch plus the score
-    temporaries of one compute fragment."""
+    """Scoped VMEM bytes of one paged build: its VMEM scratch plus, on the
+    dot_general loop, the score temporaries of one compute fragment."""
     scratch_bytes = sum(
         vmem_buffer_bytes(buffer.shape, buffer.dtype)
         for buffer in paged_scratch_shapes(
@@ -1116,9 +1176,12 @@ def estimate_vmem_bytes(
             rotary_dtype=rotary_dtype,
             gqa_fold=gqa_fold,
             kv_dtype=kv_dtype,
+            uses_mxu_pipeline=uses_mxu_pipeline,
         )
         if buffer.memory_space == pltpu.VMEM
     )
+    if uses_mxu_pipeline:
+        return scratch_bytes
     temporary_bytes = (
         gqa_fold
         * block_sizes.block_q_compute
@@ -1261,6 +1324,7 @@ def paged_pallas_call(
         rotary_dtype=rotary_dtype,
         gqa_fold=traits.gqa_fold,
         kv_dtype=kv_cache.dtype,
+        uses_mxu_pipeline=traits.uses_mxu_pipeline,
     )
     # Note (david): the pool is pinned to HBM because memory space
     # assignment otherwise moves a pool that fits its VMEM budget there and
@@ -1391,6 +1455,17 @@ def flash_attn_varlen_paged(
     capacity = pages_per_seq * page_size
     gqa_fold = num_q_heads // num_kv_heads
     bq = block_sizes.block_q
+    uses_mxu_pipeline = not interpret and paged_uses_mxu_pipeline(
+        block_sizes=block_sizes,
+        head_dim=head_dim,
+    )
+    if uses_mxu_pipeline and block_sizes != paged_mxu_block_sizes(
+        block_sizes, gqa_fold
+    ):
+        raise ValueError(
+            "an explicit MXU build runs dispatch.resolve_paged_block_sizes's"
+            f" block sizes; got {block_sizes}."
+        )
     paged = PagedKVInfo(
         num_kv_heads=num_kv_heads,
         page_size=page_size,
@@ -1422,6 +1497,14 @@ def flash_attn_varlen_paged(
         pages_per_seq=pages_per_seq,
         causal=causal,
         left=window_left,
+        max_kept_rows=(
+            pivot_kept_rows(variant.window) if uses_mxu_pipeline else None
+        ),
+        mxu_groups=(
+            mxu_row_layout(gqa_fold * bq // FRAGMENT_ROWS)
+            if uses_mxu_pipeline
+            else None
+        ),
     )
     traits = PagedFwdTraits(
         block_sizes=block_sizes,
@@ -1435,6 +1518,7 @@ def flash_attn_varlen_paged(
         is_per_seq=True,
         guard_threshold=overflow_guard_threshold(capacity),
         **rotary_fields(padded_rotary, rotary_interleaved),
+        uses_mxu_pipeline=uses_mxu_pipeline,
         paged=paged,
         gqa_fold=gqa_fold,
     )
