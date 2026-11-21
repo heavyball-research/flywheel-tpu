@@ -709,9 +709,8 @@ def validate(
     Every (legal block, items) cell is timed, so the oracle is the measured
     best over the whole lattice rather than over the heuristic's own pruned
     grid. The heuristic's choice is then scored against that oracle; its
-    regret is the gap between the two. Returns the cell records (the shape
-    analyze_mla_prior reads) and a per-pattern summary with the mean and
-    maximum regret.
+    regret is the gap between the two. Returns the cell records and a
+    per-pattern summary with the mean and maximum regret.
     """
     from benchmarks.common.lengths import split_budget
     from benchmarks.common.timing import time_call
