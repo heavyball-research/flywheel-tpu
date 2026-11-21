@@ -21,6 +21,15 @@ from ...core.tpu import (
     NUM_SUBLANES,
 )
 from ..config import LOG2E, NT_DIM_NUMBERS, next_pow2, vmem_limit_bytes
+from ..dispatch import get_device_variant_name
+from ..mla_prefill_calibration import (
+    MlaPrefillCostConstants,
+    MlaPrefillWorkload,
+    candidate_lattice,
+    config_cost,
+    get_mla_prefill_cost_constants,
+    workload_samples,
+)
 from ..softmax import overflow_guard_threshold
 from .decode import lane_broadcast
 from .mla_decode import CACHE_ROW_DIM, LATENT_DIM, cache_tile_rows, mla_block_kv
@@ -118,7 +127,102 @@ def mla_prefill_vmem_bytes(
     )
 
 
-def default_mla_prefill_config(
+INTERPRET_CHIP = "TPU v6e"
+
+
+def _default_chip() -> str:
+    """The chip the default config plans for."""
+    if jax.default_backend() == "tpu":
+        return get_device_variant_name()
+    return INTERPRET_CHIP
+
+
+def _calibrated_default_mla_prefill_config(
+    constants: MlaPrefillCostConstants,
+    *,
+    num_heads: int,
+    page_size: int,
+    pages_per_seq: int,
+    cache_dtype: jnp.dtype,
+    return_lse: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    batch: int,
+    num_tokens: int,
+) -> MlaPrefillConfig | None:
+    """The least-cost measured config under the workload prior.
+
+    Candidate block_q values are capped at the longest chunk's next power of
+    two, so a short-chunk batch does not price q blocks it cannot fill. For
+    each (block_q, block_kv) the group_rows that fits VMEM with the least
+    measured factor is kept: group_rows enters the model only through that
+    factor. A lattice with no VMEM-feasible config, or a call whose static
+    shapes the workload prior rejects, returns None and the caller keeps the
+    max_seqlen rule.
+    """
+    capacity = pages_per_seq * page_size
+    try:
+        workload = MlaPrefillWorkload(
+            batch=batch,
+            num_tokens=num_tokens,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            capacity=capacity,
+        )
+        samples = workload_samples(workload)
+    except ValueError:
+        return None
+    width_cap = max(32, next_pow2(max_seqlen_q))
+    vmem_budget = constants.vmem_fraction * vmem_limit_bytes()
+    # Note (david): group_rows has no cost of its own, only its measured
+    # factor, so only the least-factor VMEM-feasible group of a (block_q,
+    # block_kv) can win.
+    groups = {}
+    for block_q, block_kv, row_groups in candidate_lattice(
+        page_size=page_size,
+        max_seqlen_k=max_seqlen_k,
+        capacity=capacity,
+        constants=constants,
+        num_heads=num_heads,
+    ):
+        if block_q > width_cap:
+            continue
+        config = MlaPrefillConfig(block_q, block_kv, row_groups)
+        if (
+            mla_prefill_vmem_bytes(
+                config,
+                num_heads=num_heads,
+                cache_dtype=cache_dtype,
+                return_lse=return_lse,
+            )
+            > vmem_budget
+        ):
+            continue
+        group_rows = (block_q // row_groups) * num_heads
+        key = (block_q, block_kv)
+        entry = (constants.group_rows_factor(group_rows), config)
+        if key not in groups or entry[0] < groups[key][0]:
+            groups[key] = entry
+    if not groups:
+        return None
+    priced = []
+    for (block_q, block_kv), (_, config) in groups.items():
+        group_rows = (block_q // config.row_groups) * num_heads
+        cost = config_cost(
+            block_q,
+            block_kv,
+            group_rows,
+            samples=samples,
+            constants=constants,
+            num_heads=num_heads,
+        )
+        # Note (david): ties take the longer kv block, then the wider q
+        # block, as the calibrated decode config does.
+        priced.append((cost, -block_kv, -block_q, config))
+    return min(priced)[3]
+
+
+def _legacy_default_mla_prefill_config(
     *,
     num_heads: int,
     page_size: int,
@@ -171,6 +275,58 @@ def default_mla_prefill_config(
                 f" {vmem_limit_bytes()}-byte VMEM limit at a one-token q"
                 f" block and a {block_kv}-token kv block."
             )
+
+
+def default_mla_prefill_config(
+    *,
+    num_heads: int,
+    page_size: int,
+    pages_per_seq: int,
+    cache_dtype: jnp.dtype,
+    return_lse: bool,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    batch: int | None = None,
+    num_tokens: int | None = None,
+) -> MlaPrefillConfig:
+    """The config of one build: the measured (block_q, block_kv, row_groups)
+    that the chip's calibrated cost model and the workload prior make
+    average-optimal, else the target block and row group of the
+    max_seqlen rule.
+
+    batch is the number of requests and num_tokens the call's total query
+    tokens; both are static in a compiled call. Without them the cost model
+    has no mean chunk and the max_seqlen rule picks the config, as it does
+    for a chip or dtype with no calibrated constants.
+    """
+    if batch is not None and num_tokens is not None:
+        constants = get_mla_prefill_cost_constants(
+            _default_chip(), jnp.dtype(cache_dtype).name
+        )
+        if constants is not None:
+            config = _calibrated_default_mla_prefill_config(
+                constants,
+                num_heads=num_heads,
+                page_size=page_size,
+                pages_per_seq=pages_per_seq,
+                cache_dtype=cache_dtype,
+                return_lse=return_lse,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                batch=batch,
+                num_tokens=num_tokens,
+            )
+            if config is not None:
+                return config
+    return _legacy_default_mla_prefill_config(
+        num_heads=num_heads,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        cache_dtype=cache_dtype,
+        return_lse=return_lse,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+    )
 
 
 def mla_prefill_schedule(

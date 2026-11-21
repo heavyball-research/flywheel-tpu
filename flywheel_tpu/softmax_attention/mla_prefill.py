@@ -152,6 +152,8 @@ def flash_mla_prefill(
             return_lse=return_lse,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
+            batch=kv_lens.shape[0],
+            num_tokens=num_tokens,
         )
         return mla_prefill_pallas(
             q_nope,
