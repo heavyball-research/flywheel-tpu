@@ -18,13 +18,18 @@ import json
 import pathlib
 
 from benchmarks.softmax_attention.calibrate_mla_decode_config import (
-    BLOCKS,
     constant_snippet,
     fit_constants,
     fit_floor,
 )
+from flywheel_tpu.softmax_attention.mla_decode_calibration import (
+    legal_block_kv,
+)
 
 RESULTS = pathlib.Path("benchmarks/softmax_attention/results")
+# The saved grids were measured at page 128, where every lane multiple is a
+# whole number of pages.
+BLOCKS = legal_block_kv(128, 2048)
 DATASETS = {
     "v2": RESULTS / "mla_calibration_v2" / "measurements.jsonl",
     "short": RESULTS / "mla_calibration_short" / "measurements.jsonl",
