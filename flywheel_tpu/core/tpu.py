@@ -23,5 +23,7 @@ NUM_SUBLANES = 8
 # therefore step in whole 16-row tiles, which is legal under either tiling;
 # HBM DMAs stay on the hbm_bf16_tile_rows() grid.
 BF16_TILE_ROWS = 2 * NUM_SUBLANES
+# The rows and columns of an MXU's weight tile (v6e, v7x).
+MXU_COLUMNS = 2 * NUM_LANES
 BF16_BYTES = 2
 F32_BYTES = 4
