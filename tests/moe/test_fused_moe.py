@@ -17,9 +17,9 @@
 The grid is FlashInfer's bf16 fused-MoE grid: hidden 2048, 128 experts,
 top-8, 3 and 777 tokens, intermediate 768 and its TP4 and TP8 slices 192 and
 96, which prepare_expert_weights pads to 256 and 128. The experts of the
-benchmarked models and the options that run other paths of the fused MLP are
-added to it. Off TPU the kernels run in the Pallas TPU interpreter, on the
-smallest cases.
+benchmarked models, experts too wide for VMEM and the options that run other
+paths of the fused MLP are added to it. Off TPU the kernels run in the Pallas
+TPU interpreter, on the smallest cases.
 """
 
 import pytest
@@ -72,6 +72,15 @@ SHAPES = [
     ),
 ]
 
+# (tokens, hidden, intermediate, experts, top_k): experts as wide as
+# DeepSeek-V3's and GLM-4.5's, and a hidden 4096 expert at a small batch,
+# which stream in weight blocks on v7x.
+WIDE_EXPERT_SHAPES = [
+    pytest.param(512, 7168, 2048, 8, 8, id="h7168-i2048-t512", marks=TPU_ONLY),
+    pytest.param(512, 5120, 1536, 8, 8, id="h5120-i1536-t512", marks=TPU_ONLY),
+    pytest.param(64, 4096, 1792, 8, 2, id="h4096-i1792-t64", marks=TPU_ONLY),
+]
+
 # (tokens, hidden, intermediate, experts, top_k, activation, options)
 OPTIONS = [
     pytest.param(
@@ -102,7 +111,9 @@ OPTIONS = [
 ]
 
 
-@pytest.mark.parametrize("tokens, hidden, intermediate, experts, top_k", SHAPES)
+@pytest.mark.parametrize(
+    "tokens, hidden, intermediate, experts, top_k", SHAPES + WIDE_EXPERT_SHAPES
+)
 def test_fused_moe(tokens, hidden, intermediate, experts, top_k):
     hidden_states, router_logits, w_gate, w_up, w2 = make_moe_problem(
         tokens, hidden, intermediate, experts

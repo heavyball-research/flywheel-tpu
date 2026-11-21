@@ -129,6 +129,19 @@ WEIGHT_BLOCK_TILE_M = 256
 # shapes while the buffers stay small enough for large hidden and
 # intermediate sizes.
 WEIGHT_BLOCK_DEPTH = 2
+# Note (david): the register allocator's spill slots count against the scoped
+# VMEM limit like the scratch buffers. Their bound is in f32 [tile_m, columns]
+# tiles: on the whole-expert path the wider of the input and the output, and
+# the intermediate; on the weight-blocked path the widest of the output, the
+# input and a block's gate|up. The relayout of the output to the packing-dim
+# layout spills UNALIGNED_OUTPUT_SPILL_TILES output tiles when the width is
+# not a multiple of OUTPUT_SPILL_ALIGNMENT, and row segments spill a block of
+# w1. Fitted per TPU generation to the VMEM the compiler reports and rounded
+# up by SPILL_MARGIN_ROWS: a bound too low fails the compile, one too high
+# only narrows a block.
+OUTPUT_SPILL_ALIGNMENT = 2048
+UNALIGNED_OUTPUT_SPILL_TILES = {V6E_GENERATION: 1, V7X_GENERATION: 2}
+SPILL_MARGIN_ROWS = 32
 DEFAULT_PIPELINE_DEPTHS = PipelineDepths()
 
 
@@ -1261,16 +1274,45 @@ def zero_buffer_rows(dims: Dimensions) -> int:
     return min(ZERO_BUFFER_BYTES // row_bytes, dims.size_m)
 
 
+def spill_bytes(
+    dims: Dimensions,
+    *,
+    tile_m: int,
+    weight_block_columns: int | None,
+    weight_block_segment_rows: int | None,
+) -> int:
+    """Upper bound of the register allocator's spill slots at one
+    configuration (see SPILL_MARGIN_ROWS)."""
+    rows = tile_m + SPILL_MARGIN_ROWS
+    if weight_block_columns is None:
+        columns = max(dims.size_k, dims.size_n_out) + dims.size_n // 2
+        return rows * columns * F32_BYTES
+    generation, _ = generation_and_mxu_columns()
+    if generation not in UNALIGNED_OUTPUT_SPILL_TILES:
+        raise ValueError(f"no spill model for TPU generation {generation}")
+    if dims.size_n_out % OUTPUT_SPILL_ALIGNMENT == 0:
+        output_tiles = 1
+    else:
+        output_tiles = UNALIGNED_OUTPUT_SPILL_TILES[generation]
+    columns = max(
+        output_tiles * dims.size_n_out, dims.size_k, 2 * weight_block_columns
+    )
+    spill = rows * columns * F32_BYTES
+    if weight_block_segment_rows is not None:
+        spill += dims.size_k * 2 * weight_block_columns * BF16_BYTES
+    return spill
+
+
 def vmem_bytes(
     dims: Dimensions,
     *,
     tile_m: int,
     pipeline_depths: PipelineDepths,
     weight_block_columns: int | None,
+    weight_block_segment_rows: int | None,
 ) -> int:
-    """The kernel's VMEM scratch buffers at one configuration: what the
-    scoped VMEM limit checks. The matmul intermediates live in the
-    compiler's internal scratch, outside the limit."""
+    """The kernel's scoped VMEM at one configuration: its scratch buffers
+    and the bound of the compiler's spill slots."""
     intermediate_size = dims.size_n // 2
     row_buffers = (
         tile_m
@@ -1297,7 +1339,13 @@ def vmem_bytes(
             * BF16_BYTES
             + tile_m * dims.size_n_out * F32_BYTES
         )
-    return row_buffers + fixed_buffers + weights
+    spill = spill_bytes(
+        dims,
+        tile_m=tile_m,
+        weight_block_columns=weight_block_columns,
+        weight_block_segment_rows=weight_block_segment_rows,
+    )
+    return row_buffers + fixed_buffers + weights + spill
 
 
 def plan_weight_streams(
@@ -1306,6 +1354,7 @@ def plan_weight_streams(
     tile_m: int | None,
     pipeline_depths: PipelineDepths,
     weight_block_columns: int | None,
+    weight_block_segment_rows: int | None,
 ) -> tuple[int | None, int]:
     """(weight_block_columns, tile_m) of the kernel; a given value is kept.
 
@@ -1318,13 +1367,16 @@ def plan_weight_streams(
     over the tile.
     """
     limit = vmem_limit_bytes()
+    config_vmem_bytes = functools.partial(
+        vmem_bytes,
+        dims,
+        pipeline_depths=pipeline_depths,
+        weight_block_segment_rows=weight_block_segment_rows,
+    )
 
     def _fits(block_columns, candidate_tile_m):
-        return limit >= vmem_bytes(
-            dims,
-            tile_m=candidate_tile_m,
-            pipeline_depths=pipeline_depths,
-            weight_block_columns=block_columns,
+        return limit >= config_vmem_bytes(
+            tile_m=candidate_tile_m, weight_block_columns=block_columns
         )
 
     if tile_m is not None:
@@ -1353,11 +1405,8 @@ def plan_weight_streams(
         for block_columns in block_widths:
             if _fits(block_columns, candidate_tile_m):
                 return block_columns, candidate_tile_m
-    smallest = vmem_bytes(
-        dims,
-        tile_m=block_tiles[-1],
-        pipeline_depths=pipeline_depths,
-        weight_block_columns=block_widths[-1],
+    smallest = config_vmem_bytes(
+        tile_m=block_tiles[-1], weight_block_columns=block_widths[-1]
     )
     raise ValueError(
         f"no weight stream fits VMEM: the smallest, tile_m={block_tiles[-1]}"
@@ -1553,6 +1602,7 @@ def make_config(
         tile_m=tile_m,
         pipeline_depths=depths,
         weight_block_columns=weight_block_columns,
+        weight_block_segment_rows=weight_block_segment_rows,
     )
     if tail_bucket:
         if tail_bucket_m_values is not None:
