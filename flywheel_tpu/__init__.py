@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""FlyWheel: attention kernels for TPU, implemented in JAX Pallas."""
+"""FlyWheel: efficient kernels for TPU, implemented in JAX Pallas."""
 
 import importlib
 import warnings
 
+from flywheel_tpu.moe import fused_moe, fused_moe_softmax_topk
 from flywheel_tpu.softmax_attention import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -29,6 +30,8 @@ __all__ = [
     "flash_attn_func",
     "flash_attn_varlen_func",
     "flash_attn_with_kvcache",
+    "fused_moe",
+    "fused_moe_softmax_topk",
 ]
 
 # Note (david): the internal names tpu-inference's flywheel backend imports

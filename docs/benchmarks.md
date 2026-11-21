@@ -1,7 +1,8 @@
 # Benchmarks
 
 The numbers on this page were measured on TPU v6e with `jax[tpu]==0.11.0` and
-`libtpu==0.0.44`, the stack tpu-inference runs. The same benchmarks on v7x are
+`libtpu==0.0.44`, the stack tpu-inference runs, except the MoE section's,
+whose stack it gives. The same benchmarks on v7x are
 in [v7x.md](v7x.md). Run the commands below from a source checkout, in the venv
 of the [README](../README.md#installation)'s `uv sync --extra tpu`.
 
@@ -264,3 +265,86 @@ PYTHONPATH=. uv run --no-sync python benchmarks/linear_attention/benchmark/bench
     --impl baseline --output results/kda_fwd_baseline.json
 ```
 
+## MoE
+
+`fused_moe_softmax_topk` on one v6e chip, with its default knobs, measured
+with `jax[tpu]==0.11.2` and `libtpu==0.0.50`. On v6e its routing and token
+sort are XLA ops and its combine is a TensorCore kernel.
+
+Each cell is the wall-clock time of one jitted call, the median over rounds
+of queued calls, from the bf16 router logits [T, E] to the combined bf16
+output [T, hidden], so every implementation does its own softmax, top-k
+(renormalized), token sort and combine. The weights are bf16, prepared once
+outside the timed call (ours with `prepare_expert_weights`), and everything
+runs on one TensorCore with no expert parallelism. Each baseline's output is
+checked against ours before it is timed. The columns after the first are our
+speedup, the baseline's time over ours:
+
+- **torchtpu**: vllm-torchtpu's default path for unquantized experts without
+  expert parallelism, at
+  [b08f10f](https://github.com/vllm-project/vllm-torchtpu/tree/b08f10f):
+  `select_experts` (softmax, its router top-k kernel, renormalize) and
+  `fused_moe_func` in
+  [`fused_moe_gmm.py`](https://github.com/vllm-project/vllm-torchtpu/blob/b08f10f/src/vllm_torchtpu/layers/core/fused_moe_gmm.py),
+  every env knob at its default.
+- **GMM**: tpu-inference's `GMM_TP` backend on one device: XLA routing and
+  token gather, [tokamax `gmm_v2`](https://github.com/openxla/tokamax/tree/84e5f36/tokamax/_src/ops/experimental/gmm_v2)
+  for the gate/up projection (with the activation fused) and again for the
+  down projection, and the SparseCore `dense_gather_reduce` combine. The glue
+  follows `fused_moe_func` in tpu-inference's `fused_moe_gmm.py` at
+  [4420cae](https://github.com/vllm-project/tpu-inference/blob/4420cae/tpu_inference/layers/common/fused_moe_gmm.py).
+- **ragged_dot**: XLA, `jax.lax.ragged_dot` twice between an XLA sort and an
+  f32 combine.
+
+Qwen3-30B-A3B experts: hidden 2048, intermediate 768, 128 experts, top-8:
+
+| T | flywheel ms | torchtpu | GMM | ragged_dot |
+|---:|---:|---:|---:|---:|
+| 8 | 0.450 | 0.98x | 0.98x | 0.98x |
+| 64 | 1.070 | 1.00x | 1.00x | 1.00x |
+| 512 | 1.135 | 1.04x | 1.04x | 0.99x |
+| 2048 | 1.241 | 1.29x | 1.28x | 1.86x |
+| 4096 | 1.543 | 1.66x | 1.35x | 2.35x |
+| 16384 | 3.055 | 2.14x | 2.18x | 3.89x |
+| 65536 | 12.232 | 1.97x | 2.01x | 3.68x |
+
+Qwen3-Next-80B-A3B experts: hidden 2048, intermediate 512, 512 experts, top-10:
+
+| T | flywheel ms | torchtpu | GMM | ragged_dot |
+|---:|---:|---:|---:|---:|
+| 8 | 0.442 | 0.98x | 0.98x | 0.99x |
+| 64 | 2.131 | 1.00x | 1.00x | 1.00x |
+| 512 | 2.953 | 1.02x | 1.02x | 1.02x |
+| 2048 | 3.064 | 1.24x | 1.31x | 1.48x |
+| 4096 | 3.495 | 1.32x | 1.45x | 1.84x |
+| 16384 | 5.151 | 2.12x | 2.46x | 3.77x |
+| 65536 | 15.168 | 2.46x | 2.97x | 4.76x |
+
+hidden 2048, intermediate 1408, 256 experts, top-8:
+
+| T | flywheel ms | torchtpu | GMM | ragged_dot |
+|---:|---:|---:|---:|---:|
+| 8 | 0.922 | 0.98x | 0.98x | 0.99x |
+| 64 | 3.537 | 1.00x | 1.00x | 1.00x |
+| 512 | 4.056 | 1.01x | 1.01x | 1.00x |
+| 2048 | 4.141 | 1.10x | 1.10x | 1.25x |
+| 4096 | 4.467 | 1.15x | 1.15x | 1.51x |
+| 16384 | 5.735 | 1.63x | 1.63x | 3.05x |
+| 65536 | 18.113 | 1.65x | 1.69x | 3.22x |
+
+Up to T = 512 the time is the read of each selected expert's weights, so the
+four implementations tie. From T = 2048 on, the fused kernel keeps the sorted
+activations and the gate/up intermediate out of HBM and gathers and combines
+the rows in its own DMA streams.
+
+```bash
+git submodule update --init third_party/tpu-inference third_party/tokamax
+git clone https://github.com/vllm-project/vllm-torchtpu.git ../vllm-torchtpu
+git -C ../vllm-torchtpu checkout b08f10f
+uv pip install jax==0.11.2 jaxlib==0.11.2 libtpu==0.0.50
+PYTHONPATH=. uv run --no-sync python benchmarks/moe/bench_fused_moe.py \
+    --models qwen3-30b-a3b qwen3-next-80b-a3b h2048-i1408-e256-k8 \
+    --tokens 8 64 512 2048 4096 16384 65536 \
+    --impls flywheel torchtpu gmm ragged_dot --torchtpu-source ../vllm-torchtpu \
+    --output results/moe.json
+```
