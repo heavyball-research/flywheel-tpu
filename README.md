@@ -143,6 +143,13 @@ FlyWheel powers attention in:
   VLLM_WORKER_MULTIPROC_METHOD=fork vllm serve Qwen/Qwen3.5-0.8B --attention-backend flywheel
   ```
 
+- [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu) (SGLang on
+  TPU), as `--attention-backend flywheel` with the `sglang[flywheel]` extra:
+
+  ```bash
+  sglang serve --model-path Qwen/Qwen3-0.6B --device tpu --enable-torch-compile --attention-backend flywheel
+  ```
+
 ## Acknowledgement
 
 FlyWheel's API follows [FlashAttention](https://github.com/Dao-AILab/flash-attention).
