@@ -48,8 +48,29 @@ import math
 import statistics
 import warnings
 
+from ..core.tpu import NUM_LANES
+
 
 _NORMAL = statistics.NormalDist()
+
+
+def legal_block_kv(page_size: int, max_block_kv: int) -> tuple[int, ...]:
+    """Every block_kv the kernel accepts up to max_block_kv, increasing.
+
+    The kernel's domain is B > 0, B a whole lane tile (B % NUM_LANES == 0),
+    and either a whole multiple of a page or a whole fraction of one:
+    B % page_size == 0 or page_size % B == 0. B is therefore at least
+    NUM_LANES, so the lattice starts there. A page whose first legal block is
+    past max_block_kv leaves the lattice empty; the kernel would reject every
+    candidate, and the caller's feasibility filters decide what to do.
+    """
+    if page_size <= 0:
+        raise ValueError(f"page_size must be positive; got {page_size}.")
+    return tuple(
+        block
+        for block in range(NUM_LANES, max_block_kv + 1, NUM_LANES)
+        if block % page_size == 0 or page_size % block == 0
+    )
 
 
 def item_work_fraction(
@@ -189,6 +210,20 @@ class MlaDecodeCostConstants:
     block and the item: predictions use efficiency(block_kv) * block_kv *
     work + r_item, so a calibrated entry carries the measured item cost in
     efficiency and leaves r_item at 0.
+
+    page_efficiency holds (page_size, block_kv, value) overrides measured on
+    a page size other than the one block_efficiency was fitted on, base_page.
+    An exact (page, block) entry wins; otherwise the base entry serves and
+    efficiency_source labels it "fallback" when the call's page differs from
+    base_page. No value is interpolated: a block absent from both tables is
+    unlisted and costs 1.0. A page whose legal lattice is fully measured has
+    exact entries for every block the kernel accepts there.
+
+    r_step and the floor fraction were also measured per page: page_r_step
+    holds (page_size, value) and page_floor holds (page_size, block_kv,
+    value). An exact entry wins; otherwise the base scalar or block_floor
+    entry serves. The page tables are not interpolated, and a page left out
+    of them reuses the base page's measured costs.
     """
 
     r_item: float
@@ -198,18 +233,60 @@ class MlaDecodeCostConstants:
     vmem_fraction: float = 0.75
     calibrated_on: str = ""
     block_floor: tuple[tuple[int, float], ...] = ()
+    page_efficiency: tuple[tuple[int, int, float], ...] = ()
+    page_r_step: tuple[tuple[int, float], ...] = ()
+    page_floor: tuple[tuple[int, int, float], ...] = ()
+    base_page: int = 0
 
-    def efficiency(self, block_kv: int) -> float:
+    def efficiency_with_source(
+        self, block_kv: int, page_size: int | None = None
+    ) -> tuple[float, str]:
+        """The block's efficiency and where the value came from.
+
+        "page" is a measured (page, block) override, "base" the table fitted
+        on base_page (also what a call with no page size gets), "fallback"
+        the base value reused on an unmeasured page, and "unlisted" the 1.0
+        default. The last two are the only non-measured values, and neither
+        interpolates a neighbor.
+        """
+        if page_size is not None:
+            for page, block, value in self.page_efficiency:
+                if page == page_size and block == block_kv:
+                    return value, "page"
         for block, value in self.block_efficiency:
             if block == block_kv:
-                return value
-        return 1.0
+                if (
+                    page_size is not None
+                    and self.base_page
+                    and page_size != self.base_page
+                ):
+                    return value, "fallback"
+                return value, "base"
+        return 1.0, "unlisted"
 
-    def floor_fraction(self, block_kv: int) -> float:
+    def efficiency(
+        self, block_kv: int, page_size: int | None = None
+    ) -> float:
+        return self.efficiency_with_source(block_kv, page_size)[0]
+
+    def floor_fraction(
+        self, block_kv: int, page_size: int | None = None
+    ) -> float:
+        if page_size is not None:
+            for page, block, value in self.page_floor:
+                if page == page_size and block == block_kv:
+                    return value
         for block, value in self.block_floor:
             if block == block_kv:
                 return value
         return 1.0
+
+    def r_step_for_page(self, page_size: int | None = None) -> float:
+        if page_size is not None:
+            for page, value in self.page_r_step:
+                if page == page_size:
+                    return value
+        return self.r_step
 
 
 def _lognormal(weight: float, mean: float, cv: float) -> LengthComponent:
@@ -271,14 +348,21 @@ def config_cost(
     constants: MlaDecodeCostConstants,
     bases: tuple[LengthBase, ...] = WORKLOAD_PRIOR,
     quantile_count: int = 128,
+    page_size: int | None = None,
 ) -> float:
-    """The prior-weighted cost of one (block, items per step), in columns."""
+    """The prior-weighted cost of one (block, items per step), in columns.
+
+    page_size selects the page-aware efficiency and step-cost overrides when
+    the calibration measured them; None uses the base table. The floor
+    fraction likewise prefers a measured (page, block) entry.
+    """
     if items_per_step < 1:
         raise ValueError(
             f"items_per_step must be positive; got {items_per_step}."
         )
-    efficiency = constants.efficiency(block_kv)
-    floor_fraction = constants.floor_fraction(block_kv)
+    efficiency = constants.efficiency(block_kv, page_size)
+    floor_fraction = constants.floor_fraction(block_kv, page_size)
+    r_step = constants.r_step_for_page(page_size)
     total = 0.0
     for base in bases:
         items = batch * base.expected_ceil(
@@ -294,39 +378,96 @@ def config_cost(
         total += base.weight * (
             efficiency * work * steps * items_per_step * block_kv
             + constants.r_item * steps * items_per_step
-            + constants.r_step * steps
+            + r_step * steps
         )
     return total
 
 
 # Filled by the calibration script; empty while the feature is dormant.
-# v3: fitted 2026-11-19 from 211 cells on TPU v6e -- the uniform 16k/32k
-# grid (batch 32/128), the short 512-2048 grid (batch 32/128), and the
-# block x length floor grid (batch 64, valid lengths 64-8192, 128-page
-# table). R^2 0.982, MAPE 12.3%. block_floor is the measured per-item
-# work floor at each block.
+# v4: fitted 2026-11-20 from three TPU v6e runs -- the full legal lattice at
+# page 128 (16 blocks, the base table), page 512 (6 blocks), and page 1024
+# (5 blocks, the deployment page). Each run fits the uniform 16k/32k grid
+# (batch 32/128) and the block x length floor grid (batch 64, valid lengths
+# up to one block). R^2 0.963/0.975/0.978 and MAPE 7.9/10.4/12.2% for pages
+# 128/512/1024. The page_* tables carry the exact per-page measurements: no
+# page's costs are interpolated from another page.
 CALIBRATION: dict[str, dict[str, MlaDecodeCostConstants]] = {
     "TPU v6e": {
         "bfloat16": MlaDecodeCostConstants(
             r_item=0.0,
-            r_step=263.712,
+            r_step=153.612,
             block_efficiency=(
                 (128, 1.0),
-                (256, 0.787104),
-                (512, 0.755948),
-                (1024, 0.742238),
-                (2048, 0.756332),
+                (256, 0.758717),
+                (384, 0.702154),
+                (512, 0.713909),
+                (640, 0.700717),
+                (768, 0.696399),
+                (896, 0.695250),
+                (1024, 0.704597),
+                (1152, 0.706842),
+                (1280, 0.705663),
+                (1408, 0.708697),
+                (1536, 0.709315),
+                (1664, 0.710506),
+                (1792, 0.711738),
+                (1920, 0.714266),
+                (2048, 0.717755),
             ),
             max_block_kv=2048,
             vmem_fraction=0.75,
-            calibrated_on="TPU v6e, JAX 0.11.0, 2026-11-19",
-            block_floor=(
-                (128, 0.920766),
-                (256, 0.881365),
-                (512, 0.802515),
-                (1024, 0.702709),
-                (2048, 0.626567),
+            calibrated_on=(
+                "TPU v6e, pages 128/512/1024, 2026-11-20"
             ),
+            block_floor=(
+                (128, 0.922527),
+                (256, 0.882401),
+                (384, 0.877304),
+                (512, 0.808566),
+                (640, 0.780306),
+                (768, 0.730870),
+                (896, 0.733756),
+                (1024, 0.704379),
+                (1152, 0.693010),
+                (1280, 0.665367),
+                (1408, 0.670443),
+                (1536, 0.645958),
+                (1664, 0.647168),
+                (1792, 0.628514),
+                (1920, 0.635040),
+                (2048, 0.626190),
+            ),
+            page_efficiency=(
+                (512, 128, 1.0),
+                (512, 256, 0.798126),
+                (512, 512, 0.783634),
+                (512, 1024, 0.792800),
+                (512, 1536, 0.809561),
+                (512, 2048, 0.821386),
+                (1024, 128, 1.0),
+                (1024, 256, 0.757785),
+                (1024, 512, 0.768669),
+                (1024, 1024, 0.781746),
+                (1024, 2048, 0.810513),
+            ),
+            page_r_step=(
+                (512, 249.633),
+                (1024, 257.371),
+            ),
+            page_floor=(
+                (512, 128, 0.974757),
+                (512, 256, 0.869107),
+                (512, 512, 0.766427),
+                (512, 1024, 0.655521),
+                (512, 1536, 0.596259),
+                (512, 2048, 0.572177),
+                (1024, 128, 0.931845),
+                (1024, 256, 0.951983),
+                (1024, 512, 0.782012),
+                (1024, 1024, 0.644400),
+                (1024, 2048, 0.564255),
+            ),
+            base_page=128,
         ),
     },
 }

@@ -31,6 +31,7 @@ from ..mla_decode_calibration import (
     MlaDecodeCostConstants,
     config_cost,
     get_mla_cost_constants,
+    legal_block_kv,
 )
 from ..softmax import overflow_guard_threshold
 from .decode import lane_broadcast
@@ -369,13 +370,21 @@ def _calibrated_default_mla_config(
     average-optimal.
 
     A batch's lengths are runtime data, so the cost is the prior's weighted
-    average over its length distributions, not one length's. Every whole
-    lane-tile block up to the constants' maximum, and every power-of-two items
-    a step up to the step budgets, is priced; the least cost that fits the
-    constants' VMEM fraction and the SMEM budget wins, and a tie takes the
-    longer block. A call whose table outgrows SMEM at every candidate (a
-    planning bound past what the chip can hold) returns None, and the caller
-    falls back to the tuned table and the max_seqlen rule, with a warning.
+    average over its length distributions, not one length's. Every block the
+    kernel accepts up to the constants' maximum and the table's capacity --
+    every whole lane tile that is a whole multiple or a whole fraction of a
+    page -- and every items count up to the step budgets is priced. Measured
+    on v6e, items 1 and 2 ran 56% and 15% slower than items 8, while items
+    3-7 ran within 2.6%, so a block whose cap allows 4 items prunes 1 and 2
+    and keeps 3..cap; a shorter cap keeps every integer it allows. A block
+    the calibration never measured is not a candidate while the table lists
+    any measured block: its 1.0 efficiency and 1.0 floor are placeholders,
+    and restricting the choice to measured blocks is honest where pricing a
+    placeholder is not. The least cost that fits the constants' VMEM fraction
+    and the SMEM budget wins, and a tie takes the longer block. A call whose
+    table outgrows SMEM at every candidate (a planning bound past what the
+    chip can hold) returns None, and the caller falls back to the tuned table
+    and the max_seqlen rule, with a warning.
     """
     capacity = pages_per_seq * page_size
     shape = {
@@ -391,48 +400,51 @@ def _calibrated_default_mla_config(
         constants.max_block_kv, max(NUM_LANES, next_pow2(capacity))
     )
     priced = []
-    seen_blocks = set()
-    target_block_kv = NUM_LANES
-    while target_block_kv <= max_target:
-        block_kv = mla_block_kv(page_size, pages_per_seq, target_block_kv)
+    for block_kv in legal_block_kv(page_size, max_target):
+        # Note: a block the calibration never measured has only placeholder
+        # costs (efficiency 1.0, floor 1.0), not measurements, so it is not a
+        # candidate while the table lists any measured block. An empty table
+        # is the dormant state and keeps every block, as before.
         if (
-            block_kv not in seen_blocks
-            and block_kv <= constants.max_block_kv
+            constants.block_efficiency
+            and constants.efficiency_with_source(
+                block_kv, page_size
+            )[1]
+            == "unlisted"
         ):
-            seen_blocks.add(block_kv)
-            max_items = min(
-                MAX_ITEMS_PER_STEP, TARGET_STEP_TOKENS // block_kv
-            )
-            items_per_step = 1
-            while items_per_step <= max_items:
-                config = MlaDecodeConfig(block_kv, items_per_step)
-                if mla_vmem_bytes(config, **shape) <= vmem_budget:
-                    fits_smem = (
-                        mla_smem_bytes(
-                            config,
-                            batch=batch,
-                            page_size=page_size,
-                            pages_per_seq=pages_per_seq,
-                        )
-                        <= smem_budget
+            continue
+        max_items = min(
+            MAX_ITEMS_PER_STEP, TARGET_STEP_TOKENS // block_kv
+        )
+        first_items = 3 if max_items >= 4 else 1
+        for items_per_step in range(first_items, max_items + 1):
+            config = MlaDecodeConfig(block_kv, items_per_step)
+            if mla_vmem_bytes(config, **shape) <= vmem_budget:
+                fits_smem = (
+                    mla_smem_bytes(
+                        config,
+                        batch=batch,
+                        page_size=page_size,
+                        pages_per_seq=pages_per_seq,
                     )
-                    priced.append(
-                        (
-                            config_cost(
-                                block_kv,
-                                items_per_step,
-                                batch=batch,
-                                capacity=capacity,
-                                constants=constants,
-                            ),
-                            -block_kv,
+                    <= smem_budget
+                )
+                priced.append(
+                    (
+                        config_cost(
+                            block_kv,
                             items_per_step,
-                            config,
-                            fits_smem,
-                        )
+                            batch=batch,
+                            capacity=capacity,
+                            constants=constants,
+                            page_size=page_size,
+                        ),
+                        -block_kv,
+                        items_per_step,
+                        config,
+                        fits_smem,
                     )
-                items_per_step *= 2
-        target_block_kv *= 2
+                )
     candidates = [entry for entry in priced if entry[4]]
     if not candidates:
         if not priced:
