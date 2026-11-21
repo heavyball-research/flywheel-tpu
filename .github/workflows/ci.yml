@@ -33,6 +33,9 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      SHARD: ${{ matrix.shard }}
+      SHARDS: ${{ strategy.job-total }}
     # The suite is about 1000 worker-minutes in the interpreter, so 20 shards of 4 workers
     # each take 10 to 25 minutes. The count can change freely: each shard reads it from
     # strategy.job-total.
@@ -52,20 +55,27 @@ jobs:
         run: |
           if [ "$GITHUB_EVENT_NAME" = schedule ]; then jax=jax; else jax="jax==${JAX_VERSION}"; fi
           uv pip install -e . "$jax" "pytest>=8" pytest-xdist
-      # tests/conftest.py keeps every N-th test from the i-th on.
+      # tests/conftest.py keeps every N-th test from the i-th on. Two high_memory
+      # tests on one runner fill its memory, so they run after the rest, one at
+      # a time.
       - name: Test
-        env:
-          SHARD: ${{ matrix.shard }}
-          SHARDS: ${{ strategy.job-total }}
         run: >
           python -m pytest -n auto -rfE --durations=20
-          --shard="$SHARD/$SHARDS"
+          --shard="$SHARD/$SHARDS" -m "not high_memory"
           --junitxml="junit-cpu-$SHARD.xml"
+      - name: Test high_memory
+        if: ${{ !cancelled() }}
+        run: >
+          python -m pytest -n 0 -rfE --durations=20
+          --shard="$SHARD/$SHARDS" -m high_memory
+          --junitxml="junit-cpu-high-memory-$SHARD.xml"
       - if: ${{ !cancelled() }}
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: junit-cpu-${{ matrix.shard }}
-          path: junit-cpu-${{ matrix.shard }}.xml
+          path: |
+            junit-cpu-${{ matrix.shard }}.xml
+            junit-cpu-high-memory-${{ matrix.shard }}.xml
 
   # One name for branch protection that does not change with the shard count. A shard that
   # fails, times out or is cancelled fails it. It runs even on a cancelled run, because a
