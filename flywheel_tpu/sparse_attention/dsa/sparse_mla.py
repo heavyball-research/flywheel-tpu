@@ -61,6 +61,27 @@ from flywheel_tpu.sparse_attention.dsa.kernels.sparse_mla import (
 )
 from flywheel_tpu.topk.kernels.sparse_core_topk import TopkGeometry
 
+# Note (david): a chunk's kernels lower once per shape, however many chunks
+# of a call run them.
+gather_chunk_rows = jax.jit(
+    dsa_gather_pallas,
+    static_argnames=(
+        "num_tokens",
+        "top_k",
+        "page_size",
+        "pages_per_seq",
+        "writes_cache_rows",
+    ),
+)
+attend_chunk_rows = jax.jit(
+    dsa_sparse_mla_pallas,
+    static_argnames=(
+        "num_chunk_tokens",
+        "sm_scale",
+        "return_lse",
+        "writes_padding",
+    ),
+)
 QUERY_DTYPE = jnp.dtype(jnp.bfloat16)
 MAX_HEADS = NUM_LANES
 # Note (david): a call cuts its tokens into about TARGET_CHUNKS chunks, so each
@@ -114,16 +135,24 @@ def token_metadata(
     used = jnp.clip(position + 1, 0, top_k).reshape(-1, step_tokens).max(1)
     blocked = (used + BLOCK_SLOTS - 1) // BLOCK_SLOTS * BLOCK_SLOTS
     step_slots = jnp.where(blocked > max_blocked_slots(top_k), top_k, blocked)
-    columns = {
-        META_TABLE_OFFSET: request * pages_per_seq,
-        META_POSITION: position,
-        META_SLOTS: jnp.repeat(step_slots, step_tokens),
-    }
-    zeros = jnp.zeros_like(position)
-    token_meta = jnp.stack(
-        [columns.get(lane, zeros) for lane in range(META_WORDS)], axis=1
+    token_meta = lane_rows(
+        {
+            META_TABLE_OFFSET: request * pages_per_seq,
+            META_POSITION: position,
+            META_SLOTS: jnp.repeat(step_slots, step_tokens),
+        },
+        META_WORDS,
     )
     return token_meta, step_slots
+
+
+def lane_rows(columns: dict[int, jax.Array], num_words: int) -> jax.Array:
+    """(N, num_words) rows of the (N,) columns keyed by their lane, zeros in
+    the other lanes."""
+    zeros = jnp.zeros_like(next(iter(columns.values())))
+    return jnp.stack(
+        [columns.get(lane, zeros) for lane in range(num_words)], axis=1
+    )
 
 
 def chunk_row(first_index_row: int, first_token: int) -> jax.Array:
@@ -147,6 +176,30 @@ class SplitCache(NamedTuple):
     pages_per_seq: int
 
 
+def split_cache(
+    nope_cache: jax.Array,
+    rope_cache: jax.Array,
+    block_table: jax.Array,
+    num_slots: int,
+) -> SplitCache:
+    """The gather's view of the split cache, a token taking num_slots
+    slots."""
+    # Note (david): the SparseCore DMAs whole 32-byte granules, so a table
+    # row starts on one.
+    pages_per_seq = pl.cdiv(block_table.shape[1], NUM_SUBLANES) * NUM_SUBLANES
+    table = jnp.pad(
+        block_table, ((0, 0), (0, pages_per_seq - block_table.shape[1]))
+    )
+    return SplitCache(
+        block_table=table.reshape(-1),
+        nope_cache=nope_cache.reshape(-1, NOPE_WORDS),
+        rope_cache=rope_cache.reshape(-1, ROPE_WORDS),
+        top_k=num_slots,
+        page_size=nope_cache.shape[1],
+        pages_per_seq=pages_per_seq,
+    )
+
+
 class ChunkAttention(NamedTuple):
     """The operands every chunk's gather and attention share."""
 
@@ -165,11 +218,12 @@ class ChunkAttention(NamedTuple):
         """The SparseCore's (nope_rows, rope_rows, flag_rows) of num_tokens
         tokens, their first index row and token in the gather's chunk
         row."""
-        return dsa_gather_pallas(
+        return gather_chunk_rows(
             row,
             indices,
             self.token_meta,
             num_tokens=num_tokens,
+            writes_cache_rows=False,
             **self.cache._asdict(),
         )
 
@@ -201,15 +255,17 @@ class ChunkAttention(NamedTuple):
         rows: tuple[jax.Array, jax.Array, jax.Array],
         previous: tuple[jax.Array, ...] | None,
         *,
-        first_token: int,
+        first_token: int | jax.Array,
         num_tokens: int,
         scalars: jax.Array,
+        writes_padding: bool = True,
     ) -> tuple[jax.Array, ...]:
         """Attend the call's tokens [first_token, first_token + num_tokens)
         over their gathered rows, with scalars the call's scalars, which a
         caller may pass through a barrier; returns (out, [lse]) with their
-        rows written into previous's."""
-        return dsa_sparse_mla_pallas(
+        rows written into previous's, the rows of steps of padding only if
+        writes_padding."""
+        return attend_chunk_rows(
             self.q_nope,
             self.q_pe,
             *rows,
@@ -220,6 +276,7 @@ class ChunkAttention(NamedTuple):
             num_chunk_tokens=num_tokens,
             sm_scale=self.sm_scale,
             return_lse=self.return_lse,
+            writes_padding=writes_padding,
         )
 
 
@@ -242,28 +299,15 @@ def chunk_attention(
     to gather_slots(top_k)."""
     num_tokens = q_nope.shape[0]
     step_tokens = tokens_per_step(num_tokens)
-    num_slots = gather_slots(top_k)
-    page_size = nope_cache.shape[1]
     # Note (david): the attention steps over whole groups of tokens, so the
     # padded rows join with no position and a zero output.
     padded_tokens = pl.cdiv(num_tokens, step_tokens) * step_tokens
     token_pad = ((0, padded_tokens - num_tokens), (0, 0), (0, 0))
-    # Note (david): the SparseCore DMAs whole 32-byte granules, so a table
-    # row starts on one.
-    pages_per_seq = pl.cdiv(block_table.shape[1], NUM_SUBLANES) * NUM_SUBLANES
-    table = jnp.pad(
-        block_table, ((0, 0), (0, pages_per_seq - block_table.shape[1]))
-    ).reshape(-1)
-    cache = SplitCache(
-        block_table=table,
-        nope_cache=nope_cache.reshape(-1, NOPE_WORDS),
-        rope_cache=rope_cache.reshape(-1, ROPE_WORDS),
-        top_k=num_slots,
-        page_size=page_size,
-        pages_per_seq=pages_per_seq,
+    cache = split_cache(
+        nope_cache, rope_cache, block_table, gather_slots(top_k)
     )
     token_meta, step_slots = token_metadata(
-        cu_q_lens, kv_lens, padded_tokens, pages_per_seq, num_slots
+        cu_q_lens, kv_lens, padded_tokens, cache.pages_per_seq, cache.top_k
     )
     return ChunkAttention(
         q_nope=jnp.pad(q_nope, token_pad),

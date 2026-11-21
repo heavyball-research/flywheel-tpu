@@ -60,6 +60,8 @@ sparse attention layer step (benchmarks/common/dsa.py): each impl writes the
 batch's index keys and latents into empty fp8 caches of DSA_PAGE pages, then
 scores, selects and attends. A DSA cell whose last sequence fails
 COS_DIFF_BOUND or INDEX_DEFICIT_BOUND is recorded as check_failed.
+flywheel_dsa_indexer and torchtpu_dsa_indexer score and select alone, the
+batch written before the clock, and only INDEX_DEFICIT_BOUND applies.
 
 Attention work is the causal (query, key) pairs, sum(s (s + 1) / 2), which
 the patterns do not hold constant, so only TFLOP/s compares across patterns.
