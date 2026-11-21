@@ -16,14 +16,27 @@
 benchmarks, and the SHA-pinned loader for vllm-torchtpu's DSA kernels.
 
 A step is one DSA layer's forward: the index-K cache write, the latent cache
-write, the indexer's scores, their top-k and the sparse attention.
+write, the indexer's scores, their top-k and the sparse attention. With given
+indices (a .npy of one request's selection per position) a step is the
+forward of a layer that reuses a selection: the latent cache write, then the
+attention on the given rows.
 
   flywheel_dsa               dsa_index_cache_write, dsa_cache_write, then
-                             dsa_attention
+                             dsa_attention; with given indices,
+                             dsa_cache_write, then
+                             dsa_attention_from_indices
   torchtpu_dsa               vllm-torchtpu's sparse attention indexer op,
-                             then its sparse MLA op
+                             then its sparse MLA op; with given indices, the
+                             sparse MLA op alone
   torchtpu_dsa_masked_dense  the same with masked-dense routing admitted, as
                              TPU_MLA_MASKED_DENSE_ENABLED=1 does for glm52
+
+An indexer impl runs the indexer's scores and their top-k alone, on caches
+the impl writes before the clock:
+
+  flywheel_dsa_indexer       dsa_indices
+  torchtpu_dsa_indexer       vllm-torchtpu's streamindex_topk at the serving
+                             settings
 
 --torchtpu-source is a vllm-torchtpu checkout at TORCHTPU_DSA_GIT_SHA. Its
 kernel files are imported under stub parent packages, each verified against
@@ -107,8 +120,20 @@ DSA_GEOMETRIES = {
 FLYWHEEL_DSA = "flywheel_dsa"
 TORCHTPU_DSA = "torchtpu_dsa"
 TORCHTPU_DSA_MASKED_DENSE = "torchtpu_dsa_masked_dense"
-TORCHTPU_DSA_IMPLS = (TORCHTPU_DSA, TORCHTPU_DSA_MASKED_DENSE)
-DSA_IMPLS = (FLYWHEEL_DSA, *TORCHTPU_DSA_IMPLS)
+FLYWHEEL_DSA_INDEXER = "flywheel_dsa_indexer"
+TORCHTPU_DSA_INDEXER = "torchtpu_dsa_indexer"
+TORCHTPU_DSA_IMPLS = (
+    TORCHTPU_DSA,
+    TORCHTPU_DSA_MASKED_DENSE,
+    TORCHTPU_DSA_INDEXER,
+)
+DSA_INDEXER_IMPLS = (FLYWHEEL_DSA_INDEXER, TORCHTPU_DSA_INDEXER)
+DSA_IMPLS = (
+    FLYWHEEL_DSA,
+    TORCHTPU_DSA,
+    TORCHTPU_DSA_MASKED_DENSE,
+    *DSA_INDEXER_IMPLS,
+)
 # Note (david): kernels/mla/dispatch.py admits masked-dense routing for this
 # profile only.
 MASKED_DENSE_GEOMETRY = "glm52"
@@ -348,7 +373,9 @@ class DsaLayer:
     queries, keys and meta map a call's token-major operands and requests to
     the impl's layout. step(caches, queries, keys, *meta) -> (outputs, caches)
     is the jitted layer step with its caches donated. selection(...) gives
-    request's selected (q_len, top_k) positions, -1 padded."""
+    request's selected (q_len, top_k) positions, -1 padded; a layer with
+    given indices selects none itself. An indexer layer has no
+    attention_out: its step selects alone and writes no cache."""
 
     empty_caches: Callable[[int], tuple[jax.Array, ...]]
     write: Callable[..., tuple[jax.Array, ...]]
@@ -357,8 +384,13 @@ class DsaLayer:
     meta: Callable[[DsaRequests], tuple[jax.Array, ...]]
     step: Callable[..., tuple[object, tuple[jax.Array, ...]]]
     selection: Callable[..., jax.Array]
-    attention_out: Callable[[object], jax.Array]
+    attention_out: Callable[[object], jax.Array] | None
     info: dict[str, object]
+    has_given_indices: bool = False
+
+    @property
+    def is_indexer_only(self) -> bool:
+        return self.attention_out is None
 
 
 def dsa_args_error(
@@ -411,16 +443,11 @@ def flywheel_empty_caches(num_pages: int) -> tuple[jax.Array, ...]:
     )
 
 
-def flywheel_write(caches, keys, cu_q_lens, kv_lens, block_table):
+def flywheel_latent_write(caches, keys, cu_q_lens, kv_lens, block_table):
+    """dsa_cache_write alone: the index cache stays as it is."""
     from flywheel_tpu.sparse_attention.dsa.cache_write import dsa_cache_write
-    from flywheel_tpu.sparse_attention.dsa.index_cache_write import (
-        dsa_index_cache_write,
-    )
 
     index_cache, nope_cache, rope_cache = caches
-    index_cache = dsa_index_cache_write(
-        keys.index_keys, index_cache, cu_q_lens, kv_lens, block_table
-    )
     nope_cache, rope_cache = dsa_cache_write(
         keys.latent,
         keys.rope,
@@ -431,6 +458,20 @@ def flywheel_write(caches, keys, cu_q_lens, kv_lens, block_table):
         block_table,
     )
     return index_cache, nope_cache, rope_cache
+
+
+def flywheel_write(caches, keys, cu_q_lens, kv_lens, block_table):
+    from flywheel_tpu.sparse_attention.dsa.index_cache_write import (
+        dsa_index_cache_write,
+    )
+
+    index_cache, *latent_caches = caches
+    index_cache = dsa_index_cache_write(
+        keys.index_keys, index_cache, cu_q_lens, kv_lens, block_table
+    )
+    return flywheel_latent_write(
+        (index_cache, *latent_caches), keys, cu_q_lens, kv_lens, block_table
+    )
 
 
 def flywheel_topk(geometry: DsaGeometry, max_seqlen_k: int) -> Callable:
@@ -481,7 +522,7 @@ def build_flywheel_layer(
     geometry: DsaGeometry, max_seqlen_k: int, route: str | None
 ) -> DsaLayer:
     """flywheel's layer step: its two cache writes, then dsa_attention
-    through route, or the route it picks on device if None."""
+    through route, or each request by the rule if None."""
     import jax
     import jax.numpy as jnp
 
@@ -525,6 +566,171 @@ def build_flywheel_layer(
         ),
         attention_out=lambda out: out,
         info={"max_seqlen_k": max_seqlen_k, "route": route},
+    )
+
+
+def given_selection(
+    indices_path: Path, positions: np.ndarray, top_k: int
+) -> np.ndarray:
+    """The (len(positions), top_k) int32 rows at positions of a .npy file
+    whose row p is the selection of one request's token at position p;
+    fails unless each row lies in [-1, its position]. A token under position
+    top_k sees at most top_k positions and takes them all, then -1, whatever
+    the file's row holds."""
+    rows = np.load(indices_path, mmap_mode="r")
+    if rows.ndim != 2 or rows.shape[1] != top_k:
+        raise ValueError(
+            f"{indices_path} must hold (positions, {top_k}) rows; got"
+            f" {rows.shape}."
+        )
+    elif positions.max() >= rows.shape[0]:
+        raise ValueError(
+            f"{indices_path} holds {rows.shape[0]} positions; a token sits at"
+            f" {positions.max()}."
+        )
+    slots = np.arange(top_k, dtype=np.int32)
+    selection = np.where(
+        positions[:, None] < top_k,
+        np.where(slots <= positions[:, None], slots, -1),
+        np.asarray(rows[positions], np.int32),
+    )
+    if not ((selection >= -1) & (selection <= positions[:, None])).all():
+        raise ValueError(f"{indices_path}: a row selects past its position.")
+    return selection
+
+
+def given_indices_layer(
+    layer: DsaLayer,
+    step: Callable,
+    indices_path: Path,
+    top_k: int,
+    num_tokens: int,
+) -> DsaLayer:
+    """layer with step in place of its own step and selection: meta ends
+    with indices_path's rows of the call's token positions, then -1 rows up
+    to the step's num_tokens."""
+    import jax.numpy as jnp
+
+    def _rows(requests):
+        selection = given_selection(
+            indices_path, requests.token_positions(), top_k
+        )
+        padding = ((0, num_tokens - selection.shape[0]), (0, 0))
+        return jnp.asarray(np.pad(selection, padding, constant_values=-1))
+
+    def _selection(outputs, caches, queries, requests, request):
+        del outputs, caches, queries  # Unused: the indices are given.
+        first, last = requests.cu_q_lens[request : request + 2]
+        positions = requests.token_positions()[first:last]
+        return given_selection(indices_path, positions, top_k)
+
+    return dataclasses.replace(
+        layer,
+        meta=lambda requests: (*layer.meta(requests), _rows(requests)),
+        step=step,
+        selection=_selection,
+        info={**layer.info, "indices": str(indices_path)},
+        has_given_indices=True,
+    )
+
+
+def build_flywheel_from_indices_layer(
+    geometry: DsaGeometry,
+    max_seqlen_k: int,
+    route: str | None,
+    indices_path: Path,
+    num_tokens: int,
+) -> DsaLayer:
+    """flywheel's layer that reuses another layer's selection: its latent
+    cache write, then dsa_attention_from_indices through route, or each
+    request by the rule if None, on indices_path's rows of the tokens'
+    positions."""
+    import jax
+
+    from flywheel_tpu.sparse_attention.dsa.attention import (
+        dsa_attention_from_indices,
+    )
+
+    layer = build_flywheel_layer(geometry, max_seqlen_k, route)
+
+    def _step(caches, queries, keys, *meta):
+        *requests, scale, topk_indices = meta
+        caches = flywheel_latent_write(caches, keys, *requests)
+        out = dsa_attention_from_indices(
+            queries.q_nope,
+            queries.q_pe,
+            caches[1],
+            caches[2],
+            topk_indices,
+            *requests,
+            max_seqlen_k=max_seqlen_k,
+            sm_scale=geometry.sm_scale,
+            kv_scale=scale,
+            route=route,
+        )
+        return out, caches
+
+    return given_indices_layer(
+        layer,
+        jax.jit(_step, donate_argnums=(0,)),
+        indices_path,
+        geometry.top_k,
+        num_tokens,
+    )
+
+
+def step_selection(
+    outputs: jax.Array,
+    caches: tuple[jax.Array, ...],
+    queries: DsaQueries,
+    requests: DsaRequests,
+    request: int,
+) -> jax.Array:
+    """request's rows of outputs, the call's (T, top_k) selection."""
+    del caches, queries  # Unused.
+    first, last = requests.cu_q_lens[request : request + 2]
+    return outputs[first:last]
+
+
+def indexer_step(select: Callable) -> Callable:
+    """An indexer layer's step: select(index_cache, queries, *meta) alone,
+    the caches passed through untouched."""
+
+    def step(caches, queries, keys, *meta):
+        del keys  # Unused: the caches are written before the clock.
+        return select(caches[0], queries, *meta), caches
+
+    return step
+
+
+def build_flywheel_indexer_layer(
+    geometry: DsaGeometry, max_seqlen_k: int
+) -> DsaLayer:
+    """flywheel's indexer: dsa_indices on its written index cache."""
+    import jax
+
+    from flywheel_tpu.sparse_attention.dsa.attention import dsa_indices
+
+    @jax.jit
+    def select(index_cache, queries, cu_q_lens, kv_lens, block_table):
+        return dsa_indices(
+            queries.index_queries,
+            queries.index_weights,
+            index_cache,
+            cu_q_lens,
+            kv_lens,
+            block_table,
+            max_seqlen_k=max_seqlen_k,
+            top_k=geometry.top_k,
+        )
+
+    return dataclasses.replace(
+        build_flywheel_layer(geometry, max_seqlen_k, route=None),
+        meta=flywheel_meta,
+        step=indexer_step(select),
+        selection=step_selection,
+        attention_out=None,
+        info={"max_seqlen_k": max_seqlen_k},
     )
 
 
@@ -793,18 +999,13 @@ def torchtpu_config(
     )
 
 
-def torchtpu_write(torchtpu, config, caches, keys, seq_lens, pages, cu_q_lens):
-    """Both ops' cache writes, as the indexer and the sparse MLA op do."""
+def torchtpu_latent_write(
+    torchtpu, config, caches, keys, seq_lens, pages, cu_q_lens
+):
+    """The sparse MLA op's cache write alone: the index cache stays as it
+    is."""
     index_cache, nope_cache, rope_cache = caches
     nope_spec, rope_spec = config.specs(torchtpu, nope_cache.shape[0])
-    index_cache = torchtpu.kv_append.coalesced_kv_append(
-        index_cache,
-        pack_index_keys(keys.index_keys),
-        seq_lens,
-        pages,
-        cu_q_lens,
-        kv_layout=config.index_layout,
-    )
     nope_cache, rope_cache = torchtpu.mla_kv.update_sparse_mla_kv_cache(
         nope_cache,
         rope_cache,
@@ -817,6 +1018,28 @@ def torchtpu_write(torchtpu, config, caches, keys, seq_lens, pages, cu_q_lens):
         rope_spec=rope_spec,
     )
     return index_cache, nope_cache, rope_cache
+
+
+def torchtpu_write(torchtpu, config, caches, keys, seq_lens, pages, cu_q_lens):
+    """Both ops' cache writes, as the indexer and the sparse MLA op do."""
+    index_cache, *latent_caches = caches
+    index_cache = torchtpu.kv_append.coalesced_kv_append(
+        index_cache,
+        pack_index_keys(keys.index_keys),
+        seq_lens,
+        pages,
+        cu_q_lens,
+        kv_layout=config.index_layout,
+    )
+    return torchtpu_latent_write(
+        torchtpu,
+        config,
+        (index_cache, *latent_caches),
+        keys,
+        seq_lens,
+        pages,
+        cu_q_lens,
+    )
 
 
 def torchtpu_topk(torchtpu, config, index_cache, queries, *meta):
@@ -883,6 +1106,17 @@ def torchtpu_attend(torchtpu, config, caches, queries, topk, *meta):
     return out[..., :LATENT_DIM]
 
 
+def torchtpu_from_indices_step(torchtpu, config, caches, queries, keys, *meta):
+    """The sparse MLA op alone, on the top-k that meta ends with: its cache
+    write, then its attention."""
+    *requests, topk = meta
+    caches = torchtpu_latent_write(
+        torchtpu, config, caches, keys, *requests[:3]
+    )
+    out = torchtpu_attend(torchtpu, config, caches, queries, topk, *requests)
+    return (out, topk), caches
+
+
 def torchtpu_meta(
     requests: DsaRequests, padded_seqs: int
 ) -> tuple[jax.Array, ...]:
@@ -929,9 +1163,7 @@ def pad_tokens(values: jax.Array, num_tokens: int) -> jax.Array:
 
 def torchtpu_selection(outputs, caches, queries, requests, request):
     """The step's own top-k of request's tokens."""
-    del caches, queries  # Unused.
-    first, last = requests.cu_q_lens[request : request + 2]
-    return outputs[1][first:last]
+    return step_selection(outputs[1], caches, queries, requests, request)
 
 
 def build_torchtpu_layer(
@@ -941,9 +1173,11 @@ def build_torchtpu_layer(
     batch: int,
     is_masked_dense: bool,
     source: Path,
+    indices_path: Path | None,
 ) -> DsaLayer:
     """torchtpu's layer step: the indexer op, then the sparse MLA op, on the
-    runner's padded tokens and requests."""
+    runner's padded tokens and requests; with indices_path, the sparse MLA op
+    alone on its rows of the tokens' positions."""
     import jax
 
     from flywheel_tpu.softmax_attention.config import next_pow2
@@ -963,7 +1197,7 @@ def build_torchtpu_layer(
         return (out, topk), caches
 
     write = jax.jit(_write, donate_argnums=(0,))
-    return DsaLayer(
+    layer = DsaLayer(
         empty_caches=functools.partial(torchtpu_empty_caches, torchtpu, config),
         write=lambda caches, keys, requests: write(
             caches, keys, *torchtpu_meta(requests, len(requests.kv_lens))[:3]
@@ -989,6 +1223,45 @@ def build_torchtpu_layer(
             ),
         },
     )
+    if indices_path is None:
+        return layer
+    step = functools.partial(torchtpu_from_indices_step, torchtpu, config)
+    return given_indices_layer(
+        layer,
+        jax.jit(step, donate_argnums=(0,)),
+        indices_path,
+        geometry.top_k,
+        padded_tokens,
+    )
+
+
+def build_torchtpu_indexer_layer(
+    geometry: DsaGeometry, *, num_tokens: int, batch: int, source: Path
+) -> DsaLayer:
+    """torchtpu's indexer op alone on its written index cache, on the
+    runner's padded tokens and requests."""
+    import jax
+
+    torchtpu = load_torchtpu_dsa(source)
+    config = torchtpu_config(torchtpu, geometry, is_masked_dense=False)
+
+    @jax.jit
+    def select(index_cache, queries, *meta):
+        return torchtpu_topk(torchtpu, config, index_cache, queries, *meta)
+
+    return dataclasses.replace(
+        build_torchtpu_layer(
+            geometry,
+            num_tokens=num_tokens,
+            batch=batch,
+            is_masked_dense=False,
+            source=source,
+            indices_path=None,
+        ),
+        step=indexer_step(select),
+        selection=step_selection,
+        attention_out=None,
+    )
 
 
 def build_dsa_layer(
@@ -1000,13 +1273,25 @@ def build_dsa_layer(
     max_seqlen_k: int,
     torchtpu_source: Path | None,
     route: str | None = None,
+    indices_path: Path | None = None,
 ) -> DsaLayer:
     """impl's layer for calls of num_tokens tokens of batch requests whose
-    kv_lens stay within max_seqlen_k; route pins flywheel's route."""
-    if impl == FLYWHEEL_DSA:
+    kv_lens stay within max_seqlen_k; route pins flywheel's route, and
+    indices_path gives the layer its indices."""
+    if impl == FLYWHEEL_DSA and indices_path is not None:
+        return build_flywheel_from_indices_layer(
+            geometry, max_seqlen_k, route, indices_path, num_tokens
+        )
+    elif impl == FLYWHEEL_DSA:
         return build_flywheel_layer(geometry, max_seqlen_k, route)
+    elif impl == FLYWHEEL_DSA_INDEXER:
+        return build_flywheel_indexer_layer(geometry, max_seqlen_k)
     elif torchtpu_source is None:
         raise ValueError(f"--impl {impl} needs --torchtpu-source.")
+    elif impl == TORCHTPU_DSA_INDEXER:
+        return build_torchtpu_indexer_layer(
+            geometry, num_tokens=num_tokens, batch=batch, source=torchtpu_source
+        )
     else:
         return build_torchtpu_layer(
             geometry,
@@ -1014,6 +1299,7 @@ def build_dsa_layer(
             batch=batch,
             is_masked_dense=impl == TORCHTPU_DSA_MASKED_DENSE,
             source=torchtpu_source,
+            indices_path=indices_path,
         )
 
 
@@ -1122,9 +1408,10 @@ def edge_rows(first: int, last: int) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class DsaScenario:
-    """A serving scenario's DSA calls on one impl. fresh() makes its caches;
-    check_dsa reads rows of the last call's tokens, and logical(request) gives
-    that request's keys as the calls leave the cache."""
+    """A serving scenario's DSA calls on one impl. fresh() makes its caches
+    and initial_caches() the ones a timed step starts from; check_dsa reads
+    rows of the last call's tokens, and logical(request) gives that
+    request's keys as the calls leave the cache."""
 
     layer: DsaLayer
     geometry: DsaGeometry
@@ -1135,6 +1422,17 @@ class DsaScenario:
     requests: list[DsaRequests]
     rows: np.ndarray
     logical: Callable[[int], DsaKeys]
+
+    def initial_caches(self) -> tuple[jax.Array, ...]:
+        """fresh() caches; for an indexer layer, with every call's keys
+        written already, so that the clock holds the indexer alone. A call
+        sees no position past its kv_lens, so keys written early change no
+        selection."""
+        caches = self.fresh()
+        if self.layer.is_indexer_only:
+            for (keys, _), requests in zip(self.calls, self.requests):
+                caches = self.layer.write(caches, keys, requests)
+        return caches
 
     def step(self, caches):
         outputs = None
@@ -1283,10 +1581,11 @@ def check_dsa(
     scenario: DsaScenario, outputs, caches: tuple[jax.Array, ...]
 ) -> dict[str, float]:
     """The last call's cos_diff on the scenario's rows against the f32
-    attention over the impl's own selection, and the worst row's index score
-    deficit against the f32 indexer's top-k."""
+    attention over the impl's own selection, None for an indexer layer, and
+    the worst row's index score deficit against the f32 indexer's top-k,
+    None for given indices."""
     layer, requests = scenario.layer, scenario.requests[-1]
-    out = layer.attention_out(outputs)
+    out = None if layer.is_indexer_only else layer.attention_out(outputs)
     token_requests = requests.token_requests()
     positions = requests.token_positions()
     reference = jitted_reference_row()
@@ -1306,28 +1605,38 @@ def check_dsa(
                 top_k=scenario.geometry.top_k,
                 sm_scale=scenario.geometry.sm_scale,
             )
-            got.append(np.asarray(out[row].astype(np.float32)))
-            want.append(np.asarray(row_out))
+            if out is not None:
+                got.append(np.asarray(out[row].astype(np.float32)))
+                want.append(np.asarray(row_out))
             deficits.append(float(deficit))
     return {
-        "cos_diff": cos_diff(np.stack(got), np.stack(want)),
-        "index_score_deficit": max(deficits),
+        "cos_diff": (
+            None if out is None else cos_diff(np.stack(got), np.stack(want))
+        ),
+        "index_score_deficit": (
+            None if layer.has_given_indices else max(deficits)
+        ),
         "check_rows": len(deficits),
     }
 
 
 def measure_dsa(scenario: DsaScenario) -> dict[str, object]:
     """Time the scenario, then check one fresh run of it."""
-    timing, _ = time_call(scenario.step, scenario.fresh())
-    outputs, caches = scenario.step(scenario.fresh())
+    timing, _ = time_call(scenario.step, scenario.initial_caches())
+    outputs, caches = scenario.step(scenario.initial_caches())
     checked = check_dsa(scenario, outputs, caches)
-    is_ok = (
-        checked["cos_diff"] <= COS_DIFF_BOUND
-        and checked["index_score_deficit"] <= INDEX_DEFICIT_BOUND
+    layer = scenario.layer
+    is_attention_ok = (
+        layer.is_indexer_only or checked["cos_diff"] <= COS_DIFF_BOUND
     )
+    is_selection_ok = (
+        layer.has_given_indices
+        or checked["index_score_deficit"] <= INDEX_DEFICIT_BOUND
+    )
+    is_ok = is_attention_ok and is_selection_ok
     num_tokens = sum(requests.num_tokens for requests in scenario.requests)
     return {
-        **scenario.layer.info,
+        **layer.info,
         **timing,
         **checked,
         "ms_per_call": timing["median_ms"] / len(scenario.calls),

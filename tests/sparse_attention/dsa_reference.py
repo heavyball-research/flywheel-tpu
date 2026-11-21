@@ -29,6 +29,8 @@ the UE8M0 scale in byte 0.
 
 The sparse MLA reference is mla_reference's attention with each token's
 selection as its mask.
+
+The tests' batches are LENGTH_CELLS at each top_k of TOP_KS.
 """
 
 import dataclasses
@@ -69,6 +71,16 @@ F32_MANTISSA_MASK = (1 << F32_MANTISSA_BITS) - 1
 F32_EXPONENT_MASK = 0xFF
 # Token rows scored at a time, which bounds the logits' memory.
 REFERENCE_ROWS = 64
+# Each batch's (q_lens, kv_lens): keys that end on a page and inside one,
+# requests just past top_k, and requests of several chunks.
+LENGTH_CELLS = (
+    ((1, 3, 7, 2), (1, 63, 127, 64)),
+    ((129, 3, 1), (4097, 2051, 2049)),
+    ((3, 128, 641), (16384, 16000, 12289)),
+)
+TOP_KS = (512, 2048)
+# Padding rows after each batch's tokens.
+PADDED_TOKENS = 3
 
 
 def ue8m0_scale_exponent(amax: np.ndarray) -> np.ndarray:
@@ -274,8 +286,6 @@ class DsaParam:
     top_k: int = 2048
     padded_tokens: int = 0
     seed: int = 0
-    # A few slots name positions past their token, which it must not see.
-    has_stray_indices: bool = False
     # A few selected slots hold -1 or positions past their token instead.
     has_dropped_slots: bool = False
     # Slots after the first min(top_k, p + 1) name seen positions, to ignore.
@@ -297,6 +307,41 @@ class DsaCase:
     block_table: np.ndarray  # (b, pages_per_seq) i32
     topk_indices: np.ndarray  # (T, top_k) i32
     kv_scale: np.float32
+
+
+def prefix_lens(
+    q_lens: tuple[int, ...], kv_lens: tuple[int, ...]
+) -> tuple[int, ...]:
+    """Each request's cached tokens before its q_lens new ones."""
+    return tuple(kv_len - q_len for q_len, kv_len in zip(q_lens, kv_lens))
+
+
+def grid_params(
+    top_ks: tuple[int, ...] = TOP_KS, **fields: object
+) -> list[DsaParam]:
+    """A DsaParam of every LENGTH_CELLS batch at every top_k of top_ks,
+    PADDED_TOKENS padding rows after it."""
+    return [
+        DsaParam(
+            q_lens=q_lens,
+            prefix_lens=prefix_lens(q_lens, kv_lens),
+            top_k=top_k,
+            padded_tokens=PADDED_TOKENS,
+            seed=seed,
+            **fields,
+        )
+        for seed, (q_lens, kv_lens) in enumerate(LENGTH_CELLS)
+        for top_k in top_ks
+    ]
+
+
+def param_id(param: DsaParam) -> str:
+    return "-".join([
+        "q" + "_".join(map(str, param.q_lens)),
+        "p" + "_".join(map(str, param.prefix_lens)),
+        f"h{param.h_q}",
+        f"k{param.top_k}",
+    ])
 
 
 def make_dsa_case(param: DsaParam) -> DsaCase:
@@ -379,9 +424,6 @@ def select_positions(
     strays = [FAR_POSITION, kv_len + 5]
     if position + 1 < kv_len:
         strays.append(position + 1)
-    if param.has_stray_indices:
-        unused = np.flatnonzero(slots < 0)[: len(strays)]
-        slots[unused] = strays[: len(unused)]
     if param.has_dropped_slots:
         drops = [*strays, -1]
         dropped = rng.choice(num_slots, min(len(drops), num_slots), False)

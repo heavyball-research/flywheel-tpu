@@ -104,10 +104,11 @@ def dsa_sparse_mla_kernel(
     num_steps: int,
     sm_scale_log2: float,
     return_lse: bool,
+    writes_padding: bool,
 ) -> None:
     """Attend the chunk's steps that hold request tokens, each over its first
-    slots of gathered rows, then write the zero outputs of its steps of
-    padding.
+    slots of gathered rows, then, if writes_padding, write the zero outputs
+    of its steps of padding.
 
     refs holds the earlier chunks' operands, which only carry their rows
     through and are skipped, then out_hbm, [lse_hbm], the rings of the
@@ -304,13 +305,15 @@ def dsa_sparse_mla_kernel(
         )
     lax.fori_loop(0, num_attended, _attend, 0)
 
-    @pl.when(num_attended < num_steps)
     def _start_padding():
         _write_no_keys(
             out_ring.at[PADDING_SLOT],
             None if lse_ring is None else lse_ring.at[PADDING_SLOT],
         )
         _for_padding_steps(_start)
+
+    if writes_padding:
+        pl.when(num_attended < num_steps)(_start_padding)
 
     # Note (david): a kernel must not exit with DMAs in flight; a chunk of
     # padding alone has not waited for its first step's.
@@ -322,7 +325,8 @@ def dsa_sparse_mla_kernel(
                 _output_copies(last_step, lax.rem(last_step, NUM_STAGES))
             )
         )
-    pl.when(num_attended < num_steps)(lambda: _for_padding_steps(_wait))
+    if writes_padding:
+        pl.when(num_attended < num_steps)(lambda: _for_padding_steps(_wait))
 
 
 def _attend_step(
@@ -721,6 +725,7 @@ def dsa_sparse_mla_pallas(
     num_chunk_tokens: int,
     sm_scale: float,
     return_lse: bool,
+    writes_padding: bool,
 ) -> tuple[jax.Array, ...]:
     """Attend tokens [first_token, first_token + num_chunk_tokens) of the
     call, whose gathered rows nope_rows, rope_rows and flag_rows hold.
@@ -747,6 +752,8 @@ def dsa_sparse_mla_pallas(
       num_chunk_tokens: the chunk's tokens, a multiple of the step's tokens.
       sm_scale: positive scale of q_nope . latent + q_pe . rope.
       return_lse: also return the lse rows.
+      writes_padding: write the chunk's steps of padding; else they keep
+        previous's rows.
 
     Returns:
       (out, [lse]): out (T, H, LATENT_DIM) bf16 and lse (T / G, G, NUM_LANES)
@@ -831,6 +838,7 @@ def dsa_sparse_mla_pallas(
         num_steps=num_chunk_tokens // step_tokens,
         sm_scale_log2=sm_scale * LOG2E,
         return_lse=return_lse,
+        writes_padding=writes_padding,
     )
     return pl.pallas_call(
         kernel,

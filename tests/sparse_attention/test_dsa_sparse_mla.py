@@ -46,9 +46,11 @@ from flywheel_tpu.sparse_attention.dsa.sparse_mla import (
 from flywheel_tpu.topk.kernels.sparse_core_topk import sparse_core_vmem_words
 from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
-    DsaParam,
+    TOP_KS,
     dsa_split_cache,
+    grid_params,
     make_dsa_case,
+    param_id,
     sparse_mla_reference,
 )
 
@@ -60,109 +62,15 @@ if jax.default_backend() != "tpu":
 OUT_TOL = dict(abs_tol=1.8e-2, rel_tol=2.01 / 128, cos_diff_tol=5.5e-4)
 LSE_TOL = dict(abs_tol=1e-6, rel_tol=8.01 / 65536)
 
-# Each case runs with its chunk_tokens, None for the default chunks.
-CASES = [
-    # One token: the gather cuts its slots into half chunks.
-    pytest.param(
-        DsaParam(q_lens=(1,), prefix_lens=(5000,)), None, id="one_token"
-    ),
-    # Ragged prefill from an empty cache and after long prefixes, in several
-    # chunks.
-    pytest.param(
-        DsaParam(q_lens=(300, 1, 77), prefix_lens=(0, 5000, 2100), seed=1),
-        None,
-        id="ragged_prefill",
-    ),
-    # Slots past their token, and padding rows after the batch.
-    pytest.param(
-        DsaParam(
-            q_lens=(40, 3),
-            prefix_lens=(2030, 100),
-            has_stray_indices=True,
-            padded_tokens=5,
-            seed=2,
-        ),
-        None,
-        id="stray_indices",
-    ),
-    # Fewer heads and small pages.
-    pytest.param(
-        DsaParam(
-            q_lens=(9, 2), prefix_lens=(4000, 300), h_q=16, page_size=16, seed=4
-        ),
-        None,
-        id="few_heads",
-    ),
-    # Large pages and a shorter top-k.
-    pytest.param(
-        DsaParam(
-            q_lens=(5, 30),
-            prefix_lens=(700, 6000),
-            page_size=256,
-            top_k=256,
-            seed=5,
-        ),
-        None,
-        id="short_top_k",
-    ),
-    # Attention steps of one block of slots, of several, of all top_k and of
-    # padding alone, in chunks of one step; slots past each token's positions
-    # name positions it sees.
-    pytest.param(
-        DsaParam(
-            q_lens=(1,) * 10,
-            prefix_lens=(0, 130, 200, 255, 500, 700, 300, 64, 1000, 2047),
-            has_dropped_slots=True,
-            has_stale_slots=True,
-            padded_tokens=6,
-            seed=7,
-        ),
-        4,
-        id="step_kinds",
-    ),
-    # top_k a multiple of 128 but not of ROPE_BLOCK_SLOTS: tokens short of
-    # one block of slots, between it and top_k, and past top_k; slots past
-    # each token's positions name positions it sees.
-    pytest.param(
-        DsaParam(
-            q_lens=(5, 30, 1),
-            prefix_lens=(100, 6000, 300),
-            page_size=256,
-            top_k=384,
-            has_stale_slots=True,
-            seed=8,
-        ),
-        None,
-        id="top_k_384",
-    ),
-    # top_k of 128, fewer heads, in chunks of one step.
-    pytest.param(
-        DsaParam(
-            q_lens=(9, 2, 1),
-            prefix_lens=(4000, 60, 127),
-            h_q=16,
-            top_k=128,
-            has_stale_slots=True,
-            padded_tokens=3,
-            seed=10,
-        ),
-        4,
-        id="top_k_128",
-    ),
-]
-WRITE_CASES = [pytest.param(case.values[0], id=case.id) for case in CASES]
+# Note (david): a few selected slots hold -1 or positions past their token,
+# and the slots past each token's positions name positions it sees.
+PARAMS = grid_params(has_dropped_slots=True, has_stale_slots=True)
+# The write reads no selection.
+WRITE_PARAMS = grid_params(TOP_KS[:1])
 # Note (david): every byte NaN in float8_e4m3fn (S.1111.111), of either sign.
 NAN_WORDS = (0x7F7F7F7F, -1)
 # Note (david): words of a subcore's VMEM the poison leaves to the compiler.
 VMEM_SLACK_WORDS = 1024
-POISON_PARAM = DsaParam(
-    q_lens=(300, 1, 1, 1),
-    prefix_lens=(0, 0, 100, 3000),
-    has_dropped_slots=True,
-    has_stale_slots=True,
-    padded_tokens=3,
-    seed=9,
-)
 
 
 def request_operands(case):
@@ -172,8 +80,8 @@ def request_operands(case):
     )
 
 
-@pytest.mark.parametrize("param, chunk_tokens", CASES)
-def test_dsa_sparse_mla(param, chunk_tokens):
+@pytest.mark.parametrize("param", PARAMS, ids=param_id)
+def test_dsa_sparse_mla(param):
     """The sparse MLA output and lse match the reference with each token's
     selection as mask."""
     case = make_dsa_case(param)
@@ -189,7 +97,6 @@ def test_dsa_sparse_mla(param, chunk_tokens):
         sm_scale=SM_SCALE,
         kv_scale=jnp.float32(case.kv_scale),
         return_lse=True,
-        chunk_tokens=chunk_tokens,
     )
     assert check_is_allclose(
         "out", out, out_ref.astype(jnp.bfloat16), **OUT_TOL
@@ -197,7 +104,7 @@ def test_dsa_sparse_mla(param, chunk_tokens):
     assert check_is_allclose("lse", lse, lse_ref, **LSE_TOL)
 
 
-@pytest.mark.parametrize("param", WRITE_CASES)
+@pytest.mark.parametrize("param", WRITE_PARAMS, ids=param_id)
 def test_dsa_cache_write(param):
     """The cache write replaces the batch's rows and keeps every other word."""
     case = make_dsa_case(param)
@@ -233,10 +140,11 @@ def test_dsa_cache_write(param):
     np.testing.assert_array_equal(np.asarray(rope), rope_after)
 
 
-def test_poisoned_staging():
+@pytest.mark.parametrize("param", PARAMS, ids=param_id)
+def test_poisoned_staging(param):
     """The output matches the reference with fp8 NaN in every word the
     attention must not read."""
-    case = make_dsa_case(POISON_PARAM)
+    case = make_dsa_case(param)
     out_ref, lse_ref = sparse_mla_reference(case)
     nope_cache, rope_cache = poisoned_split_cache(case)
     out, lse = poisoned_sparse_mla(

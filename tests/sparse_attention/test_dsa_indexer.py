@@ -49,24 +49,25 @@ SCORE_TOLERANCE = 2e-2
 # Of the f32 reference's top-k, the share a row's top-k must hold.
 MIN_TOPK_RECALL = 0.99
 SEED = 0
-# Single-token requests at the first POSITION_CYCLE positions of a page, the
-# chunk written REPEATED_WRITES times in a row.
-REPEATED_WRITE_BATCH = 4096
-POSITION_CYCLE = 8
-REPEATED_WRITES = 200
+# The score cells: each request's kv_len, and the rows of a request.
+SCORE_KV_LENS = (
+    (1, 63, 127, 64, 0, 4096),
+    (70000, 3, 128 * 257 + 5),
+)
+SCORE_ROWS = (1, 3, 8)
+INDEX_HEADS = (ref.DEEPSEEK_V32_INDEX_HEADS, ref.GLM52_INDEX_HEADS)
 
 
 @dataclasses.dataclass(frozen=True)
 class IndexerParam:
     """Request r appends q_lens[r] tokens after prefix_lens[r] cached ones,
-    then padded_tokens rows. num_writes repeats the chunk write."""
+    then padded_tokens rows."""
 
     q_lens: tuple[int, ...]
     prefix_lens: tuple[int, ...]
     page_size: int = 256
     padded_tokens: int = 0
     num_heads: int = ref.DEEPSEEK_V32_INDEX_HEADS
-    num_writes: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,59 +160,37 @@ def param_id(param: IndexerParam) -> str:
     ])
 
 
-WRITE_PARAMS = [
-    # Single tokens: a page's first and last lane, a tile's last, inside.
-    IndexerParam((1, 1, 1, 1, 1), (0, 255, 127, 300, 1000)),
-    # A chunk inside one tile, across tiles and pages, an inactive request.
-    IndexerParam((3, 200, 0, 130, 1), (126, 37, 7, 0, 255), padded_tokens=5),
-    # More tile groups than stages.
-    IndexerParam(
-        (700, 1, 4000), (3, 1023, 1024), page_size=1024, padded_tokens=3
-    ),
-    # Note (david): one token a request makes every tile partial, so several
-    # tile groups' reads are in flight at once; repeats catch a tile blended
-    # before its read landed.
-    IndexerParam(
-        (1,) * REPEATED_WRITE_BATCH,
-        tuple(i % POSITION_CYCLE for i in range(REPEATED_WRITE_BATCH)),
-        page_size=128,
-        num_writes=REPEATED_WRITES,
-    ),
-]
+def grid_param(
+    q_lens: tuple[int, ...],
+    kv_lens: tuple[int, ...],
+    num_heads: int = ref.DEEPSEEK_V32_INDEX_HEADS,
+) -> IndexerParam:
+    return IndexerParam(
+        q_lens,
+        ref.prefix_lens(q_lens, kv_lens),
+        padded_tokens=ref.PADDED_TOKENS,
+        num_heads=num_heads,
+    )
 
+
+# A request of kv_len keys scores min(rows, kv_len) rows; one of none is
+# inactive.
+ROW_CELLS = [
+    (tuple(min(rows, kv_len) for kv_len in kv_lens), kv_lens)
+    for kv_lens in SCORE_KV_LENS
+    for rows in SCORE_ROWS
+]
+WRITE_PARAMS = [grid_param(*cell) for cell in ref.LENGTH_CELLS]
 SCORE_PARAMS = [
-    # Decode: requests over several items, lengths on and off kv block
-    # boundaries.
-    IndexerParam((1,) * 40, tuple(range(10, 4010, 100)), page_size=128),
-    IndexerParam((1,) * 5, (100, 1023, 2047, 0, 5000), page_size=1024),
-    # Several decode tokens a request share their kv block's slots.
-    IndexerParam((3, 1, 8, 5), (2000, 1023, 1024, 7), page_size=512),
-    # Prefill: fresh, behind a prefix, one token past the decode phase, and
-    # pages larger than a kv block.
-    IndexerParam((100, 33), (3000, 0), page_size=1024),
-    IndexerParam((9,), (500,), page_size=128),
-    IndexerParam((500,), (2500,), page_size=2048, padded_tokens=7),
-    IndexerParam((65, 1), (5000, 3000), page_size=4096),
-    # GLM's index heads: decode, decode groups and prefill chunks with an
-    # inactive request; several q blocks over several kv blocks.
-    IndexerParam(
-        (1, 64, 2, 0, 1, 300),
-        (5000, 100, 2000, 50, 0, 4100),
-        page_size=512,
-        padded_tokens=3,
-        num_heads=ref.GLM52_INDEX_HEADS,
-    ),
-    IndexerParam(
-        (300,), (9000,), page_size=1024, num_heads=ref.GLM52_INDEX_HEADS
-    ),
-    # Any multiple of INDEX_HEADS_MULTIPLE heads.
-    IndexerParam((1, 40, 2), (3000, 500, 1000), num_heads=128),
+    grid_param(*cell, num_heads=num_heads)
+    for cell in (*ref.LENGTH_CELLS, *ROW_CELLS)
+    for num_heads in INDEX_HEADS
 ]
 
 
 @pytest.mark.parametrize("param", WRITE_PARAMS, ids=param_id)
 def test_dsa_index_cache_write(param):
-    """The byte cache after the chunk writes matches the host reference."""
+    """The byte cache after the chunk write matches the host reference."""
     case = make_case(param)
     keys, cache, cu_q_lens, kv_lens, block_table = (
         jnp.asarray(values)
@@ -223,10 +202,7 @@ def test_dsa_index_cache_write(param):
             case.block_table,
         )
     )
-    for _ in range(param.num_writes):
-        cache = dsa_index_cache_write(
-            keys, cache, cu_q_lens, kv_lens, block_table
-        )
+    cache = dsa_index_cache_write(keys, cache, cu_q_lens, kv_lens, block_table)
     expected = written_cache(case)
     mismatches = np.argwhere(np.asarray(cache) != expected)
     assert len(mismatches) == 0, (

@@ -77,9 +77,10 @@
 #     MLA_DECODE_STEPS  decode steps per timed call (default 64); verify
 #                     runs VERIFY_STEPS
 #     DSA_IMPLS       DSA layer impls, e.g. "flywheel_dsa torchtpu_dsa
-#                     torchtpu_dsa_masked_dense" (default: none); the torchtpu
-#                     ones need TORCHTPU_SOURCE, and torchtpu_dsa_masked_dense
-#                     runs glm52 only
+#                     torchtpu_dsa_masked_dense", or indexer impls, e.g.
+#                     "flywheel_dsa_indexer torchtpu_dsa_indexer" (default:
+#                     none); the torchtpu ones need TORCHTPU_SOURCE, and
+#                     torchtpu_dsa_masked_dense runs glm52 only
 #     TORCHTPU_PYTHON interpreter of the torchtpu DSA impls (default: PYTHON)
 #     DSA_GEOMETRIES  default "v32 glm52"
 #     DSA_DECODE_SEQS default "8192 32768 131072"
