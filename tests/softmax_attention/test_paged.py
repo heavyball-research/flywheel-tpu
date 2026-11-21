@@ -29,7 +29,16 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
-from tests.softmax_attention.util import apply_rotary_emb
+from flywheel_tpu.softmax_attention.dispatch import resolve_paged_tiles
+from flywheel_tpu.softmax_attention.inputs import make_variant
+from flywheel_tpu.softmax_attention.kernels import fwd_paged
+from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    paged_uses_mxu_pipeline,
+)
+from tests.softmax_attention.util import (
+    apply_rotary_emb,
+    requires_mxu_accumulators,
+)
 
 INTERPRET = jax.default_backend() != "tpu"
 OUT_TOL = dict(rtol=2e-2, atol=3e-2)
@@ -1227,3 +1236,476 @@ def test_paged_fp8_attention_sinks(dtype, entry, heads, kv_heads, window_left):
     keep = 1 / (1 + np.exp(head_sinks - lse))
     assert np.abs(sink_lse - np.logaddexp(lse, head_sinks)).max() < 1e-2
     assert np.abs(sink_out - out * keep.T[:, :, None]).max() < 2e-2
+
+
+# Note (david): an explicit build runs 1024 rows per kv head group, so one q
+# head per kv head takes 1024-token q blocks; the cases' longest chunk is
+# long enough for dispatch to pick them.
+MXU_FOLDS = [
+    pytest.param(4, 4, id="fold1"),
+    pytest.param(16, 4, id="fold4"),
+    pytest.param(16, 2, id="fold8"),
+]
+# Note (david): 2^-64 flags every live row.
+FORCED_GUARD_THRESHOLD = -64.0
+
+
+@pytest.fixture(name="explicit_builds")
+def fixture_explicit_builds(monkeypatch):
+    """The traits of the paged builds traced on the explicit MXU pipeline
+    while the test runs; caches are cleared around it, so every call traces
+    its kernel."""
+    builds = []
+    mxu_body = fwd_paged.paged_mxu_fwd_body
+
+    def recorded_body(traits, *args, **kwargs):
+        builds.append(traits)
+        return mxu_body(traits, *args, **kwargs)
+
+    monkeypatch.setattr(fwd_paged, "paged_mxu_fwd_body", recorded_body)
+    jax.clear_caches()
+    yield builds
+    jax.clear_caches()
+
+
+def mxu_ragged_case(heads, kv_heads):
+    """A head_dim 256 batch whose 512-token q blocks after the first hold
+    rows of several requests: the end of a 700-token chunk, a 37-token
+    request with no prefix, a 1-token one and the start of a 300-token chunk;
+    the empty request owns no row."""
+    return random_ragged_case(
+        lengths=(700, 0, 37, 1, 300),
+        prefixes=(1300, 512, 0, 255, 2048),
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        capacity=4096,
+        padding=9,
+    )
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "page_size,gqa_fold,max_seqlen_q_bucket,window_size",
+    [
+        (128, 4, 1024, (-1, -1)),
+        (768, 4, 1024, (-1, -1)),
+        (384, 4, 1024, (-1, -1)),
+        (128, 1, 128, (-1, -1)),
+        (256, 2, 16, (-1, -1)),
+        (128, 4, 1024, (127, 0)),
+        (128, 4, 1024, (4095, 0)),
+        (768, 4, 1024, (127, 0)),
+        (256, 2, 16, (127, 0)),
+    ],
+)
+def test_paged_mxu_dispatch(
+    page_size, gqa_fold, max_seqlen_q_bucket, window_size
+):
+    # Note (david): every page size, block and window runs the explicit
+    # loop: a 768-token page gives kv blocks of three MXU tiles, a 384-token
+    # page tile DMAs of half a tile, and short chunks small q blocks.
+    head_dim = 256
+    variant = make_variant(
+        head_dim**-0.5,
+        softcap=0.0,
+        causal=True,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+    )
+    block_sizes = resolve_paged_tiles(
+        max_seqlen_q_bucket=max_seqlen_q_bucket,
+        max_seqlen_k_bucket=8192,
+        page_size=page_size,
+        head_dim=head_dim,
+        rotary_dtype=None,
+        gqa_fold=gqa_fold,
+        variant=variant,
+        kv_dtype=jnp.dtype(jnp.bfloat16),
+    )
+    assert paged_uses_mxu_pipeline(block_sizes=block_sizes, head_dim=head_dim)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "heads,kv_heads,blocks",
+    [
+        (4, 4, (128, 256, 16, 256)),
+        (8, 4, (128, 512, 16, 256)),
+        (16, 4, (128, 768, 32, 256)),
+    ],
+)
+def test_paged_mxu_small_blocks(heads, kv_heads, blocks, explicit_builds):
+    # Note (david): pinned blocks of few fragments a tile run the explicit
+    # loop as they are: a row's tiles in whole slot laps, those past its live
+    # ones hiding every key.
+    case = mxu_ragged_case(heads, kv_heads)
+    expected = ragged_reference(*case, causal=True)
+    actual = run_paged(*case, causal=True, block_sizes=blocks)
+    assert explicit_builds
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "heads,kv_heads,blocks",
+    [(8, 4, (128, 256, 16, 256)), (4, 4, (128, 512, 16, 256))],
+)
+def test_paged_mxu_row_groups(heads, kv_heads, blocks, explicit_builds):
+    # Note (david): runs of requests of one live kv tile share start segments
+    # (row groups), up to a group's capacity, between lone longer rows.
+    case = random_ragged_case(
+        lengths=(64, 37, 1, 100, 64, 0, 64, 30, 600, 64, 50, 9, 64),
+        prefixes=(0, 100, 200, 0, 30, 512, 0, 150, 1000, 0, 0, 240, 20),
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        capacity=4096,
+        padding=9,
+    )
+    expected = ragged_reference(*case, causal=True)
+    actual = run_paged(*case, causal=True, block_sizes=blocks)
+    assert explicit_builds
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@requires_mxu_accumulators
+def test_paged_mxu_overflow_guard_replays_rows(explicit_builds):
+    # Note (david): keys [0, 512) score 0 and keys [512, 1100) score ~200 nats,
+    # so rows past 512 anchor on their first kv tile and overflow on the third;
+    # only their replay keeps them finite.
+    length, kv_heads, heads, head_dim = 1100, 4, 16, 256
+    num_pages, page_size = 16, 128
+    scale = 1 / math.sqrt(head_dim)
+    direction = np.zeros(head_dim)
+    direction[0] = 1.0
+    magnitude = math.sqrt(200.0 / scale)
+    q = np.broadcast_to(magnitude * direction, (length, heads, head_dim))
+    k = np.zeros((length, kv_heads, head_dim))
+    k[512:] = magnitude * direction
+    v = np.where(np.arange(length)[:, None, None] < 512, 1.0, 3.0) * np.ones(
+        (length, kv_heads, head_dim)
+    )
+    pages = np.zeros((num_pages, page_size, kv_heads, head_dim))
+    case = (
+        bf16(q),
+        bf16(pages),
+        bf16(pages),
+        bf16(k),
+        bf16(v),
+        jnp.array([0, length], jnp.int32),
+        jnp.array([0], jnp.int32),
+        jnp.arange(num_pages, dtype=jnp.int32)[None],
+    )
+    expected = ragged_reference(*case, causal=True)
+    actual = run_paged(*case, causal=True)
+    assert explicit_builds
+    assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("causal", [False, True])
+def test_paged_mxu_forced_guard_replay(causal, monkeypatch, explicit_builds):
+    # Note (david): every live row is flagged, so each one is recomputed as it
+    # is completed, before its output is written, while the next row runs.
+    monkeypatch.setattr(
+        fwd_paged,
+        "overflow_guard_threshold",
+        lambda capacity: FORCED_GUARD_THRESHOLD,
+    )
+    case = mxu_ragged_case(16, 4)
+    expected = ragged_reference(*case, causal=causal)
+    actual = run_paged(*case, causal=causal)
+    assert explicit_builds
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+# A chunk after a long prefix: each 512-token q block of the chunk runs six
+# unmasked 1024-key kv blocks, check units 0 to 3 of which are checked at the
+# end of the next unit's first body; the rest replay with the row.
+LONG_ROW_PREFIX = 6144
+LONG_ROW_LENGTH = 1024
+LONG_ROW_UNIT = 1024
+# A spiked key's score in nats against the anchor of its rows, at 0.
+OVERFLOW_SCORE = 200.0
+MXU_TILE_KEYS = 256
+
+
+def long_row_case(heads, kv_heads, spikes, *, rows=None):
+    """random_ragged_case's tuple for one LONG_ROW_LENGTH-token chunk after a
+    LONG_ROW_PREFIX-token prefix whose chunk rows (all when None) point along
+    one direction; every key scores 0 against them but those of each
+    (start, stop, score) of spikes, which score score nats."""
+    head_dim = 256
+    q, kc, vc, k, v, cu, lengths, table = random_ragged_case(
+        lengths=(LONG_ROW_LENGTH,),
+        prefixes=(LONG_ROW_PREFIX,),
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        capacity=8192,
+        padding=0,
+    )
+    scale = 1 / math.sqrt(head_dim)
+    magnitude = math.sqrt(OVERFLOW_SCORE / scale)
+    q, kc, k = (np.array(x, np.float32) for x in (q, kc, k))
+    q[:] = 0.0
+    q[slice(None) if rows is None else rows, :, 0] = magnitude
+    kc[..., 0] = 0.0
+    k[..., 0] = 0.0
+    page_size, table_row = kc.shape[1], np.asarray(table)[0]
+    for start, stop, score in spikes:
+        for position in range(start, stop):
+            value = score / (magnitude * scale)
+            if position < LONG_ROW_PREFIX:
+                page = table_row[position // page_size]
+                kc[page, position % page_size, :, 0] = value
+            else:
+                k[position - LONG_ROW_PREFIX, :, 0] = value
+    return bf16(q), bf16(kc), vc, bf16(k), v, cu, lengths, table
+
+
+def unit_tiles_keys(unit, first_tile, end_tile):
+    """(start, stop) of the keys of tiles [first_tile, end_tile) of check
+    unit unit of a long_row_case row."""
+    return (
+        unit * LONG_ROW_UNIT + first_tile * MXU_TILE_KEYS,
+        unit * LONG_ROW_UNIT + end_tile * MXU_TILE_KEYS,
+    )
+
+
+# The last fragments of a fold-4 512-token q block's tile: its last token chunk
+# of 16 rows for every folded head.
+LAST_FRAGMENT_ROWS = np.concatenate(
+    [np.arange(496, 512), np.arange(1008, 1024)]
+)
+GUARD_CASES = [
+    pytest.param(
+        dict(spikes=[(*unit_tiles_keys(0, 2, 3), OVERFLOW_SCORE)]),
+        id="unit0",
+    ),
+    pytest.param(
+        dict(spikes=[(*unit_tiles_keys(2, 1, 2), OVERFLOW_SCORE)]),
+        id="middle-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[(*unit_tiles_keys(1, 3, 4), OVERFLOW_SCORE)],
+            rows=LAST_FRAGMENT_ROWS,
+        ),
+        id="last-fragments",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*unit_tiles_keys(5, 1, 2), OVERFLOW_SCORE),
+                (LONG_ROW_PREFIX, LONG_ROW_PREFIX + 57, OVERFLOW_SCORE),
+            ]
+        ),
+        id="final-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*unit_tiles_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*unit_tiles_keys(3, 2, 3), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="two-units",
+    ),
+    # Unit 1's replay runs through unit 2's first tiles, whose keys raise the
+    # anchor past the one unit 2's checkpoint was written on; unit 2's last
+    # tile then flags unit 2, which replays from that checkpoint.
+    pytest.param(
+        dict(
+            spikes=[
+                (*unit_tiles_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*unit_tiles_keys(2, 0, 1), 2 * OVERFLOW_SCORE),
+                (*unit_tiles_keys(2, 3, 4), 3 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="anchor-raised-by-replay",
+    ),
+]
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spec", GUARD_CASES)
+def test_paged_mxu_guard_replays_flagged_units(spec, explicit_builds):
+    # Note (david): the spiked keys score ~200 nats against rows that anchor on
+    # their first kv tile at 0, so only a replay keeps those rows finite.
+    case = long_row_case(16, 4, **spec)
+    expected = ragged_reference(*case, causal=True)
+    actual = run_paged(*case, causal=True)
+    assert explicit_builds
+    assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("heads,kv_heads", MXU_FOLDS)
+def test_paged_mxu_guard_replays_a_middle_unit_with_sinks(
+    heads, kv_heads, explicit_builds
+):
+    spikes = [(*unit_tiles_keys(2, 1, 2), OVERFLOW_SCORE)]
+    case = long_row_case(heads, kv_heads, spikes)
+    sinks = jnp.asarray(
+        np.random.default_rng(5).uniform(-2.0, 8.0, heads), jnp.float32
+    )
+    expected = ragged_reference(*case, causal=True, sinks=sinks)
+    actual = run_paged(*case, causal=True, learnable_sink=sinks)
+    assert explicit_builds
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+# Note (david): a 768-token page's own pick is a one-page kv block of three
+# tiles, which the explicit loop does not run; two pages make six.
+PAGE_768_BLOCK_SIZES = (256, 1536, 128, 256)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "heads,kv_heads,page_size,num_block_tiles,block_sizes",
+    [
+        pytest.param(4, 4, 128, 4, None, id="fold1"),
+        pytest.param(16, 4, 128, 4, None, id="fold4"),
+        pytest.param(16, 2, 128, 4, None, id="fold8"),
+        pytest.param(16, 4, 512, 4, None, id="fold4-page512"),
+        pytest.param(32, 1, 128, 2, None, id="fold32"),
+        pytest.param(16, 4, 2048, 8, None, id="fold4-page2048"),
+        pytest.param(16, 4, 768, 6, PAGE_768_BLOCK_SIZES, id="fold4-page768"),
+    ],
+)
+def test_paged_mxu_forced_guard_replays_units(
+    heads,
+    kv_heads,
+    page_size,
+    num_block_tiles,
+    block_sizes,
+    monkeypatch,
+    explicit_builds,
+):
+    # Note (david): every check unit and every row is flagged: each checked
+    # unit replays at the end of the next unit's first body, and each row's
+    # final unit as the row is completed. Check units of four tiles hold
+    # parts of blocks of six or eight.
+    monkeypatch.setattr(
+        fwd_paged,
+        "overflow_guard_threshold",
+        lambda capacity: FORCED_GUARD_THRESHOLD,
+    )
+    case = random_ragged_case(
+        lengths=(1024, 200),
+        prefixes=(5000, 3001),
+        heads=heads,
+        kv_heads=kv_heads,
+        head_dim=256,
+        page_size=page_size,
+        capacity=6144,
+        padding=0,
+    )
+    expected = ragged_reference(*case, causal=True)
+    actual = run_paged(*case, causal=True, block_sizes=block_sizes)
+    assert explicit_builds
+    assert {traits.num_k_compute_tiles for traits in explicit_builds} == {
+        num_block_tiles
+    }
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+# A left window over long_row_case rows: row r of the chunk first sees key
+# LONG_ROW_PREFIX + r - left, where it takes its anchor. A q block's rows take
+# theirs in its first tiles, which its masked check units hold.
+PAGED_WINDOW_GUARD_CASES = [
+    # Rows of q block 0 anchored on its tile 0 meet the spike on tile 1,
+    # where later rows take their anchors: masked unit 0 is flagged.
+    pytest.param(
+        16, 4, 4095, [(2400, 2410, OVERFLOW_SCORE)], None, id="anchor-unit"
+    ),
+    # Unit 1 of q block 0, after every anchor: its first unmasked unit.
+    pytest.param(
+        16, 4, 4095, [(3600, 3610, OVERFLOW_SCORE)], None, id="after-anchors"
+    ),
+    # 1024-token q blocks: the rows past 822 anchor on tile 4, after unit 0,
+    # and enter unit 1's checkpoint unanchored; unit 1 replays from it.
+    pytest.param(
+        4,
+        4,
+        3895,
+        [(2600, 2610, OVERFLOW_SCORE), (3700, 3710, 2 * OVERFLOW_SCORE)],
+        (1024, 1024, 512, 256),
+        id="before-anchors",
+    ),
+]
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "heads,kv_heads,window_left,spikes,block_sizes", PAGED_WINDOW_GUARD_CASES
+)
+def test_paged_mxu_guard_replays_flagged_units_in_a_window(
+    heads, kv_heads, window_left, spikes, block_sizes, explicit_builds
+):
+    case = long_row_case(heads, kv_heads, spikes)
+    expected = ragged_reference(*case, causal=True, window_left=window_left)
+    actual = run_paged(
+        *case,
+        causal=True,
+        window_size=(window_left, 0),
+        block_sizes=block_sizes,
+    )
+    assert explicit_builds
+    assert np.all(np.isfinite(np.asarray(actual[0], np.float32)))
+    assert_extend_matches(actual, expected, case[5], case[6])
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "page_size,block_sizes,num_block_tiles",
+    [
+        pytest.param(128, None, 2, id="block2"),
+        pytest.param(128, (512, 1024, 256, 256), 4, id="block4"),
+        pytest.param(768, PAGE_768_BLOCK_SIZES, 6, id="page768"),
+        pytest.param(2048, (256, 2048, 128, 256), 8, id="page2048"),
+    ],
+)
+def test_paged_mxu_forced_guard_replays_window_units_with_sinks(
+    page_size, block_sizes, num_block_tiles, monkeypatch, explicit_builds
+):
+    # Note (david): every check unit and every row is flagged under a left
+    # window: the replays start before, at and after the rows' anchor tiles.
+    monkeypatch.setattr(
+        fwd_paged,
+        "overflow_guard_threshold",
+        lambda capacity: FORCED_GUARD_THRESHOLD,
+    )
+    heads, window_left = 16, 2500
+    case = random_ragged_case(
+        lengths=(1024, 200),
+        prefixes=(5000, 3001),
+        heads=heads,
+        kv_heads=4,
+        head_dim=256,
+        page_size=page_size,
+        capacity=6144,
+        padding=0,
+    )
+    sinks = jnp.asarray(
+        np.random.default_rng(5).uniform(-2.0, 8.0, heads), jnp.float32
+    )
+    expected = ragged_reference(
+        *case, causal=True, window_left=window_left, sinks=sinks
+    )
+    actual = run_paged(
+        *case,
+        causal=True,
+        window_size=(window_left, 0),
+        learnable_sink=sinks,
+        block_sizes=block_sizes,
+    )
+    assert {traits.num_k_compute_tiles for traits in explicit_builds} == {
+        num_block_tiles
+    }
+    assert_extend_matches(actual, expected, case[5], case[6])

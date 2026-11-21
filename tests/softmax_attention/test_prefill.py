@@ -576,7 +576,7 @@ def kvcache_cases(seqlens):
     "causal,local", [(False, False), (True, False), (False, True)]
 )
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 256])
 # Note (david): every cache layout holds whole 128-token tiles, so the
 # capacities are multiples of 128; cache_seqlens draws unaligned lengths.
 @pytest.mark.parametrize(
