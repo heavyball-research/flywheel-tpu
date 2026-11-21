@@ -69,7 +69,7 @@ def load_qkv_realigned(
     seq_chunks = []
     for idx in range(cfg.seq_tile_size):
         record = metadata_ref.get_record(p_id, idx)
-        # Note: the tile's one aligned DMA landed record idx's tokens
+        # Note (deepolar): the tile's one aligned DMA landed record idx's tokens
         # r_base - window_base rows down; padded records (r_size 0, r_base 0)
         # read row 0, which the caller masks. pltpu.roll only accepts
         # non-negative shifts, so rotate them up by block_rows - offset.

@@ -171,7 +171,7 @@ class GDNConfig:
 
     @property
     def qkv_block_rows(self) -> int:
-        # Note: a tile's records are consecutive batch rows (see
+        # Note (deepolar): a tile's records are consecutive batch rows (see
         # memory_ref.out_window), so the tile fetches them as one DMA, widened
         # to the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
         # early and rounded up to whole tiles. A BATCHED decode tile of 4

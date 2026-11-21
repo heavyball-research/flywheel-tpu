@@ -39,10 +39,10 @@ from flywheel_tpu.linear_attention.gdn import (
 # VMEM, so large-head models (e.g. Qwen3.5-397B: 64 local v-heads, 21M per
 # buffered window even at tile_size 1) do not fit the default budget; windowed
 # kernels get a higher limit and the decode tile is sized against it.
-# Note: at 0.7 of v7x's 64 MiB, a mixed tile of 128 tokens does not compile for
-# 32 KDA or 48 GDN value heads at head_dim 128 (its scratch is 24 and 28 MiB;
-# the compiler's temporaries take the rest). 0.8 fits both; there GDN prefill
-# runs 1.16x faster than with the 64-token tile, KDA up to 1.07x.
+# Note (deepolar): at 0.7 of v7x's 64 MiB, a mixed tile of 128 tokens does not
+# compile for 32 KDA or 48 GDN value heads at head_dim 128 (its scratch is 24
+# and 28 MiB; the compiler's temporaries take the rest). 0.8 fits both; there
+# GDN prefill runs 1.16x faster than with the 64-token tile, KDA up to 1.07x.
 # A higher limit costs more than it gains: XLA treats the limit as taken while
 # the kernel runs, and from 0.9 of VMEM on v7x (0.99 on v6e) it splits the ops
 # around the kernel, adding 5-9 us to a decode call.
@@ -1641,8 +1641,8 @@ def launch_fused_conv1d_gdn(
                 "VMEM for its replay decode tile, over the "
                 f"{vmem_limit / 2**20:.1f} MiB limit"
             )
-        # Note: v7x has half of v6e's VMEM, so the tile shrinks as the
-        # decode tile without replay does: until its scratch plus 1.7 states
+        # Note (deepolar): v7x has half of v6e's VMEM, so the tile shrinks as
+        # the decode tile without replay does: until its scratch plus 1.7 states
         # per sequence fits (v7x, 32 value heads at head_dim 128 with bf16
         # records: 52.7 MiB at tile 3, over the 51.2 MiB limit).
         decode_tile_size = min(
@@ -1662,13 +1662,13 @@ def launch_fused_conv1d_gdn(
             decode_tile_size -= 1
     else:
         decode_tile_size = min(decode_tile_size, num_tokens)
-        # Note: every state ring slot holds each sequence's initial state and
-        # its one checkpoint, so a decode tile's scratch grows by four states
-        # per sequence (v7x, 48 value heads at head_dim 128: 52 MiB at tile 4).
-        # The tile shrinks until its scratch, plus 1.7 states per sequence for
-        # the compiler's temporaries, fits the scoped VMEM limit. On v7x the
-        # temporaries of tiles 3 and 4 measure 1.4-1.65 states per sequence
-        # (KDA 32/32 and 16/16, GDN 16/48 and 16/32, limit bisected).
+        # Note (deepolar): every state ring slot holds each sequence's initial
+        # state and its one checkpoint, so a decode tile's scratch grows by four
+        # states per sequence (v7x, 48 value heads at head_dim 128: 52 MiB at
+        # tile 4). The tile shrinks until its scratch, plus 1.7 states per
+        # sequence for the compiler's temporaries, fits the scoped VMEM limit.
+        # On v7x the temporaries of tiles 3 and 4 measure 1.4-1.65 states per
+        # sequence (KDA 32/32 and 16/16, GDN 16/48 and 16/32, limit bisected).
         # A verify window keeps one checkpoint per position, which the scratch
         # counts; with it, tiles of 2-4 sequences still measure at most 1.65
         # states of temporaries per sequence (v6e and v7x, the same shapes,
