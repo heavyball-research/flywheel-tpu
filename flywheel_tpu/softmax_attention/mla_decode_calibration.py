@@ -300,9 +300,16 @@ def _pareto(
 
 
 # Percent of traffic each scale and shape carries in the default prior. The
-# scale split follows the published traces' medians (short requests dominate);
-# the shape split favors the moderate and heavy-tailed fits the traces report.
-_SCALES = ((256.0, 0.40), (1024.0, 0.45), (4096.0, 0.15))
+# scale split follows the published traces' medians (short requests dominate),
+# doubled from the earlier 256/1024/4096 layout after measurement on TPU v6e.
+# With the v4 constants, five saved batches drawn from the earlier layout put
+# this one 1.50% behind their measured best on average and the earlier one
+# 1.73%; four 64k/128k workloads put it 0.21% behind against 0.90%
+# (results/mla_prior_v4). The draws are mixed: one of five is worse here
+# (2.77% vs 2.08%), so the scales are a deployment assumption, not a fit.
+# The shape split is unchanged and favors the moderate and heavy-tailed
+# fits the traces report.
+_SCALES = ((512.0, 0.40), (2048.0, 0.45), (8192.0, 0.15))
 _SHAPES = (
     ("lognormal_cv0.5", 0.30, lambda mean: (
         _lognormal(1.0, mean, 0.5),
