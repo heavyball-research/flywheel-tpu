@@ -1,4 +1,4 @@
-# Run the pre-commit hooks (pyink, pylint, zizmor) over the whole tree.
+# Run the pre-commit hooks (pyink, pylint, zizmor, license-header) over the whole tree.
 name: lint
 
 on:
