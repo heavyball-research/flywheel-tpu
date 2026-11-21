@@ -17,11 +17,14 @@
 The per-seq schedule cuts each sequence into its own q blocks, one SMEM table
 row each, and synthesizes its masks in-kernel: the sequence bounds plus the
 causal or window edges around each sequence's own bottom-right diagonal.
+
+On a chip with MXU accumulators a head_dim 256 build runs its fragments on
+the explicit MXU pipeline instead (kernels/fwd_varlen_mxu.py).
 """
 
 import dataclasses
 from collections.abc import Sequence
-from functools import partial, reduce
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -30,11 +33,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tpu import NUM_LANES
-from flywheel_tpu.softmax_attention.config import (
-    QKVLayout,
-    hbm_bf16_tile_rows,
-    vmem_limit_bytes,
-)
+from flywheel_tpu.softmax_attention.block_stream import VarlenBlockStream
+from flywheel_tpu.softmax_attention.config import QKVLayout, vmem_limit_bytes
 from flywheel_tpu.softmax_attention.dma import advance, drain
 from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
@@ -54,6 +54,7 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     ScoreMask,
     SoftmaxPass,
     cancel_pending_pv,
+    carried_finish,
     carry_out_pv,
     fill_packed_tail,
     finish_row_lse,
@@ -69,9 +70,7 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     qk,
     rotate_staged,
     stage_bounds,
-    start_kv_block,
     start_q_row,
-    wait_kv_block,
     wait_q_row,
 )
 from flywheel_tpu.softmax_attention.fwd_call import (
@@ -79,6 +78,13 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     check_rotary_operands,
     rotary_fields,
     staged_shape,
+)
+from flywheel_tpu.softmax_attention.fwd_mxu import pivot_kept_rows
+from flywheel_tpu.softmax_attention.kernels.fwd_varlen_mxu import (
+    run_padded_to_blocks,
+    varlen_mxu_fwd_body,
+    varlen_mxu_groups,
+    varlen_mxu_scratch_shapes,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
@@ -120,7 +126,8 @@ def flash_fwd_varlen_kernel(
     )
     # The schedule masks each sequence around its own diagonal, so the loop
     # runs without the Variant's static mask.
-    varlen_fwd_body(
+    body = varlen_mxu_fwd_body if traits.uses_mxu_pipeline else varlen_fwd_body
+    body(
         traits,
         variant.without_mask(),
         schedule,
@@ -254,7 +261,6 @@ def varlen_fwd_body(
 
     num_head_groups = schedule.num_head_groups
     num_rows = schedule.num_rows
-    q_heads_per_kv_head = schedule.q_heads_per_kv_head
     # Note (david): only a left window can mask a row's whole first fragment
     # while later keys stay visible; anchoring on that masked score would push
     # the row's first visible key past the guard into a replay.
@@ -274,49 +280,17 @@ def varlen_fwd_body(
     # against 2330 for the whole copy). Blocks j and j + 1 hold at most two
     # slots, so the slot block j + 2 takes is free for its start anywhere in
     # block j's step.
-    def _block_desc(head, kv, ctx):
-        """The DMA inputs of kv block kv of head's group in the row of ctx."""
-        # Note (david): the heads-outer fold flattens (heads, batch) with
-        # B = heads_outer_batch, so q index n * B + b reads kv index
-        # (n // q_heads_per_kv_head) * B + b; the batch-outer fold flattens
-        # (batch, heads), so consecutive q indices share one kv index.
-        kv_head = head // q_heads_per_kv_head
-        desc = (kv_head, schedule.kv_token(kv, ctx))
-        # Note (david): the descriptors ride the loop carry, which needs strong
-        # int32 scalars.
-        return tuple(jnp.asarray(field, jnp.int32) for field in desc)
-
-    def _select_desc(predicate, desc_true, desc_false):
-        return tuple(
-            jnp.where(predicate, field_true, field_false)
-            for field_true, field_false in zip(desc_true, desc_false)
-        )
-
-    # Note (david): a block whose DMA inputs equal the previous block's holds
-    # the same staged data, so it runs from the previous block's slot; dense GQA
-    # at one kv block per row otherwise re-staged each block once per q head
-    # (v6e, 32:4 d256, 1024 tokens: 63.4 against 60.6 us). Paged blocks start
-    # their DMAs inside the copy and a rotary K is rotated in place, so both
-    # load every block.
-    reuses_blocks = not (rotary_dim and rotary_k)
-
-    def _is_fresh(desc, prev_desc):
-        if reuses_blocks:
-            differs = [
-                field != prev_field
-                for field, prev_field in zip(desc, prev_desc)
-            ]
-            return reduce(jnp.logical_or, differs)
-        else:
-            return jnp.bool_(True)
+    blocks = VarlenBlockStream(
+        traits=traits, schedule=schedule, kv_refs=kv_refs
+    )
+    reuses_blocks = blocks.reuses_blocks
 
     def _start_block_data(desc, slot):
-        kv_head, kv_tok = desc
-        start_kv_block(traits, kv_refs, kv_head, kv_tok, slot)
+        blocks.start(desc, slot)
 
     def _wait_block_data(desc, slot):
         del desc
-        wait_kv_block(traits, kv_refs, slot)
+        blocks.wait(slot)
 
     pending_frag = pending_fragment(traits)
 
@@ -346,13 +320,8 @@ def varlen_fwd_body(
         # (v6e, 512 x 512 paged: 3537 against 2872 bundles).
         parity_smem[0] = lax.rem(row_parity + kv - lo, 2)
 
-        first_next_row_desc, second_ahead_desc = ahead
-        ahead_desc = _select_desc(
-            kv + 2 <= hi,
-            _block_desc(base_head, kv + 2, ctx),
-            _select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc),
-        )
-        is_ahead_fresh = _is_fresh(ahead_desc, next_block_desc).astype(
+        ahead_desc = blocks.ahead_desc(base_head, kv, hi, ctx, ahead)
+        is_ahead_fresh = blocks.is_fresh(ahead_desc, next_block_desc).astype(
             jnp.int32
         )
         ahead_slot = jnp.where(
@@ -734,39 +703,9 @@ def varlen_fwd_body(
             schedule.packed_q_end,
         )
 
-    def _row_after(g, si):
-        """The (group, row) after row si of group g; the grid's last row is its
-        own successor."""
-        is_row_end = si == num_rows - 1
-        is_grid_end = jnp.logical_and(g == num_head_groups - 1, is_row_end)
-        next_g = jnp.where(
-            is_row_end, jnp.minimum(g + 1, num_head_groups - 1), g
-        )
-        next_si = jnp.where(is_grid_end, si, jnp.where(is_row_end, 0, si + 1))
-        return next_g, next_si
-
-    def _first_two_blocks(g, si):
-        """The descriptors of the first two blocks of the flattened order from
-        row si of group g on, and that row's (lo, hi, ctx)."""
-        lo, hi, ctx = schedule.row_interval(si)
-        after_g, after_si = _row_after(g, si)
-        after_lo, _, after_ctx = schedule.row_interval(after_si)
-        first_desc = _block_desc(g * group_heads, lo, ctx)
-        second_desc = _select_desc(
-            lo < hi,
-            _block_desc(g * group_heads, lo + 1, ctx),
-            _block_desc(after_g * group_heads, after_lo, after_ctx),
-        )
-        return first_desc, second_desc, (lo, hi, ctx)
-
     def _carried_finish(row_state):
-        # Note (david): a loop carry drops q_token's pl.multiple_of, and the
-        # output DMA window must start on the hbm_bf16_tile_rows() grid, where
-        # q_token put it.
         row_parity, finish = row_state
-        return row_parity, finish._replace(
-            q_tok=pl.multiple_of(finish.q_tok, hbm_bf16_tile_rows())
-        )
+        return row_parity, carried_finish(finish)
 
     def _row_body(g, si, carry):
         """carry ends with the row's first block's new parity and the previous
@@ -785,9 +724,9 @@ def varlen_fwd_body(
         # Note (david): past the grid's last row the lookahead is that row
         # itself, so the q stream prefetches nothing, and the kv stream reloads
         # blocks the kernel waits out after its loop.
-        next_g, next_si = _row_after(g, si)
-        first_next_desc, second_next_desc, (_, _, next_ctx) = _first_two_blocks(
-            next_g, next_si
+        next_g, next_si = blocks.row_after(g, si)
+        first_next_desc, second_next_desc, (_, _, next_ctx) = (
+            blocks.first_two_blocks(next_g, next_si)
         )
         base_head = g * group_heads
         next_head = next_g * group_heads
@@ -863,9 +802,11 @@ def varlen_fwd_body(
         )
 
     cancel_pending_pv(pending)
-    first_desc, second_desc, _ = _first_two_blocks(jnp.int32(0), jnp.int32(0))
+    first_desc, second_desc, _ = blocks.first_two_blocks(
+        jnp.int32(0), jnp.int32(0)
+    )
     _start_block_data(first_desc, 0)
-    is_second_fresh = _is_fresh(second_desc, first_desc).astype(jnp.int32)
+    is_second_fresh = blocks.is_fresh(second_desc, first_desc).astype(jnp.int32)
     second_slot = is_second_fresh
 
     @pl.when(is_second_fresh > 0)
@@ -1059,7 +1000,11 @@ def varlen_pallas_call(
     rotary_dtype, rotary_operands = check_rotary_operands(
         rotary, traits, q.dtype, q_seq_len, kv_seq_len
     )
-    scratch_shapes = varlen_scratch_shapes(
+    if traits.uses_mxu_pipeline:
+        scratch_shapes_of = varlen_mxu_scratch_shapes
+    else:
+        scratch_shapes_of = varlen_scratch_shapes
+    scratch_shapes = scratch_shapes_of(
         traits,
         q_dtype=q.dtype,
         k_dtype=k.dtype,
@@ -1146,6 +1091,55 @@ def flash_attn_forward_varlen(
     traits = dataclasses.replace(
         traits, **rotary_fields(rotary, rotary_interleaved)
     )
+    run_kernel = partial(
+        run_varlen_kernel,
+        seq_operands=(cu_seqlens_q, cu_seqlens_k, sinks),
+        variant=variant,
+        interpret=interpret,
+    )
+    if traits.uses_mxu_pipeline:
+        return run_padded_to_blocks(
+            run_kernel, q, k, v, rotary, traits, return_lse=variant.return_lse
+        )
+    else:
+        return run_kernel(
+            q, k, v, rotary, varlen_sched=varlen_sched, traits=traits
+        )
+
+
+def check_varlen_sinks(
+    sinks: jax.Array, q: jax.Array, traits: FwdTraits
+) -> None:
+    """Raise unless sinks is (nheads,), one logit per q head."""
+    # Note (deepolar): packed rows carry no batch, so the flat q head is the
+    # sequence head itself.
+    num_seq_heads = (
+        q.shape[0]
+        if traits.token_major is None
+        else traits.token_major.num_q_heads
+    )
+    if sinks.shape != (num_seq_heads,):
+        raise ValueError(
+            f"sinks must be ({num_seq_heads},), one per q head; got"
+            f" {sinks.shape}."
+        )
+
+
+def run_varlen_kernel(
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    rotary: tuple[jax.Array, jax.Array | None] | None,
+    *,
+    seq_operands: tuple[jax.Array, jax.Array, jax.Array | None],
+    varlen_sched: VarlenSchedule,
+    traits: FwdTraits,
+    variant: Variant,
+    interpret: bool,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Build the schedule table of seq_operands, (cu_seqlens_q, cu_seqlens_k,
+    sinks), and run the varlen kernel of traits."""
+    cu_seqlens_q, cu_seqlens_k, sinks = seq_operands
     # Note (david): padding rows past cu_seqlens_q[-1] own no q block and come
     # back out = 0, lse = -inf, so they cost no attention; kv tokens past
     # cu_seqlens_k[-1] are masked wherever a block loads them. Resolving the
@@ -1160,22 +1154,19 @@ def flash_attn_forward_varlen(
         bkv_compute=traits.bkv_compute,
         left=left,
         right=right,
+        max_kept_rows=(
+            pivot_kept_rows(variant.window)
+            if traits.uses_mxu_pipeline
+            else None
+        ),
+        mxu_groups=(
+            varlen_mxu_groups(traits) if traits.uses_mxu_pipeline else None
+        ),
     )
     smem_operands = [table]
     variant.check_sinks_operand(sinks)
     if sinks is not None:
-        # Note (deepolar): packed rows carry no batch, so the flat q head is the
-        # sequence head itself.
-        num_seq_heads = (
-            q.shape[0]
-            if traits.token_major is None
-            else traits.token_major.num_q_heads
-        )
-        if sinks.shape != (num_seq_heads,):
-            raise ValueError(
-                f"sinks must be ({num_seq_heads},), one per q head; got"
-                f" {sinks.shape}."
-            )
+        check_varlen_sinks(sinks, q, traits)
         smem_operands.append(variant.sink_logits(sinks))
 
     return varlen_pallas_call(
