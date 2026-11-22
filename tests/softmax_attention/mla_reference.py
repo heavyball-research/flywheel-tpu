@@ -39,6 +39,7 @@ import random
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from flywheel_tpu.softmax_attention.mla_decode import (
     CACHE_ROW_DIM,
@@ -63,10 +64,27 @@ REFERENCE_ROWS = 256
 # The largest finite fp8 cache value, onto which an fp8 case's kv_scale maps
 # the data's max abs.
 FP8_MAX = float(jnp.finfo(FP8_CACHE_DTYPE).max)
+# A cell with this many cached tokens or query rows (tokens times query heads)
+# holds several GB in the Pallas interpreter.
+HIGH_MEMORY_KV_TOKENS = 1 << 17
+HIGH_MEMORY_QUERY_ROWS = 1 << 17
 
 
 def cdiv(x, y):
     return (x + y - 1) // y
+
+
+def high_memory_marks(
+    kv_tokens: int, query_rows: int
+) -> list[pytest.MarkDecorator]:
+    """[pytest.mark.high_memory] for a cell of kv_tokens cached tokens and
+    query_rows query rows at either high-memory size, else []."""
+    if (
+        kv_tokens >= HIGH_MEMORY_KV_TOKENS
+        or query_rows >= HIGH_MEMORY_QUERY_ROWS
+    ):
+        return [pytest.mark.high_memory]
+    return []
 
 
 @dataclasses.dataclass(frozen=True)

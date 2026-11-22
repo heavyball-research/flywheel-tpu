@@ -40,6 +40,7 @@ from tests.softmax_attention.mla_reference import (
     MlaPrefillParam,
     check_is_allclose,
     draw_kv_lens,
+    high_memory_marks,
     make_prefill_case,
     prefill_reference,
     quantize_case,
@@ -162,15 +163,19 @@ def check_cell(
 
 def grid(params, *, sampled):
     """params under both masks as pytest params; under --subset the sampled
-    params and the full-mask cells keep one in SUBSET_STRIDE."""
+    params and the full-mask cells keep one in SUBSET_STRIDE, and the
+    high-memory cells are marked high_memory."""
     cells = []
     for param in params:
+        query_tokens = sum(param.q_lens)
         for causal in (True, False):
             stride = SUBSET_STRIDE ** (int(sampled(param)) + int(not causal))
+            marks = high_memory_marks(
+                query_tokens + sum(param.prefix_lens),
+                query_tokens * param.h_q,
+            )
             if stride > 1:
-                marks = [pytest.mark.subset_sample(stride)]
-            else:
-                marks = []
+                marks.append(pytest.mark.subset_sample(stride))
             cells.append(
                 pytest.param(
                     param,
@@ -453,7 +458,10 @@ DENSE_DECODE_CELLS = [
             f"{'-zero' if is_corner else ''}-h{h_q}"
             f"-{'fp8' if is_fp8 else 'bf16'}-{'causal' if causal else 'full'}"
         ),
-        marks=[pytest.mark.subset_sample(SUBSET_STRIDE)],
+        marks=[
+            pytest.mark.subset_sample(SUBSET_STRIDE),
+            *high_memory_marks(b * s_k, b * s_q * h_q),
+        ],
     )
     for b, s_q, s_k, is_varlen, is_corner in [
         (b, s_q, s_k, is_varlen, False)
