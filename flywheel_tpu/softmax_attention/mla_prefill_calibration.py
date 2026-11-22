@@ -475,7 +475,7 @@ def _warn_once(chip: str, cache_dtype: str) -> None:
     warnings.warn(
         f"MLA prefill has no calibrated cost constants for {chip}"
         f" / {cache_dtype}; the max_seqlen-based rule picks the config."
-        " See docs/mla_prefill_cost_model.md to measure and add an entry.",
+        " See docs/mla_prefill_block_heuristic.md to measure and add an entry.",
         stacklevel=3,
     )
 
