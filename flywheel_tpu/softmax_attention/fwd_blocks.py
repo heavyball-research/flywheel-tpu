@@ -100,6 +100,8 @@ NUM_O_SLOTS = 3
 # Note (david): the kv stream prefetches two blocks ahead, so its ring holds
 # the running block, the next one and the one in flight.
 NUM_KV_STAGES = 3
+# The tokens a rolled loop step of a staged block's rotation rotates.
+ROTARY_STEP_TOKENS = NUM_LANES
 
 
 class RowFinish(NamedTuple):
@@ -269,6 +271,38 @@ def rotary_copies(
         )
 
 
+def rotate_token_rows(
+    traits: FwdTraits,
+    head_ref: jax.Array,
+    coeff_ref: jax.Array,
+    num_tokens: int,
+) -> None:
+    """Rotate the num_tokens token rows of head_ref, an explicit MXU build's
+    head-dim-minor block, in place by the rows of coeff_ref,
+    ROTARY_STEP_TOKENS a rolled loop step."""
+
+    # Note (david): an explicit MXU build's block, read as one value, takes
+    # more vector registers than a core has, and the compiler spills it at
+    # every site that rotates one.
+    def _rotate(rows):
+        head_ref[rows, :] = rotate_tile(
+            head_ref[rows, :],
+            coeff_ref[rows, :],
+            interleaved=traits.rotary_interleaved,
+            head_dim_minor=True,
+        )
+
+    def _rotate_step(step, carry):
+        start = pl.multiple_of(step * ROTARY_STEP_TOKENS, ROTARY_STEP_TOKENS)
+        _rotate(pl.ds(start, ROTARY_STEP_TOKENS))
+        return carry
+
+    num_steps, num_tail_tokens = divmod(num_tokens, ROTARY_STEP_TOKENS)
+    lax.fori_loop(0, num_steps, _rotate_step, None)
+    if num_tail_tokens:
+        _rotate(pl.ds(num_steps * ROTARY_STEP_TOKENS, num_tail_tokens))
+
+
 def rotate_staged(
     traits: FwdTraits,
     buf: jax.Array,
@@ -283,6 +317,11 @@ def rotate_staged(
             traits, buf.at[slot], g, block, lane_width_qk, traits.qkv_layout
         )
         coeff_group = 0 if traits.rotary_groups == 1 else g
+        if traits.uses_mxu_pipeline:
+            rotate_token_rows(
+                traits, head_ref, coeff_buf.at[slot, coeff_group], block
+            )
+            continue
         staged = head_ref[...]
         head_value = take_half(staged, half, lane_width_qk)
         rotated = rotate_tile(
