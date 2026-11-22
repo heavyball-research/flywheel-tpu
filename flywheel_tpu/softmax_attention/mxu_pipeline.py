@@ -255,6 +255,31 @@ def _load_register(timed: TimedItem) -> int | None:
     return STAGING_REGISTER if timed.starts_tile else None
 
 
+def _v_push_tick(
+    delays: PipelineDelays, tile_tick: int, prev_tile_tick: int
+) -> int:
+    """The tick of the V push of the tile that starts at tile_tick: after the
+    load of the tile before it, which started at prev_tile_tick."""
+    lead_v_tick = tile_tick + delays.pv_issue - delays.v_push_lead
+    return max(lead_v_tick, prev_tile_tick + 1 + delays.pv_issue)
+
+
+def num_carried_v_pushes(delays: PipelineDelays, tile_items: int) -> int:
+    """How many V pushes a segment of tiles of tile_items items each leaves
+    due after it: its last tiles, whose V the next segment still reads."""
+    num_carried = 0
+    while (
+        _v_push_tick(
+            delays,
+            -(num_carried + 1) * tile_items,
+            -(num_carried + 2) * tile_items,
+        )
+        >= 0
+    ):
+        num_carried += 1
+    return num_carried
+
+
 def _segment_pushes(
     delays: PipelineDelays,
     tail: "Tail",
@@ -280,9 +305,8 @@ def _segment_pushes(
         if not timed.starts_tile:
             continue
         lead_k_tick = timed.tick - delays.k_push_lead
-        lead_v_tick = timed.tick + delays.pv_issue - delays.v_push_lead
         k_tick = max(lead_k_tick, prev_tile_tick + 1)
-        v_tick = max(lead_v_tick, prev_tile_tick + 1 + delays.pv_issue)
+        v_tick = _v_push_tick(delays, timed.tick, prev_tile_tick)
         if not (timed.tick == 0 and tail.has_staged_next_k):
             k_plan.setdefault(max(k_tick, 0), []).append(timed)
         push = PendingPush(v_tick, timed.ops, timed.item.tile)

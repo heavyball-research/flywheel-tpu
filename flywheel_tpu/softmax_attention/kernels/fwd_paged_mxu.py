@@ -109,9 +109,11 @@ from flywheel_tpu.softmax_attention.kv_layout import (
 from flywheel_tpu.softmax_attention.mxu_pipeline import (
     FRAGMENT_ROWS,
     MxuPipeline,
+    PipelineDelays,
     PipelineState,
     Tail,
     WorkItem,
+    num_carried_v_pushes,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
@@ -140,6 +142,11 @@ class TileStream(NamedTuple):
     prefetch_tiles: int
     described_tiles: int
 
+    def num_kept_tiles(self, num_started_tiles: int) -> int:
+        """How many tiles right before a segment's first keep their slots
+        while the segment starts num_started_tiles tiles' DMAs."""
+        return self.num_slots - self.prefetch_tiles - num_started_tiles
+
     @property
     def replay_slot(self) -> int:
         return self.num_slots
@@ -155,16 +162,24 @@ class TileStream(NamedTuple):
 
 def tile_stream(group_rows: int) -> TileStream:
     """The tile stream of rows of group_rows rows: room for its longest
-    segment's tiles and the tiles in flight, more than a segment holds since
-    a segment waits for the tile after it before it starts its prefetches."""
-    tiles = row_tiles(group_rows // FRAGMENT_ROWS)
+    segment's tiles, the tiles before them whose V push is still due, and
+    the tiles in flight, more than a segment holds since a segment waits for
+    the tile after it before it starts its prefetches."""
+    fragments_per_tile = group_rows // FRAGMENT_ROWS
+    tiles = row_tiles(fragments_per_tile)
     segment_tiles = max(tiles.start_tiles, tiles.body_tiles, tiles.unit_tiles)
+    # Note (david): a tile's V is read at its V push, which may run in the
+    # segment after the tile's. A DMA start is not ordered after the loads of
+    # its own segment, so that segment's DMAs keep off the tile's slot.
+    unread_tiles = num_carried_v_pushes(PipelineDelays(), fragments_per_tile)
     num_slots = pl.next_power_of_2(
-        segment_tiles + max(MXU_MIN_PREFETCH_TILES, segment_tiles + 1)
+        segment_tiles
+        + unread_tiles
+        + max(MXU_MIN_PREFETCH_TILES, segment_tiles + 1)
     )
     return TileStream(
         num_slots=num_slots,
-        prefetch_tiles=num_slots - segment_tiles,
+        prefetch_tiles=num_slots - segment_tiles - unread_tiles,
         described_tiles=pl.next_power_of_2(segment_tiles),
     )
 
@@ -1034,12 +1049,20 @@ class PagedMxuLoop:
         self,
         ops: PagedFragmentOps,
         items: tuple[WorkItem, ...],
+        tail: Tail,
         num_tiles: int = 1,
         prefetch_item: int | None = None,
     ) -> PrefetchingOps:
-        """ops whose segment of items starts the prefetches of num_tiles
-        tiles at its first tile's item prefetch_item (its middle one when
-        None): a DMA start orders the segment's memory accesses around it."""
+        """ops whose segment of items, run after tail, starts the prefetches
+        of num_tiles tiles at its first tile's item prefetch_item (its middle
+        one when None): a DMA start orders the segment's memory accesses
+        around it."""
+        num_unread_tiles = len(tail.pending_v_pushes)
+        assert num_unread_tiles <= self.stream.num_kept_tiles(num_tiles), (
+            f"a segment that starts {num_tiles} tiles' DMAs overwrites the"
+            f" slot of one of the {num_unread_tiles} tiles whose V push is"
+            f" still due; {self.stream}."
+        )
         first_tile = [item for item in items if item.tile == items[0].tile]
         if prefetch_item is None:
             first = len(first_tile) // 2
@@ -1350,16 +1373,16 @@ class PagedMxuLoop:
             if zeroes_row_start(self.traits.group_bq // FRAGMENT_ROWS):
                 self.o[states[0]] = jnp.zeros(self.o.shape[1:], self.o.dtype)
         items = self.start_items()
+        tail = self.finished_tail(finished, prev_parity)
         state = self.pipeline.advance(
-            PipelineState(
-                probs=probs, tail=self.finished_tail(finished, prev_parity)
-            ),
+            PipelineState(probs=probs, tail=tail),
             items,
             self.with_prefetch(
                 self.slot_ops(
                     slots, tiles, states=states, row_starts=row_starts
                 ),
                 items,
+                tail,
                 num_tiles=num_slots,
                 prefetch_item=MXU_START_PREFETCH_ITEM,
             ),
@@ -1702,7 +1725,7 @@ class PagedMxuLoop:
         state = self.pipeline.advance(
             PipelineState(probs=probs, tail=assumed),
             items,
-            self.with_prefetch(ops, items, num_tiles=body_tiles),
+            self.with_prefetch(ops, items, assumed, num_tiles=body_tiles),
             next_k_tile=self.staged_k(next_tile),
         )
         self.pipeline.check_loop_tail(state.tail, assumed)
@@ -1817,7 +1840,7 @@ class PagedMxuLoop:
             PipelineState(probs=probs, tail=assumed),
             items,
             self.with_prefetch(
-                self.masked_ops(row, (tile,), (tile_number,)), items
+                self.masked_ops(row, (tile,), (tile_number,)), items, assumed
             ),
             next_k_tile=self.staged_k(next_tile),
         )
@@ -1852,7 +1875,9 @@ class PagedMxuLoop:
             state = self.pipeline.advance(
                 PipelineState(probs=probs, tail=assumed),
                 items,
-                self.with_prefetch(_masked(first), items, num_tiles=unit),
+                self.with_prefetch(
+                    _masked(first), items, assumed, num_tiles=unit
+                ),
                 next_k_tile=self.staged_k(next_tile),
             )
             self.pipeline.check_loop_tail(state.tail, assumed)
