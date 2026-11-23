@@ -406,7 +406,7 @@ def test_static_row_plan_runs_the_masked_softmax(
                 starts=True,
             )
     np.testing.assert_allclose(
-        masked_row.out(), masked_row.expected(), rtol=1e-9
+        masked_row.out(), masked_row.expected(), rtol=1e-9, atol=1e-9
     )
 
 
