@@ -39,13 +39,12 @@ from flywheel_tpu.linear_attention.gdn import (
 # VMEM, so large-head models (e.g. Qwen3.5-397B: 64 local v-heads, 21M per
 # buffered window even at tile_size 1) do not fit the default budget; windowed
 # kernels get a higher limit and the decode tile is sized against it.
-# Note (deepolar): at 0.7 of v7x's 64 MiB, a mixed tile of 128 tokens does not
-# compile for 32 KDA or 48 GDN value heads at head_dim 128 (its scratch is 24
-# and 28 MiB; the compiler's temporaries take the rest). 0.8 fits both; there
-# GDN prefill runs 1.16x faster than with the 64-token tile, KDA up to 1.07x.
+# Note (deepolar): at 0.7 of v7x's VMEM, a mixed tile of 128 tokens does not
+# compile for the largest KDA and GDN head counts at head_dim 128; 0.8 fits
+# them.
 # A higher limit costs more than it gains: XLA treats the limit as taken while
-# the kernel runs, and from 0.9 of VMEM on v7x (0.99 on v6e) it splits the ops
-# around the kernel, adding 5-9 us to a decode call.
+# the kernel runs, and near all of VMEM it splits the small ops around the
+# kernel into more ops, which slows every decode call.
 DEFAULT_VMEM_FRACTION = 0.8
 WINDOWED_VMEM_FRACTION = 0.9
 # Note (david): pallas_call operands are the flattened metadata leaves, then
@@ -1615,84 +1614,55 @@ def launch_fused_conv1d_gdn(
             ),
         )
 
+    # Note (deepolar): every state ring slot holds each sequence's initial
+    # state and its one checkpoint, so a decode tile's scratch grows by four
+    # states per sequence, and v7x has half of v6e's VMEM. The tile shrinks
+    # until its scratch, plus 1.7 states per sequence for the compiler's
+    # temporaries, fits the scoped VMEM limit. The kernel updates the state in
+    # f32 whatever its stored dtype, so the temporaries count f32 states.
+    # A verify window keeps one checkpoint per position, which the scratch
+    # counts; its temporaries stay under the same 1.7 states, so a windowed
+    # tile only gets the windowed limit.
+    # Note (david): a replay tile reads a checkpoint's hi plane, and its lo
+    # plane on a flush, and writes at most one checkpoint per sequence whatever
+    # its window; its scratch counts the records.
+    decode_tile_size = min(decode_tile_size, num_tokens)
     if replay_window:
-        # Note (david): a replay tile reads a checkpoint's hi plane, and its
-        # lo plane on a flush, and writes at most one checkpoint per sequence
-        # whatever its window: two f32 checkpoints' bytes per sequence and
-        # ring slot, plus one for the compiler's temporaries. Only the conv
-        # state keeps a checkpoint per window position.
-        decode_tile_size = min(decode_tile_size, num_tokens)
-        state_bytes = n_v * d_k * d_v * F32_BYTES
-        record_bytes = replay_window * (
-            replay_state.shape[-1] * replay_state.dtype.itemsize
-            + replay_gates.shape[-1] * F32_BYTES
-        )
-        conv_ckpt_bytes = (kernel_size - 1) * dim * F32_BYTES
-        ring_bytes_per_seq = config.NUM_BUFFERS * (
-            2 * state_bytes
-            + (num_spec_tokens + 2) * conv_ckpt_bytes
-            + 2 * record_bytes
-        )
-        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        vmem_bytes_per_seq = ring_bytes_per_seq + state_bytes
-        if vmem_bytes_per_seq > vmem_limit:
-            raise ValueError(
-                f"one sequence needs {vmem_bytes_per_seq / 2**20:.1f} MiB of "
-                "VMEM for its replay decode tile, over the "
-                f"{vmem_limit / 2**20:.1f} MiB limit"
-            )
-        # Note (deepolar): v7x has half of v6e's VMEM, so the tile shrinks as
-        # the decode tile without replay does: until its scratch plus 1.7 states
-        # per sequence fits (v7x, 32 value heads at head_dim 128 with bf16
-        # records: 52.7 MiB at tile 3, over the 51.2 MiB limit).
-        decode_tile_size = min(
-            decode_tile_size, vmem_limit // vmem_bytes_per_seq
-        )
-        while decode_tile_size > 1 and (
-            _kernel_config(
-                config.GDNMode.BATCHED,
-                decode_tile_size,
-                recurrent_state_dtype=recurrent_state.dtype,
-                conv_state_dtype=conv_state.dtype,
-                replay_record_dtype=replay_state.dtype,
-            ).scratch_vmem_bytes()
-            + 17 * decode_tile_size * state_bytes // 10
-            > vmem_limit
-        ):
-            decode_tile_size -= 1
+        vmem_fraction = DEFAULT_VMEM_FRACTION
+        record_dtype = replay_state.dtype
     else:
-        decode_tile_size = min(decode_tile_size, num_tokens)
-        # Note (deepolar): every state ring slot holds each sequence's initial
-        # state and its one checkpoint, so a decode tile's scratch grows by four
-        # states per sequence (v7x, 48 value heads at head_dim 128: 52 MiB at
-        # tile 4). The tile shrinks until its scratch, plus 1.7 states per
-        # sequence for the compiler's temporaries, fits the scoped VMEM limit.
-        # On v7x the temporaries of tiles 3 and 4 measure 1.4-1.65 states per
-        # sequence (KDA 32/32 and 16/16, GDN 16/48 and 16/32, limit bisected).
-        # A verify window keeps one checkpoint per position, which the scratch
-        # counts; with it, tiles of 2-4 sequences still measure at most 1.65
-        # states of temporaries per sequence (v6e and v7x, the same shapes,
-        # windows 2-4), so a windowed tile shrinks against the same 1.7 states
-        # and the windowed limit.
         vmem_fraction = (
             WINDOWED_VMEM_FRACTION
             if num_spec_tokens > 0
             else DEFAULT_VMEM_FRACTION
         )
-        vmem_limit = int(vmem_fraction * tpu_info.vmem_capacity_bytes)
-        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
-        while decode_tile_size > 1 and (
+        record_dtype = jnp.float32
+    vmem_limit = int(vmem_fraction * tpu_info.vmem_capacity_bytes)
+    state_bytes = n_v * d_k * d_v * F32_BYTES
+
+    def decode_tile_vmem_bytes(tile_size: int) -> int:
+        return (
             _kernel_config(
                 config.GDNMode.BATCHED,
-                decode_tile_size,
+                tile_size,
                 recurrent_state_dtype=recurrent_state.dtype,
                 conv_state_dtype=conv_state.dtype,
-                replay_record_dtype=jnp.float32,
+                replay_record_dtype=record_dtype,
             ).scratch_vmem_bytes()
-            + 17 * decode_tile_size * state_bytes // 10
-            > vmem_limit
-        ):
-            decode_tile_size -= 1
+            + 17 * tile_size * state_bytes // 10
+        )
+
+    while (
+        decode_tile_size > 1
+        and decode_tile_vmem_bytes(decode_tile_size) > vmem_limit
+    ):
+        decode_tile_size -= 1
+    if decode_tile_vmem_bytes(decode_tile_size) > vmem_limit:
+        raise ValueError(
+            "a decode tile of one sequence needs "
+            f"{decode_tile_vmem_bytes(decode_tile_size) / 2**20:.1f} MiB of "
+            f"VMEM, over the {vmem_limit / 2**20:.1f} MiB limit"
+        )
 
     # Note (david): b and a keep the compact [batch, 1, heads] layout: they are
     # tiny, and their untiled leading token axis keeps ragged DMAs offset-free.
