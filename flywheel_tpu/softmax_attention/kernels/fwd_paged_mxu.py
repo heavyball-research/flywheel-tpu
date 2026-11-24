@@ -271,6 +271,12 @@ def paged_uses_mxu_pipeline(
     )
 
 
+def valid_v_end(ctx: ScheduleRow) -> jax.Array:
+    """The end of the row's keys whose V rows its block's page DMAs load:
+    staged rows past kv_load_end keep stale VMEM, which may hold NaN."""
+    return jnp.minimum(ctx.kv_used_end, ctx.kv_load_end)
+
+
 def explicit_paged_block_kv(block_kv: int, tiles: MxuRowTiles) -> int:
     """block_kv padded to whole loop bodies of MXU tiles of the default
     pipeline, at least a row's start segment, which runs inside one block."""
@@ -683,7 +689,7 @@ class SlotRow(NamedTuple):
     kept_start: jax.Array
     kept_end: jax.Array
     key_start: jax.Array
-    kv_used_end: jax.Array
+    valid_v_end: jax.Array
 
 
 class PagedRow(NamedTuple):
@@ -1531,7 +1537,7 @@ class PagedMxuLoop:
         """The source of the tile row runs as its tile tile_number;
         is_masked zeroes its V rows past the row's valid keys."""
         if is_masked:
-            num_valid_rows = row.ctx.kv_used_end - self.key_start(
+            num_valid_rows = valid_v_end(row.ctx) - self.key_start(
                 row.span, tile_number
             )
         else:
@@ -1672,7 +1678,7 @@ class PagedMxuLoop:
                         short_key,
                         self.key_start(span, first_long_tile + slot),
                     ),
-                    kv_used_end=ctx.kv_used_end,
+                    valid_v_end=valid_v_end(ctx),
                 )
             )
         return tuple(slots)
@@ -1861,7 +1867,7 @@ class PagedMxuLoop:
                         jnp.where(is_short, tile, long_tile),
                     ),
                     kv_head=row.kv_head,
-                    num_valid_rows=slot.kv_used_end - slot.key_start,
+                    num_valid_rows=slot.valid_v_end - slot.key_start,
                 )
             )
         first = self.first_finish(finished, finished.parity)
