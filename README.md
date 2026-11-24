@@ -34,10 +34,10 @@ kernel, on TPU v6e and v7x (DSA on v7x).
   and return JAX arrays.
 - **Serving-ready**: paged bf16 and fp8 KV caches, chunked prefill, prefix
   caching and speculative verify windows.
-- **Adopted**: merged into
+- **Official backend**: an official attention backend of
   [tpu-inference](https://github.com/vllm-project/tpu-inference) (vLLM on
   TPU) and [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu)
-  (SGLang on TPU) as `--attention-backend flywheel`. See
+  (SGLang on TPU), as `--attention-backend flywheel`. See
   [Adoption](#adoption).
 
 ## Core Features
