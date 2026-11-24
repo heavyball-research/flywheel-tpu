@@ -230,16 +230,15 @@ def qkv_copy(
     buf_ref: jax.Ref,
     sem: jax.Ref,
     p_id: int | jax.Array,
-    idx: int,
     metadata_ref: MetadataRef,
+    cfg: config.KDAConfig,
 ):
-    """The DMA that fetches record idx's rows of a native [batch, dim] input,
-    widened to their aligned window."""
-    record = metadata_ref.get_record(p_id, idx)
-    window_base, window_rows = aligned_window(record.r_base, record.r_size)
+    """The one DMA that fetches the tile's rows of a native [batch, dim]
+    input, widened to their aligned window, the output's (out_window)."""
+    window_base, window_rows, _, _ = out_window(p_id, metadata_ref, cfg)
     return pltpu.make_async_copy(
         hbm_ref.at[pl.ds(window_base, window_rows)],
-        buf_ref.at[idx, pl.ds(0, window_rows)],
+        buf_ref.at[0, pl.ds(0, window_rows)],
         sem,
     )
 
@@ -252,14 +251,14 @@ def start_qkv_in(
     metadata_ref: MetadataRef,
     cfg: config.KDAConfig,
 ) -> None:
-    """Fetch each record's rows of a native [batch, dim] input, widened to
-    their aligned window.
+    """Fetch the tile's rows of a native [batch, dim] input, widened to their
+    aligned window.
 
-    A record's first row lands at row r_base % SUBLANE_ALIGN of its block
-    rather than at row 0, and the rows past r_size are not the record's.
+    The tile's records are consecutive rows, so record idx's first row lands
+    at row r_base - window_base of the block, and rows outside the records
+    are not the tile's.
     """
-    for idx in range(cfg.seq_tile_size):
-        qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).start()
+    qkv_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).start()
 
 
 def wait_qkv_in(
@@ -270,14 +269,13 @@ def wait_qkv_in(
     metadata_ref: MetadataRef,
     cfg: config.KDAConfig,
 ) -> None:
-    # Note (david): each copy is waited on with its own descriptor, not one
-    # wait_row_dma sized to the summed rows. These rows are the block's tiled
-    # axis, and where Mosaic tiles the block 16 rows deep (v7x, e.g. a verify
-    # window's 16-row block) the summed self-copy left the semaphore nonzero at
-    # kernel exit and halted the core: three 8-row copies against one 24-row
-    # wait. A copy's own descriptor takes back exactly what it added.
-    for idx in range(cfg.seq_tile_size):
-        qkv_copy(hbm_ref, buf_ref, sem, p_id, idx, metadata_ref).wait()
+    # Note (david): the copy is waited on with its own descriptor, not
+    # wait_row_dma sized to its rows. These rows are the block's tiled axis,
+    # and where Mosaic tiles the block 16 rows deep (v7x, e.g. a verify
+    # window's 16-row block) a self-copy of another size left the semaphore
+    # nonzero at kernel exit and halted the core. A copy's own descriptor
+    # takes back exactly what it added.
+    qkv_copy(hbm_ref, buf_ref, sem, p_id, metadata_ref, cfg).wait()
 
 
 def start_compact_in(

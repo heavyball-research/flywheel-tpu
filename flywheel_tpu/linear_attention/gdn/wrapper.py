@@ -25,7 +25,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tiling import round_up
-from flywheel_tpu.core.tpu import BF16_BYTES, BF16_TILE_ROWS, F32_BYTES
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, F32_BYTES
 from flywheel_tpu.linear_attention.gdn import (
     compute_conv1d,
     compute_gdn,
@@ -39,7 +39,13 @@ from flywheel_tpu.linear_attention.gdn import (
 # VMEM, so large-head models (e.g. Qwen3.5-397B: 64 local v-heads, 21M per
 # buffered window even at tile_size 1) do not fit the default budget; windowed
 # kernels get a higher limit and the decode tile is sized against it.
-DEFAULT_VMEM_FRACTION = 0.7
+# Note (deepolar): at 0.7 of v7x's VMEM, a mixed tile of 128 tokens does not
+# compile for the largest KDA and GDN head counts at head_dim 128; 0.8 fits
+# them.
+# A higher limit costs more than it gains: XLA treats the limit as taken while
+# the kernel runs, and near all of VMEM it splits the small ops around the
+# kernel into more ops, which slows every decode call.
+DEFAULT_VMEM_FRACTION = 0.8
 WINDOWED_VMEM_FRACTION = 0.9
 # Note (david): pallas_call operands are the flattened metadata leaves, then
 # qkv, b, a, conv_state, recurrent_state and the aliased output.
@@ -1564,77 +1570,99 @@ def launch_fused_conv1d_gdn(
     )
     aligned_num_v_heads = round_up(n_v, num_lanes)
 
-    if replay_window:
-        # Note (david): a replay tile reads a checkpoint's hi plane, and its
-        # lo plane on a flush, and writes at most one checkpoint per sequence
-        # whatever its window: two f32 checkpoints' bytes per sequence and
-        # ring slot, plus one for the compiler's temporaries. Only the conv
-        # state keeps a checkpoint per window position.
-        decode_tile_size = min(decode_tile_size, num_tokens)
-        state_bytes = n_v * d_k * d_v * F32_BYTES
-        record_bytes = replay_window * (
-            replay_state.shape[-1] * replay_state.dtype.itemsize
-            + replay_gates.shape[-1] * F32_BYTES
-        )
-        conv_ckpt_bytes = (kernel_size - 1) * dim * F32_BYTES
-        ring_bytes_per_seq = config.NUM_BUFFERS * (
-            2 * state_bytes
-            + (num_spec_tokens + 2) * conv_ckpt_bytes
-            + 2 * record_bytes
-        )
-        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        vmem_bytes_per_seq = ring_bytes_per_seq + state_bytes
-        if decode_tile_size * vmem_bytes_per_seq > vmem_limit:
-            raise ValueError(
-                f"decode_tile_size {decode_tile_size} needs "
-                f"{decode_tile_size * vmem_bytes_per_seq / 2**20:.1f} MiB of "
-                "VMEM for its replay decode tiles, over the "
-                f"{vmem_limit / 2**20:.1f} MiB limit; the largest that fits "
-                f"is {vmem_limit // vmem_bytes_per_seq}"
-            )
-    elif num_spec_tokens > 0:
-        # Note (david): a verify window keeps one state checkpoint per position
-        # and sequence in VMEM, multiplying the per-sequence footprint by the
-        # window size. The tile shrinks so the double-buffered windows fit in
-        # about half the scoped VMEM budget; weights, activation scratch and
-        # compiler temporaries take the rest.
-        verify_window_size = num_spec_tokens + 1
-        recurrent_ckpt_bytes = n_v * d_k * d_v * F32_BYTES
-        conv_ckpt_bytes = (kernel_size - 1) * dim * F32_BYTES
-        activation_bytes = (
-            dim * F32_BYTES
-            + 2 * aligned_num_v_heads * F32_BYTES
-            + n_v * d_v * BF16_BYTES
-        )
-        bytes_per_seq = verify_window_size * (
-            recurrent_ckpt_bytes + conv_ckpt_bytes + activation_bytes
-        )
-        vmem_budget = int(WINDOWED_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        spec_tile_budget = (vmem_budget // 2) // config.NUM_BUFFERS
-        decode_tile_size = max(
-            1,
-            min(
-                decode_tile_size, num_tokens, spec_tile_budget // bytes_per_seq
+    def _kernel_config(
+        mode: config.GDNMode,
+        tile_size: int,
+        *,
+        recurrent_state_dtype: jnp.dtype,
+        conv_state_dtype: jnp.dtype,
+        replay_record_dtype: jnp.dtype,
+    ) -> config.GDNConfig:
+        if mode == config.GDNMode.PER_SEQ:
+            window_size = 1
+            kernel_compute_chunk = compute_chunk_size
+            kernel_replay_window = 0
+        else:
+            window_size = num_spec_tokens + 1
+            # Note (david): a BATCHED tile holds each sequence's whole verify
+            # window, which is one math chunk.
+            kernel_compute_chunk = window_size
+            kernel_replay_window = replay_window
+        return config.GDNConfig(
+            mode=mode,
+            batch_size=batch_size,
+            kernel_size=kernel_size,
+            tile_size=tile_size,
+            compute_chunk_size=kernel_compute_chunk,
+            window_size=window_size,
+            replay_window=kernel_replay_window,
+            split_checkpoint=replay_window > 0,
+            conv_slot_major=conv_slot_major,
+            split_out_heads=split_out_heads,
+            dim_size=dim,
+            num_kq_heads=n_kq,
+            num_v_heads=n_v,
+            kq_head_dim=d_k,
+            v_head_dim=d_v,
+            dtypes=config.Dtypes(
+                act_in=qkv.dtype,
+                act_out=qkv.dtype,
+                compute=compute_precision,
+                recurrent_state=recurrent_state_dtype,
+                conv_state=conv_state_dtype,
+                replay_record=replay_record_dtype,
             ),
         )
+
+    # Note (deepolar): every state ring slot holds each sequence's initial
+    # state and its one checkpoint, so a decode tile's scratch grows by four
+    # states per sequence, and v7x has half of v6e's VMEM. The tile shrinks
+    # until its scratch, plus 1.7 states per sequence for the compiler's
+    # temporaries, fits the scoped VMEM limit. The kernel updates the state in
+    # f32 whatever its stored dtype, so the temporaries count f32 states.
+    # A verify window keeps one checkpoint per position, which the scratch
+    # counts; its temporaries stay under the same 1.7 states, so a windowed
+    # tile only gets the windowed limit.
+    # Note (david): a replay tile reads a checkpoint's hi plane, and its lo
+    # plane on a flush, and writes at most one checkpoint per sequence whatever
+    # its window; its scratch counts the records.
+    decode_tile_size = min(decode_tile_size, num_tokens)
+    if replay_window:
+        vmem_fraction = DEFAULT_VMEM_FRACTION
+        record_dtype = replay_state.dtype
     else:
-        decode_tile_size = min(decode_tile_size, num_tokens)
-        # Note (david): every state ring slot holds each sequence's initial
-        # state and its one checkpoint. Where the rings cannot fit the scoped
-        # VMEM limit (v7x has half of v6e's VMEM: 4 sequences of 48 value heads
-        # at head_dim 128), the tile shrinks until they do, with one more state
-        # per sequence left for the compiler's temporaries.
-        state_bytes = n_v * d_k * d_v * recurrent_state.dtype.itemsize
-        ring_bytes_per_seq = (
-            config.NUM_BUFFERS
-            * 2
-            * (state_bytes + (kernel_size - 1) * dim * F32_BYTES)
+        vmem_fraction = (
+            WINDOWED_VMEM_FRACTION
+            if num_spec_tokens > 0
+            else DEFAULT_VMEM_FRACTION
         )
-        vmem_limit = int(DEFAULT_VMEM_FRACTION * tpu_info.vmem_capacity_bytes)
-        if decode_tile_size * ring_bytes_per_seq > vmem_limit:
-            decode_tile_size = max(
-                1, vmem_limit // (ring_bytes_per_seq + state_bytes)
-            )
+        record_dtype = jnp.float32
+    vmem_limit = int(vmem_fraction * tpu_info.vmem_capacity_bytes)
+    state_bytes = n_v * d_k * d_v * F32_BYTES
+
+    def decode_tile_vmem_bytes(tile_size: int) -> int:
+        return (
+            _kernel_config(
+                config.GDNMode.BATCHED,
+                tile_size,
+                recurrent_state_dtype=recurrent_state.dtype,
+                conv_state_dtype=conv_state.dtype,
+                replay_record_dtype=record_dtype,
+            ).scratch_vmem_bytes()
+            + 17 * tile_size * state_bytes // 10
+        )
+
+    while (
+        decode_tile_size > 1
+        and decode_tile_vmem_bytes(decode_tile_size) > vmem_limit
+    ):
+        decode_tile_size -= 1
+    if decode_tile_vmem_bytes(decode_tile_size) > vmem_limit:
+        raise ValueError(
+            "a decode tile of one sequence needs "
+            f"{decode_tile_vmem_bytes(decode_tile_size) / 2**20:.1f} MiB of "
+            f"VMEM, over the {vmem_limit / 2**20:.1f} MiB limit"
+        )
 
     # Note (david): b and a keep the compact [batch, 1, heads] layout: they are
     # tiny, and their untiled leading token axis keeps ragged DMAs offset-free.
@@ -1668,46 +1696,20 @@ def launch_fused_conv1d_gdn(
     ]:
         if mode == config.GDNMode.PER_SEQ:
             tile_size = mixed_tile_size
-            window_size = 1
-            kernel_compute_chunk = compute_chunk_size
-            kernel_replay_window = 0
         else:
             tile_size = decode_tile_size
-            window_size = num_spec_tokens + 1
-            # Note (david): a BATCHED tile holds each sequence's whole verify
-            # window, which is one math chunk.
-            kernel_compute_chunk = window_size
-            kernel_replay_window = replay_window
-
-        cfg = config.GDNConfig(
-            mode=mode,
-            batch_size=batch_size,
-            kernel_size=kernel_size,
-            tile_size=tile_size,
-            compute_chunk_size=kernel_compute_chunk,
-            window_size=window_size,
-            replay_window=kernel_replay_window,
-            split_checkpoint=replay_window > 0,
-            conv_slot_major=conv_slot_major,
-            split_out_heads=split_out_heads,
-            dim_size=dim,
-            num_kq_heads=n_kq,
-            num_v_heads=n_v,
-            kq_head_dim=d_k,
-            v_head_dim=d_v,
-            dtypes=config.Dtypes(
-                act_in=qkv.dtype,
-                act_out=qkv.dtype,
-                compute=compute_precision,
-                recurrent_state=in_recurrent_state.dtype,
-                conv_state=in_conv_state.dtype,
-                replay_record=(
-                    jnp.float32
-                    if in_replay_state is None
-                    else in_replay_state.dtype
-                ),
+        cfg = _kernel_config(
+            mode,
+            tile_size,
+            recurrent_state_dtype=in_recurrent_state.dtype,
+            conv_state_dtype=in_conv_state.dtype,
+            replay_record_dtype=(
+                jnp.float32
+                if in_replay_state is None
+                else in_replay_state.dtype
             ),
         )
+        window_size = cfg.window_size
 
         # Note (david): the metadata is rebuilt for every layer; the compiler
         # CSEs the copies.

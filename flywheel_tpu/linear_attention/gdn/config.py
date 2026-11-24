@@ -22,7 +22,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tiling import round_up
+from flywheel_tpu.core.tiling import round_up, vmem_buffer_bytes
 from flywheel_tpu.core.tpu import BF16_TILE_ROWS, NUM_SUBLANES
 
 # Note (david): Mosaic requires every DMA offset and size along a tiled
@@ -171,10 +171,12 @@ class GDNConfig:
 
     @property
     def qkv_block_rows(self) -> int:
-        # Note (david): a sequence may start at any token, so its DMA widens to
-        # the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
-        # early and rounded up to whole tiles.
-        widened_rows = self.chunk_size + SUBLANE_ALIGN - 1
+        # Note (deepolar): a tile's records are consecutive batch rows (see
+        # memory_ref.out_window), so the tile fetches them as one DMA, widened
+        # to the enclosing sublane-aligned window: up to SUBLANE_ALIGN - 1 rows
+        # early and rounded up to whole tiles. A BATCHED decode tile of 4
+        # sequences reads 8 or 16 rows instead of 8 per sequence.
+        widened_rows = self.seq_tile_size * self.chunk_size + SUBLANE_ALIGN - 1
         return round_up(widened_rows, SUBLANE_ALIGN)
 
     @property
@@ -309,7 +311,7 @@ class GDNConfig:
 
         return {
             "qkv_buf": pltpu.VMEM(
-                (slots, tile_seqs, self.qkv_block_rows, self.dim_size),
+                (slots, 1, self.qkv_block_rows, self.dim_size),
                 self.dtypes.act_in,
             ),
             "b_buf": pltpu.VMEM(ba_shape, jnp.float32),
@@ -342,3 +344,11 @@ class GDNConfig:
             "carry_recurrent_scratch_ref": carry_recurrent_scratch,
             "sems": pltpu.SemaphoreType.DMA((NUM_STREAMS, slots)),
         }
+
+    def scratch_vmem_bytes(self) -> int:
+        """VMEM bytes of the scratch buffers, padded to Mosaic's tiles."""
+        return sum(
+            vmem_buffer_bytes(ref.shape, ref.dtype)
+            for ref in self.get_scratch_shape_dict().values()
+            if ref is not None and ref.memory_space == pltpu.VMEM
+        )

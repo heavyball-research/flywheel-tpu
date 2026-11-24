@@ -64,16 +64,18 @@ def load_qkv_realigned(
     """Read one compute chunk's raw qkv as [seq, compute_chunk, dim] f32."""
     assert cfg.mode == config.KDAMode.BATCHED
     block_rows = qkv_slot_ref.shape[1]
+    window_base, _, _, _ = memory_ref.out_window(p_id, metadata_ref, cfg)
+    block = qkv_slot_ref[0].astype(jnp.float32)
     seq_chunks = []
     for idx in range(cfg.seq_tile_size):
-        r_base = metadata_ref.get_record(p_id, idx).r_base
-        delta = r_base & (config.SUBLANE_ALIGN - 1)
-        block = qkv_slot_ref[idx].astype(jnp.float32)
-        # Note (david): the aligned DMA landed the tokens delta rows down, and
-        # pltpu.roll only accepts non-negative shifts, so rotate them up by
-        # block_rows - delta.
+        record = metadata_ref.get_record(p_id, idx)
+        # Note (deepolar): the tile's one aligned DMA landed record idx's tokens
+        # r_base - window_base rows down; padded records (r_size 0, r_base 0)
+        # read row 0, which the caller masks. pltpu.roll only accepts
+        # non-negative shifts, so rotate them up by block_rows - offset.
+        offset = jnp.where(record.r_size > 0, record.r_base - window_base, 0)
         seq_chunks.append(
-            pltpu.roll(block, block_rows - delta, 0)[: cfg.compute_chunk_size]
+            pltpu.roll(block, block_rows - offset, 0)[: cfg.compute_chunk_size]
         )
     return jnp.stack(seq_chunks, axis=0)
 

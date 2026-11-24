@@ -379,6 +379,8 @@ def test_fused_recurrent_vllm_decode(
             (2, 160, 2, 4, 64, 1, 0, True, True, 32),
             (2, 1024, 2, 4, 64, 1, 0, True, True, 64),
             (2, 1024, 2, 8, 128, 1, 0, True, False, 64),
+            # 32 value heads at head_dim 128 must fit v7x's VMEM.
+            (2, 1024, 32, 32, 128, 1, 0, True, False, 64),
         ],
     ),
 )
