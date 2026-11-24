@@ -37,7 +37,6 @@ from jax.experimental.pallas import tpu as pltpu
 from flywheel_tpu.core.tiling import round_up, vmem_buffer_bytes
 from flywheel_tpu.core.tpu import (
     F32_BYTES,
-    MXU_COLUMNS,
     NUM_LANES,
     NUM_SUBLANES,
 )
@@ -100,10 +99,10 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     pivot_kept_rows,
 )
 from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+    block_ring,
     paged_mxu_block_sizes,
     paged_mxu_fwd_body,
     paged_uses_mxu_pipeline,
-    tile_stream,
 )
 from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_halves,
@@ -1045,18 +1044,17 @@ def paged_scratch_shapes(
 
     The kernel allocates them all, and estimate_vmem_bytes sums the VMEM
     ones. The Q, out, plane and pending V buffers are bf16, q's dtype
-    (check_paged_inputs). An explicit MXU build stages kv in tile_stream's
-    slots of one tile, has no planes and no bounds rows, and stages a
-    replayed row's Q in one more Q slot."""
+    (check_paged_inputs). An explicit MXU build stages kv in block_ring's
+    slots of one block, plus one for a replay's tile, has no planes and no
+    bounds rows, and stages a replayed row's Q in one more Q slot."""
     bq, bkv = block_sizes.block_q, block_sizes.block_kv
     bkv_compute = block_sizes.block_kv_compute
     num_stages = block_sizes.num_stages
     if uses_mxu_pipeline:
-        num_kv_stages = tile_stream(gqa_fold * bq).num_staging_slots
-        staged_rows = MXU_COLUMNS
+        num_kv_stages = block_ring(gqa_fold * bq, bkv).num_staging_slots
         num_q_slots = num_stages + 1
     else:
-        num_kv_stages, staged_rows = NUM_KV_STAGES, bkv
+        num_kv_stages = NUM_KV_STAGES
         num_q_slots = num_stages
     bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
     vmem = pltpu.VMEM
@@ -1080,7 +1078,7 @@ def paged_scratch_shapes(
     # plane; a word's (kv_word_rows, head_dim) rows pad to nothing, so the
     # staging costs what two dense planes of the cache dtype would.
     word_buffer = vmem(
-        (num_kv_stages, staged_rows, 1, kv_word_rows(kv_dtype), head_dim),
+        (num_kv_stages, bkv, 1, kv_word_rows(kv_dtype), head_dim),
         kv_dtype,
     )
     if uses_mxu_pipeline:
@@ -1125,7 +1123,7 @@ def paged_row_state_buffers(
     max, the row sum pair, the f32 accumulator's NUM_O_SLOTS slots, pending
     probs, pending V tile, and SMEM guard flags, block parity and pending-PV
     fields. An explicit MXU build keeps num_row_states row states, the entry
-    state of NUM_CHECKPOINTS check units, and in SMEM the kv tile stream and
+    state of NUM_CHECKPOINTS check units, and in SMEM the kv block stream and
     the guard flags of a row and of a check unit."""
     group_bq = gqa_fold * block_sizes.block_q
     bf16, f32 = jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)
@@ -1138,7 +1136,10 @@ def paged_row_state_buffers(
             vmem((num_states, group_bq, head_dim), f32),
             vmem((NUM_CHECKPOINTS, group_bq, NUM_LANES), f32),
             vmem((NUM_CHECKPOINTS, group_bq, head_dim), f32),
-            smem((tile_stream(group_bq).num_state_words,), jnp.int32),
+            smem(
+                (block_ring(group_bq, block_sizes.block_kv).num_state_words,),
+                jnp.int32,
+            ),
             smem((PAGED_HEAD_FOLD,), jnp.int32),
             smem((1,), jnp.int32),
         ]
