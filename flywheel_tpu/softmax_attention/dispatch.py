@@ -15,9 +15,11 @@
 
 """Kernel choice for softmax attention: block sizes and tuned configs.
 
-get_kernel builds the dense and packed forward kernels from a tuned config or
-the analytic default_block_sizes, through make_flash_attn_mha, which checks one
-forward build and picks its dense, runtime-offset or varlen kernel.
+get_kernel builds the dense and packed forward kernels from a tuned config, or
+from the analytic default_dense_fwd_config (square dense head-major builds on
+the chips it was measured on) or default_block_sizes, through
+make_flash_attn_mha, which checks one forward build and picks its dense,
+runtime-offset or varlen kernel.
 resolve_paged_block_sizes picks the paged forward kernel's tiles;
 resolve_bwd_config picks the backward's blocks and head fold and
 resolve_kvcache_config the KV-cache decode kernel's config. This
@@ -69,6 +71,7 @@ from flywheel_tpu.softmax_attention.config import (
     pick_tile,
     vmem_limit_bytes,
 )
+from flywheel_tpu.softmax_attention.fwd_blocks import NUM_KV_STAGES, NUM_O_SLOTS
 from flywheel_tpu.softmax_attention.kernels.decode import (
     kvcache_config_vmem_bytes,
     validate_kvcache_config,
@@ -211,6 +214,62 @@ BWD_KV_COMPUTE_BLOCKS = (256, 128, 64, 32, 16, 8)
 # still fit VMEM.
 MAX_SINGLE_BLOCK_HEAD_FOLD = 8
 FULL_FOLD_MAX_BLOCK = 512
+# Note: default_dense_fwd_config was measured on v6e and v7x only, at heads of
+# 64, 128 and 256 from 128 to 131072 tokens with a causal or a full mask. A
+# build on any other device keeps default_block_sizes, unfolded.
+DENSE_FWD_DEVICES = ("TPU v6", "TPU v7")
+# Note: a kv compute tile as wide as the MXU (256 columns on v6e and v7x)
+# leaves less of a causal mask's upper triangle to compute than a 512-key one.
+# On v7x it was the faster tile at every length and mask (8192 tokens, 16:4
+# heads of 128: 704 against 746 us causal, 1316 against 1325 us full; still 1%
+# at 131072 tokens). The wider tile's static schedule saves v7x nothing: it
+# has as many spills and fills (within 3%, causal) in 3.5-3.9 times the spill
+# slots. A 128-key tile unrolls twice the fragments and ran 15% to 6x slower
+# at a 256-row q tile.
+DENSE_FWD_KV_COMPUTE_BLOCKS = (256, 512, 384, 128)
+# Note: heads that keep the 512-key tile, per device. On v6e at heads of 256 it
+# ran faster wherever the mask leaves little to skip (16:4 heads: 1489 against
+# 1533 us at 8192 tokens with a full mask, and 2-4% causal from 16384 tokens
+# up), with both MXUs busy on 75-83% of cycles against 66-74%, and its static
+# schedule has 28% fewer spills and fills at 8192 tokens causal (14% fewer at
+# heads of 128). Under a causal mask the MXU-wide tile skips more of the upper
+# triangle, which is most of a short row: it was the faster one at one block
+# (64 heads of 2048 tokens ran 3.97 against 4.18 us a head, 256 heads of 1024
+# tokens 1.71 against 1.89) and at two (16, 48:16 and 12:4 heads of 4096
+# tokens: 1.4-3.0%), and the two tied within 1% at four.
+WIDE_KV_TILE_HEAD_DIMS = {"TPU v6": (256,)}
+WIDE_KV_TILE_MIN_CAUSAL_BLOCKS = 4
+# Note: at heads of 64 a HEAD_DIM_MINOR call runs XLA copies around the kernel
+# (76 of its 780 us on v7x at 8192 tokens with 16:4 heads, and 252 us around a
+# 209 us kernel for 512 heads of 512 tokens folded by 16), which SEQ_MINOR
+# with the transposed PV does not: its swaps fold into the layout XLA already
+# gives the operands (dense_pallas_call). With 512 x 512 compute tiles it ran
+# 5-6% faster than the default on v7x and 14% on v6e at that shape (738
+# against 780 us and 728 against 850 us causal), and 2-18% faster than the
+# tuned v6e entries, which hold it at 256-row q tiles. Those entries use the
+# layout from 512 tokens up; a smaller block, whose q compute tile is under a
+# lane tile, keeps HEAD_DIM_MINOR.
+SEQ_MINOR_MIN_BLOCK = 512
+SEQ_MINOR_COMPUTE_BLOCK = 512
+# Note: an unfolded one-block head pays a fixed 0.5-0.9 us on top of its
+# matmul work, as much as all of that work at 1024 tokens. v7x counters at 512
+# tokens put 65% of a head's cycles in issuing bundles and 14% in DMA waits.
+# A fold shares that cost (512 heads of 512 tokens, heads of 128: 0.41 against
+# 1.03 us a head on v7x at a fold of 16, 0.47 against 0.98 on v6e), and stopped
+# paying once a group's q x kv area passed one full block's: against the
+# faster unfolded build, 4 heads of 1024 tokens gained 9-15%, and at 2048
+# tokens a fold of 2 lost 7-15%. No fold was measured under 512 tokens or past
+# 16 heads (32 fit v6e only, at a tie).
+MAX_FOLD_GROUP_AREA = FWD_BLOCKS[0] * FWD_BLOCKS[0]
+MIN_FOLDED_BLOCK = 512
+MAX_DENSE_HEAD_FOLD = 16
+# Note: dense_fold_vmem_bytes counts a fold's staging rings and row state, not
+# its score tiles or spilled registers. Of the folds compiled on v6e and v7x,
+# every one it puts under 60% of the limit built and every one over 100%
+# failed. Between them v7x's 16 heads of 512 tokens (heads of 128, 69%) build,
+# while 4 heads of 2048 tokens (69%, a fold MAX_FOLD_GROUP_AREA rules out)
+# fail at a 512-key tile.
+DENSE_FOLD_VMEM_FRACTION = 0.7
 
 default_bwd_block = functools.partial(default_block, candidates=BWD_BLOCKS)
 
@@ -830,6 +889,135 @@ def default_block_sizes(
     )
 
 
+def dense_fold_vmem_bytes(head_fold: int, block: int, head_dim: int) -> int:
+    """VMEM of the staging rings and row state of a one-block dense forward
+    that folds head_fold heads of block tokens.
+
+    Each folded token row holds the Q and out rings (MIN_NUM_STAGES bf16 slots
+    each), the K and V rings (NUM_KV_STAGES bf16 slots each), the f32 o
+    accumulator (NUM_O_SLOTS slots) and the row max and two row sums (one f32
+    lane tile each). A head_dim that does not fill its lane tiles is padded to
+    them. Score tiles, the pending PV and spilled registers are not counted.
+    """
+    lanes = round_up(head_dim, NUM_LANES)
+    bf16_bytes = jnp.dtype(jnp.bfloat16).itemsize
+    f32_bytes = jnp.dtype(jnp.float32).itemsize
+    row_bytes = (
+        (2 * MIN_NUM_STAGES + 2 * NUM_KV_STAGES) * bf16_bytes * lanes
+        + NUM_O_SLOTS * f32_bytes * lanes
+        + 3 * f32_bytes * NUM_LANES
+    )
+    return head_fold * block * row_bytes
+
+
+def default_dense_fwd_config(
+    *,
+    num_heads: int,
+    num_kv_heads: int,
+    seq_len: int,
+    head_dim: int,
+    head_dim_v: int,
+    causal: bool,
+    return_lse: bool,
+    heads_outer_batch: int | None,
+    device_name: str,
+    vmem_limit: int,
+) -> TunedConfig | None:
+    """The analytic config, in CONFIG_FIELDS order, of a square dense
+    head-major forward build that missed the tuned table.
+
+    Returns None where the build keeps default_block_sizes unfolded: on a
+    device the config was not measured on (DENSE_FWD_DEVICES), or with a V
+    head of another width than the Q head, which no measured build had.
+
+    num_heads and num_kv_heads are flat counts, seq_len is the padded q and kv
+    length, device_name is get_device_name()'s and vmem_limit
+    vmem_limit_bytes()'s. The blocks and the q compute tile are
+    default_block_sizes's. On top of them:
+
+    - the kv compute tile is the MXU-wide one (DENSE_FWD_KV_COMPUTE_BLOCKS),
+      or the 512-key one for WIDE_KV_TILE_HEAD_DIMS heads under a full mask
+      or from WIDE_KV_TILE_MIN_CAUSAL_BLOCKS blocks a row, for a folded build
+      and for the SEQ_MINOR layout;
+    - an MHA build of one block of at least MIN_FOLDED_BLOCK tokens folds
+      the most heads, a power of two dividing num_heads, that keep a group's
+      q x kv area within MAX_FOLD_GROUP_AREA and its staging within
+      DENSE_FOLD_VMEM_FRACTION of vmem_limit;
+    - a 64-wide head takes SEQ_MINOR with the transposed PV and 512-row q
+      tiles from SEQ_MINOR_MIN_BLOCK tokens a block, unless it returns lse,
+      which the transposed PV does not.
+    """
+    if device_name not in DENSE_FWD_DEVICES or head_dim_v != head_dim:
+        return None
+    blocks = default_block_sizes(seq_len, seq_len, head_dim=head_dim)
+    # A square axis has one block size.
+    block = blocks.block_q
+    block_q_compute = blocks.block_q_compute
+
+    head_fold = 1
+    # Note: heads_outer_batch runs unfolded only (make_flash_attn_mha), and a
+    # fold needs the whole sequence in one block and one q head per kv head.
+    if (
+        num_heads == num_kv_heads
+        and heads_outer_batch is None
+        and block == seq_len
+        and block >= MIN_FOLDED_BLOCK
+    ):
+        max_head_fold = min(
+            MAX_DENSE_HEAD_FOLD, MAX_FOLD_GROUP_AREA // (block * block)
+        )
+        while (
+            head_fold * 2 <= max_head_fold
+            and num_heads % (head_fold * 2) == 0
+            and dense_fold_vmem_bytes(head_fold * 2, block, head_dim)
+            <= DENSE_FOLD_VMEM_FRACTION * vmem_limit
+        ):
+            head_fold *= 2
+
+    is_seq_minor = (
+        head_dim == PAIRED_HEAD_DIM
+        and not return_lse
+        and block >= SEQ_MINOR_MIN_BLOCK
+    )
+    if (
+        is_seq_minor
+        and block % SEQ_MINOR_COMPUTE_BLOCK == 0
+        and block // SEQ_MINOR_COMPUTE_BLOCK >= MIN_Q_TILES_PER_BLOCK
+    ):
+        block_q_compute = SEQ_MINOR_COMPUTE_BLOCK
+
+    # Note: a folded build keeps the 512-key tile. 16 folded heads of 512
+    # tokens (heads of 128) with a full mask ran 41% slower on v7x and 31% on
+    # v6e at 256 keys, with both MXUs busy on 20% of v7x's cycles against 61%;
+    # with a causal mask the two tiles ran within 3%.
+    takes_wide_kv_tile = (
+        head_fold > 1
+        or is_seq_minor
+        or (
+            head_dim in WIDE_KV_TILE_HEAD_DIMS.get(device_name, ())
+            and (
+                not causal or seq_len >= WIDE_KV_TILE_MIN_CAUSAL_BLOCKS * block
+            )
+        )
+    )
+    if takes_wide_kv_tile:
+        kv_compute_blocks = FWD_KV_COMPUTE_BLOCKS
+    else:
+        kv_compute_blocks = DENSE_FWD_KV_COMPUTE_BLOCKS
+    return (
+        block,
+        block,
+        block_q_compute,
+        pick_tile(kv_compute_blocks, block),
+        MIN_NUM_STAGES,
+        head_fold,
+        (
+            QKVLayout.SEQ_MINOR if is_seq_minor else QKVLayout.HEAD_DIM_MINOR
+        ).name.lower(),
+        is_seq_minor,
+    )
+
+
 def make_flash_attn_mha(
     num_heads: int,
     seqlen_q: int,
@@ -1178,6 +1366,29 @@ def get_kernel(
         )
     else:
         tuned_config = None
+    # Note: a square dense head-major build the table could have served, but
+    # holds no entry for, takes its analytic config the way a tuned one is
+    # taken below. Token-major and varlen builds were not measured for it.
+    if (
+        tuned_config is None
+        and blocks_override is None
+        and variant.matches_tuned_table
+        and not is_rectangular
+        and not is_varlen
+        and not token_major
+    ):
+        tuned_config = default_dense_fwd_config(
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            seq_len=seqlen_q,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            causal=variant.causal,
+            return_lse=variant.return_lse,
+            heads_outer_batch=heads_outer_batch,
+            device_name=get_device_name(),
+            vmem_limit=vmem_limit_bytes(),
+        )
     if tuned_config is not None:
         tuned = dict(zip(CONFIG_FIELDS, tuned_config))
         head_fold = tuned["head_fold"]
@@ -1222,7 +1433,8 @@ def get_kernel(
                 block_q_compute=block_q_compute,
             )
         # Note (david): only varlen has a fold table of its own, so a dense
-        # build that missed the tuned configs runs unfolded. The kernel folds
+        # build that missed the tuned configs and has no analytic config
+        # (default_dense_fwd_config) runs unfolded. The kernel folds
         # varlen only on square physical blocks, which chunked prefill breaks
         # while keeping the padded axes equal. The table was measured head-major
         # but serves token-major too: the fold amortizes per-head step costs the
