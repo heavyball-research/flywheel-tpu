@@ -2324,16 +2324,25 @@ def test_varlen_mxu_guard_replays_a_middle_unit_with_sinks(
 @skip_interpret
 @requires_mxu_accumulators
 @pytest.mark.parametrize(
-    "nheads,nheads_k,block_kv",
+    "nheads,nheads_k,block_q,block_kv,block_q_compute",
     [
-        pytest.param(8, 2, 512, id="fold4-block2"),
-        pytest.param(8, 2, 1024, id="fold4-block4"),
-        pytest.param(8, 2, 2048, id="fold4-block8"),
-        pytest.param(4, 4, 1024, id="fold1-block4"),
+        pytest.param(8, 2, 512, 512, 128, id="fold4-block2"),
+        pytest.param(8, 2, 512, 1024, 128, id="fold4-block4"),
+        pytest.param(8, 2, 512, 2048, 128, id="fold4-block8"),
+        pytest.param(4, 4, 512, 1024, 128, id="fold1-block4"),
+        # A block too short for the default pipeline depth: a shallower
+        # pipeline on a smaller slot ring (fwd_mxu.pipeline_shape).
+        pytest.param(4, 4, 128, 512, 32, id="fold1-q128-block2"),
     ],
 )
 def test_varlen_mxu_forced_guard_replays_units(
-    nheads, nheads_k, block_kv, monkeypatch, explicit_varlen_builds
+    nheads,
+    nheads_k,
+    block_q,
+    block_kv,
+    block_q_compute,
+    monkeypatch,
+    explicit_varlen_builds,
 ):
     # Note (david): every check unit and every row is flagged: each checked
     # unit replays at the end of the next unit's first body, and each row's
@@ -2359,7 +2368,7 @@ def test_varlen_mxu_forced_guard_replays_units(
         max(seqlens_k),
         causal=True,
         return_softmax_lse=True,
-        block_sizes=(512, block_kv, 128, 128),
+        block_sizes=(block_q, block_kv, block_q_compute, 128),
     )
     assert {
         traits.num_k_compute_tiles for traits in explicit_varlen_builds

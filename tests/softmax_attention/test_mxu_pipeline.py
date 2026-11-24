@@ -41,6 +41,7 @@ from flywheel_tpu.softmax_attention.mxu_pipeline import (
     NUM_SLOTS,
     MxuPipeline,
     PipelineDelays,
+    PipelineShape,
     PipelineState,
     WorkItem,
 )
@@ -123,11 +124,11 @@ def mxus_fixture(monkeypatch):
     return model
 
 
-def make_pipeline(delays=PipelineDelays()):
+def make_pipeline(shape=PipelineShape()):
     return MxuPipeline(
-        delays=delays,
-        qk_slots=tuple(Slot(0, index) for index in range(NUM_SLOTS)),
-        pv_slots=tuple(Slot(1, index) for index in range(NUM_SLOTS)),
+        delays=shape.delays,
+        qk_slots=tuple(Slot(0, index) for index in range(shape.num_slots)),
+        pv_slots=tuple(Slot(1, index) for index in range(shape.num_slots)),
     )
 
 
@@ -503,6 +504,79 @@ def test_lap_of_short_tiles(mxus, num_fragments):
     pipeline.drain(state)
     check(attention, mxus, lambda fragment: range(num_tiles))
     assert mxus.num_pushes == [num_tiles, num_tiles]
+
+
+def tiles_items(num_fragments, first_tile, num_tiles):
+    return sum(
+        (
+            tile_items(num_fragments, tile)
+            for tile in range(first_tile, first_tile + num_tiles)
+        ),
+        (),
+    )
+
+
+@pytest.mark.parametrize(
+    "num_fragments,block_tiles",
+    [(4, 2), (4, 4), (4, 6), (8, 2), (16, 2), (24, 2)],
+)
+def test_block_pipeline_runs_rows_inside_one_block(
+    mxus, num_fragments, block_tiles
+):
+    """A kv block too short for the default depth takes a shallower
+    pipeline on a smaller ring (fwd_mxu.pipeline_shape): its start segment
+    fits in the block, its loop bodies tile the block and follow their own
+    tail, a replay finds its slots free, and every pop meets its issue."""
+    shape = fwd_mxu.pipeline_shape(num_fragments, block_tiles)
+    assert shape != PipelineShape()
+    tiles = fwd_mxu.row_tiles(num_fragments, shape)
+    assert tiles.start_tiles <= block_tiles
+    assert block_tiles % tiles.body_tiles == 0
+    num_bodies = 3
+    num_tiles = tiles.start_tiles + num_bodies * tiles.body_tiles
+    attention = Attention(num_fragments, num_tiles)
+    pipeline = make_pipeline(shape)
+    body_items = tiles_items(num_fragments, 0, tiles.body_tiles)
+    state = pipeline.advance(
+        pipeline.idle_state(),
+        tiles_items(num_fragments, 0, tiles.start_tiles),
+        attention.ops(),
+        next_k_tile=lambda: attention.ops().k_tile(tiles.start_tiles),
+    )
+    for first in range(tiles.start_tiles, num_tiles, tiles.body_tiles):
+        in_flight = set(mxus.results)
+        for slot in pipeline.free_slots(
+            state.tail, fwd_mxu.REPLAY_RESULT_SLOTS
+        ):
+            assert slot not in in_flight
+        assumed = pipeline.tail_of(
+            body_items,
+            attention.ops(first - tiles.body_tiles),
+            has_staged_next_k=True,
+        )
+        pipeline.check_loop_tail(state.tail, assumed)
+        next_first = first + tiles.body_tiles
+        state = pipeline.advance(
+            PipelineState(probs=state.probs, tail=assumed),
+            body_items,
+            attention.ops(first),
+            next_k_tile=None
+            if next_first == num_tiles
+            else (lambda t=next_first: attention.ops(t).k_tile(0)),
+        )
+    pipeline.drain(state)
+    check(attention, mxus, lambda fragment: range(num_tiles))
+
+
+@pytest.mark.parametrize(
+    "num_fragments,block_tiles", [(4, 16), (8, 8), (16, 4), (32, 2), (64, 2)]
+)
+def test_block_of_default_depth_keeps_default_pipeline(
+    num_fragments, block_tiles
+):
+    assert fwd_mxu.pipeline_shape(num_fragments, block_tiles) == (
+        PipelineShape()
+    )
 
 
 def test_fewer_items_than_a_lap(mxus):

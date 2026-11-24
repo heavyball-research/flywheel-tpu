@@ -69,6 +69,7 @@ from flywheel_tpu.softmax_attention.mxu_pipeline import (
     STAGING_REGISTER,
     FragmentOps,
     PipelineDelays,
+    PipelineShape,
     WorkItem,
 )
 from flywheel_tpu.softmax_attention.schedule import (
@@ -109,10 +110,15 @@ REPLAY_STAGING_REGISTER = 1 - STAGING_REGISTER
 REPLAY_RESULT_SLOTS = 2
 # The checkpoints of a unit and the unit after it.
 NUM_CHECKPOINTS = 2
+# The shallowest pipeline: a QK latency, a carried fragment and a PV latency
+# of one tick each.
+MIN_PV_POP = 3
 # A check unit: a first body, whose end checks the unit before, and a last
 # body. Its first body may be a row's start segment.
 UNIT_TILES = 2 * LOOP_BODY_TILES
 assert ROW_START_TILES == LOOP_BODY_TILES
+# The smaller slot rings pipeline_shape tries are the powers of two below it.
+assert NUM_SLOTS & (NUM_SLOTS - 1) == 0, NUM_SLOTS
 # A row's final unit holds its last FINAL_UNIT_SPAN whole check units and the
 # tiles after them.
 FINAL_UNIT_SPAN = 2
@@ -460,27 +466,83 @@ def mxu_block_sizes(block_sizes: BlockSizes) -> BlockSizes:
     )
 
 
-def row_tiles(fragments_per_tile: int) -> MxuRowTiles:
-    """How a loop groups the kv tiles of a row of fragments_per_tile
-    fragments a tile (schedule.mxu_row_tiles)."""
-    delays = PipelineDelays()
+def row_tiles(
+    fragments_per_tile: int, shape: PipelineShape = PipelineShape()
+) -> MxuRowTiles:
+    """How a loop on a pipeline of shape groups the kv tiles of a row of
+    fragments_per_tile fragments a tile (schedule.mxu_row_tiles)."""
     return mxu_row_tiles(
         fragments_per_tile,
-        num_slots=NUM_SLOTS,
-        qk_pop=delays.qk_pop,
-        pv_pop=delays.pv_pop,
+        num_slots=shape.num_slots,
+        qk_pop=shape.delays.qk_pop,
+        pv_pop=shape.delays.pv_pop,
         min_start_tiles=ROW_START_TILES,
         min_body_tiles=LOOP_BODY_TILES,
     )
 
 
-def group_capacity(fragments_per_tile: int) -> int:
+def _scaled_delays(pv_pop: int) -> PipelineDelays:
+    """The default delays scaled down to pv_pop: carried fragments in the
+    default ratio, at least one, equal QK and PV latencies around them, and
+    the default push leads, V's at most pv_issue."""
+    default = PipelineDelays()
+    num_carried = max(pv_pop * default.num_carried_probs // default.pv_pop, 1)
+    qk_pop = (pv_pop - num_carried) // 2
+    pv_issue = qk_pop + num_carried
+    return PipelineDelays(
+        qk_pop=qk_pop,
+        pv_issue=pv_issue,
+        pv_pop=pv_pop,
+        k_push_lead=default.k_push_lead,
+        v_push_lead=min(default.v_push_lead, pv_issue),
+    )
+
+
+def _fits_block(
+    shape: PipelineShape, fragments_per_tile: int, block_tiles: int
+) -> bool:
+    """Whether shape's ring holds every result plus a replay's, its start
+    segment fits in a block of block_tiles tiles and its bodies tile it."""
+    tiles = row_tiles(fragments_per_tile, shape)
+    return (
+        shape.has_enough_slots
+        and shape.delays.qk_pop + REPLAY_RESULT_SLOTS <= shape.num_slots
+        and tiles.start_tiles <= block_tiles
+        and block_tiles % tiles.body_tiles == 0
+    )
+
+
+@functools.cache
+def pipeline_shape(fragments_per_tile: int, block_tiles: int) -> PipelineShape:
+    """The pipeline of rows of fragments_per_tile fragments a tile whose
+    start segment runs inside one kv block of block_tiles tiles. A block of
+    at least default pv_pop items takes the default pipeline, and the caller
+    pads it to whole default bodies. A smaller block takes the deepest
+    shallower pipeline that fits it, on the smallest ring that holds it."""
+    default = PipelineShape()
+    if block_tiles * fragments_per_tile >= default.delays.pv_pop:
+        return default
+    ring_sizes = [1 << power for power in range(NUM_SLOTS.bit_length())]
+    for pv_pop in range(block_tiles * fragments_per_tile, MIN_PV_POP - 1, -1):
+        for num_slots in ring_sizes:
+            shape = PipelineShape(_scaled_delays(pv_pop), num_slots)
+            if _fits_block(shape, fragments_per_tile, block_tiles):
+                return shape
+    raise ValueError(
+        f"no explicit MXU pipeline runs {fragments_per_tile} fragments a tile"
+        f" in kv blocks of {block_tiles} tiles."
+    )
+
+
+def group_capacity(
+    fragments_per_tile: int, shape: PipelineShape = PipelineShape()
+) -> int:
     """The most rows of a row group: one per tile of a start segment, or one
     when their row states would hold more than MAX_GROUP_STATE_ROWS rows."""
-    num_slots = row_tiles(fragments_per_tile).start_tiles
-    if num_slots * fragments_per_tile * FRAGMENT_ROWS > MAX_GROUP_STATE_ROWS:
+    start_tiles = row_tiles(fragments_per_tile, shape).start_tiles
+    if start_tiles * fragments_per_tile * FRAGMENT_ROWS > MAX_GROUP_STATE_ROWS:
         return 1
-    return num_slots
+    return start_tiles
 
 
 def mxu_row_layout(fragments_per_tile: int) -> tuple[MxuRowTiles, int]:
@@ -510,11 +572,13 @@ def for_each_later_row(
         lax.fori_loop(1, num_rows, _row, None)
 
 
-def zeroes_row_start(fragments_per_tile: int) -> bool:
+def zeroes_row_start(
+    fragments_per_tile: int, shape: PipelineShape = PipelineShape()
+) -> bool:
     """Whether a row starts its accumulator at zero: a tile of fewer items
     than pv_pop leaves first-tile items in flight past the start segment,
     where a loop body finishes them as later ones."""
-    return fragments_per_tile < PipelineDelays().pv_pop
+    return fragments_per_tile < shape.delays.pv_pop
 
 
 def aligned_rows(row: jax.Array | int) -> jax.Array | int:

@@ -23,7 +23,7 @@ Tick t issues the QK of item t and runs one later stage of three older items:
     PV pop and accumulate of item t - pv_pop
     QK pop and softmax of item t - qk_pop
 
-Item t takes result slot t mod NUM_SLOTS of each MXU. A loop emits its items
+Item t takes result slot t mod num_slots of each MXU. A loop emits its items
 in segments, one straight-line run of ticks each; the items still in flight
 at a segment's end are its tail. Nothing here knows attention: a FragmentOps
 object reads the operands and folds the results.
@@ -41,8 +41,8 @@ from flywheel_tpu.core.tpu import BF16_TILE_ROWS
 
 # The q rows of one work item: one bf16 tile, the least an MXU op streams.
 FRAGMENT_ROWS = BF16_TILE_ROWS
-# The result slots of each MXU's ring. A slot number is static, so a rolled
-# loop body holds whole laps of NUM_SLOTS items.
+# The result slots of each MXU's default ring. A slot number is static, so a
+# rolled loop body holds whole laps of a ring's items.
 NUM_SLOTS = 32
 QK_MXU = 0
 PV_MXU = 1
@@ -76,6 +76,22 @@ class PipelineDelays:
         """The ticks back within which an earlier tile delays a push: its
         first item's load frees the register."""
         return max(self.k_push_lead, self.pv_issue) + 1
+
+
+@dataclasses.dataclass(frozen=True)
+class PipelineShape:
+    """A pipeline's tick delays and the result slots of each MXU's ring."""
+
+    delays: PipelineDelays = PipelineDelays()
+    num_slots: int = NUM_SLOTS
+
+    @property
+    def has_enough_slots(self) -> bool:
+        """Whether a slot holds each result from its issue to its pop."""
+        delays = self.delays
+        return (
+            max(delays.qk_pop, delays.pv_pop - delays.pv_issue) < self.num_slots
+        )
 
 
 class WorkItem(NamedTuple):
@@ -338,14 +354,16 @@ def _empty_tail(delays: PipelineDelays, slot_base: int = 0) -> Tail:
 
 def _advanced_tail(
     delays: PipelineDelays,
+    num_slots: int,
     tail: Tail,
     items: tuple[WorkItem, ...],
     ops: FragmentOps,
     *,
     has_next_k: bool,
 ) -> Tail:
-    """The tail a segment of items, finished by ops, leaves after tail."""
-    segment = _segment_items(tail, items, ops)
+    """The tail a segment of items, finished by ops, leaves after tail on a
+    ring of num_slots."""
+    segment = _segment_items(num_slots, tail, items, ops)
     _, _, pending, next_k_tick = _segment_pushes(
         delays, tail, segment, len(items), has_next_k
     )
@@ -358,7 +376,7 @@ def _advanced_tail(
         items=all_items[first_kept:],
         item_ops=all_ops[first_kept:],
         starts_tile=all_starts[first_kept:],
-        slot_base=(tail.slot_base + first_kept) % NUM_SLOTS,
+        slot_base=(tail.slot_base + first_kept) % num_slots,
         ticks_since_tile=min(len(items) - last_tile_tick, delays.push_horizon),
         pending_v_pushes=pending,
         has_staged_next_k=next_k_tick is not None,
@@ -366,16 +384,16 @@ def _advanced_tail(
 
 
 def _segment_items(
-    tail: Tail, items: tuple[WorkItem, ...], ops: FragmentOps
+    num_slots: int, tail: Tail, items: tuple[WorkItem, ...], ops: FragmentOps
 ) -> tuple[TimedItem, ...]:
     """items on the timeline after tail, from tick 0 on."""
-    first_slot = tail.end_slot(NUM_SLOTS)
+    first_slot = tail.end_slot(num_slots)
     return tuple(
         TimedItem(
             tick=position,
             item=item,
             ops=ops,
-            slot=(first_slot + position) % NUM_SLOTS,
+            slot=(first_slot + position) % num_slots,
             starts_tile=starts,
         )
         for position, (item, starts) in enumerate(
@@ -384,7 +402,7 @@ def _segment_items(
     )
 
 
-def _tail_items(tail: Tail) -> tuple[TimedItem, ...]:
+def _tail_items(num_slots: int, tail: Tail) -> tuple[TimedItem, ...]:
     """tail's items on the timeline, at the ticks before 0."""
     first_tick = -len(tail.items)
     return tuple(
@@ -392,7 +410,7 @@ def _tail_items(tail: Tail) -> tuple[TimedItem, ...]:
             tick=first_tick + position,
             item=item,
             ops=ops,
-            slot=(tail.slot_base + position) % NUM_SLOTS,
+            slot=(tail.slot_base + position) % num_slots,
             starts_tile=starts,
         )
         for position, (item, ops, starts) in enumerate(
@@ -403,9 +421,9 @@ def _tail_items(tail: Tail) -> tuple[TimedItem, ...]:
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class MxuPipeline:
-    """A ring of NUM_SLOTS result slots of each of the chip's first two MXUs
-    and the tick schedule over them. Build one per kernel with allocate(),
-    inside the kernel body."""
+    """A ring of result slots of each of the chip's first two MXUs and the
+    tick schedule over them. Build one per kernel with allocate(), inside
+    the kernel body."""
 
     delays: PipelineDelays
     qk_slots: tuple[jax.Array, ...]
@@ -413,40 +431,38 @@ class MxuPipeline:
     has_mode_free_accumulate: bool = False
 
     def __post_init__(self) -> None:
-        assert len(self.qk_slots) == len(self.pv_slots) == NUM_SLOTS
-        delays = self.delays
-        # A slot must hold a result from its issue to its pop.
-        assert max(delays.qk_pop, delays.pv_pop - delays.pv_issue) < NUM_SLOTS
+        assert len(self.qk_slots) == len(self.pv_slots)
+        assert PipelineShape(self.delays, self.num_slots).has_enough_slots
 
     @property
     def num_slots(self) -> int:
-        return NUM_SLOTS
+        return len(self.qk_slots)
 
     @classmethod
     def allocate(
         cls,
-        delays: PipelineDelays = PipelineDelays(),
+        shape: PipelineShape = PipelineShape(),
         *,
         has_mode_free_accumulate: bool = False,
     ) -> "MxuPipeline":
-        """A pipeline over fresh result slots. has_mode_free_accumulate
-        (Tail.signature) is for loops whose rows start their accumulators at
-        zero."""
+        """A pipeline of shape over fresh result slots.
+        has_mode_free_accumulate (Tail.signature) is for loops whose rows
+        start their accumulators at zero."""
         tpu_info = pltpu.get_tpu_info()
         assert tpu_info.num_accumulators, tpu_info.chip_version
         slot_type = jax.ShapeDtypeStruct(
             (FRAGMENT_ROWS, tpu_info.mxu_column_size), jnp.float32
         )
         return cls(
-            delays=delays,
+            delays=shape.delays,
             has_mode_free_accumulate=has_mode_free_accumulate,
             qk_slots=tuple(
                 jax.empty_ref(slot_type, memory_space=pltpu.ACC(QK_MXU))
-                for _ in range(NUM_SLOTS)
+                for _ in range(shape.num_slots)
             ),
             pv_slots=tuple(
                 jax.empty_ref(slot_type, memory_space=pltpu.ACC(PV_MXU))
-                for _ in range(NUM_SLOTS)
+                for _ in range(shape.num_slots)
             ),
         )
 
@@ -463,7 +479,7 @@ class MxuPipeline:
         actual_signature, assumed_signature = (
             tail.signature(
                 self.delays,
-                NUM_SLOTS,
+                self.num_slots,
                 has_mode_free_accumulate=self.has_mode_free_accumulate,
             )
             for tail in (actual, assumed)
@@ -489,12 +505,14 @@ class MxuPipeline:
         where has_staged_next_k."""
         num_runs = -(-self.delays.pv_pop // len(items))
         tail = _empty_tail(
-            self.delays, (slot_base - (num_runs - 1) * len(items)) % NUM_SLOTS
+            self.delays,
+            (slot_base - (num_runs - 1) * len(items)) % self.num_slots,
         )
         for run in range(num_runs):
             is_last = run == num_runs - 1
             tail = _advanced_tail(
                 self.delays,
+                self.num_slots,
                 tail,
                 items,
                 ops,
@@ -519,7 +537,7 @@ class MxuPipeline:
         if tail is None:
             tail = _empty_tail(self.delays)
         new_tail = _advanced_tail(
-            self.delays, tail, items, ops, has_next_k=has_next_k
+            self.delays, self.num_slots, tail, items, ops, has_next_k=has_next_k
         )
         probs = self._emit(state, items, ops, next_k_tile)
         return PipelineState(probs=probs, tail=new_tail)
@@ -527,10 +545,10 @@ class MxuPipeline:
     def free_slots(self, tail: Tail, count: int) -> tuple[jax.Array, ...]:
         """count QK result slots that hold no result between the segment
         that left tail and the next one."""
-        assert count <= NUM_SLOTS - self.delays.qk_pop, count
-        first = tail.end_slot(NUM_SLOTS)
+        assert count <= self.num_slots - self.delays.qk_pop, count
+        first = tail.end_slot(self.num_slots)
         return tuple(
-            self.qk_slots[(first + offset) % NUM_SLOTS]
+            self.qk_slots[(first + offset) % self.num_slots]
             for offset in range(count)
         )
 
@@ -554,8 +572,8 @@ class MxuPipeline:
         tail = state.tail
         if tail is None:
             tail = _empty_tail(delays)
-        segment = _segment_items(tail, items, ops)
-        timeline = _tail_items(tail) + segment
+        segment = _segment_items(self.num_slots, tail, items, ops)
+        timeline = _tail_items(self.num_slots, tail) + segment
         by_tick = {timed.tick: timed for timed in timeline}
         self._check_slots(timeline)
 

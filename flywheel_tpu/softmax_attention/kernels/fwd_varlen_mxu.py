@@ -91,6 +91,7 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     masked_logits,
     mxu_pipeline_applies,
     per_seq_geometry,
+    pipeline_shape,
     pivot_kept_rows,
     pivot_order,
     replay_matmul,
@@ -106,6 +107,7 @@ from flywheel_tpu.softmax_attention.mxu_pipeline import (
     NUM_SLOTS,
     FragmentOps,
     MxuPipeline,
+    PipelineShape,
     PipelineState,
     Tail,
     WorkItem,
@@ -153,21 +155,39 @@ def varlen_gqa_fold(q_heads_per_kv_head: int, is_token_major: bool) -> int:
     return 1 if is_token_major else q_heads_per_kv_head
 
 
-def varlen_group_rows(fragments_per_tile: int) -> int:
-    """The most rows of a row group of an explicit varlen build."""
-    return min(group_capacity(fragments_per_tile), MAX_VARLEN_GROUP_ROWS)
+def varlen_group_rows(fragments_per_tile: int, shape: PipelineShape) -> int:
+    """The most rows of a row group of an explicit varlen build on a
+    pipeline of shape."""
+    return min(group_capacity(fragments_per_tile, shape), MAX_VARLEN_GROUP_ROWS)
+
+
+def varlen_pipeline_shape(traits: FwdTraits) -> PipelineShape:
+    """The pipeline of the build's rows, whose start segment runs inside
+    one kv block."""
+    return pipeline_shape(
+        traits.group_bq // FRAGMENT_ROWS, traits.num_k_compute_tiles
+    )
 
 
 def varlen_mxu_groups(traits: FwdTraits) -> tuple[MxuRowTiles, int]:
     """(row tiles, group capacity) of the build's rows, for its schedule."""
     fragments_per_tile = traits.group_bq // FRAGMENT_ROWS
-    return row_tiles(fragments_per_tile), varlen_group_rows(fragments_per_tile)
+    shape = varlen_pipeline_shape(traits)
+    return (
+        row_tiles(fragments_per_tile, shape),
+        varlen_group_rows(fragments_per_tile, shape),
+    )
 
 
-def explicit_block_kv(block_kv: int, tiles: MxuRowTiles) -> int:
-    """block_kv padded to whole loop bodies of MXU tiles, at least a row's
-    start segment, which runs inside one block."""
-    num_tiles = max(-(-block_kv // MXU_COLUMNS), tiles.start_tiles)
+def explicit_block_kv(block_kv: int, fragments_per_tile: int) -> int:
+    """block_kv in whole MXU tiles, at least ROW_START_TILES, padded to
+    whole loop bodies of the pipeline it takes (fwd_mxu.pipeline_shape)."""
+    num_tiles = round_up(
+        max(-(-block_kv // MXU_COLUMNS), ROW_START_TILES), LOOP_BODY_TILES
+    )
+    tiles = row_tiles(
+        fragments_per_tile, pipeline_shape(fragments_per_tile, num_tiles)
+    )
     return round_up(num_tiles, tiles.body_tiles) * MXU_COLUMNS
 
 
@@ -195,14 +215,14 @@ def varlen_mxu_block_sizes(
     ):
         block_q_compute *= 2
     fragments_per_tile = gqa_fold * block_q // FRAGMENT_ROWS
+    block_kv = explicit_block_kv(block_sizes.block_kv, fragments_per_tile)
+    shape = pipeline_shape(fragments_per_tile, block_kv // MXU_COLUMNS)
     return BlockSizes(
         block_q=block_q,
-        block_kv=explicit_block_kv(
-            block_sizes.block_kv, row_tiles(fragments_per_tile)
-        ),
+        block_kv=block_kv,
         block_kv_compute=MXU_COLUMNS,
         block_q_compute=block_q_compute,
-        num_stages=QUEUED_GROUPS * varlen_group_rows(fragments_per_tile),
+        num_stages=QUEUED_GROUPS * varlen_group_rows(fragments_per_tile, shape),
         qkv_layout=QKVLayout.HEAD_DIM_MINOR,
     )
 
@@ -610,9 +630,14 @@ class VarlenMxuLoop:
         return self.traits.bq // FRAGMENT_ROWS
 
     @property
+    def shape(self) -> PipelineShape:
+        """The pipeline's delays and slot ring."""
+        return varlen_pipeline_shape(self.traits)
+
+    @property
     def tiles(self) -> MxuRowTiles:
         """How a row groups its tiles."""
-        return row_tiles(self.traits.group_bq // FRAGMENT_ROWS)
+        return row_tiles(self.traits.group_bq // FRAGMENT_ROWS, self.shape)
 
     @property
     def has_half_tiles(self) -> bool:
@@ -915,7 +940,9 @@ class VarlenMxuLoop:
     @property
     def group_rows(self) -> int:
         """The most rows of a row group."""
-        return varlen_group_rows(self.traits.group_bq // FRAGMENT_ROWS)
+        return varlen_group_rows(
+            self.traits.group_bq // FRAGMENT_ROWS, self.shape
+        )
 
     def row_state(
         self, parity: jax.Array | int, member: jax.Array | int
@@ -1230,7 +1257,7 @@ class VarlenMxuLoop:
         num_slots, unit = self.num_slots, self.tiles.unit_tiles
         prev_parity = NUM_ROW_PARITIES - 1 - parity
         if not is_short and zeroes_row_start(
-            self.traits.group_bq // FRAGMENT_ROWS
+            self.traits.group_bq // FRAGMENT_ROWS, self.shape
         ):
             self.o[self.row_state(parity, 0)] = jnp.zeros(
                 self.o.shape[1:], self.o.dtype
@@ -1629,7 +1656,9 @@ class VarlenMxuLoop:
         if (
             tiles.body_tiles != LOOP_BODY_TILES
             or tiles.start_tiles != ROW_START_TILES
-            or zeroes_row_start(self.traits.group_bq // FRAGMENT_ROWS)
+            or zeroes_row_start(
+                self.traits.group_bq // FRAGMENT_ROWS, self.shape
+            )
         ):
             return False
         max_row_tiles = self.schedule.num_kv_blocks * self.num_block_tiles
@@ -2103,15 +2132,17 @@ def make_mxu_loop(
         guard_smem,
         unit_guard,
     ) = state
+    shape = varlen_pipeline_shape(traits)
     loop = VarlenMxuLoop(
         traits=traits,
         variant=variant,
         operands=operands,
         schedule=schedule,
         pipeline=MxuPipeline.allocate(
+            shape,
             has_mode_free_accumulate=zeroes_row_start(
-                traits.group_bq // FRAGMENT_ROWS
-            )
+                traits.group_bq // FRAGMENT_ROWS, shape
+            ),
         ),
         blocks=VarlenBlockStream(
             traits=traits,
@@ -2314,7 +2345,9 @@ def varlen_mxu_scratch_shapes(
     num_stages = traits.num_stages
     head_dim_qk, head_dim_v = traits.head_dim_qk, traits.head_dim_v
     group_bq = traits.group_bq
-    num_states = NUM_ROW_PARITIES * varlen_group_rows(group_bq // FRAGMENT_ROWS)
+    num_states = NUM_ROW_PARITIES * varlen_group_rows(
+        group_bq // FRAGMENT_ROWS, varlen_pipeline_shape(traits)
+    )
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     num_rotary_streams = (1 + int(rotary_k)) if rotary_dim else 0
     layout = QKVLayout.HEAD_DIM_MINOR
