@@ -17,11 +17,10 @@
 
 **FlyWheel** is a kernel library for TPU, written in JAX Pallas by
 [heavyball-research](https://github.com/heavyball-research). It implements
-softmax attention (MHA and MQA/GQA) behind flash-attn's API, and the fused
-linear attention layers of hybrid models (GDN and KDA), for prefill, decode
-and training on TPU v6e and v7x. For serving, it also runs DeepSeek sparse
-attention (DSA) over paged fp8 caches on v7x, and the routed experts of MoE
-layers as one fused MLP kernel.
+softmax attention (MHA and MQA/GQA) behind flash-attn's API, the fused
+linear attention layers of hybrid models (GDN and KDA), DeepSeek sparse
+attention (DSA), and the routed experts of MoE layers as one fused MLP
+kernel, on TPU v6e and v7x (DSA on v7x).
 
 ## Why FlyWheel?
 
