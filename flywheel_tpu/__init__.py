@@ -24,7 +24,7 @@ from flywheel_tpu.softmax_attention import (
     flash_attn_with_kvcache,
 )
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 
 __all__ = [
     "flash_attn_func",
