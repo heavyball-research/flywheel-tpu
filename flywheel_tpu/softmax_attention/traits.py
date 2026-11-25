@@ -35,6 +35,7 @@ from flywheel_tpu.core.tpu import (
     MXU_COLUMNS,
     NUM_LANES,
     NUM_SUBLANES,
+    is_mxu_head_dim,
 )
 from flywheel_tpu.softmax_attention.config import (
     BlockSizes,
@@ -49,7 +50,6 @@ from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_rows,
     merged_cache_heads,
 )
-from flywheel_tpu.softmax_attention.mxu.pipeline import is_mxu_head_dim
 from flywheel_tpu.softmax_attention.rotary import ROTARY_DIM_MULTIPLE
 from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 

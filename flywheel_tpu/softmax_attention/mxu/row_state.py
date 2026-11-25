@@ -46,7 +46,12 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tiling import round_up
-from flywheel_tpu.core.tpu import MXU_COLUMNS, NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.core.tpu import (
+    MXU_COLUMNS,
+    NUM_LANES,
+    NUM_SUBLANES,
+    is_mxu_head_dim,
+)
 from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     BlockSizes,
@@ -71,7 +76,6 @@ from flywheel_tpu.softmax_attention.mxu.pipeline import (
     PipelineDelays,
     PipelineShape,
     WorkItem,
-    is_mxu_head_dim,
     pad_to_mxu_width,
 )
 from flywheel_tpu.softmax_attention.schedule import (
