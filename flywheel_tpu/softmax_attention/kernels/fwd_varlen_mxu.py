@@ -2140,6 +2140,7 @@ def make_mxu_loop(
         schedule=schedule,
         pipeline=MxuPipeline.allocate(
             shape,
+            head_dim_v=traits.head_dim_v,
             has_mode_free_accumulate=zeroes_row_start(
                 traits.group_bq // FRAGMENT_ROWS, shape
             ),

@@ -49,6 +49,7 @@ from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_rows,
     merged_cache_heads,
 )
+from flywheel_tpu.softmax_attention.mxu_pipeline import is_mxu_head_dim
 from flywheel_tpu.softmax_attention.rotary import ROTARY_DIM_MULTIPLE
 from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 
@@ -257,9 +258,11 @@ class FwdTraits(QKVTraits):
                     "rotary batch must match token-major batch or be shared."
                 )
         # The explicit MXU pipeline streams head-dim-minor K and V tiles of
-        # MXU_COLUMNS keys by MXU_COLUMNS dims.
+        # MXU_COLUMNS keys.
         assert not self.uses_mxu_pipeline or (
-            head_dim_qk == head_dim_v == bkv_compute == MXU_COLUMNS
+            head_dim_qk == head_dim_v
+            and is_mxu_head_dim(head_dim_v)
+            and bkv_compute == MXU_COLUMNS
             and self.is_head_dim_minor
             and not self.transposed_pv
         ), (head_dim_qk, head_dim_v, bkv_compute, self.qkv_layout)

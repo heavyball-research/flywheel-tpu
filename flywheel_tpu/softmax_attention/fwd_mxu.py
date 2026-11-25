@@ -71,6 +71,8 @@ from flywheel_tpu.softmax_attention.mxu_pipeline import (
     PipelineDelays,
     PipelineShape,
     WorkItem,
+    is_mxu_head_dim,
+    pad_to_mxu_width,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
@@ -135,15 +137,17 @@ def mxu_pipeline_applies(
     transposed_pv: bool,
 ) -> bool:
     """Whether the chip and the shapes allow the explicit MXU pipeline: MXU
-    result accumulators, K, V and a tile of scores as wide as an MXU, and
-    tokens on sublanes. A kernel adds its own conditions."""
+    result accumulators, a tile of scores as wide as an MXU, K and V of one
+    head_dim the pipeline takes, and tokens on sublanes. A kernel adds its
+    own conditions."""
     if jax.default_backend() != "tpu":
         return False
     tpu_info = pltpu.get_tpu_info()
     if not tpu_info.num_accumulators or tpu_info.mxu_column_size != MXU_COLUMNS:
         return False
     return (
-        head_dim == head_dim_v == MXU_COLUMNS
+        head_dim == head_dim_v
+        and is_mxu_head_dim(head_dim)
         and block_sizes.qkv_layout == QKVLayout.HEAD_DIM_MINOR
         and not transposed_pv
     )
@@ -876,12 +880,12 @@ def replay_matmul(
     segments: rhs goes through REPLAY_STAGING_REGISTER and the f32 result
     through slot, a free QK result slot (MxuPipeline.free_slots)."""
     pltpu.matmul_push_rhs(
-        rhs,
+        pad_to_mxu_width(rhs),
         staging_register=REPLAY_STAGING_REGISTER,
         mxu_index=QK_MXU,
         transpose=transpose,
     )
-    pltpu.matmul_acc_lhs(slot, lhs, REPLAY_STAGING_REGISTER)
+    pltpu.matmul_acc_lhs(slot, pad_to_mxu_width(lhs), REPLAY_STAGING_REGISTER)
     return pltpu.matmul_pop(slot)
 
 
@@ -969,7 +973,8 @@ def fold_replayed_fragment(
     weighted_values = replay_matmul(
         value_slot, probs.astype(jnp.bfloat16), v_tile()
     )
-    accumulate_rebased(o_ref, weighted_values, rescale, starts)
+    head_dim_v = o_ref.shape[-1]
+    accumulate_rebased(o_ref, weighted_values[:, :head_dim_v], rescale, starts)
 
 
 @dataclasses.dataclass(frozen=True, eq=False)

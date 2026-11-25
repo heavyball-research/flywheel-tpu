@@ -30,6 +30,7 @@ import dataclasses
 import numpy as np
 import pytest
 
+from flywheel_tpu.core.tpu import MXU_COLUMNS
 from flywheel_tpu.softmax_attention import fwd_mxu, mxu_pipeline
 from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
@@ -55,6 +56,8 @@ from flywheel_tpu.softmax_attention.variant import Variant
 
 KEYS = 256
 HEAD_DIM = 256
+# A head width the pipeline zero-pads to MXU_COLUMNS at issue.
+PADDED_HEAD_DIM = 128
 # A static plan's q block: its fragments fill a segment.
 BLOCK_Q = 1024
 MASK_VALUE = DEFAULT_MASK_VALUE
@@ -85,11 +88,13 @@ class MxuModel:
         assert staging_register == mxu_pipeline.STAGING_REGISTER
         if self.staged[mxu_index] is not None:
             raise AssertionError(f"MXU {mxu_index}: push into a full register")
+        assert rhs.shape == (MXU_COLUMNS, MXU_COLUMNS), rhs.shape
         rhs = np.asarray(rhs, np.float64)
         self.staged[mxu_index] = rhs.T if transpose else rhs
         self.num_pushes[mxu_index] += 1
 
     def acc_lhs(self, slot, lhs, load_staged_rhs=None):
+        assert lhs.shape[-1] == MXU_COLUMNS, lhs.shape
         mxu = slot.mxu
         if load_staged_rhs is not None:
             if self.staged[mxu] is None:
@@ -124,11 +129,12 @@ def mxus_fixture(monkeypatch):
     return model
 
 
-def make_pipeline(shape=PipelineShape()):
+def make_pipeline(shape=PipelineShape(), head_dim=HEAD_DIM):
     return MxuPipeline(
         delays=shape.delays,
         qk_slots=tuple(Slot(0, index) for index in range(shape.num_slots)),
         pv_slots=tuple(Slot(1, index) for index in range(shape.num_slots)),
+        head_dim_v=head_dim,
     )
 
 
@@ -136,16 +142,20 @@ class Attention:
     """Static-anchor softmax attention of one q block over kv tiles; a
     fragment's row state starts at the first tile it meets."""
 
-    def __init__(self, num_fragments, num_tiles, seed=0):
+    def __init__(self, num_fragments, num_tiles, seed=0, head_dim=HEAD_DIM):
         generator = np.random.default_rng(seed)
-        self.q = generator.standard_normal(
-            (num_fragments * FRAGMENT_ROWS, HEAD_DIM)
-        ) / np.sqrt(HEAD_DIM)
-        self.k = generator.standard_normal((num_tiles * KEYS, HEAD_DIM))
-        self.v = generator.standard_normal((num_tiles * KEYS, HEAD_DIM))
+        q = generator.standard_normal(
+            (num_fragments * FRAGMENT_ROWS, head_dim)
+        ) / np.sqrt(head_dim)
+        k = generator.standard_normal((num_tiles * KEYS, head_dim))
+        v = generator.standard_normal((num_tiles * KEYS, head_dim))
+        # float32 values: an operand zero-padded at issue comes back float32.
+        self.q, self.k, self.v = (
+            x.astype(np.float32).astype(np.float64) for x in (q, k, v)
+        )
         self.anchor = {}
         self.row_sum = np.zeros((self.q.shape[0], 1))
-        self.out = np.zeros((self.q.shape[0], HEAD_DIM))
+        self.out = np.zeros((self.q.shape[0], head_dim))
 
     def ops(self, tile_offset=0):
         return AttentionOps(self, tile_offset)
@@ -411,11 +421,12 @@ def test_static_row_plan_runs_the_masked_softmax(
     )
 
 
+@pytest.mark.parametrize("head_dim", [PADDED_HEAD_DIM, HEAD_DIM])
 @pytest.mark.parametrize("num_fragments", [16, 32, 64, 128])
-def test_tile_segments_then_drain(mxus, num_fragments):
+def test_tile_segments_then_drain(mxus, num_fragments, head_dim):
     num_tiles = 5
-    attention = Attention(num_fragments, num_tiles)
-    pipeline = make_pipeline()
+    attention = Attention(num_fragments, num_tiles, head_dim=head_dim)
+    pipeline = make_pipeline(head_dim=head_dim)
     ops = attention.ops()
     state = pipeline.idle_state()
     for tile in range(num_tiles):
