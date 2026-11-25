@@ -27,6 +27,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax.experimental import pallas as pl
 
 from flywheel_tpu.core.tpu import NUM_SUBLANES
@@ -45,9 +46,18 @@ PER_SEQ_ROW_FIELDS = (
     "unmask_from",
     "live_tiles_hi",
     "first_live_tile_hi",
+    "first_live_tile_lo",
+    "last_anchor_key",
+    "kept_start",
+    "kept_end",
 )
 PAGED_KV_FIELDS = ("kv_used_end", "kv_load_end", "page_base")
-TABLE_META_FIELDS = ("num_rows", "packed_q_end")
+# An explicit MXU build's row groups (mxu_row_groups): per row its stream
+# tiles and the rows of the group it starts (0 past a group's first row),
+# per group (indexed by group) its first row and its rows.
+MXU_ROW_FIELDS = ("stream_tiles", "group_rows")
+MXU_GROUP_FIELDS = ("group_first", "group_size")
+TABLE_META_FIELDS = ("num_rows", "packed_q_end", "num_groups")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -78,9 +88,15 @@ class ScheduleRow(NamedTuple):
     kv_start aligned down to the sublane tile. kv_frontier is one past the last
     key any kept row attends. [lo, hi] is the kv block interval. kv block kv
     needs the bounds mask iff kv >= mask_from or kv < unmask_from.
-    live_tiles_hi is block hi's kv compute tiles below the frontier. Only the
-    paged table sets kv_used_end (seqused_k), kv_load_end (the end of the
-    block's page loads) and page_base (the sequence's first block table entry).
+    live_tiles_hi is block hi's kv compute tiles below the frontier.
+    first_live_tile_lo is the first kv compute tile of block lo that holds a
+    key a kept row sees, and last_anchor_key the first key the block's last
+    kept row sees. The block keeps rows [kept_start, kept_end) of its
+    sequence; the loop blends rows [q_tok, kept_start) from the previous
+    block's stage. Only the paged table sets kv_used_end (seqused_k),
+    kv_load_end (the end of the block's page loads) and page_base (the
+    sequence's first block table entry), and only an explicit MXU build's
+    stream_tiles and group_rows (mxu_row_groups).
     """
 
     q_tok: jax.Array
@@ -95,9 +111,15 @@ class ScheduleRow(NamedTuple):
     unmask_from: jax.Array
     live_tiles_hi: jax.Array
     first_live_tile_hi: jax.Array | int = 0
+    first_live_tile_lo: jax.Array | int = 0
+    last_anchor_key: jax.Array | int = 0
+    kept_start: jax.Array | int = 0
+    kept_end: jax.Array | int = 0
     kv_used_end: jax.Array | None = None
     kv_load_end: jax.Array | None = None
     page_base: jax.Array | None = None
+    stream_tiles: jax.Array | None = None
+    group_rows: jax.Array | None = None
 
 
 BlockIndex = jax.Array | int
@@ -127,6 +149,8 @@ class FwdSchedule:
         before the packed write.
       has_q_span: per-seq only; q_bounds returns a span row (a left window
         bounds q from above), otherwise its span is None.
+      window: per-seq only; the (left, right) reach of each sequence's
+        window around its bottom-right diagonal, None unbounded.
       heads_outer_batch: dense head-major only. None is the batch-outer fold
         (q fold index h reads kv fold index h // q_heads_per_kv_head); an int B
         is a heads-outer fold of B sequences (q fold index n * B + b reads kv
@@ -138,6 +162,8 @@ class FwdSchedule:
       kv_page: paged only; (page_base, kv, page) -> the physical page holding
         page page of kv block kv, read from the block table row at page_base
         and clamped into that row.
+      row_group, num_groups: an explicit MXU build's row groups
+        (mxu_row_groups); row_group(j) is (first row, rows) of group j.
     """
 
     num_head_groups: int
@@ -161,6 +187,7 @@ class FwdSchedule:
         | None
     ) = None
     has_q_span: bool = False
+    window: tuple[int | None, int | None] = (None, None)
     blend_start: Callable[[ScheduleRow], jax.Array] | None = None
     heads_outer_batch: int | None = None
     kv_page: Callable[[jax.Array, BlockIndex, int], jax.Array] | None = None
@@ -169,6 +196,8 @@ class FwdSchedule:
     first_live_tile: Callable[[BlockIndex, ScheduleRow], jax.Array] | None = (
         None
     )
+    row_group: Callable[[BlockIndex], tuple[jax.Array, jax.Array]] | None = None
+    num_groups: jax.Array | None = None
 
 
 class DenseFwdParams(NamedTuple):
@@ -461,6 +490,7 @@ def per_seq_schedule_rows(
     bkv_compute: int,
     left: int | None,
     right: int | None,
+    max_kept_rows: int | None = None,
 ) -> PerSeqRows:
     """Host-side rows of the per-seq schedule, one per q block.
 
@@ -472,9 +502,14 @@ def per_seq_schedule_rows(
     unbounded, and causal is (None, 0). Rows past num_rows are never read.
 
     The aligned base drags rows of earlier sequences into the first block and
-    the last block runs past q_end: the loop blends rows [q_tok, q_start) from
-    the previous block's stage, and tail rows are overwritten by the next block
-    or, past cu_q[-1], written as out = 0, lse = -inf.
+    the last block runs past q_end: the loop blends rows [q_tok, kept_start)
+    from the previous block's stage, and tail rows are overwritten by the next
+    block or, past cu_q[-1], written as out = 0, lse = -inf.
+
+    A block keeps at most max_kept_rows rows (None: bq) of its sequence: below
+    bq, block i keeps rows [cu_q[r] + i * s, cu_q[r] + (i + 1) * s), s the
+    largest such span a block from the row aligned down holds, and starts at
+    that row aligned down.
     """
     # Note (david): pl.multiple_of is an unchecked hint, and a lying hint
     # corrupts data silently instead of failing the verifier. A base of
@@ -508,19 +543,29 @@ def per_seq_schedule_rows(
     kv_start = jnp.asarray(kv_start, jnp.int32)
     kv_end = jnp.asarray(kv_end, jnp.int32)
     batch = cu_q.shape[0] - 1
-    num_blocks_per_seq = jnp.where(
-        jnp.diff(cu_q) > 0,
-        -(-(cu_q[1:] - align_to_sublane_tile(cu_q[:-1])) // bq),
-        0,
-    )
+    q_lens = jnp.diff(cu_q)
+    splits_rows = max_kept_rows is not None and max_kept_rows < bq
+    if splits_rows:
+        # A block from a kept span's first row aligned down holds the span.
+        kept_span = min(max_kept_rows, bq - tile_rows + 1)
+        num_blocks_per_seq = -(-q_lens // kept_span)
+        max_blocks = padded_total_q // kept_span + 2 * batch
+    else:
+        num_blocks_per_seq = jnp.where(
+            q_lens > 0,
+            -(-(cu_q[1:] - align_to_sublane_tile(cu_q[:-1])) // bq),
+            0,
+        )
+        # Note (david): the table is static, so it holds the most q blocks
+        # any cu_seqlens_q can need: a sequence of n rows whose base aligns
+        # down by d < bq rows covers ceil((n + d) / bq) <= n // bq + 2
+        # blocks.
+        max_blocks = padded_total_q // bq + 2 * batch
     qblk_prefix = jnp.concatenate([
         jnp.zeros((1,), jnp.int32),
         jnp.cumsum(num_blocks_per_seq).astype(jnp.int32),
     ])
-    # Note (david): the table is static, so it holds the most q blocks any
-    # cu_seqlens_q can need: a sequence of n rows whose base aligns down by
-    # d < bq rows covers ceil((n + d) / bq) <= n // bq + 2 blocks.
-    rows = jnp.arange(padded_total_q // bq + 2 * batch, dtype=jnp.int32)
+    rows = jnp.arange(max_blocks, dtype=jnp.int32)
     # Note (david): empty sequences share their successor's prefix entry, so
     # counting the entries at or below a row skips them.
     seq_idx = jnp.sum(
@@ -530,17 +575,27 @@ def per_seq_schedule_rows(
     q_start, q_end = cu_q[seq_idx], cu_q[seq_idx + 1]
     seq_kv_start, seq_kv_end = kv_start[seq_idx], kv_end[seq_idx]
     kv_base = align_to_sublane_tile(seq_kv_start)
-    q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
+    if splits_rows:
+        kept_start = q_start + block_in_seq * kept_span
+        q_block_start = align_to_sublane_tile(kept_start)
+    else:
+        kept_start = q_start
+        q_block_start = align_to_sublane_tile(q_start) + block_in_seq * bq
     q_tok = jnp.minimum(q_block_start, padded_total_q - bq)
+    if splits_rows:
+        kept_end = jnp.minimum(kept_start + kept_span, q_end)
+    else:
+        kept_end = jnp.minimum(q_tok + bq, q_end)
     bottom_right_offset = seq_kv_end - q_end
     # Note (david): rows of the window outside the sequence are overwritten or
     # discarded, so the frontier follows the last row the block owns.
-    last_valid_q = jnp.minimum(q_block_start + bq, q_end) - 1
+    first_kept_q = jnp.maximum(kept_start, q_tok)
+    last_kept_q = kept_end - 1
     if right is None:
         kv_frontier = seq_kv_end
     else:
         kv_frontier = jnp.minimum(
-            seq_kv_end, last_valid_q + bottom_right_offset + right + 1
+            seq_kv_end, last_kept_q + bottom_right_offset + right + 1
         )
     # Note (david): a degenerate cu (kv_len == 0) still gets one kv block,
     # because every row must write its output.
@@ -561,16 +616,18 @@ def per_seq_schedule_rows(
     if left is None:
         lo = jnp.zeros_like(hi)
         unmask_from = seq_unmask_from
+        kv_lo_token = last_anchor_key = seq_kv_start
     else:
-        first_kept_q = jnp.maximum(q_start, q_tok)
         kv_lo_token = jnp.maximum(
             seq_kv_start, first_kept_q + bottom_right_offset - left
         )
         lo = jnp.clip((kv_lo_token - kv_base) // bkv, 0, hi)
-        last_kept_q = jnp.minimum(q_tok + bq, q_end) - 1
         unmask_from = jnp.maximum(
             seq_unmask_from,
             -((kv_base - (last_kept_q + bottom_right_offset - left)) // bkv),
+        )
+        last_anchor_key = jnp.maximum(
+            seq_kv_start, last_kept_q + bottom_right_offset - left
         )
     # Note (david): only hi's window can clamp at the padded axis end, and every
     # block below hi lies wholly below the frontier.
@@ -582,6 +639,12 @@ def per_seq_schedule_rows(
     # sequence; its leading tiles hold none of this sequence's keys.
     first_live_tile_hi = jnp.clip(
         (seq_kv_start - hi_kv_tok) // bkv_compute, 0, live_tiles_hi - 1
+    )
+    lo_kv_tok = jnp.minimum(kv_base + lo * bkv, padded_total_k - bkv)
+    first_live_tile_lo = jnp.clip(
+        (kv_lo_token - lo_kv_tok) // bkv_compute,
+        0,
+        jnp.where(lo == hi, live_tiles_hi, num_kv_tiles) - 1,
     )
     fields = dict(
         q_tok=q_tok,
@@ -596,6 +659,10 @@ def per_seq_schedule_rows(
         unmask_from=unmask_from,
         live_tiles_hi=live_tiles_hi,
         first_live_tile_hi=first_live_tile_hi,
+        first_live_tile_lo=first_live_tile_lo,
+        last_anchor_key=last_anchor_key,
+        kept_start=kept_start,
+        kept_end=kept_end,
     )
     return PerSeqRows(fields, seq_idx, qblk_prefix[batch], cu_q[batch])
 
@@ -605,13 +672,92 @@ def pack_schedule_table(
     fields: dict[str, jax.Array],
     num_rows: jax.Array,
     packed_q_end: jax.Array,
+    num_groups: jax.Array | None = None,
 ) -> jax.Array:
-    """The flat int32 SMEM table of layout from per-row field columns."""
+    """The flat int32 SMEM table of layout from per-row field columns;
+    num_groups (an explicit MXU build's) defaults to num_rows."""
     columns = [jnp.asarray(fields[name], jnp.int32) for name in layout.fields]
-    meta = jnp.stack(
-        [jnp.asarray(num_rows, jnp.int32), jnp.asarray(packed_q_end, jnp.int32)]
-    )
+    meta = jnp.stack([
+        jnp.asarray(value, jnp.int32)
+        for value in (
+            num_rows,
+            packed_q_end,
+            num_rows if num_groups is None else num_groups,
+        )
+    ])
     return jnp.concatenate([jnp.stack(columns).reshape(-1), meta])
+
+
+def per_seq_row_tiles(
+    fields: dict[str, jax.Array], *, num_block_tiles: int
+) -> jax.Array:
+    """The live kv tiles of each per-seq row: its blocks lo..hi from block
+    lo's first live tile on, block hi cut at its live tiles."""
+    return (
+        (fields["hi"] - fields["lo"]) * num_block_tiles
+        + fields["live_tiles_hi"]
+        - fields["first_live_tile_lo"]
+    )
+
+
+def mxu_row_groups(
+    row_tiles: jax.Array,
+    num_rows: jax.Array,
+    tiles: "MxuRowTiles",
+    group_rows: int,
+    joins: jax.Array | None = None,
+) -> dict[str, jax.Array]:
+    """The MXU_ROW_FIELDS and MXU_GROUP_FIELDS columns and the group count
+    of an explicit MXU loop over rows of row_tiles live tiles, the first
+    num_rows of them real.
+
+    A row of one live tile shares its start segment, tiles.start_tiles
+    tiles, with the rows of one live tile after it, up to group_rows rows; a
+    row joins the row before it only where joins holds, when given. Any
+    other row runs alone. A group streams its rows' tiles, then tiles that
+    hide every key up to a whole start segment; a row alone streams its live
+    tiles in whole units, at least a start segment.
+    """
+    num_slots, unit = tiles.start_tiles, tiles.unit_tiles
+    assert 1 <= group_rows <= num_slots, (group_rows, num_slots)
+    size = row_tiles.shape[0]
+    rows = jnp.arange(size, dtype=jnp.int32)
+    is_real = rows < num_rows
+    is_short = jnp.logical_and(row_tiles == 1, is_real)
+    no_row = jnp.zeros((1,), jnp.bool_)
+    continues = jnp.logical_and(
+        is_short, jnp.concatenate([no_row, is_short[:-1]])
+    )
+    if joins is not None:
+        continues = jnp.logical_and(continues, joins)
+    is_run_end = jnp.logical_and(
+        is_short, ~jnp.concatenate([continues[1:], no_row])
+    )
+    run_start = lax.cummax(jnp.where(continues, 0, rows), axis=0)
+    run_end = lax.cummin(
+        jnp.where(is_run_end, rows + 1, size), axis=0, reverse=True
+    )
+    group_start = rows - (rows - run_start) % group_rows
+    group_end = jnp.minimum(group_start + group_rows, run_end)
+    short_stream = jnp.where(
+        rows == group_end - 1, 1 + num_slots - (group_end - group_start), 1
+    )
+    long_stream = -(-jnp.maximum(row_tiles, num_slots) // unit) * unit
+    starts_group = jnp.logical_and(
+        is_real, jnp.logical_or(~is_short, rows == group_start)
+    )
+    group = jnp.cumsum(starts_group.astype(jnp.int32)) - 1
+    # Rows that start no group scatter past the columns, which drops them.
+    group_index = jnp.where(starts_group, group, size)
+    rows_of_group = jnp.where(is_short, group_end - group_start, 1)
+    zeros = jnp.zeros((size,), jnp.int32)
+    return dict(
+        stream_tiles=jnp.where(is_short, short_stream, long_stream),
+        group_rows=jnp.where(starts_group, rows_of_group, 0),
+        group_first=zeros.at[group_index].set(rows, mode="drop"),
+        group_size=zeros.at[group_index].set(rows_of_group, mode="drop"),
+        num_groups=jnp.sum(starts_group.astype(jnp.int32)),
+    )
 
 
 def varlen_schedule_table(
@@ -624,11 +770,15 @@ def varlen_schedule_table(
     bkv_compute: int,
     left: int | None,
     right: int | None,
+    max_kept_rows: int | None = None,
+    mxu_groups: "tuple[MxuRowTiles, int] | None" = None,
 ) -> tuple[jax.Array, ScheduleTableLayout]:
     """(table, layout) of the packed K/V varlen kernel's schedule, whose kv
     axis packs sequence r at [cu_k[r], cu_k[r + 1]). left / right is the
     window around each sequence's own bottom-right diagonal (Variant.window):
-    None is unbounded, and causal is (None, 0)."""
+    None is unbounded, and causal is (None, 0). max_kept_rows as in
+    per_seq_schedule_rows; mxu_groups is an explicit MXU build's (tiles,
+    group_rows) of mxu_row_groups."""
     cu_k = jnp.asarray(cu_seqlens_k, jnp.int32)
     rows = per_seq_schedule_rows(
         cu_seqlens_q,
@@ -641,12 +791,58 @@ def varlen_schedule_table(
         bkv_compute=bkv_compute,
         left=left,
         right=right,
+        max_kept_rows=max_kept_rows,
     )
+    # A group's rows read their tiles from its first row's first kv block.
+    first_tile_key = rows.fields["kv_base"] + rows.fields["lo"] * bkv
+    block_start = jnp.minimum(first_tile_key, varlen_sched.padded_total_k - bkv)
+    tile_start = block_start + rows.fields["first_live_tile_lo"] * bkv_compute
+    prev_block_start = jnp.concatenate([block_start[:1], block_start[:-1]])
+    joins = jnp.logical_and(
+        tile_start >= prev_block_start,
+        tile_start + bkv_compute <= prev_block_start + bkv,
+    )
+    return pack_per_seq_table(
+        rows,
+        PER_SEQ_ROW_FIELDS,
+        rows.fields,
+        num_block_tiles=bkv // bkv_compute,
+        mxu_groups=mxu_groups,
+        joins=joins,
+    )
+
+
+def pack_per_seq_table(
+    rows: PerSeqRows,
+    row_fields: tuple[str, ...],
+    fields: dict[str, jax.Array],
+    *,
+    num_block_tiles: int,
+    mxu_groups: "tuple[MxuRowTiles, int] | None",
+    constants: tuple[tuple[str, int], ...] = (),
+    joins: jax.Array | None = None,
+) -> tuple[jax.Array, ScheduleTableLayout]:
+    """(table, layout) of a per-seq schedule of rows, its row_fields taken
+    from fields, plus an explicit MXU build's row groups (mxu_row_groups of
+    the (tiles, group_rows) pair mxu_groups, and of joins) when given."""
+    num_groups = None
+    if mxu_groups is not None:
+        groups = mxu_row_groups(
+            per_seq_row_tiles(rows.fields, num_block_tiles=num_block_tiles),
+            rows.num_rows,
+            *mxu_groups,
+            joins,
+        )
+        num_groups = groups.pop("num_groups")
+        row_fields += MXU_ROW_FIELDS + MXU_GROUP_FIELDS
+        fields = dict(fields, **groups)
     layout = ScheduleTableLayout(
-        fields=PER_SEQ_ROW_FIELDS, num_rows=rows.seq_idx.shape[0]
+        fields=row_fields,
+        num_rows=rows.seq_idx.shape[0],
+        constants=constants,
     )
     table = pack_schedule_table(
-        layout, rows.fields, rows.num_rows, rows.packed_q_end
+        layout, fields, rows.num_rows, rows.packed_q_end, num_groups
     )
     return table, layout
 
@@ -663,6 +859,8 @@ def paged_schedule_table(
     pages_per_seq: int,
     causal: bool,
     left: int | None,
+    max_kept_rows: int | None = None,
+    mxu_groups: "tuple[MxuRowTiles, int] | None" = None,
 ) -> tuple[jax.Array, ScheduleTableLayout]:
     """(table, layout) of the paged varlen kernel's schedule.
 
@@ -670,7 +868,8 @@ def paged_schedule_table(
     the flat (batch * pages_per_seq,) block table; the right edge is causal's 0
     or unbounded. A q block loads and owns its keys only up to its frontier,
     so a q block early in a chunk neither fetches nor scores the keys only
-    later rows see.
+    later rows see. max_kept_rows as in per_seq_schedule_rows, mxu_groups as
+    in varlen_schedule_table.
     """
     kv_lens = jnp.asarray(seqused_k, jnp.int32)
     rows = per_seq_schedule_rows(
@@ -686,16 +885,15 @@ def paged_schedule_table(
         bkv_compute=bkv_compute,
         left=left,
         right=0 if causal else None,
+        max_kept_rows=max_kept_rows,
     )
-    layout = ScheduleTableLayout(
-        fields=tuple(
+    row_fields = (
+        tuple(
             name
             for name in PER_SEQ_ROW_FIELDS
             if name not in ("kv_start", "kv_base", "first_live_tile_hi")
         )
-        + PAGED_KV_FIELDS,
-        num_rows=rows.seq_idx.shape[0],
-        constants=(("kv_start", 0), ("kv_base", 0)),
+        + PAGED_KV_FIELDS
     )
     # Note (david): DMAs move whole 8-row sublane tiles, so the loads end at
     # the frontier rounded up, capped at the sequence's pages.
@@ -711,10 +909,14 @@ def paged_schedule_table(
         kv_load_end=kv_load_end,
         page_base=rows.seq_idx * pages_per_seq,
     )
-    table = pack_schedule_table(
-        layout, fields, rows.num_rows, rows.packed_q_end
+    return pack_per_seq_table(
+        rows,
+        row_fields,
+        fields,
+        num_block_tiles=bkv // bkv_compute,
+        mxu_groups=mxu_groups,
+        constants=(("kv_start", 0), ("kv_base", 0)),
     )
-    return table, layout
 
 
 def make_per_seq_fwd_schedule(
@@ -743,10 +945,17 @@ def make_per_seq_fwd_schedule(
         # (v6e, 32:8 d128, 8 ragged rows over 16K, paged: 4.140 against 4.167
         # ms).
         values = dict(layout.constants)
-        for index, name in enumerate(layout.fields):
-            values[name] = table_ref[index * layout.num_rows + si]
+        for name in layout.fields:
+            if name not in MXU_GROUP_FIELDS:
+                values[name] = _field(name, si)
         row = ScheduleRow(**values)
         return row.lo, row.hi, row
+
+    def _field(name, index):
+        return table_ref[layout.fields.index(name) * layout.num_rows + index]
+
+    def _row_group(group):
+        return tuple(_field(name, group) for name in MXU_GROUP_FIELDS)
 
     def _block_flags(_, kv, row):
         return jnp.bool_(False), jnp.logical_or(
@@ -804,10 +1013,13 @@ def make_per_seq_fwd_schedule(
         kv_token=_kv_token,
         q_bounds=_q_bounds,
         has_q_span=left is not None,
-        blend_start=lambda row: row.q_start,
+        window=(left, right),
+        blend_start=lambda row: row.kept_start,
         packed_q_end=table_ref[layout.meta_index("packed_q_end")],
         num_live_tiles=_num_live_tiles,
         first_live_tile=_first_live_tile,
+        row_group=_row_group if "group_first" in layout.fields else None,
+        num_groups=table_ref[layout.meta_index("num_groups")],
     )
 
 
@@ -855,6 +1067,121 @@ def make_paged_fwd_schedule(
         return block_table_ref[page_base + table_index]
 
     return dataclasses.replace(per_seq_schedule, kv_page=_kv_page)
+
+
+class MxuRowTiles(NamedTuple):
+    """How an explicit MXU build's loop groups a row's kv tiles, each tile
+    one work item per fragment of the row.
+
+    unit_tiles is the fewest tiles whose items fill whole slot ring laps; a
+    row runs whole units, its tiles past its last live one hiding every key.
+    body_tiles is a rolled loop body. start_tiles is a row's first segment:
+    whole bodies, long enough that its first tile's softmaxes and the
+    previous row's last items finish inside it.
+    """
+
+    unit_tiles: int
+    start_tiles: int
+    body_tiles: int
+
+
+def mxu_row_tiles(
+    fragments_per_tile: int,
+    *,
+    num_slots: int,
+    qk_pop: int,
+    pv_pop: int,
+    min_start_tiles: int,
+    min_body_tiles: int,
+) -> MxuRowTiles:
+    """The tile grouping of rows of fragments_per_tile fragments a tile, on
+    a ring of num_slots result slots and the pipeline's qk_pop and pv_pop
+    delays: start and body segments of at least min_start_tiles and
+    min_body_tiles tiles, in whole units."""
+    unit_tiles = num_slots // math.gcd(fragments_per_tile, num_slots)
+    body_tiles = -(-min_body_tiles // unit_tiles) * unit_tiles
+    # A row's tiles after its start segment run in whole bodies.
+    start_tiles = max(
+        min_start_tiles,
+        1 + -(-qk_pop // fragments_per_tile),
+        -(-pv_pop // fragments_per_tile),
+    )
+    return MxuRowTiles(
+        unit_tiles=unit_tiles,
+        start_tiles=-(-start_tiles // body_tiles) * body_tiles,
+        body_tiles=body_tiles,
+    )
+
+
+def dense_mxu_blocks(
+    *,
+    seqlen_q: int,
+    seqlen_kv: int,
+    block_q: int,
+    block_kv: int,
+    causal_offset: int | None,
+    kv_tile: int,
+    kv_unit: int,
+    min_kv_block: int,
+    min_q_block: int,
+) -> tuple[int, int] | None:
+    """(block_q, block_kv) of a dense explicit MXU build, which groups
+    dispatch's blocks so its loop's segments hold whole units of work; both
+    axes pad to whole blocks. None when a causal mask whose offset is no whole
+    number of blocks spans several kv blocks.
+
+    A kv axis split in several blocks takes blocks of whole kv_unit keys, at
+    least min_kv_block. Without a causal mask they hold at least dispatch's
+    block_kv, the one that pads the kv axis least, then the smallest, wins,
+    the last block holds more than one unit of the axis's keys, and a q block
+    holds at least min_q_block rows. causal_offset (None: no causal mask)
+    keeps the blocks square and the offset a whole number of blocks: they
+    start at dispatch's block_kv or the q axis, whichever is smaller, and
+    the one that pads both axes least wins.
+    With no such kv block the axis, padded to whole kv tiles, is one block:
+    a causal build whose q axis fills it and whose offset is 0 takes one
+    square block, any other splits the q axis evenly into as many blocks as
+    dispatch's block_q gives it.
+    """
+
+    def _padded(length, size):
+        return -(-length // size) * size
+
+    kv_axis = _padded(seqlen_kv, kv_tile)
+    first = max(min_kv_block, _padded(block_kv, kv_unit))
+
+    def _fits(size):
+        if causal_offset is not None:
+            return causal_offset % size == 0
+        return seqlen_kv - (_padded(seqlen_kv, size) - size) > kv_unit
+
+    if causal_offset is None:
+        start = first
+    else:
+        start = max(min_kv_block, min(first, _padded(seqlen_q, kv_unit)))
+    candidates = [
+        size for size in range(start, kv_axis, kv_unit) if _fits(size)
+    ]
+    if candidates and causal_offset is not None:
+        size = min(
+            candidates,
+            key=lambda size: (
+                _padded(seqlen_q, size) * _padded(seqlen_kv, size),
+                size,
+            ),
+        )
+        return size, size
+    if candidates:
+        size = min(
+            candidates, key=lambda size: (_padded(seqlen_kv, size), size)
+        )
+        return max(block_q, min_q_block), size
+    if causal_offset == 0 and seqlen_q == kv_axis:
+        return kv_axis, kv_axis
+    if causal_offset is None or kv_axis <= first:
+        num_q_blocks = -(-seqlen_q // block_q)
+        return -(-seqlen_q // num_q_blocks), kv_axis
+    return None
 
 
 @dataclasses.dataclass(frozen=True)

@@ -25,16 +25,26 @@ import numpy as np
 import pytest
 
 from flywheel_tpu import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
-from flywheel_tpu.softmax_attention import fwd_blocks
-from flywheel_tpu.softmax_attention.config import next_pow2
+from flywheel_tpu.softmax_attention import dispatch, fwd_blocks
+from flywheel_tpu.softmax_attention.config import BlockSizes, next_pow2
 from flywheel_tpu.softmax_attention.dispatch import (
     default_block_sizes,
+    get_kernel,
     make_flash_attn_mha,
 )
-from flywheel_tpu.softmax_attention.inputs import pad_seqlen
+from flywheel_tpu.softmax_attention.inputs import make_variant, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels import fwd_varlen
+from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    dense_has_checked_units,
+)
+from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
-from tests.softmax_attention.util import attention_ref, randn
+from tests.softmax_attention.util import (
+    HAS_MXU_ACCUMULATORS,
+    attention_ref,
+    randn,
+    requires_mxu_accumulators,
+)
 
 INTERPRET = jax.default_backend() != "tpu"
 
@@ -1315,3 +1325,1118 @@ def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
     ]
     np.testing.assert_array_equal(slot_kv[..., 0::2, :], k[:, 0])
     np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
+
+
+# Note (david): the head width whose dense and packed varlen builds run the
+# explicit MXU loops (kernels/fwd_dense_mxu.py, kernels/fwd_varlen_mxu.py) on
+# a chip with MXU accumulators; everywhere else these shapes take the
+# dot_general loops that test_prefill.py's grid covers.
+MXU_HEAD_DIM = 256
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "nheads,seqlen,causal",
+    [
+        (4, 4096, False),
+        (4, 4096, True),
+        (4, 1024, True),
+        (32, 1024, True),
+        (4, 512, True),
+        (4, 384, False),
+        (2, 128, True),
+        (1, 128, False),
+    ],
+)
+def test_dense_mxu_dispatch(nheads, seqlen, causal):
+    # Note (david): every block size runs the explicit loop: the tuned
+    # 32-head 1024-token causal build's head fold becomes one head a row,
+    # and blocks below the loop's bodies group into one kv block.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = get_kernel(
+        nheads,
+        nheads,
+        seqlen,
+        seqlen,
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "block_q,block_kv,seqlen,causal",
+    [
+        (32, 256, 512, False),
+        (128, 128, 384, False),
+        (16, 128, 128, False),
+        (256, 256, 1024, True),
+        (128, 128, 128, True),
+        (512, 512, 2176, False),
+        (512, 512, 4224, True),
+    ],
+)
+def test_dense_mxu_small_blocks(block_q, block_kv, seqlen, causal):
+    # Note (david): blocks below the loop's bodies group into larger ones, or
+    # into one kv block whose row runs as one segment; a kv axis of no whole
+    # number of blocks pads to them, a full row ending at the last body with
+    # a valid key and a causal row never meeting the padded keys.
+    q, k, v = random_qkv(0, 1, seqlen, 4, 2, MXU_HEAD_DIM)
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = make_flash_attn_mha(
+        4,
+        seqlen,
+        seqlen,
+        variant=variant,
+        block_sizes=BlockSizes(
+            block_q=block_q, block_kv=block_kv, block_q_compute=block_q // 2
+        ),
+        head_dim=MXU_HEAD_DIM,
+        num_kv_heads=2,
+        interpret=INTERPRET,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+    out = kernel(*(x[0].swapaxes(0, 1) for x in (q, k, v)))
+    assert_output_close(out.swapaxes(0, 1)[None], q, k, v, causal=causal)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,window_size",
+    [
+        (1280, 2048, (-1, -1)),
+        (1792, 1024, (-1, -1)),
+        (1200, 4096, (-1, -1)),
+        (640, 4096, (-1, -1)),
+        (1152, 8192, (-1, -1)),
+        (1040, 2048, (256, 256)),
+        (1664, 8192, (1024, -1)),
+        (1040, 1024, (256, -1)),
+    ],
+)
+def test_dense_mxu_q_blocks_of_any_fragment_count(
+    seqlen_q, seqlen_k, window_size
+):
+    # Note (david): a q block whose kv tile's items fill no whole slot lap in
+    # LOOP_BODY_TILES tiles runs longer loop bodies; a masked build whose kv
+    # block holds fewer than two of them keeps the dot_general loop.
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, window_size=window_size)
+    assert_output_close(out, q, k, v, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,causal,window_size",
+    [
+        (64, 128, True, (-1, -1)),
+        (113, 203, True, (-1, -1)),
+        (640, 128, True, (-1, -1)),
+        (1023, 1024, True, (-1, -1)),
+        (1024, 1023, True, (-1, -1)),
+        (256, 256, False, (174, 14)),
+        (512, 256, False, (44, 255)),
+        (128, 256, False, (76, 0)),
+    ],
+)
+def test_dense_mxu_masked_single_block(seqlen_q, seqlen_k, causal, window_size):
+    # Note (david): a mask without a static causal plan, over blocks too small
+    # for masked loop bodies: a kv axis of one block runs every row as one
+    # segment with every item masked.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+        causal_offset=seqlen_k - seqlen_q,
+    )
+    kernel = get_kernel(
+        4,
+        4,
+        pad_seqlen(seqlen_q),
+        pad_seqlen(seqlen_k),
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, causal=causal, window_size=window_size)
+    assert_output_close(out, q, k, v, causal=causal, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,window_size",
+    [
+        (4224, 4224, (429, 3167)),
+        (4224, 4224, (512, 512)),
+        (2176, 4224, (686, 2555)),
+        (128, 4224, (512, 512)),
+    ],
+)
+def test_dense_mxu_masked_blocks_of_one_slot_lap(
+    seqlen_q, seqlen_k, window_size
+):
+    # Note (david): a window over several kv blocks runs masked loop bodies
+    # and edge segments in q blocks of one slot lap of fragments, fewer than
+    # the pipeline holds in flight.
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=False,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+        causal_offset=seqlen_k - seqlen_q,
+    )
+    kernel = get_kernel(
+        4,
+        4,
+        pad_seqlen(seqlen_q),
+        pad_seqlen(seqlen_k),
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    traits = kernel.keywords["traits"]
+    assert traits.uses_mxu_pipeline
+    assert traits.bq == dispatch.DENSE_MXU_MIN_Q_BLOCK
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, 4, MXU_HEAD_DIM, seqlen_k=seqlen_k)
+    out = dense_attn(q, k, v, window_size=window_size)
+    assert_output_close(out, q, k, v, window_size=window_size)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlens,nheads_k,blocks",
+    [
+        ([300, 37], 8, (128, 256, 16, 256)),
+        ([128] * 6, 4, (128, 256, 16, 256)),
+        ([1, 130, 64], 2, (128, 512, 32, 256)),
+        # Runs of one-tile rows share start segments (row groups), between
+        # lone rows of several tiles.
+        ([64, 37, 100, 1, 250, 900, 17, 64, 64, 300], 4, (128, 512, 16, 256)),
+        ([40, 90, 1, 128, 60, 700, 30], 8, (128, 256, 16, 256)),
+    ],
+)
+def test_varlen_mxu_small_blocks(seqlens, nheads_k, blocks, monkeypatch):
+    # Note (david): pinned blocks of few fragments a tile run the explicit
+    # loop as they are: a row's tiles in whole slot laps, those past its live
+    # ones hiding every key.
+    explicit_bodies = []
+    explicit_body = fwd_varlen.varlen_mxu_fwd_body
+
+    def counted_body(*args, **kwargs):
+        explicit_bodies.append(args[0])
+        return explicit_body(*args, **kwargs)
+
+    monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", counted_body)
+    jax.clear_caches()
+    q, k, v, segments = packed_qkv(seqlens, 8, nheads_k, MXU_HEAD_DIM)
+    cu = cu_seqlens_of(seqlens)
+    out = varlen_attn(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max(seqlens),
+        max(seqlens),
+        causal=True,
+        block_sizes=blocks,
+    )
+    jax.clear_caches()
+    assert explicit_bodies
+    assert_segments_close(out, segments, cu, causal=True)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,causal,window_size",
+    [
+        pytest.param(1024, 8192, True, (-1, -1), id="causal-q1k-k8k"),
+        pytest.param(3072, 8192, True, (-1, -1), id="causal-q3k-k8k"),
+        pytest.param(6144, 7168, True, (-1, -1), id="causal-q6k-k7k"),
+        pytest.param(8192, 8192, False, (127, 0), id="window-127"),
+        pytest.param(8192, 8192, False, (4095, 0), id="window-4095"),
+        pytest.param(8192, 8192, False, (-1, 128), id="right-128"),
+        pytest.param(8192, 8192, False, (127, 127), id="both-bounds"),
+        pytest.param(8192, 8192, False, (1000, -1), id="left-only"),
+    ],
+)
+def test_dense_mxu_dispatch_takes_every_mask(
+    seqlen_q, seqlen_k, causal, window_size
+):
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=None,
+        return_lse=False,
+        causal_offset=seqlen_k - seqlen_q,
+    )
+    kernel = get_kernel(
+        4, 2, seqlen_q, seqlen_k, variant, False, MXU_HEAD_DIM, MXU_HEAD_DIM
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_dispatch_takes_a_runtime_offset():
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=True,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+        runtime_causal_offset=True,
+    )
+    kernel = make_flash_attn_mha(
+        4,
+        4096,
+        16384,
+        variant=variant,
+        block_sizes=BlockSizes(block_q=2048, block_kv=2048),
+        head_dim=MXU_HEAD_DIM,
+        num_kv_heads=2,
+    )
+    assert kernel.keywords["traits"].uses_mxu_pipeline
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "causal,seqlen_q,seqlen,nheads_k,scaled_quarter",
+    [
+        (True, 6144, 6144, 4, 0),
+        (True, 2048, 2048, 1, 0),
+        (False, 4096, 4096, 4, 3),
+        (False, 1152, 8192, 4, 3),
+    ],
+)
+def test_dense_mxu_guard_replay(
+    causal, seqlen_q, seqlen, nheads_k, scaled_quarter
+):
+    # Note (david): keys scaled far up in a block a row visits after the one
+    # its anchors come from push its row sums past the guard, so the row
+    # replays: a causal row anchors on its diagonal block and meets block 0
+    # later, a full row anchors on block 0. The sinks and lse read the
+    # replayed state; the one-block MQA rows run from one staged block, and
+    # the 1152-row q block's longer loop bodies leave no check unit.
+    q, k, v = random_qkv(
+        0, 1, seqlen_q, 4, nheads_k, MXU_HEAD_DIM, seqlen_k=seqlen
+    )
+    quarter = seqlen // 4
+    keys = slice(scaled_quarter * quarter, (scaled_quarter + 1) * quarter)
+    k = k.at[:, keys].multiply(40.0)
+    sinks = jnp.array([0.0, 30.0, 300.0, -5.0], jnp.float32)
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)),
+        causal=causal,
+        learnable_sink=sinks,
+        return_softmax_lse=True,
+        interpret=INTERPRET,
+    )
+    assert_output_close(to_head_major(out), q, k, v, causal=causal, sinks=sinks)
+    assert_lse_close(lse, q, k, v, causal=causal, sinks=sinks)
+
+
+# A dense guard case runs 2048-token blocks, one check unit each: the last q
+# block of a 12288-token causal grid visits blocks 0 to 5 in order (units 0 to
+# 5), the last its diagonal block. Units 0 to 3 are checked at the end of the
+# next block's first body; units 4 and 5 make the row's final unit.
+GUARD_SEQLEN = 12288
+GUARD_BLOCK = 2048
+GUARD_TILE_KEYS = 256
+# A spiked key's score in nats against rows that score 0 everywhere else.
+OVERFLOW_SCORE = 200.0
+LAST_Q_BLOCK = slice(GUARD_SEQLEN - GUARD_BLOCK, GUARD_SEQLEN)
+# The last fragment's rows of the last q block: 16 rows.
+DENSE_LAST_FRAGMENT_ROWS = slice(GUARD_SEQLEN - 16, GUARD_SEQLEN)
+# Note (david): 2^-64 flags every check unit and every row.
+FORCED_GUARD_THRESHOLD = -64.0
+
+
+def guard_qkv(spikes, rows, *, seqlen=GUARD_SEQLEN, nheads=4, nheads_k=2):
+    """random_qkv's (1, seqlen, heads, d) arrays where the q rows rows point
+    along one direction and every other q row is zero: every key scores 0
+    against them but those of each (start, stop, score) of spikes, which
+    score score nats."""
+    q, k, v = random_qkv(0, 1, seqlen, nheads, nheads_k, MXU_HEAD_DIM)
+    scale = MXU_HEAD_DIM**-0.5
+    magnitude = math.sqrt(OVERFLOW_SCORE / scale)
+    q, k = (np.array(x, np.float32) for x in (q, k))
+    q[:] = 0.0
+    q[:, rows, :, 0] = magnitude
+    k[..., 0] = 0.0
+    for start, stop, score in spikes:
+        k[:, start:stop, :, 0] = score / (magnitude * scale)
+    return jnp.asarray(q, jnp.bfloat16), jnp.asarray(k, jnp.bfloat16), v
+
+
+def dense_unit_keys(unit, first_tile, end_tile, *, block=GUARD_BLOCK):
+    """(start, stop) of the keys of tiles [first_tile, end_tile) of check
+    unit unit of the last q block's row of a causal grid: unit u is its kv
+    block u, the last its diagonal block."""
+    first_key = unit * block
+    return (
+        first_key + first_tile * GUARD_TILE_KEYS,
+        first_key + end_tile * GUARD_TILE_KEYS,
+    )
+
+
+def assert_checked_build(nheads, nheads_k, seqlen, causal):
+    """Assert that flash_attn_func's build of the shape runs the explicit MXU
+    loop with checked units."""
+    variant = make_variant(
+        MXU_HEAD_DIM**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=(-1, -1),
+        learnable_sink=None,
+        return_lse=False,
+    )
+    kernel = get_kernel(
+        nheads,
+        nheads_k,
+        seqlen,
+        seqlen,
+        variant,
+        False,
+        MXU_HEAD_DIM,
+        MXU_HEAD_DIM,
+    )
+    traits = kernel.keywords["traits"]
+    assert traits.uses_mxu_pipeline
+    assert dense_has_checked_units(
+        seqlen // traits.bkv, traits.bq // FRAGMENT_ROWS
+    )
+
+
+def explicit_dense_attn(
+    q, k, v, *, block_q, block_kv, causal, window_size=(-1, -1), sinks=None
+):
+    """make_flash_attn_mha's dense build of block_q x block_kv blocks on
+    (1, seqlen, nheads, d) arrays; the build must run the explicit MXU loop
+    with checked units. With sinks it returns (out, lse)."""
+    _, seqlen, nheads, head_dim = q.shape
+    variant = make_variant(
+        head_dim**-0.5,
+        softcap=0.0,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=sinks,
+        return_lse=sinks is not None,
+    )
+    kernel = make_flash_attn_mha(
+        nheads,
+        seqlen,
+        seqlen,
+        variant=variant,
+        block_sizes=BlockSizes(block_q=block_q, block_kv=block_kv),
+        head_dim=head_dim,
+        num_kv_heads=k.shape[2],
+        interpret=INTERPRET,
+    )
+    traits = kernel.keywords["traits"]
+    assert traits.uses_mxu_pipeline
+    assert dense_has_checked_units(
+        seqlen // traits.bkv, traits.bq // FRAGMENT_ROWS
+    )
+    sink_args = () if sinks is None else (sinks,)
+    outputs = kernel(*(x[0].swapaxes(0, 1) for x in (q, k, v)), *sink_args)
+    if sinks is None:
+        return outputs.swapaxes(0, 1)[None]
+    out, lse = outputs
+    return out.swapaxes(0, 1)[None], lse[None]
+
+
+DENSE_GUARD_CASES = [
+    pytest.param(
+        dict(spikes=[(*dense_unit_keys(0, 0, 1), OVERFLOW_SCORE)]),
+        id="unit0",
+    ),
+    pytest.param(
+        dict(spikes=[(*dense_unit_keys(2, 1, 2), OVERFLOW_SCORE)]),
+        id="middle-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[(*dense_unit_keys(1, 7, 8), OVERFLOW_SCORE)],
+            rows=DENSE_LAST_FRAGMENT_ROWS,
+        ),
+        id="last-fragments",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(4, 3, 4), OVERFLOW_SCORE),
+                (*dense_unit_keys(5, 1, 2), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="final-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*dense_unit_keys(3, 2, 3), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="two-units",
+    ),
+    # Unit 1's replay runs through unit 2's first body, whose keys raise the
+    # anchor past the one unit 2's checkpoint was written on; unit 2's last
+    # tile then flags unit 2, which replays from that checkpoint.
+    pytest.param(
+        dict(
+            spikes=[
+                (*dense_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*dense_unit_keys(2, 0, 1), 2 * OVERFLOW_SCORE),
+                (*dense_unit_keys(2, 7, 8), 3 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="anchor-raised-by-replay",
+    ),
+]
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spec", DENSE_GUARD_CASES)
+def test_dense_mxu_guard_replays_flagged_units(spec):
+    # Note (david): the spiked keys score ~200 nats against rows anchored at
+    # 0, so only a replay keeps those rows finite.
+    assert_checked_build(4, 2, GUARD_SEQLEN, causal=True)
+    q, k, v = guard_qkv(spec["spikes"], spec.get("rows", LAST_Q_BLOCK))
+    out = dense_attn(q, k, v, causal=True)
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=True)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_a_middle_unit_with_sinks():
+    spikes = [(*dense_unit_keys(2, 1, 2), OVERFLOW_SCORE)]
+    q, k, v = guard_qkv(spikes, LAST_Q_BLOCK)
+    sinks = random_sinks(4)
+    out, lse = flash_attn_func(
+        *map(to_head_major, (q, k, v)),
+        causal=True,
+        learnable_sink=sinks,
+        return_softmax_lse=True,
+        interpret=INTERPRET,
+    )
+    assert_output_close(to_head_major(out), q, k, v, causal=True, sinks=sinks)
+    assert_lse_close(lse, q, k, v, causal=True, sinks=sinks)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_full_row_units():
+    # Note (david): full rows anchor on block 0's first tile; blocks 0 and 1
+    # of the four are checked units, the first replaying from the row start.
+    seqlen = 8192
+    assert_checked_build(4, 2, seqlen, causal=False)
+    spikes = [
+        (2 * GUARD_TILE_KEYS, 3 * GUARD_TILE_KEYS, OVERFLOW_SCORE),
+        (
+            GUARD_BLOCK + 5 * GUARD_TILE_KEYS,
+            GUARD_BLOCK + 6 * GUARD_TILE_KEYS,
+            2 * OVERFLOW_SCORE,
+        ),
+    ]
+    q, k, v = guard_qkv(spikes, slice(0, seqlen), seqlen=seqlen)
+    out = dense_attn(q, k, v, causal=False)
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=False)
+
+
+@requires_mxu_accumulators
+def test_dense_mxu_guard_replays_units_of_1024_token_blocks():
+    # Note (david): the diagonal block's static items close the row, in its
+    # final unit with block 4.
+    seqlen, block = 6144, 1024
+    spikes = [
+        (*dense_unit_keys(0, 0, 1, block=block), OVERFLOW_SCORE),
+        (
+            *dense_unit_keys(2, 1, 2, block=block),
+            2 * OVERFLOW_SCORE,
+        ),
+        (
+            *dense_unit_keys(5, 3, 4, block=block),
+            3 * OVERFLOW_SCORE,
+        ),
+    ]
+    q, k, v = guard_qkv(spikes, slice(seqlen - block, seqlen), seqlen=seqlen)
+    out = explicit_dense_attn(
+        q, k, v, block_q=block, block_kv=block, causal=True
+    )
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(out, q, k, v, causal=True)
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "causal,seqlen,block_q,block_kv",
+    [
+        pytest.param(True, 8192, 2048, 2048, id="causal"),
+        pytest.param(True, 4096, 1024, 1024, id="causal-short-diagonal"),
+        pytest.param(False, 8192, 2048, 2048, id="full"),
+        pytest.param(False, 6144, 1024, 2048, id="full-two-body-q"),
+    ],
+)
+def test_dense_mxu_forced_guard_replays_units(
+    causal, seqlen, block_q, block_kv, monkeypatch
+):
+    # Note (david): every check unit and every row is flagged: each checked
+    # unit replays at the end of the next block's first body, and each row's
+    # final unit after the row's drain.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda kv_seq_len: FORCED_GUARD_THRESHOLD,
+    )
+    q, k, v = random_qkv(0, 1, seqlen, 4, 2, MXU_HEAD_DIM)
+    out = explicit_dense_attn(
+        q, k, v, block_q=block_q, block_kv=block_kv, causal=causal
+    )
+    assert_output_close(out, q, k, v, causal=causal)
+
+
+# A left window over guard_qkv rows: the last q block's rows first see keys
+# 2049 to 4096, where they take their anchors.
+DENSE_GUARD_WINDOW = (8191, -1)
+DENSE_WINDOW_GUARD_CASES = [
+    # Unit 0 (block 1 of 2048 keys) holds the rows' anchor tiles; the rows
+    # anchored before its tile 5 meet the spike there.
+    pytest.param(2048, 2048, [(3500, 3510, OVERFLOW_SCORE)], id="anchor-unit"),
+    # Unit 2 (block 3), after every anchor.
+    pytest.param(
+        2048, 2048, [(7000, 7010, OVERFLOW_SCORE)], id="after-anchors"
+    ),
+    # Unit 0 (block 2 of 1024 keys) ends before the anchors of the rows past
+    # 11262, which enter unit 1's checkpoint unanchored; unit 1 replays from
+    # it.
+    pytest.param(
+        2048,
+        1024,
+        [(2900, 2910, OVERFLOW_SCORE), (3900, 3910, 2 * OVERFLOW_SCORE)],
+        id="before-anchors",
+    ),
+    # block_q 1024 against 2048-key blocks runs the masked runtime plan.
+    pytest.param(
+        1024,
+        2048,
+        [(3500, 3510, OVERFLOW_SCORE), (7000, 7010, 2 * OVERFLOW_SCORE)],
+        id="runtime-plan",
+    ),
+]
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize("block_q,block_kv,spikes", DENSE_WINDOW_GUARD_CASES)
+def test_dense_mxu_guard_replays_flagged_units_in_a_window(
+    block_q, block_kv, spikes
+):
+    q, k, v = guard_qkv(spikes, LAST_Q_BLOCK)
+    out = explicit_dense_attn(
+        q,
+        k,
+        v,
+        block_q=block_q,
+        block_kv=block_kv,
+        causal=True,
+        window_size=DENSE_GUARD_WINDOW,
+    )
+    assert np.all(np.isfinite(np.asarray(out, np.float32)))
+    assert_output_close(
+        out, q, k, v, causal=True, window_size=DENSE_GUARD_WINDOW
+    )
+
+
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "block_q,block_kv",
+    [
+        pytest.param(2048, 1024, id="static-plan"),
+        pytest.param(1024, 2048, id="runtime-plan"),
+    ],
+)
+def test_dense_mxu_forced_guard_replays_window_units_with_sinks(
+    block_q, block_kv, monkeypatch
+):
+    # Note (david): every check unit and every row is flagged under a left
+    # window: the replays start before, at and after the rows' anchor tiles.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda kv_seq_len: FORCED_GUARD_THRESHOLD,
+    )
+    window = (5000, -1)
+    q, k, v = random_qkv(0, 1, 8192, 4, 2, MXU_HEAD_DIM)
+    sinks = random_sinks(4)
+    out, lse = explicit_dense_attn(
+        q,
+        k,
+        v,
+        block_q=block_q,
+        block_kv=block_kv,
+        causal=True,
+        window_size=window,
+        sinks=sinks,
+    )
+    mask_kwargs = dict(causal=True, window_size=window, sinks=sinks)
+    assert_output_close(out, q, k, v, **mask_kwargs)
+    assert_lse_close(lse, q, k, v, **mask_kwargs)
+
+
+skip_interpret = pytest.mark.skipif(
+    INTERPRET, reason="interpret mode affords short sequences only"
+)
+
+
+def assert_segments_close(out, segments, cu_q, lse=None, **mask_kwargs):
+    """Each packed sequence's out (and lse) against its own reference."""
+    for index, segment in enumerate(segments):
+        rows = slice(int(cu_q[index]), int(cu_q[index + 1]))
+        if rows.start == rows.stop:
+            continue
+        assert_output_close(out[rows][None], *segment, **mask_kwargs)
+        if lse is not None:
+            assert_lse_close(lse[None, :, rows], *segment, **mask_kwargs)
+
+
+def unequal_packed_qkv(seqlens_q, seqlens_k, nheads, nheads_k, d):
+    """packed_qkv with each sequence's own q and kv lengths."""
+    segments = [
+        random_qkv(index, 1, seqlen_q, nheads, nheads_k, d, seqlen_k=seqlen_k)
+        for index, (seqlen_q, seqlen_k) in enumerate(zip(seqlens_q, seqlens_k))
+    ]
+    q, k, v = (
+        jnp.concatenate([segment[axis][0] for segment in segments])
+        for axis in range(3)
+    )
+    return q, k, v, segments
+
+
+@pytest.mark.parametrize(
+    "seqlens,causal,window_size",
+    [
+        ([300, 37], True, (-1, -1)),
+        ([300, 37], True, (127, -1)),
+        ([300, 37], False, (300, 200)),
+        ([300, 37], False, (-1, 100)),
+        ([16] * 8, True, (-1, -1)),
+        ([1, 130], True, (-1, -1)),
+        ([16] * 8, True, (127, -1)),
+        ([1, 130], False, (300, 200)),
+    ],
+)
+def test_varlen_mxu_takes_the_explicit_path(
+    monkeypatch, seqlens, causal, window_size
+):
+    # Note (david): short sequences take dispatch's small blocks, which the
+    # explicit loop runs as they are.
+    explicit_bodies = []
+    explicit_body = fwd_varlen.varlen_mxu_fwd_body
+
+    def counted_body(*args, **kwargs):
+        explicit_bodies.append(args[0])
+        return explicit_body(*args, **kwargs)
+
+    monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", counted_body)
+    jax.clear_caches()
+    q, k, v, segments = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
+    cu = cu_seqlens_of(seqlens)
+    out = varlen_attn(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max(seqlens),
+        max(seqlens),
+        causal=causal,
+        window_size=window_size,
+    )
+    jax.clear_caches()
+    assert bool(explicit_bodies) == HAS_MXU_ACCUMULATORS
+    assert_segments_close(
+        out, segments, cu, causal=causal, window_size=window_size
+    )
+
+
+@skip_interpret
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_mxu_guard_replay(causal):
+    # Note (david): the second sequence's last keys score far above its rows'
+    # first-tile anchors, so its rows replay; the replay loop's unroll factor
+    # leaves the output as it is.
+    seqlens = [384, 2048, 100]
+    q, k, v, segments = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
+    k = k.at[384 + 1536 : 384 + 2048].multiply(40.0)
+    segments[1] = (segments[1][0], k[None, 384 : 384 + 2048], segments[1][2])
+    cu = cu_seqlens_of(seqlens)
+    outs = [
+        varlen_attn(
+            q,
+            k,
+            v,
+            cu,
+            cu,
+            max(seqlens),
+            max(seqlens),
+            causal=causal,
+            return_softmax_lse=True,
+            guard_replay_unroll=unroll,
+        )
+        for unroll in (1, 2)
+    ]
+    out, lse = outs[0]
+    assert_segments_close(out, segments, cu, lse, causal=causal)
+    assert jnp.array_equal(outs[1][0], out)
+
+
+# A chunk after a long prefix, its 512-token q blocks against kv blocks of 4
+# tiles: the chunk's two rows run 26 and 28 live tiles, whose check units 0 to
+# 3 and 0 to 4 are checked at the end of the next unit's first body; the rest
+# replay with the row.
+GUARD_PREFIX = 6144
+GUARD_CHUNK = 1024
+GUARD_BLOCK_SIZES = (512, 1024, 128, 128)
+MXU_TILE_KEYS = 256
+GUARD_UNIT_KEYS = 4 * MXU_TILE_KEYS
+
+
+@pytest.fixture(name="explicit_varlen_builds")
+def fixture_explicit_varlen_builds(monkeypatch):
+    """The traits of the packed builds traced on the explicit MXU pipeline
+    while the test runs; the kernel caches are cleared around it, so every
+    call builds and traces its kernel."""
+    builds = []
+    mxu_body = fwd_varlen.varlen_mxu_fwd_body
+
+    def recorded_body(traits, *args, **kwargs):
+        builds.append(traits)
+        return mxu_body(traits, *args, **kwargs)
+
+    monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", recorded_body)
+    get_kernel.cache_clear()
+    jax.clear_caches()
+    yield builds
+    get_kernel.cache_clear()
+    jax.clear_caches()
+
+
+def guard_case(nheads, nheads_k, spikes, *, rows=None):
+    """(q, k, v, segments) of one GUARD_CHUNK-token chunk whose keys are a
+    GUARD_PREFIX-token prefix and itself; its q rows (all when None) point
+    along one direction, against which every key scores 0 but those of each
+    (start, stop, score) of spikes, which score score nats."""
+    seqlen_k = GUARD_PREFIX + GUARD_CHUNK
+    q, k, v, _ = unequal_packed_qkv(
+        [GUARD_CHUNK], [seqlen_k], nheads, nheads_k, MXU_HEAD_DIM
+    )
+    scale = MXU_HEAD_DIM**-0.5
+    magnitude = math.sqrt(OVERFLOW_SCORE / scale)
+    q = np.zeros(q.shape, np.float32)
+    q[slice(None) if rows is None else rows, :, 0] = magnitude
+    k = np.array(k, np.float32)
+    k[..., 0] = 0.0
+    for start, stop, score in spikes:
+        k[start:stop, :, 0] = score / (magnitude * scale)
+    q, k = (jnp.asarray(x, jnp.bfloat16) for x in (q, k))
+    return q, k, v, [(q[None], k[None], v[None])]
+
+
+def run_guard_case(q, k, v, **kwargs):
+    """varlen_attn on a guard_case chunk, with GUARD_BLOCK_SIZES."""
+    return varlen_attn(
+        q,
+        k,
+        v,
+        cu_seqlens_of([GUARD_CHUNK]),
+        cu_seqlens_of([GUARD_PREFIX + GUARD_CHUNK]),
+        GUARD_CHUNK,
+        GUARD_PREFIX + GUARD_CHUNK,
+        causal=True,
+        return_softmax_lse=True,
+        block_sizes=GUARD_BLOCK_SIZES,
+        **kwargs,
+    )
+
+
+def varlen_unit_keys(unit, first_tile, end_tile):
+    """(start, stop) of the keys of tiles [first_tile, end_tile) of check
+    unit unit of a guard_case row."""
+    return (
+        unit * GUARD_UNIT_KEYS + first_tile * MXU_TILE_KEYS,
+        unit * GUARD_UNIT_KEYS + end_tile * MXU_TILE_KEYS,
+    )
+
+
+# The last fragments of a fold-4 512-token q block's tile: its last token chunk
+# of 16 rows for every folded head.
+VARLEN_LAST_FRAGMENT_ROWS = np.concatenate(
+    [np.arange(496, 512), np.arange(1008, 1024)]
+)
+VARLEN_GUARD_CASES = [
+    pytest.param(
+        dict(spikes=[(*varlen_unit_keys(0, 2, 3), OVERFLOW_SCORE)]), id="unit0"
+    ),
+    pytest.param(
+        dict(spikes=[(*varlen_unit_keys(2, 1, 2), OVERFLOW_SCORE)]),
+        id="middle-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[(*varlen_unit_keys(1, 3, 4), OVERFLOW_SCORE)],
+            rows=VARLEN_LAST_FRAGMENT_ROWS,
+        ),
+        id="last-fragments",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(5, 1, 2), OVERFLOW_SCORE),
+                (GUARD_PREFIX, GUARD_PREFIX + 57, OVERFLOW_SCORE),
+            ]
+        ),
+        id="final-unit",
+    ),
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*varlen_unit_keys(3, 2, 3), 2 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="two-units",
+    ),
+    # Unit 1's replay runs through unit 2's first tiles, whose keys raise the
+    # anchor past the one unit 2's checkpoint was written on; unit 2's last
+    # tile then flags unit 2, which replays from that checkpoint.
+    pytest.param(
+        dict(
+            spikes=[
+                (*varlen_unit_keys(1, 1, 2), OVERFLOW_SCORE),
+                (*varlen_unit_keys(2, 0, 1), 2 * OVERFLOW_SCORE),
+                (*varlen_unit_keys(2, 3, 4), 3 * OVERFLOW_SCORE),
+            ]
+        ),
+        id="anchor-raised-by-replay",
+    ),
+]
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spec", VARLEN_GUARD_CASES)
+def test_varlen_mxu_guard_replays_flagged_units(spec, explicit_varlen_builds):
+    # Note (david): the spiked keys score ~200 nats against rows that anchor on
+    # their first kv tile at 0, so only a replay keeps those rows finite.
+    q, k, v, segments = guard_case(8, 2, **spec)
+    out, lse = run_guard_case(q, k, v)
+    assert {
+        traits.num_k_compute_tiles for traits in explicit_varlen_builds
+    } == {GUARD_BLOCK_SIZES[1] // MXU_TILE_KEYS}
+    assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
+    assert_segments_close(
+        out, segments, cu_seqlens_of([GUARD_CHUNK]), lse, causal=True
+    )
+
+
+# A left window over guard_case rows: q block 0's rows first see keys 2049
+# to 2560, so its unit 0 starts at key 2048 and holds every row's anchor.
+GUARD_WINDOW = (4095, -1)
+VARLEN_WINDOW_GUARD_CASES = [
+    # Rows anchored on tile 0 meet the spike on tile 1, where later rows
+    # take their anchors: the flagged unit holds anchor tiles.
+    pytest.param([(2300, 2311, OVERFLOW_SCORE)], id="anchor-unit"),
+    # Unit 2 of q block 0, unit 1's last tile of q block 1.
+    pytest.param([(4352, 4401, OVERFLOW_SCORE)], id="after-anchors"),
+]
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("spikes", VARLEN_WINDOW_GUARD_CASES)
+def test_varlen_mxu_guard_replays_flagged_units_in_a_window(
+    spikes, explicit_varlen_builds
+):
+    q, k, v, segments = guard_case(8, 2, spikes)
+    out, lse = run_guard_case(q, k, v, window_size=GUARD_WINDOW)
+    assert explicit_varlen_builds
+    assert jnp.all(jnp.isfinite(out.astype(jnp.float32)))
+    assert_segments_close(
+        out,
+        segments,
+        cu_seqlens_of([GUARD_CHUNK]),
+        lse,
+        causal=True,
+        window_size=GUARD_WINDOW,
+    )
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("nheads,nheads_k", [(8, 2), (4, 4)])
+def test_varlen_mxu_guard_replays_a_middle_unit_with_sinks(
+    nheads, nheads_k, explicit_varlen_builds
+):
+    q, k, v, segments = guard_case(
+        nheads, nheads_k, [(*varlen_unit_keys(2, 1, 2), OVERFLOW_SCORE)]
+    )
+    sinks = random_sinks(nheads)
+    out, lse = run_guard_case(q, k, v, learnable_sink=sinks)
+    assert explicit_varlen_builds
+    assert_segments_close(
+        out,
+        segments,
+        cu_seqlens_of([GUARD_CHUNK]),
+        lse,
+        causal=True,
+        sinks=sinks,
+    )
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize(
+    "nheads,nheads_k,block_q,block_kv,block_q_compute",
+    [
+        pytest.param(8, 2, 512, 512, 128, id="fold4-block2"),
+        pytest.param(8, 2, 512, 1024, 128, id="fold4-block4"),
+        pytest.param(8, 2, 512, 2048, 128, id="fold4-block8"),
+        pytest.param(4, 4, 512, 1024, 128, id="fold1-block4"),
+        # A block too short for the default pipeline depth: a shallower
+        # pipeline on a smaller slot ring (fwd_mxu.pipeline_shape).
+        pytest.param(4, 4, 128, 512, 32, id="fold1-q128-block2"),
+    ],
+)
+def test_varlen_mxu_forced_guard_replays_units(
+    nheads,
+    nheads_k,
+    block_q,
+    block_kv,
+    block_q_compute,
+    monkeypatch,
+    explicit_varlen_builds,
+):
+    # Note (david): every check unit and every row is flagged: each checked
+    # unit replays at the end of the next unit's first body, and each row's
+    # final unit as the row is completed, while the next row runs; the
+    # 2500-token sequence's rows hold no checked unit and replay whole.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda seqlen_kv: FORCED_GUARD_THRESHOLD,
+    )
+    seqlens_q, seqlens_k = [1024, 200, 2500], [6024, 3201, 2500]
+    q, k, v, segments = unequal_packed_qkv(
+        seqlens_q, seqlens_k, nheads, nheads_k, MXU_HEAD_DIM
+    )
+    cu_q, cu_k = cu_seqlens_of(seqlens_q), cu_seqlens_of(seqlens_k)
+    out, lse = varlen_attn(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=True,
+        return_softmax_lse=True,
+        block_sizes=(block_q, block_kv, block_q_compute, 128),
+    )
+    assert {
+        traits.num_k_compute_tiles for traits in explicit_varlen_builds
+    } == {block_kv // MXU_TILE_KEYS}
+    assert_segments_close(out, segments, cu_q, lse, causal=True)
+
+
+@skip_interpret
+@requires_mxu_accumulators
+def test_varlen_mxu_check_units_over_six_tile_blocks(explicit_varlen_builds):
+    # Note (david): with 1536-key kv blocks the first sequence's check unit 1
+    # opens kv block 1 on its last body.
+    seqlens = [6144, 300]
+    q, k, v, segments = packed_qkv(seqlens, 8, 2, MXU_HEAD_DIM)
+    cu = cu_seqlens_of(seqlens)
+    out = varlen_attn(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        max(seqlens),
+        max(seqlens),
+        causal=True,
+        block_sizes=(512, 1536, 128, 128),
+    )
+    assert {
+        traits.num_k_compute_tiles for traits in explicit_varlen_builds
+    } == {1536 // MXU_TILE_KEYS}
+    assert_segments_close(out, segments, cu, causal=True)
+
+
+@skip_interpret
+@requires_mxu_accumulators
+@pytest.mark.parametrize("left", [700, 2500])
+def test_varlen_mxu_forced_guard_replays_window_units_with_sinks(
+    left, monkeypatch, explicit_varlen_builds
+):
+    # Note (david): every check unit and row is flagged under a left window:
+    # the replays start before, at and after the rows' anchor tiles.
+    monkeypatch.setattr(
+        dispatch,
+        "overflow_guard_threshold",
+        lambda seqlen_kv: FORCED_GUARD_THRESHOLD,
+    )
+    nheads, nheads_k = 8, 2
+    seqlens_q, seqlens_k = [1024, 200, 2500], [6024, 3201, 2500]
+    q, k, v, segments = unequal_packed_qkv(
+        seqlens_q, seqlens_k, nheads, nheads_k, MXU_HEAD_DIM
+    )
+    sinks = random_sinks(nheads)
+    cu_q, cu_k = cu_seqlens_of(seqlens_q), cu_seqlens_of(seqlens_k)
+    window = (left, -1)
+    out, lse = varlen_attn(
+        q,
+        k,
+        v,
+        cu_q,
+        cu_k,
+        max(seqlens_q),
+        max(seqlens_k),
+        causal=True,
+        window_size=window,
+        learnable_sink=sinks,
+        return_softmax_lse=True,
+        block_sizes=(512, 1024, 128, 128),
+    )
+    assert explicit_varlen_builds
+    assert_segments_close(
+        out, segments, cu_q, lse, causal=True, window_size=window, sinks=sinks
+    )

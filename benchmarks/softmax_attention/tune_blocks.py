@@ -966,6 +966,7 @@ def main(argv=None):
         "causal",
         1,
         args.seq,
+        args.seq,
     )
     return search(cell, args)
 

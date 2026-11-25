@@ -12,17 +12,28 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Naive attention, the RoPE reference and the random padding masks the flash
-attn tests share."""
+"""Naive attention, the RoPE reference, the random padding masks and the MXU
+accumulator check the flash attn tests share."""
 
 import math
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from tests.softmax_attention.padding import pad_input, unpad_input
 
+# Whether the kernels run on a chip whose MXUs have result accumulators (TPU
+# v7x), which the explicit MXU pipeline needs.
+HAS_MXU_ACCUMULATORS = (
+    jax.default_backend() == "tpu" and pltpu.get_tpu_info().num_accumulators > 0
+)
+requires_mxu_accumulators = pytest.mark.skipif(
+    not HAS_MXU_ACCUMULATORS,
+    reason="the explicit MXU pipeline needs MXU result accumulators (TPU v7x)",
+)
 # Note (david): masking with a finite value instead of -inf keeps a fully masked
 # row finite, so jax.vjp through it does not leak NaN into every input; such
 # rows are zeroed explicitly.

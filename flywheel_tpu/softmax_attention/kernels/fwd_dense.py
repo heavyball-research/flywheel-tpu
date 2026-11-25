@@ -17,7 +17,7 @@ offset one, and their main loop."""
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from functools import partial, reduce
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -25,14 +25,18 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tpu import NUM_LANES
+from flywheel_tpu.core.tpu import NUM_LANES, NUM_SUBLANES
+from flywheel_tpu.softmax_attention.block_stream import (
+    DenseBlockStream,
+    select_desc,
+)
 from flywheel_tpu.softmax_attention.config import (
     QKVLayout,
     TokenMajorInfo,
     from_head_minor,
     vmem_limit_bytes,
 )
-from flywheel_tpu.softmax_attention.dma import advance, drain
+from flywheel_tpu.softmax_attention.dma import drain
 from flywheel_tpu.softmax_attention.fwd_blocks import (
     NUM_KV_STAGES,
     NUM_O_SLOTS,
@@ -50,23 +54,20 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     RowStateRefs,
     ScoreMask,
     SoftmaxPass,
+    advance_dense_q_row,
     cancel_pending_pv,
     carry_out_pv,
-    finish_row_lse,
+    finish_row_lse_and_sinks,
     finish_row_out,
-    fold_out_sinks,
     fragment_pv,
-    head_sinks,
     issue_pending_pv,
     o_copy,
     online_softmax,
     pending_fragment,
     qk,
     rotate_staged,
-    start_kv_block,
-    start_q_row,
-    wait_kv_block,
     wait_q_row,
+    wait_rotated_kv_block,
 )
 from flywheel_tpu.softmax_attention.fwd_call import (
     check_qkv_operands,
@@ -74,6 +75,14 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     rotary_fields,
     staged_shape,
 )
+from flywheel_tpu.softmax_attention.fwd_mxu import NUM_CHECKPOINTS
+from flywheel_tpu.softmax_attention.inputs import ROTARY_TOKEN_AXIS, pad_axis
+from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+    CheckRefs,
+    dense_has_checked_units,
+    make_dense_mxu_loop,
+)
+from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
 from flywheel_tpu.softmax_attention.schedule import (
     DenseFwdParams,
     FwdSchedule,
@@ -90,6 +99,7 @@ def flash_fwd_kernel(
     traits: FwdTraits,
     variant: Variant,
     dense_params: DenseFwdParams,
+    num_valid_keys: int | None = None,
 ) -> None:
     if variant.has_sinks:
         sinks_ref, q_hbm, k_hbm, v_hbm, *refs = refs
@@ -105,6 +115,7 @@ def flash_fwd_kernel(
         v_hbm,
         refs,
         operands=VariantOperands(sinks_ref=sinks_ref),
+        num_valid_keys=num_valid_keys,
     )
 
 
@@ -118,6 +129,7 @@ def dense_fwd_body(
     refs: Sequence[jax.Array],
     *,
     operands: VariantOperands,
+    num_valid_keys: int | None = None,
 ) -> None:
     """Run the dense fragment pipeline over every block the schedule yields.
 
@@ -125,13 +137,16 @@ def dense_fwd_body(
     and operands the variant's traced values, and refs are the rotary
     operands, the outputs and the scratch, in dense_scratch_shapes's order.
     The logits run in log2 units: Q reaches the QK matmul pre-multiplied by
-    log2(e). The varlen and paged builds run their own loops
-    (kernels/fwd_varlen.py, kernels/fwd_paged.py).
+    log2(e). Under traits.uses_mxu_pipeline the rows run through
+    kernels/fwd_dense_mxu.py's DenseMxuLoop instead. The varlen and paged
+    builds run their own loops (kernels/fwd_varlen.py, kernels/fwd_paged.py).
 
     operands.sinks_ref is None or an SMEM (nheads,) float32 of per-head sink
     logits in log2 units, one per sequence head (flat q head f reads
     f % nheads, or f // heads_outer_batch heads-outer), each added to its
-    head's softmax denominator.
+    head's softmax denominator. num_valid_keys is an explicit MXU build's kv
+    keys before the padding to whole blocks; None when the mask shows no
+    padded key to an unpadded q row (shows_padded_keys).
     """
     assert not (traits.is_paged or traits.is_per_seq), traits
     assert schedule.q_token is None and schedule.num_live_tiles is None
@@ -144,14 +159,12 @@ def dense_fwd_body(
     num_q_compute_tiles = traits.num_q_compute_tiles
     num_compute_tiles = traits.num_compute_tiles
     head_fold = traits.head_fold
-    group_heads = traits.group_heads
     is_lane_paired = traits.is_lane_paired
     rotary_dim, rotary_k = traits.rotary_dim, traits.rotary_k
     variant.check_operands(operands)
     return_lse = variant.return_lse
     window = variant.window
     causal_offset = variant.mask_offset(operands)
-    sinks_ref = operands.sinks_ref
 
     remaining_refs = list(refs)
     if rotary_dim:
@@ -172,6 +185,15 @@ def dense_fwd_body(
         *pipeline_refs, lse_stage = remaining_refs
     else:
         pipeline_refs, lse_stage = remaining_refs, None
+    if traits.uses_mxu_pipeline and dense_has_checked_units(
+        schedule.num_kv_blocks, bq // FRAGMENT_ROWS
+    ):
+        *pipeline_refs, checkpoint_sum, checkpoint_o, unit_guard = pipeline_refs
+        check_refs = CheckRefs(checkpoint_sum, checkpoint_o, unit_guard)
+    else:
+        check_refs = None
+    if traits.uses_mxu_pipeline:
+        *pipeline_refs, row_end_sum = pipeline_refs
     # Note (david): the exact unpack pins this variable-arity tail against
     # dense_scratch_shapes's scratch list; a silent mismatch would shift every
     # ref.
@@ -224,8 +246,6 @@ def dense_fwd_body(
     has_static_mask = window != (None, None)
     num_head_groups = schedule.num_head_groups
     num_rows = schedule.num_rows
-    q_heads_per_kv_head = schedule.q_heads_per_kv_head
-    heads_outer_batch = schedule.heads_outer_batch
     # Note (david): a partial block of a dense window (causal included) masks
     # every fragment of the generic copy, about as many VPU ops as the softmax.
     # Under bq % bkv == 0 and a static offset its fragment flags are static per
@@ -267,54 +287,29 @@ def dense_fwd_body(
     # against 2330 for the whole copy). Blocks j and j + 1 hold at most two
     # slots, so the slot block j + 2 takes is free for its start anywhere in
     # block j's step.
-    def _block_desc(head, kv):
-        """The DMA inputs of kv block kv of head's group."""
-        # Note (david): the heads-outer fold flattens (heads, batch) with
-        # B = heads_outer_batch, so q index n * B + b reads kv index
-        # (n // q_heads_per_kv_head) * B + b; the batch-outer fold flattens
-        # (batch, heads), so consecutive q indices share one kv index.
-        if heads_outer_batch is None:
-            kv_head = head // q_heads_per_kv_head
-        else:
-            kv_head = (
-                head // heads_outer_batch // q_heads_per_kv_head
-            ) * heads_outer_batch + head % heads_outer_batch
-        desc = (kv_head, kv * bkv)
-        # Note (david): the descriptors ride the loop carry, which needs strong
-        # int32 scalars.
-        return tuple(jnp.asarray(field, jnp.int32) for field in desc)
-
-    def _select_desc(predicate, desc_true, desc_false):
-        return tuple(
-            jnp.where(predicate, field_true, field_false)
-            for field_true, field_false in zip(desc_true, desc_false)
+    if traits.uses_mxu_pipeline:
+        mxu_loop, blocks = make_dense_mxu_loop(
+            traits=traits,
+            variant=variant,
+            operands=operands,
+            schedule=schedule,
+            kv_refs=kv_refs,
+            loop_refs=(q_refs, out_refs, state, row_end_sum, check_refs),
+            num_valid_keys=num_valid_keys,
         )
-
-    # Note (david): a block whose DMA inputs equal the previous block's holds
-    # the same staged data, so it runs from the previous block's slot; dense GQA
-    # at one kv block per row otherwise re-staged each block once per q head
-    # (v6e, 32:4 d256, 1024 tokens: 63.4 against 60.6 us). Paged blocks start
-    # their DMAs inside the copy and a rotary K is rotated in place, so both
-    # load every block.
-    reuses_blocks = not (rotary_dim and rotary_k)
-
-    def _is_fresh(desc, prev_desc):
-        if reuses_blocks:
-            differs = [
-                field != prev_field
-                for field, prev_field in zip(desc, prev_desc)
-            ]
-            return reduce(jnp.logical_or, differs)
-        else:
-            return jnp.bool_(True)
+    else:
+        mxu_loop = None
+        blocks = DenseBlockStream(
+            traits=traits, schedule=schedule, kv_refs=kv_refs
+        )
+    reuses_blocks = blocks.reuses_blocks
 
     def _start_block_data(desc, slot):
-        kv_head, kv_tok = desc
-        start_kv_block(traits, kv_refs, kv_head, kv_tok, slot)
+        blocks.start(desc, slot)
 
     def _wait_block_data(desc, slot):
         del desc
-        wait_kv_block(traits, kv_refs, slot)
+        blocks.wait(slot)
 
     pending_frag = pending_fragment(traits)
 
@@ -343,12 +338,12 @@ def dense_fwd_body(
         parity_smem[0] = lax.rem(row_parity + kv - lo, 2)
 
         first_next_row_desc, second_ahead_desc = ahead
-        ahead_desc = _select_desc(
+        ahead_desc = select_desc(
             kv + 2 <= hi,
-            _block_desc(base_head, kv + 2),
-            _select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc),
+            blocks.desc(base_head, kv + 2),
+            select_desc(kv + 1 == hi, first_next_row_desc, second_ahead_desc),
         )
-        is_ahead_fresh = _is_fresh(ahead_desc, next_block_desc).astype(
+        is_ahead_fresh = blocks.is_fresh(ahead_desc, next_block_desc).astype(
             jnp.int32
         )
         ahead_slot = jnp.where(
@@ -612,31 +607,6 @@ def dense_fwd_body(
             None,
         )
 
-    def _row_after(g, si):
-        """The (group, row) after row si of group g; the grid's last row is its
-        own successor."""
-        is_row_end = si == num_rows - 1
-        is_grid_end = jnp.logical_and(g == num_head_groups - 1, is_row_end)
-        next_g = jnp.where(
-            is_row_end, jnp.minimum(g + 1, num_head_groups - 1), g
-        )
-        next_si = jnp.where(is_grid_end, si, jnp.where(is_row_end, 0, si + 1))
-        return next_g, next_si
-
-    def _first_two_blocks(g, si):
-        """The descriptors of the first two blocks of the flattened order from
-        row si of group g on, and that row's (lo, hi, ctx)."""
-        lo, hi, ctx = schedule.row_interval(si)
-        after_g, after_si = _row_after(g, si)
-        after_lo, _, _ = schedule.row_interval(after_si)
-        first_desc = _block_desc(g * group_heads, lo)
-        second_desc = _select_desc(
-            lo < hi,
-            _block_desc(g * group_heads, lo + 1),
-            _block_desc(after_g * group_heads, after_lo),
-        )
-        return first_desc, second_desc, (lo, hi, ctx)
-
     def _row_body(g, si, carry):
         """A dense row drains its own last PV and finishes at its end, so its
         first block starts at parity 0."""
@@ -652,27 +622,20 @@ def dense_fwd_body(
         # Note (david): past the grid's last row the lookahead is that row
         # itself, so the q stream prefetches nothing, and the kv stream reloads
         # blocks the kernel waits out after its loop.
-        next_g, next_si = _row_after(g, si)
-        first_next_desc, second_next_desc, _ = _first_two_blocks(
+        next_g, next_si = blocks.row_after(g, si)
+        first_next_desc, second_next_desc, _ = blocks.first_two_blocks(
             next_g, next_si
         )
-        base_head = g * group_heads
-        next_head = next_g * group_heads
-        q_tok = (schedule.first_row + si) * bq
-        next_q_tok = (schedule.first_row + next_si) * bq
-
-        q_loaded, q_inflight, q_slot = advance(
-            g * num_rows + si,
-            next_g * num_rows + next_si,
-            lambda slot: start_q_row(traits, q_refs, base_head, q_tok, slot),
-            lambda slot: start_q_row(
-                traits, q_refs, next_head, next_q_tok, slot
-            ),
-            partial(wait_q_row, traits, variant, operands, q_refs),
-            q_loaded,
-            q_inflight,
-            q_slot,
-            num_stages,
+        (base_head, q_tok), (q_loaded, q_inflight, q_slot) = (
+            advance_dense_q_row(
+                traits,
+                schedule,
+                q_refs,
+                partial(wait_q_row, traits, variant, operands, q_refs),
+                (g, si),
+                (next_g, next_si),
+                (q_loaded, q_inflight, q_slot),
+            )
         )
         kv_carry = lax.fori_loop(
             lo,
@@ -700,24 +663,9 @@ def dense_fwd_body(
             out_count=num_out_copies,
             parity=lax.rem(row_parity + hi - lo, 2),
         )
-        sinks = (
-            head_sinks(traits, sinks_ref, heads_outer_batch, base_head)
-            if variant.has_sinks
-            else None
+        finish_row_lse_and_sinks(
+            traits, variant, operands, schedule, state, out_refs, g, finish
         )
-        if return_lse:
-            finish_row_lse(
-                traits,
-                variant,
-                state,
-                out_refs,
-                g,
-                finish,
-                sinks,
-                None,
-            )
-        if sinks is not None:
-            fold_out_sinks(traits, variant, state, finish, sinks)
 
         @pl.when(pending_smem[PENDING_WRITE_PARITY] != TRASH_PARITY)
         def _drain_pending_pv():
@@ -733,16 +681,26 @@ def dense_fwd_body(
             num_out_copies + 1,
         )
 
+    if mxu_loop is not None:
+        row_body = mxu_loop.run_row
+    else:
+        row_body = _row_body
+
     cancel_pending_pv(pending)
-    first_desc, second_desc, _ = _first_two_blocks(jnp.int32(0), jnp.int32(0))
+    first_desc, second_desc, _ = blocks.first_two_blocks(
+        jnp.int32(0), jnp.int32(0)
+    )
     _start_block_data(first_desc, 0)
-    is_second_fresh = _is_fresh(second_desc, first_desc).astype(jnp.int32)
+    is_second_fresh = blocks.is_fresh(second_desc, first_desc).astype(jnp.int32)
     second_slot = is_second_fresh
 
     @pl.when(is_second_fresh > 0)
     def _start_second():
         _start_block_data(second_desc, second_slot)
 
+    if traits.uses_mxu_pipeline:
+        # An explicit row starts with its first block staged.
+        wait_rotated_kv_block(traits, kv_refs, 0)
     minus_one = jnp.int32(-1)
     zero = jnp.int32(0)
     init_carry = (
@@ -765,7 +723,7 @@ def dense_fwd_body(
         lambda g, group_carry: lax.fori_loop(
             0,
             num_rows,
-            lambda si, row_carry: _row_body(g, si, row_carry),
+            lambda si, row_carry: row_body(g, si, row_carry),
             group_carry,
         ),
         init_carry,
@@ -779,9 +737,12 @@ def dense_fwd_body(
         after_last_desc,
     ) = kv_carry
 
-    @pl.when(is_last_fresh > 0)
-    def _wait_last():
-        _wait_block_data(last_desc, last_slot)
+    # An explicit build's last row already waited for the block after it.
+    if not traits.uses_mxu_pipeline:
+
+        @pl.when(is_last_fresh > 0)
+        def _wait_last():
+            _wait_block_data(last_desc, last_slot)
 
     @pl.when(is_after_last_fresh > 0)
     def _wait_after_last():
@@ -801,13 +762,17 @@ def dense_scratch_shapes(
     k_dtype: jnp.dtype,
     v_dtype: jnp.dtype,
     rotary_dtype: jnp.dtype | None,
-    return_lse: bool,
+    variant: Variant,
+    num_kv_blocks: int,
 ) -> list[pl.MemoryRef]:
     """Every scratch buffer of one dense build, in the order dense_fwd_body
     unpacks them: Q, K and V stages, Q and (under rotary_k) K rotary
     coefficients, out stage, row max, row sum, f32 accumulator, pending
     probs, pending V tile, the SMEM guard flags, block parity and pending-PV
-    fields, the DMA semaphores and the lse rows of each folded head.
+    fields, the DMA semaphores, an explicit MXU build's largest finished row
+    sum and, when its rows of up to num_kv_blocks blocks hold checked units,
+    its check unit scratch (fwd_dense_mxu.CheckRefs), and the lse rows of
+    each folded head.
 
     Q, K, V, their rotary coefficients and the pending V tile are staged in
     traits.qkv_layout, the out stage and the accumulator in traits.o_layout.
@@ -875,7 +840,17 @@ def dense_scratch_shapes(
             (NUM_SEMS + num_rotary_streams, max(num_stages, NUM_KV_STAGES))
         ),
     ]
-    if return_lse:
+    if traits.uses_mxu_pipeline:
+        scratch_shapes.append(vmem((NUM_SUBLANES, NUM_LANES), jnp.float32))
+    if traits.uses_mxu_pipeline and dense_has_checked_units(
+        num_kv_blocks, bq // FRAGMENT_ROWS
+    ):
+        scratch_shapes += [
+            vmem((NUM_CHECKPOINTS, bq, NUM_LANES), jnp.float32),
+            vmem((NUM_CHECKPOINTS, bq, head_dim_v), jnp.float32),
+            pltpu.SMEM((1,), jnp.int32),
+        ]
+    if variant.return_lse:
         scratch_shapes.append(vmem((head_fold, bq), jnp.float32))
     return scratch_shapes
 
@@ -929,7 +904,8 @@ def dense_pallas_call(
         k_dtype=k.dtype,
         v_dtype=v.dtype,
         rotary_dtype=rotary_dtype,
-        return_lse=return_lse,
+        variant=variant,
+        num_kv_blocks=kv_seq_len // bkv,
     )
 
     if qkv_layout == QKVLayout.SEQ_MINOR:
@@ -1042,7 +1018,7 @@ def flash_attn_forward(
             traits.token_major,
         )
     smem_operands = [] if sinks is None else [variant.sink_logits(sinks)]
-    return dense_pallas_call(
+    return run_dense_call(
         partial(flash_fwd_kernel, dense_params=dense_params),
         smem_operands,
         q,
@@ -1052,10 +1028,85 @@ def flash_attn_forward(
             traits, **rotary_fields(rotary, rotary_interleaved)
         ),
         variant,
+        dense_params,
         kernel_name="flash_attn_mha_static_t1_guarded_fwd",
         interpret=interpret,
         rotary=rotary,
     )
+
+
+# The token axis of a head-major (heads, seq, head_dim) or token-major
+# (batch, seq, heads * head_dim) operand.
+TOKEN_AXIS = -2
+
+
+def shows_padded_keys(variant: Variant, seqlen_q: int, seqlen_kv: int) -> bool:
+    """Whether variant's mask shows a key past the kv axis's seqlen_kv keys to
+    one of the seqlen_q q rows: not under a right bound that keeps the last
+    row inside the axis."""
+    _, right = variant.window
+    if right is None or variant.runtime_causal_offset:
+        return True
+    return seqlen_q - 1 + variant.causal_offset + right >= seqlen_kv
+
+
+def run_dense_call(
+    kernel: Callable[..., None],
+    smem_operands: list[jax.Array],
+    q: jax.Array,
+    k: jax.Array,
+    v: jax.Array,
+    traits: FwdTraits,
+    variant: Variant,
+    dense_params: DenseFwdParams,
+    *,
+    kernel_name: str,
+    interpret: bool,
+    rotary: tuple[jax.Array, jax.Array | None] | None,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """dense_pallas_call of kernel. An explicit MXU build runs on q and kv
+    axes padded to whole blocks of dense_params, its outputs sliced back to
+    q's rows; the kernel hides the padded keys where the mask shows them to
+    one of those rows (shows_padded_keys)."""
+    run_call = partial(
+        dense_pallas_call,
+        smem_operands=smem_operands,
+        traits=traits,
+        variant=variant,
+        kernel_name=kernel_name,
+        interpret=interpret,
+    )
+    if not traits.uses_mxu_pipeline:
+        return run_call(kernel, q=q, k=k, v=v, rotary=rotary)
+    token_axis = q.ndim + TOKEN_AXIS
+    seqlen_q, seqlen_kv = q.shape[token_axis], k.shape[token_axis]
+    # The schedule's last row may end before the q axis: under a window its
+    # last q blocks may see no key.
+    num_pad_q = -seqlen_q % traits.bq
+    num_pad_kv = dense_params.num_kv_blocks * traits.bkv - seqlen_kv
+    num_valid_keys = None
+    if num_pad_kv and shows_padded_keys(variant, seqlen_q, seqlen_kv):
+        num_valid_keys = seqlen_kv
+    padded_rotary = rotary
+    if rotary is not None:
+        q_coeff, k_coeff = rotary
+        padded_rotary = (
+            pad_axis(q_coeff, ROTARY_TOKEN_AXIS, num_pad_q),
+            None
+            if k_coeff is None
+            else pad_axis(k_coeff, ROTARY_TOKEN_AXIS, num_pad_kv),
+        )
+    outputs = run_call(
+        partial(kernel, num_valid_keys=num_valid_keys),
+        q=pad_axis(q, token_axis, num_pad_q),
+        k=pad_axis(k, token_axis, num_pad_kv),
+        v=pad_axis(v, token_axis, num_pad_kv),
+        rotary=padded_rotary,
+    )
+    if not variant.return_lse:
+        return outputs[..., :seqlen_q, :]
+    o, lse = outputs
+    return o[..., :seqlen_q, :], lse[:, :seqlen_q]
 
 
 def flash_fwd_runtime_offset_kernel(
@@ -1067,6 +1118,7 @@ def flash_fwd_runtime_offset_kernel(
     traits: FwdTraits,
     variant: Variant,
     dense_params: DenseFwdParams,
+    num_valid_keys: int | None = None,
 ) -> None:
     runtime_offset = offset_ref[0]
     dense_fwd_body(
@@ -1078,6 +1130,7 @@ def flash_fwd_runtime_offset_kernel(
         v_hbm,
         refs,
         operands=VariantOperands(causal_offset=runtime_offset),
+        num_valid_keys=num_valid_keys,
     )
 
 
@@ -1096,7 +1149,7 @@ def flash_attn_forward_runtime_offset(
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     variant.check_sinks_operand(None)
     offset = jnp.asarray(runtime_offset, jnp.int32).reshape(1)
-    return dense_pallas_call(
+    return run_dense_call(
         partial(flash_fwd_runtime_offset_kernel, dense_params=dense_params),
         [offset],
         q,
@@ -1106,6 +1159,7 @@ def flash_attn_forward_runtime_offset(
             traits, **rotary_fields(rotary, rotary_interleaved)
         ),
         variant,
+        dense_params,
         kernel_name="flash_attn_mha_runtime_offset_fwd",
         interpret=interpret,
         rotary=rotary,
