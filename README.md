@@ -15,12 +15,12 @@
 [![PyPI](https://img.shields.io/pypi/v/flywheel-tpu)](https://pypi.org/project/flywheel-tpu/)
 [![License](https://img.shields.io/github/license/heavyball-research/flywheel-tpu)](LICENSE)
 
-**FlyWheel** is an attention kernel library for TPU, written in JAX Pallas by
+**FlyWheel** is a kernel library for TPU, written in JAX Pallas by
 [heavyball-research](https://github.com/heavyball-research). It implements
-softmax attention (MHA and MQA/GQA) behind flash-attn's API, and the fused
-linear attention layers of hybrid models (GDN and KDA), for prefill, decode
-and training on TPU v6e and v7x. It also runs the routed experts of MoE
-layers as one fused MLP kernel.
+softmax attention (MHA and MQA/GQA) behind flash-attn's API, the fused
+linear attention layers of hybrid models (GDN and KDA), DeepSeek sparse
+attention (DSA), and the routed experts of MoE layers as one fused MLP
+kernel, on TPU v6e and v7x.
 
 ## Why FlyWheel?
 
@@ -34,6 +34,11 @@ layers as one fused MLP kernel.
   and return JAX arrays.
 - **Serving-ready**: paged bf16 and fp8 KV caches, chunked prefill, prefix
   caching and speculative verify windows.
+- **Official backend**: an official attention backend of
+  [tpu-inference](https://github.com/vllm-project/tpu-inference) (vLLM on
+  TPU) and [SGLang-TorchTPU](https://github.com/sgl-project/sglang-torchtpu)
+  (SGLang on TPU), as `--attention-backend flywheel`. See
+  [Adoption](#adoption).
 
 ## Core Features
 
@@ -51,6 +56,18 @@ layers as one fused MLP kernel.
   embedding
 - **Backward**: `jax.grad` runs a Pallas backward kernel for MHA and MQA/GQA
   with causal or full masks
+
+### Sparse Attention
+- **DSA in one call** (v7x): `dsa_attention` scores with the lightning
+  indexer on the TensorCore, takes an exact top-k and gathers the selected
+  latents on SparseCore, and runs the sparse MLA, over paged fp8 caches; the
+  SparseCore selects one chunk of tokens while the TensorCore scores the next
+- **Ragged serving batches**: each request attends sparse, masked-dense or in
+  unions by its lengths, all in one call; a union gathers once the positions
+  that any of a run of nearby tokens selects
+- **Shared selections**: `dsa_indices` and `dsa_attention_from_indices` split
+  a layer into selection and attention, for models whose layers share
+  indices; all three live in `flywheel_tpu.sparse_attention.dsa.attention`
 
 ### Linear Attention
 - **Fused GDN and KDA**: causal conv1d + silu and the chunked delta rule in
