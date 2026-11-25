@@ -19,15 +19,22 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from .kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.decode import (
+    CACHE_DTYPES,
+    FP8_CACHE_DTYPE,
+    QUERY_DTYPE,
+)
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     CACHE_ROW_DIM,
     LATENT_DIM,
     ROPE_DIM,
     cache_packing,
     cache_tile_rows,
 )
-from .kernels.mla_prefill import default_mla_prefill_config, mla_prefill_pallas
-from .mla_decode import CACHE_DTYPES, FP8_CACHE_DTYPE, QUERY_DTYPE
+from flywheel_tpu.softmax_attention.mla.kernels.prefill import (
+    default_mla_prefill_config,
+    mla_prefill_pallas,
+)
 
 
 @functools.partial(

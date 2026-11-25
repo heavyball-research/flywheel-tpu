@@ -41,11 +41,11 @@ from flywheel_tpu.softmax_attention.config import (
     vmem_limit_bytes,
 )
 from flywheel_tpu.softmax_attention.kernels.decode import lane_broadcast
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     LATENT_DIM,
     ROPE_DIM,
 )
-from flywheel_tpu.softmax_attention.kernels.mla_prefill import (
+from flywheel_tpu.softmax_attention.mla.kernels.prefill import (
     Q_BLOCK_MASK,
     REQUEST_SHIFT,
     mla_prefill_schedule,

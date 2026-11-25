@@ -41,7 +41,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu.softmax_attention.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.decode import (
     CACHE_ROW_DIM,
     FP8_CACHE_DTYPE,
     LATENT_DIM,

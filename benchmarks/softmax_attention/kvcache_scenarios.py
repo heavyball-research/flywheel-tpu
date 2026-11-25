@@ -345,7 +345,7 @@ class Cell:
         if self.is_dsa:
             return DSA_CACHE_TOKEN_BYTES
         elif self.is_mla:
-            from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+            from flywheel_tpu.softmax_attention.mla.kernels.decode import (
                 CACHE_ROW_DIM,
             )
 
@@ -496,7 +496,7 @@ def build_mla(cell, args):
     import jax
     import jax.numpy as jnp
 
-    from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
+    from flywheel_tpu.softmax_attention.mla.decode import mla_cache_shape
 
     keys = jax.random.split(jax.random.key(cell.heads * 1000 + cell.seq), 4)
     q_latent = draw_normal(
@@ -1110,7 +1110,7 @@ def build_flywheel_mla_decode(cell, inputs, args):
     import jax.numpy as jnp
 
     from flywheel_tpu.softmax_attention.dispatch import get_tuned_mla_config
-    from flywheel_tpu.softmax_attention.mla_decode import (
+    from flywheel_tpu.softmax_attention.mla.decode import (
         flash_mla_decode,
         mla_cache_shape,
     )

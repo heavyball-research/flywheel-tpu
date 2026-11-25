@@ -23,17 +23,17 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from flywheel_tpu.softmax_attention.kernels.mla_prefill import (
+from flywheel_tpu.softmax_attention.mla.decode import (
+    LATENT_DIM,
+    mla_cache_shape,
+)
+from flywheel_tpu.softmax_attention.mla.kernels.prefill import (
     MlaPrefillConfig,
     mla_prefill_pallas,
     mla_prefill_schedule,
 )
-from flywheel_tpu.softmax_attention.mla_decode import (
-    LATENT_DIM,
-    mla_cache_shape,
-)
-from flywheel_tpu.softmax_attention.mla_prefill import flash_mla_prefill
-from tests.softmax_attention.mla_reference import (
+from flywheel_tpu.softmax_attention.mla.prefill import flash_mla_prefill
+from tests.softmax_attention.mla.reference import (
     QK_DIM,
     SM_SCALE,
     MlaParam,

@@ -32,7 +32,7 @@ from flywheel_tpu import flash_attn_varlen_func, flash_attn_with_kvcache
 from flywheel_tpu.softmax_attention.dispatch import resolve_paged_tiles
 from flywheel_tpu.softmax_attention.inputs import make_variant
 from flywheel_tpu.softmax_attention.kernels import fwd_paged
-from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.paged import (
     paged_uses_mxu_pipeline,
 )
 from tests.softmax_attention.util import (

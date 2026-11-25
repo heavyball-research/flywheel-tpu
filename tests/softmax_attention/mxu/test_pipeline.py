@@ -20,7 +20,7 @@ register, a load from an empty one, an issue into a slot whose result is
 still due and a pop of a slot nothing was issued into. So a schedule that
 passes here computes softmax attention and breaks no MXU rule, without a TPU.
 
-A dense static row plan (fwd_dense_mxu.static_row_plan) runs item by item
+A dense static row plan (mxu_dense.static_row_plan) runs item by item
 against the masked softmax, with the explicit loop's masks and deferred
 anchors.
 """
@@ -31,13 +31,14 @@ import numpy as np
 import pytest
 
 from flywheel_tpu.core.tpu import MXU_COLUMNS
-from flywheel_tpu.softmax_attention import fwd_mxu, mxu_pipeline
 from flywheel_tpu.softmax_attention.config import (
     DEFAULT_MASK_VALUE,
     BlockSizes,
 )
-from flywheel_tpu.softmax_attention.kernels import fwd_dense_mxu
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
+from flywheel_tpu.softmax_attention.mxu import pipeline as mxu_pipeline
+from flywheel_tpu.softmax_attention.mxu import row_state
+from flywheel_tpu.softmax_attention.mxu.kernels import dense as mxu_dense
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
     FRAGMENT_ROWS,
     NUM_SLOTS,
     MxuPipeline,
@@ -246,7 +247,7 @@ class MaskedRow:
     the explicit loop's softmax: an item's scores take the mask of its tile,
     a row start writes the row state, and under a left bound a masked item
     sets the anchor of the rows whose anchor tile it is
-    (fwd_mxu.fragment_anchor). out() is the normalized output."""
+    (row_state.fragment_anchor). out() is the normalized output."""
 
     def __init__(self, geometry, q_first, num_keys, seed=0):
         generator = np.random.default_rng(seed)
@@ -264,7 +265,7 @@ class MaskedRow:
         in_axis = (keys >= 0) & (keys < self.k.shape[0])
         clipped = np.clip(keys, 0, self.k.shape[0] - 1)
         scores = self.q[rows] @ self.k[clipped].T
-        bounds = fwd_mxu.tile_bounds(self.geometry, first_key).from_row(
+        bounds = row_state.tile_bounds(self.geometry, first_key).from_row(
             self.q_first
         )
         first_row = fragment * FRAGMENT_ROWS
@@ -358,18 +359,18 @@ def test_static_row_plan_runs_the_masked_softmax(
     )
     num_kv_blocks = seqlen_k // block_kv
     blocks_per_row = BLOCK_Q // block_kv
-    plan = fwd_dense_mxu.static_row_plan(
+    plan = mxu_dense.static_row_plan(
         traits,
         variant,
         offset,
-        fwd_dense_mxu.PlanRows(
+        mxu_dense.PlanRows(
             0, seqlen_q // BLOCK_Q - 1, blocks_per_row, num_kv_blocks
         ),
         PipelineDelays(),
     )
     assert plan is not None
     left, right = variant.window
-    geometry = fwd_mxu.MaskGeometry(
+    geometry = row_state.MaskGeometry(
         shift=offset, left=left, right=right, key_end=seqlen_k
     )
     masked_row = MaskedRow(geometry, row * BLOCK_Q, seqlen_k)
@@ -407,7 +408,7 @@ def test_static_row_plan_runs_the_masked_softmax(
                         # masked (DenseMxuLoop.run_row_start).
                         is_masked=bool(plan.left)
                         and block_index == 0
-                        and tile < fwd_mxu.LOOP_BODY_TILES,
+                        and tile < row_state.LOOP_BODY_TILES,
                     )
         if interior:
             run_segments(plan.right, starts=False)
@@ -535,12 +536,12 @@ def test_block_pipeline_runs_rows_inside_one_block(
     mxus, num_fragments, block_tiles
 ):
     """A kv block too short for the default depth takes a shallower
-    pipeline on a smaller ring (fwd_mxu.pipeline_shape): its start segment
+    pipeline on a smaller ring (row_state.pipeline_shape): its start segment
     fits in the block, its loop bodies tile the block and follow their own
     tail, a replay finds its slots free, and every pop meets its issue."""
-    shape = fwd_mxu.pipeline_shape(num_fragments, block_tiles)
+    shape = row_state.pipeline_shape(num_fragments, block_tiles)
     assert shape != PipelineShape()
-    tiles = fwd_mxu.row_tiles(num_fragments, shape)
+    tiles = row_state.row_tiles(num_fragments, shape)
     assert tiles.start_tiles <= block_tiles
     assert block_tiles % tiles.body_tiles == 0
     num_bodies = 3
@@ -557,7 +558,7 @@ def test_block_pipeline_runs_rows_inside_one_block(
     for first in range(tiles.start_tiles, num_tiles, tiles.body_tiles):
         in_flight = set(mxus.results)
         for slot in pipeline.free_slots(
-            state.tail, fwd_mxu.REPLAY_RESULT_SLOTS
+            state.tail, row_state.REPLAY_RESULT_SLOTS
         ):
             assert slot not in in_flight
         assumed = pipeline.tail_of(
@@ -585,7 +586,7 @@ def test_block_pipeline_runs_rows_inside_one_block(
 def test_block_of_default_depth_keeps_default_pipeline(
     num_fragments, block_tiles
 ):
-    assert fwd_mxu.pipeline_shape(num_fragments, block_tiles) == (
+    assert row_state.pipeline_shape(num_fragments, block_tiles) == (
         PipelineShape()
     )
 

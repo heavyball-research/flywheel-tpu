@@ -27,17 +27,27 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import (
+from flywheel_tpu.core.tpu import (
     BF16_BYTES,
     BF16_TILE_ROWS,
     F32_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
 )
-from ..config import LOG2E, NT_DIM_NUMBERS, next_pow2, vmem_limit_bytes
-from ..softmax import overflow_guard_threshold
-from .decode import lane_broadcast
-from .mla_decode import CACHE_ROW_DIM, LATENT_DIM, cache_tile_rows, mla_block_kv
+from flywheel_tpu.softmax_attention.config import (
+    LOG2E,
+    NT_DIM_NUMBERS,
+    next_pow2,
+    vmem_limit_bytes,
+)
+from flywheel_tpu.softmax_attention.kernels.decode import lane_broadcast
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
+    CACHE_ROW_DIM,
+    LATENT_DIM,
+    cache_tile_rows,
+    mla_block_kv,
+)
+from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 
 # Note (david): the copies of the next two items run while one computes, as an
 # item computes for about as long as its block's copy takes at few query rows.

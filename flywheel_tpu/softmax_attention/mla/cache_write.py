@@ -19,15 +19,17 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from .kernels.mla_cache_write import mla_cache_write_pallas
-from .kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.decode import CACHE_DTYPES
+from flywheel_tpu.softmax_attention.mla.kernels.cache_write import (
+    mla_cache_write_pallas,
+)
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     CACHE_ROW_DIM,
     LATENT_DIM,
     ROPE_DIM,
     cache_packing,
     cache_tile_rows,
 )
-from .mla_decode import CACHE_DTYPES
 
 # Note (david): a group's copies overlap the group before; a short group hides
 # little and a long one lengthens the unhidden first reads and last writes.

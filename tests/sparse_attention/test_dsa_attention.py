@@ -27,7 +27,7 @@ from flywheel_tpu.sparse_attention.dsa.routing import (
     MIN_MASKED_DENSE_Q_LEN,
     MIN_UNION_Q_LEN,
 )
-from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
+from tests.softmax_attention.mla.reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
     LENGTH_CELLS,
     PADDED_TOKENS,

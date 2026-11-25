@@ -63,7 +63,16 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     wait_rotated_q_row,
     wait_row_out_slot,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import (
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
+    FRAGMENT_ROWS,
+    MxuPipeline,
+    PipelineDelays,
+    PipelineState,
+    Tail,
+    WorkItem,
+    tile_starts,
+)
+from flywheel_tpu.softmax_attention.mxu.row_state import (
     FINAL_UNIT_SPAN,
     LOOP_BODY_TILES,
     NUM_CHECKPOINTS,
@@ -91,15 +100,6 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     scaled_logits,
     tile_bounds,
     zeroes_row_start,
-)
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
-    FRAGMENT_ROWS,
-    MxuPipeline,
-    PipelineDelays,
-    PipelineState,
-    Tail,
-    WorkItem,
-    tile_starts,
 )
 from flywheel_tpu.softmax_attention.schedule import FwdSchedule
 from flywheel_tpu.softmax_attention.traits import FwdTraits
@@ -139,7 +139,7 @@ def dense_uses_mxu_pipeline(
 
 def dense_body_tiles(num_fragments: int) -> int:
     """The kv tiles of a loop body of rows of num_fragments fragments: whole
-    slot ring laps of items (fwd_mxu.row_tiles)."""
+    slot ring laps of items (mxu.row_state.row_tiles)."""
     return row_tiles(num_fragments).body_tiles
 
 

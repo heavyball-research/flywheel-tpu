@@ -15,10 +15,10 @@
 """Row-state blocks of a forward main loop on the explicit MXU pipeline.
 
 A build with traits.uses_mxu_pipeline runs its fragments through
-mxu_pipeline.py: a work item is FRAGMENT_ROWS q rows of one pipeline head
-against one kv tile of MXU_COLUMNS keys. Its loop (kernels/fwd_dense_mxu.py,
-fwd_varlen_mxu.py or fwd_paged_mxu.py) keeps fwd_blocks.RowStateRefs, with
-three differences from the dot_general pipeline while a row runs:
+mxu/pipeline.py: a work item is FRAGMENT_ROWS q rows of one pipeline head
+against one kv tile of MXU_COLUMNS keys. Its loop (mxu/kernels/dense.py,
+mxu/kernels/varlen.py or mxu/kernels/paged.py) keeps fwd_blocks.RowStateRefs,
+with three differences from the dot_general pipeline while a row runs:
 
 - A row holds one parity of row_sum and o from its first tile to its finish.
 - row_sum holds lane partial sums: lane l of a row sums its probabilities at
@@ -62,7 +62,7 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     stage_row_lse,
     stage_row_out,
 )
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
     FRAGMENT_ROWS,
     NUM_SLOTS,
     QK_MXU,

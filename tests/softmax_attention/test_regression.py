@@ -34,10 +34,10 @@ from flywheel_tpu.softmax_attention.dispatch import (
 )
 from flywheel_tpu.softmax_attention.inputs import make_variant, pad_seqlen
 from flywheel_tpu.softmax_attention.kernels import fwd_varlen
-from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.dense import (
     dense_has_checked_units,
 )
-from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
+from flywheel_tpu.softmax_attention.mxu.pipeline import FRAGMENT_ROWS
 from flywheel_tpu.softmax_attention.variant import Variant, fused_q_scale
 from tests.softmax_attention.util import (
     HAS_MXU_ACCUMULATORS,
@@ -1328,7 +1328,7 @@ def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
 
 
 # Note (david): the head widths whose dense and packed varlen builds run the
-# explicit MXU loops (kernels/fwd_dense_mxu.py, kernels/fwd_varlen_mxu.py) on
+# explicit MXU loops (mxu/kernels/dense.py, mxu/kernels/varlen.py) on
 # a chip with MXU accumulators; everywhere else these shapes take the
 # dot_general loops that test_prefill.py's grid covers. The loops zero-pad
 # PADDED_MXU_HEAD_DIM to the MXU width.
@@ -2336,7 +2336,7 @@ def test_varlen_mxu_guard_replays_a_middle_unit_with_sinks(
         pytest.param(8, 2, 512, 2048, 128, id="fold4-block8"),
         pytest.param(4, 4, 512, 1024, 128, id="fold1-block4"),
         # A block too short for the default pipeline depth: a shallower
-        # pipeline on a smaller slot ring (fwd_mxu.pipeline_shape).
+        # pipeline on a smaller slot ring (mxu.row_state.pipeline_shape).
         pytest.param(4, 4, 128, 512, 32, id="fold1-q128-block2"),
     ],
 )

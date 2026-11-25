@@ -254,7 +254,7 @@ to the latent output. Unlike the functions above, this API is imported
 from its module, not the package's top level:
 
 ```python
-from flywheel_tpu.softmax_attention.mla_decode import flash_mla_decode, mla_cache_shape
+from flywheel_tpu.softmax_attention.mla.decode import flash_mla_decode, mla_cache_shape
 ```
 
 ```python
@@ -315,7 +315,7 @@ reshape of `(num_pages, page_size, 640)`, with each token's latent in
 For example, allocate a bf16 cache with
 `jnp.zeros(mla_cache_shape(num_pages, page_size, jnp.bfloat16), jnp.bfloat16)`.
 
-Implementation: [mla_decode.py](../flywheel_tpu/softmax_attention/mla_decode.py).
+Implementation: [mla/decode.py](../flywheel_tpu/softmax_attention/mla/decode.py).
 
 ### mla_cache_write
 
@@ -324,8 +324,8 @@ the new latent tokens first, then call `flash_mla_prefill` with the updated
 cache and the same chunk offsets, lengths and page table:
 
 ```python
-from flywheel_tpu.softmax_attention.mla_cache_write import mla_cache_write
-from flywheel_tpu.softmax_attention.mla_prefill import flash_mla_prefill
+from flywheel_tpu.softmax_attention.mla.cache_write import mla_cache_write
+from flywheel_tpu.softmax_attention.mla.prefill import flash_mla_prefill
 
 kv_cache = mla_cache_write(
     new_kv_c, new_k_pe, kv_cache, cu_q_lens, kv_lens, block_table,
@@ -365,7 +365,7 @@ For fp8, quantize both new tensors with the cache's per-tensor scale before
 the write. `mla_cache_write` copies the quantized values without a scale
 argument; pass `kv_scale` to the subsequent attention call.
 
-Implementation: [mla_cache_write.py](../flywheel_tpu/softmax_attention/mla_cache_write.py).
+Implementation: [mla/cache_write.py](../flywheel_tpu/softmax_attention/mla/cache_write.py).
 
 ### flash_mla_prefill
 
@@ -414,7 +414,7 @@ Return:
 """
 ```
 
-Implementation: [mla_prefill.py](../flywheel_tpu/softmax_attention/mla_prefill.py).
+Implementation: [mla/prefill.py](../flywheel_tpu/softmax_attention/mla/prefill.py).
 
 ## Linear attention
 

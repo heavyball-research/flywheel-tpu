@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import pytest
 
 from flywheel_tpu.sparse_attention.dsa.masked_dense import dsa_masked_dense
-from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
+from tests.softmax_attention.mla.reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
     dsa_split_cache,
     grid_params,
