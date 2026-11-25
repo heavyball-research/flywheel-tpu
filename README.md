@@ -92,7 +92,6 @@ kernel, on TPU v6e and v7x.
 
 Latest: [![GitHub Release](https://img.shields.io/github/v/release/heavyball-research/flywheel-tpu)](https://github.com/heavyball-research/flywheel-tpu/releases/latest)
 
-- [2026/11] [v0.5.0](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.5.0): MLA decode and chunked prefill on a paged latent cache, DeepSeek sparse attention (DSA), and fused MoE
 - [2026/11] [v0.4.1](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.4.1): optimized decode kernel and GDN conv pools
 - [2026/11] Paper on arXiv: [FlyWheel: Attention Kernels Built for the TPU](https://arxiv.org/abs/2611.01426)
 - [2026/10] [v0.4.0](https://github.com/heavyball-research/flywheel-tpu/releases/tag/v0.4.0): fp8 paged KV cache, speculative verify windows on the decode kernel, and attention sinks
