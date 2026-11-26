@@ -31,7 +31,7 @@ output_scale where the output is normalized (finish_row_out). The decode
 kernel (kernels/decode.py) calls transform_logits on each score fragment and
 fold_sink at a row's end; its caller scales Q, and it keeps its own window
 mask, output scale and lse, whose op order differs. The backward
-(kernels/bwd.py) reads softmax_scale and the causal mask with its causal
+(bwd/kernels/bwd.py) reads softmax_scale and the causal mask with its causal
 offset, and check_backward rejects every other feature it lacks.
 
 Adding a Variant feature (a new score term such as ALiBi, say) touches:
@@ -52,7 +52,7 @@ Adding a Variant feature (a new score term such as ALiBi, say) touches:
    calls only transform_logits and fold_sink, and keeps its own mask, output
    scale and lse.
 4. The backward calls no hook: name the feature in check_backward unless
-   kernels/bwd.py and bwd_pipeline.py learn it.
+   bwd/kernels/bwd.py and bwd/pipeline.py learn it.
 5. dispatch: matches_tuned_table keeps a non-default field off the tuned
    blocks until it is measured and named in TUNED_TABLE_FIELDS. The decode
    table (dispatch.resolve_kvcache_config) keys on the left window bound and

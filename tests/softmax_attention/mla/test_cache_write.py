@@ -20,19 +20,19 @@ import jax
 import jax.numpy as jnp
 import pytest
 
-from flywheel_tpu.softmax_attention.kernels.mla_cache_write import (
-    mla_cache_write_pallas,
-)
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
-    cache_packing,
-    cache_tile_rows,
-)
-from flywheel_tpu.softmax_attention.mla_cache_write import mla_cache_write
-from flywheel_tpu.softmax_attention.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.cache_write import mla_cache_write
+from flywheel_tpu.softmax_attention.mla.decode import (
     FP8_CACHE_DTYPE,
     mla_cache_shape,
 )
-from tests.softmax_attention.mla_reference import (
+from flywheel_tpu.softmax_attention.mla.kernels.cache_write import (
+    mla_cache_write_pallas,
+)
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
+    cache_packing,
+    cache_tile_rows,
+)
+from tests.softmax_attention.mla.reference import (
     MlaPrefillParam,
     check_kv_cache,
     logical_cache,

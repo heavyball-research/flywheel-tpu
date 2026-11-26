@@ -73,7 +73,23 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     wait_rotated_q_row,
     wait_row_out_slot,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import (
+from flywheel_tpu.softmax_attention.kv_layout import (
+    kv_word_halves,
+    load_staged_words,
+)
+from flywheel_tpu.softmax_attention.mxu.kernels.varlen import (
+    pivot_block,
+)
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
+    FRAGMENT_ROWS,
+    MxuPipeline,
+    PipelineDelays,
+    PipelineState,
+    Tail,
+    WorkItem,
+    num_carried_v_pushes,
+)
+from flywheel_tpu.softmax_attention.mxu.row_state import (
     ENTRY_PARITY,
     LOOP_BODY_TILES,
     NUM_CHECKPOINTS,
@@ -108,22 +124,6 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     stage_row_finish,
     tile_bounds,
     zeroes_row_start,
-)
-from flywheel_tpu.softmax_attention.kernels.fwd_varlen_mxu import (
-    pivot_block,
-)
-from flywheel_tpu.softmax_attention.kv_layout import (
-    kv_word_halves,
-    load_staged_words,
-)
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
-    FRAGMENT_ROWS,
-    MxuPipeline,
-    PipelineDelays,
-    PipelineState,
-    Tail,
-    WorkItem,
-    num_carried_v_pushes,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
@@ -421,7 +421,7 @@ class TileMember(NamedTuple):
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class PagedFragmentOps:
-    """The mxu_pipeline.FragmentOps of a segment of explicit paged rows.
+    """The mxu.pipeline.FragmentOps of a segment of explicit paged rows.
 
     q_buf[q_slot] holds the row's staged Q, unscaled: the K tiles take the
     variant's Q scale. tiles maps a tile key to its staged tile, and bounds,
@@ -929,8 +929,8 @@ class PagedMxuLoop:
         self, span: RowSpan, index: jax.Array | int
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """(visit, kv block, tile in it) of tile index of the row of span in
-        run order: the pivot block's tiles (fwd_mxu.pivot_order), the blocks
-        below it down to lo, then those above it."""
+        run order: the pivot block's tiles (mxu.row_state.pivot_order), the
+        blocks below it down to lo, then those above it."""
         tiles_a_block = self.num_block_tiles
         if not self.has_left_window:
             position = span.first_tile + index

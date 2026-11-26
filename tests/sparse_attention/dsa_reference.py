@@ -27,7 +27,7 @@ The paged index-K cache keeps tokens along lanes: cache[page, g, i, slot] is
 byte i of key dim 4 * g + i for g < KEY_GROUPS, and group SCALE_GROUP holds
 the UE8M0 scale in byte 0.
 
-The sparse MLA reference is mla_reference's attention with each token's
+The sparse MLA reference is mla/reference.py's attention with each token's
 selection as its mask.
 
 The tests' batches are LENGTH_CELLS at each top_k of TOP_KS.
@@ -38,7 +38,7 @@ import dataclasses
 import jax.numpy as jnp
 import numpy as np
 
-from flywheel_tpu.softmax_attention.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.decode import (
     FP8_CACHE_DTYPE,
     LATENT_DIM,
     ROPE_DIM,
@@ -51,7 +51,7 @@ from flywheel_tpu.sparse_attention.dsa.indexer import (
     SCALE_GROUP,
     WORD_BYTES,
 )
-from tests.softmax_attention.mla_reference import (
+from tests.softmax_attention.mla.reference import (
     QK_DIM,
     SM_SCALE,
     cdiv,
@@ -345,7 +345,7 @@ def param_id(param: DsaParam) -> str:
 
 
 def make_dsa_case(param: DsaParam) -> DsaCase:
-    """A DSA batch of mla_reference's prefill draws quantized to fp8, with
+    """A DSA batch of mla/reference.py's prefill draws quantized to fp8, with
     each token's top-k selection; padding tokens select far positions."""
     assert len(param.q_lens) == len(param.prefix_lens), param
     rng = np.random.default_rng(param.seed)

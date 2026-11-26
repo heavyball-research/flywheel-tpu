@@ -19,7 +19,7 @@ row each, and synthesizes its masks in-kernel: the sequence bounds plus the
 causal or window edges around each sequence's own bottom-right diagonal.
 
 On a chip with MXU accumulators a head_dim 256 build runs its fragments on
-the explicit MXU pipeline instead (kernels/fwd_varlen_mxu.py).
+the explicit MXU pipeline instead (mxu/kernels/varlen.py).
 """
 
 import dataclasses
@@ -79,13 +79,13 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     rotary_fields,
     staged_shape,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import pivot_kept_rows
-from flywheel_tpu.softmax_attention.kernels.fwd_varlen_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.varlen import (
     run_padded_to_blocks,
     varlen_mxu_fwd_body,
     varlen_mxu_groups,
     varlen_mxu_scratch_shapes,
 )
+from flywheel_tpu.softmax_attention.mxu.row_state import pivot_kept_rows
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
     ScheduleTableLayout,

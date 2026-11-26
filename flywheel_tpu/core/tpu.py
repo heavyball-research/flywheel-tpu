@@ -27,3 +27,9 @@ BF16_TILE_ROWS = 2 * NUM_SUBLANES
 MXU_COLUMNS = 2 * NUM_LANES
 BF16_BYTES = 2
 F32_BYTES = 4
+
+
+def is_mxu_head_dim(head_dim: int) -> bool:
+    """Whether an MXU op takes head_dim: whole lane tiles, at most an MXU's
+    width."""
+    return head_dim % NUM_LANES == 0 and head_dim <= MXU_COLUMNS

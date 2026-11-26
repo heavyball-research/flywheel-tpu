@@ -47,7 +47,7 @@ from jax.experimental.pallas import tpu as pltpu
 from flywheel_tpu.core.tpu import NUM_LANES
 from flywheel_tpu.softmax_attention.config import LOG2E, vmem_limit_bytes
 from flywheel_tpu.softmax_attention.kernels.decode import lane_broadcast
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     LATENT_DIM,
     ROPE_DIM,
 )

@@ -64,7 +64,18 @@ from flywheel_tpu.softmax_attention.fwd_blocks import (
     wait_row_out_slot,
 )
 from flywheel_tpu.softmax_attention.fwd_call import staged_shape
-from flywheel_tpu.softmax_attention.fwd_mxu import (
+from flywheel_tpu.softmax_attention.inputs import pad_axis
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
+    FRAGMENT_ROWS,
+    NUM_SLOTS,
+    FragmentOps,
+    MxuPipeline,
+    PipelineShape,
+    PipelineState,
+    Tail,
+    WorkItem,
+)
+from flywheel_tpu.softmax_attention.mxu.row_state import (
     ENTRY_PARITY,
     LOOP_BODY_TILES,
     NUM_CHECKPOINTS,
@@ -100,17 +111,6 @@ from flywheel_tpu.softmax_attention.fwd_mxu import (
     stage_row_finish,
     tile_bounds,
     zeroes_row_start,
-)
-from flywheel_tpu.softmax_attention.inputs import pad_axis
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
-    FRAGMENT_ROWS,
-    NUM_SLOTS,
-    FragmentOps,
-    MxuPipeline,
-    PipelineShape,
-    PipelineState,
-    Tail,
-    WorkItem,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
@@ -181,7 +181,8 @@ def varlen_mxu_groups(traits: FwdTraits) -> tuple[MxuRowTiles, int]:
 
 def explicit_block_kv(block_kv: int, fragments_per_tile: int) -> int:
     """block_kv in whole MXU tiles, at least ROW_START_TILES, padded to
-    whole loop bodies of the pipeline it takes (fwd_mxu.pipeline_shape)."""
+    whole loop bodies of the pipeline it takes
+    (mxu.row_state.pipeline_shape)."""
     num_tiles = round_up(
         max(-(-block_kv // MXU_COLUMNS), ROW_START_TILES), LOOP_BODY_TILES
     )
@@ -710,8 +711,8 @@ class VarlenMxuLoop:
         self, span: RowSpan, index: jax.Array | int
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """(visit, kv block, tile in it) of tile index of the row of span in
-        run order: the pivot block's tiles (fwd_mxu.pivot_order), the blocks
-        below it down to lo, then those above it."""
+        run order: the pivot block's tiles (mxu.row_state.pivot_order), the
+        blocks below it down to lo, then those above it."""
         tiles_a_block = self.num_block_tiles
         if not self.has_left_window:
             position = span.first_tile + index

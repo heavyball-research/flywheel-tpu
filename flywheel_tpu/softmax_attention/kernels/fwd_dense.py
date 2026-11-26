@@ -75,14 +75,14 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     rotary_fields,
     staged_shape,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import NUM_CHECKPOINTS
 from flywheel_tpu.softmax_attention.inputs import ROTARY_TOKEN_AXIS, pad_axis
-from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.dense import (
     CheckRefs,
     dense_has_checked_units,
     make_dense_mxu_loop,
 )
-from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
+from flywheel_tpu.softmax_attention.mxu.pipeline import FRAGMENT_ROWS
+from flywheel_tpu.softmax_attention.mxu.row_state import NUM_CHECKPOINTS
 from flywheel_tpu.softmax_attention.schedule import (
     DenseFwdParams,
     FwdSchedule,
@@ -138,7 +138,7 @@ def dense_fwd_body(
     operands, the outputs and the scratch, in dense_scratch_shapes's order.
     The logits run in log2 units: Q reaches the QK matmul pre-multiplied by
     log2(e). Under traits.uses_mxu_pipeline the rows run through
-    kernels/fwd_dense_mxu.py's DenseMxuLoop instead. The varlen and paged
+    mxu/kernels/dense.py's DenseMxuLoop instead. The varlen and paged
     builds run their own loops (kernels/fwd_varlen.py, kernels/fwd_paged.py).
 
     operands.sinks_ref is None or an SMEM (nheads,) float32 of per-head sink
@@ -771,7 +771,7 @@ def dense_scratch_shapes(
     probs, pending V tile, the SMEM guard flags, block parity and pending-PV
     fields, the DMA semaphores, an explicit MXU build's largest finished row
     sum and, when its rows of up to num_kv_blocks blocks hold checked units,
-    its check unit scratch (fwd_dense_mxu.CheckRefs), and the lse rows of
+    its check unit scratch (mxu.kernels.dense.CheckRefs), and the lse rows of
     each folded head.
 
     Q, K, V, their rotary coefficients and the pending V tile are staged in

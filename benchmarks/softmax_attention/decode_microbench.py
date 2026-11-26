@@ -702,7 +702,7 @@ class MlaStep(Step):
         import jax
         import jax.numpy as jnp
 
-        from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
+        from flywheel_tpu.softmax_attention.mla.decode import mla_cache_shape
 
         super().__init__(case, iters)
         self.fp8 = case.dtype == "fp8"
@@ -798,7 +798,7 @@ class MlaStep(Step):
         cache), the output in the same layout."""
         import jax.numpy as jnp
 
-        from flywheel_tpu.softmax_attention.mla_decode import flash_mla_decode
+        from flywheel_tpu.softmax_attention.mla.decode import flash_mla_decode
 
         kv_lens, page_indices, cu_q_lens, distribution, _ = meta
         b = self.case.b

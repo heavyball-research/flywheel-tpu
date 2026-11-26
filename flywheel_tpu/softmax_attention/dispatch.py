@@ -70,10 +70,6 @@ from flywheel_tpu.softmax_attention.config import (
     pick_tile,
     vmem_limit_bytes,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import (
-    LOOP_BODY_TILES,
-    mxu_block_sizes,
-)
 from flywheel_tpu.softmax_attention.kernels.decode import (
     kvcache_config_vmem_bytes,
     validate_kvcache_config,
@@ -82,29 +78,33 @@ from flywheel_tpu.softmax_attention.kernels.fwd_dense import (
     flash_attn_forward,
     flash_attn_forward_runtime_offset,
 )
-from flywheel_tpu.softmax_attention.kernels.fwd_dense_mxu import (
+from flywheel_tpu.softmax_attention.kernels.fwd_paged import estimate_vmem_bytes
+from flywheel_tpu.softmax_attention.kernels.fwd_varlen import (
+    flash_attn_forward_varlen,
+)
+from flywheel_tpu.softmax_attention.kv_layout import MIN_BLOCK_KV
+from flywheel_tpu.softmax_attention.mxu.kernels.dense import (
     MIN_BLOCK_BODIES,
     dense_body_tiles,
     dense_mxu_runs_blocks,
     dense_uses_mxu_pipeline,
 )
-from flywheel_tpu.softmax_attention.kernels.fwd_paged import estimate_vmem_bytes
-from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.paged import (
     paged_mxu_block_sizes,
     paged_uses_mxu_pipeline,
 )
-from flywheel_tpu.softmax_attention.kernels.fwd_varlen import (
-    flash_attn_forward_varlen,
-)
-from flywheel_tpu.softmax_attention.kernels.fwd_varlen_mxu import (
+from flywheel_tpu.softmax_attention.mxu.kernels.varlen import (
     varlen_gqa_fold,
     varlen_mxu_block_sizes,
     varlen_uses_mxu_pipeline,
 )
-from flywheel_tpu.softmax_attention.kv_layout import MIN_BLOCK_KV
-from flywheel_tpu.softmax_attention.mxu_pipeline import (
+from flywheel_tpu.softmax_attention.mxu.pipeline import (
     FRAGMENT_ROWS,
     NUM_SLOTS,
+)
+from flywheel_tpu.softmax_attention.mxu.row_state import (
+    LOOP_BODY_TILES,
+    mxu_block_sizes,
 )
 from flywheel_tpu.softmax_attention.schedule import (
     VarlenSchedule,
@@ -870,7 +870,7 @@ def pow2_fragment_tokens(rows: int, gqa_fold: int, *, rounds_up: bool) -> int:
     """The tokens per head of an explicit varlen q block of about rows rows
     of all gqa_fold heads: a power of two of whole fragments, rounded up or
     down, so that a kv tile's items fill the most whole slot ring laps
-    (fwd_mxu.row_tiles)."""
+    (mxu.row_state.row_tiles)."""
     fragments = rows / (gqa_fold * FRAGMENT_ROWS)
     if rounds_up:
         return FRAGMENT_ROWS * next_pow2(math.ceil(fragments))

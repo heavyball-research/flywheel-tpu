@@ -27,7 +27,7 @@ import jax.numpy as jnp
 
 from flywheel_tpu.core.tiling import round_up
 from flywheel_tpu.core.tpu import NUM_LANES
-from flywheel_tpu.softmax_attention.autograd import (
+from flywheel_tpu.softmax_attention.bwd.autograd import (
     attn_with_vjp,
     forward_only_attn,
 )

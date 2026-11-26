@@ -21,7 +21,7 @@ shape function (dense_scratch_shapes, varlen_scratch_shapes,
 paged_scratch_shapes) sizes its scratch from it and the forward main loops read
 it; schedules, refs and traced scalars stay arguments. DecodeTraits does the
 same for the KV-cache decode kernel (kernels/decode.py), and BwdTraits for the
-backward kernels (kernels/bwd.py, bwd_pipeline.py).
+backward kernels (bwd/kernels/bwd.py, bwd/pipeline.py).
 """
 
 import dataclasses
@@ -35,6 +35,7 @@ from flywheel_tpu.core.tpu import (
     MXU_COLUMNS,
     NUM_LANES,
     NUM_SUBLANES,
+    is_mxu_head_dim,
 )
 from flywheel_tpu.softmax_attention.config import (
     BlockSizes,
@@ -49,7 +50,6 @@ from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_rows,
     merged_cache_heads,
 )
-from flywheel_tpu.softmax_attention.mxu_pipeline import is_mxu_head_dim
 from flywheel_tpu.softmax_attention.rotary import ROTARY_DIM_MULTIPLE
 from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 
@@ -170,8 +170,8 @@ class FwdTraits(QKVTraits):
     rotary_batch is the coefficient planes' batch, and rotary_k False means K
     arrives rotated. guard_replay_unroll is the unroll factor of a varlen
     build's overflow replay loop; 1 keeps it rolled. uses_mxu_pipeline runs the
-    fragments on explicit MXU ops (mxu_pipeline.py, fwd_mxu.py), which only a
-    chip with MXU accumulators has; its kv compute tile is one MXU tile.
+    fragments on explicit MXU ops (mxu/pipeline.py, mxu/row_state.py), which
+    only a chip with MXU accumulators has; its kv compute tile is one MXU tile.
     """
 
     transposed_pv: bool
@@ -636,7 +636,7 @@ class DecodeTraits:
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class BwdTraits(QKVTraits):
-    """Static configuration of a backward build (kernels/bwd.py).
+    """Static configuration of a backward build (bwd/kernels/bwd.py).
 
     q_seq_len / kv_seq_len are the build's q and kv lengths. head_fold q heads
     share one schedule step: an MHA fold, a d64 lane pair, or under GQA/MQA

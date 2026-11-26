@@ -293,10 +293,10 @@ def build_mla_prefill(
 
     kv_scale = KV_SCALE[kv_dtype]
     if impl == "flywheel_mla":
-        from flywheel_tpu.softmax_attention.mla_cache_write import (
+        from flywheel_tpu.softmax_attention.mla.cache_write import (
             mla_cache_write,
         )
-        from flywheel_tpu.softmax_attention.mla_prefill import (
+        from flywheel_tpu.softmax_attention.mla.prefill import (
             flash_mla_prefill,
         )
 

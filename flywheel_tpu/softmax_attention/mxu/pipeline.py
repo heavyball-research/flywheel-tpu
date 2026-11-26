@@ -41,7 +41,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tpu import BF16_TILE_ROWS, MXU_COLUMNS, NUM_LANES
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, MXU_COLUMNS, is_mxu_head_dim
 
 # The q rows of one work item: one bf16 tile, the least an MXU op streams.
 FRAGMENT_ROWS = BF16_TILE_ROWS
@@ -52,12 +52,6 @@ QK_MXU = 0
 PV_MXU = 1
 # Each MXU's pushes and loads alternate, so one staging register serves it.
 STAGING_REGISTER = 0
-
-
-def is_mxu_head_dim(head_dim: int) -> bool:
-    """Whether the pipeline takes head_dim: whole lane tiles, at most an
-    MXU's width."""
-    return head_dim % NUM_LANES == 0 and head_dim <= MXU_COLUMNS
 
 
 def pad_to_mxu_width(operand: jax.Array) -> jax.Array:

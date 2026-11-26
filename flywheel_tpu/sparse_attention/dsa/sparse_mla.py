@@ -27,7 +27,7 @@ import numpy as np
 from jax.experimental import pallas as pl
 
 from flywheel_tpu.core.tpu import NUM_LANES, NUM_SUBLANES
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     LATENT_DIM,
     ROPE_DIM,
 )

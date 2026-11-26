@@ -24,7 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from flywheel_tpu.core.tiling import round_up
 from flywheel_tpu.core.tpu import NUM_LANES
-from flywheel_tpu.softmax_attention.bwd_pipeline import (
+from flywheel_tpu.softmax_attention.bwd.pipeline import (
     DQ_DIM_NUMBERS,
     NUM_SEMS_BWD,
     SEM_DI,

@@ -25,17 +25,25 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import (
+from flywheel_tpu.core.tpu import (
     BF16_BYTES,
     BF16_TILE_ROWS,
     F32_BYTES,
     NUM_LANES,
     NUM_SUBLANES,
 )
-from ..config import LOG2E, NT_DIM_NUMBERS, next_pow2, vmem_limit_bytes
-from ..dispatch import get_device_variant_name, get_tuned_mla_config
-from ..softmax import overflow_guard_threshold
-from .decode import lane_broadcast
+from flywheel_tpu.softmax_attention.config import (
+    LOG2E,
+    NT_DIM_NUMBERS,
+    next_pow2,
+    vmem_limit_bytes,
+)
+from flywheel_tpu.softmax_attention.dispatch import (
+    get_device_variant_name,
+    get_tuned_mla_config,
+)
+from flywheel_tpu.softmax_attention.kernels.decode import lane_broadcast
+from flywheel_tpu.softmax_attention.softmax import overflow_guard_threshold
 
 LATENT_DIM = 512
 ROPE_DIM = 64

@@ -134,7 +134,7 @@ from benchmarks.softmax_attention.kvcache_scenarios import (
 )
 from flywheel_tpu import flash_attn_varlen_func
 from flywheel_tpu.softmax_attention.config import next_pow2
-from flywheel_tpu.softmax_attention.mla_decode import mla_cache_shape
+from flywheel_tpu.softmax_attention.mla.decode import mla_cache_shape
 
 IMPLS = (
     "flywheel",

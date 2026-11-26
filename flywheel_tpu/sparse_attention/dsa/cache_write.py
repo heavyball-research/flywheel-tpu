@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     LATENT_DIM,
     ROPE_DIM,
 )

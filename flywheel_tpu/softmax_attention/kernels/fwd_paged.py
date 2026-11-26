@@ -22,7 +22,7 @@ head, which stages only the u32 word rows of each page that hold its K and
 V, and whose q heads are stacked over the rows of every score fragment.
 
 On a chip with MXU accumulators a head_dim 128 or 256 build runs its
-fragments on the explicit MXU pipeline instead (kernels/fwd_paged_mxu.py).
+fragments on the explicit MXU pipeline instead (mxu/kernels/paged.py).
 """
 
 from collections.abc import Sequence
@@ -92,18 +92,6 @@ from flywheel_tpu.softmax_attention.fwd_call import (
     check_rotary_operands,
     rotary_fields,
 )
-from flywheel_tpu.softmax_attention.fwd_mxu import (
-    NUM_CHECKPOINTS,
-    mxu_row_layout,
-    num_row_states,
-    pivot_kept_rows,
-)
-from flywheel_tpu.softmax_attention.kernels.fwd_paged_mxu import (
-    block_ring,
-    paged_mxu_block_sizes,
-    paged_mxu_fwd_body,
-    paged_uses_mxu_pipeline,
-)
 from flywheel_tpu.softmax_attention.kv_layout import (
     kv_word_halves,
     kv_word_rows,
@@ -111,7 +99,19 @@ from flywheel_tpu.softmax_attention.kv_layout import (
     resolve_merged_kv_heads,
     staged_words,
 )
-from flywheel_tpu.softmax_attention.mxu_pipeline import FRAGMENT_ROWS
+from flywheel_tpu.softmax_attention.mxu.kernels.paged import (
+    block_ring,
+    paged_mxu_block_sizes,
+    paged_mxu_fwd_body,
+    paged_uses_mxu_pipeline,
+)
+from flywheel_tpu.softmax_attention.mxu.pipeline import FRAGMENT_ROWS
+from flywheel_tpu.softmax_attention.mxu.row_state import (
+    NUM_CHECKPOINTS,
+    mxu_row_layout,
+    num_row_states,
+    pivot_kept_rows,
+)
 from flywheel_tpu.softmax_attention.schedule import (
     FwdSchedule,
     ScheduleTableLayout,

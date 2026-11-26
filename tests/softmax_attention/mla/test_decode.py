@@ -14,7 +14,7 @@
 
 """flash_mla_decode against FlashMLA's dense decode test.
 
-mla_reference ports FlashMLA's cases, reference and tolerances. The grid is
+mla/reference.py ports FlashMLA's cases, reference and tolerances. The grid is
 FlashMLA's dense correctness grid, run with a bf16 and an fp8 cache, and its
 dense corner cases, plus the grid's causal bf16 cells again at few query
 heads, cells at batch and page sizes FlashMLA does not reach, and edge cells
@@ -34,20 +34,20 @@ from jax.experimental import pallas as pl
 
 from flywheel_tpu.core.tpu import NUM_LANES
 from flywheel_tpu.softmax_attention.config import vmem_limit_bytes
-from flywheel_tpu.softmax_attention.kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.decode import (
+    FP8_CACHE_DTYPE,
+    LATENT_DIM,
+    MAX_QUERY_TOKENS,
+    flash_mla_decode,
+)
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     VMEM_BUDGET_FRACTION,
     MlaDecodeConfig,
     default_mla_config,
     mla_decode_pallas,
     mla_vmem_bytes,
 )
-from flywheel_tpu.softmax_attention.mla_decode import (
-    FP8_CACHE_DTYPE,
-    LATENT_DIM,
-    MAX_QUERY_TOKENS,
-    flash_mla_decode,
-)
-from tests.softmax_attention.mla_reference import (
+from tests.softmax_attention.mla.reference import (
     SM_SCALE,
     MlaParam,
     check_is_allclose,

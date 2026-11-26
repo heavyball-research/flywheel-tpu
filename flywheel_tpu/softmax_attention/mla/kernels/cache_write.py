@@ -23,9 +23,12 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ...core.tpu import NUM_SUBLANES
-from ..config import vmem_limit_bytes
-from .mla_decode import cache_packing, cache_tile_rows
+from flywheel_tpu.core.tpu import NUM_SUBLANES
+from flywheel_tpu.softmax_attention.config import vmem_limit_bytes
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
+    cache_packing,
+    cache_tile_rows,
+)
 
 # Note (david): a group's copies run while the group before it computes, and
 # its write-backs drain while the next one computes, so three slots keep the

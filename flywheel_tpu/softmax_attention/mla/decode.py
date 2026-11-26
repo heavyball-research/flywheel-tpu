@@ -19,7 +19,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from .kernels.mla_decode import (
+from flywheel_tpu.softmax_attention.mla.kernels.decode import (
     CACHE_ROW_DIM,
     LATENT_DIM,
     ROPE_DIM,

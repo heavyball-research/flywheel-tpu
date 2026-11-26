@@ -39,7 +39,7 @@ from flywheel_tpu.sparse_attention.dsa.union_attention import (
     token_unions,
     union_pass,
 )
-from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
+from tests.softmax_attention.mla.reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
     dsa_split_cache,
     grid_params,

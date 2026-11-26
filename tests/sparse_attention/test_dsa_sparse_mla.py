@@ -23,7 +23,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.softmax_attention.mla_decode import LATENT_DIM
+from flywheel_tpu.softmax_attention.mla.decode import LATENT_DIM
 from flywheel_tpu.sparse_attention.dsa.cache_write import dsa_cache_write
 from flywheel_tpu.sparse_attention.dsa.kernels.gather import (
     CHUNK_WORDS,
@@ -44,7 +44,7 @@ from flywheel_tpu.sparse_attention.dsa.sparse_mla import (
     dsa_sparse_mla,
 )
 from flywheel_tpu.topk.kernels.sparse_core_topk import sparse_core_vmem_words
-from tests.softmax_attention.mla_reference import SM_SCALE, check_is_allclose
+from tests.softmax_attention.mla.reference import SM_SCALE, check_is_allclose
 from tests.sparse_attention.dsa_reference import (
     TOP_KS,
     dsa_split_cache,
