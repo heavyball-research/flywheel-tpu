@@ -27,6 +27,10 @@ Item t takes result slot t mod num_slots of each MXU. A loop emits its items
 in segments, one straight-line run of ticks each; the items still in flight
 at a segment's end are its tail. Nothing here knows attention: a FragmentOps
 object reads the operands and folds the results.
+
+An MXU op takes operands MXU_COLUMNS lanes wide. A narrower head_dim is
+zero-padded to that width at issue, and a PV result keeps its first
+head_dim_v columns.
 """
 
 import dataclasses
@@ -37,7 +41,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
-from flywheel_tpu.core.tpu import BF16_TILE_ROWS
+from flywheel_tpu.core.tpu import BF16_TILE_ROWS, MXU_COLUMNS, NUM_LANES
 
 # The q rows of one work item: one bf16 tile, the least an MXU op streams.
 FRAGMENT_ROWS = BF16_TILE_ROWS
@@ -48,6 +52,21 @@ QK_MXU = 0
 PV_MXU = 1
 # Each MXU's pushes and loads alternate, so one staging register serves it.
 STAGING_REGISTER = 0
+
+
+def is_mxu_head_dim(head_dim: int) -> bool:
+    """Whether the pipeline takes head_dim: whole lane tiles, at most an
+    MXU's width."""
+    return head_dim % NUM_LANES == 0 and head_dim <= MXU_COLUMNS
+
+
+def pad_to_mxu_width(operand: jax.Array) -> jax.Array:
+    """operand with zero lanes appended up to MXU_COLUMNS."""
+    missing_lanes = MXU_COLUMNS - operand.shape[-1]
+    if not missing_lanes:
+        return operand
+    zeros = jnp.zeros((operand.shape[0], missing_lanes), operand.dtype)
+    return jnp.concatenate([operand, zeros], axis=-1)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -428,10 +447,12 @@ class MxuPipeline:
     delays: PipelineDelays
     qk_slots: tuple[jax.Array, ...]
     pv_slots: tuple[jax.Array, ...]
+    head_dim_v: int
     has_mode_free_accumulate: bool = False
 
     def __post_init__(self) -> None:
         assert len(self.qk_slots) == len(self.pv_slots)
+        assert is_mxu_head_dim(self.head_dim_v), self.head_dim_v
         assert PipelineShape(self.delays, self.num_slots).has_enough_slots
 
     @property
@@ -443,11 +464,12 @@ class MxuPipeline:
         cls,
         shape: PipelineShape = PipelineShape(),
         *,
+        head_dim_v: int,
         has_mode_free_accumulate: bool = False,
     ) -> "MxuPipeline":
-        """A pipeline of shape over fresh result slots.
-        has_mode_free_accumulate (Tail.signature) is for loops whose rows
-        start their accumulators at zero."""
+        """A pipeline of shape over fresh result slots whose PV results
+        keep head_dim_v columns. has_mode_free_accumulate (Tail.signature)
+        is for loops whose rows start their accumulators at zero."""
         tpu_info = pltpu.get_tpu_info()
         assert tpu_info.num_accumulators, tpu_info.chip_version
         slot_type = jax.ShapeDtypeStruct(
@@ -455,6 +477,7 @@ class MxuPipeline:
         )
         return cls(
             delays=shape.delays,
+            head_dim_v=head_dim_v,
             has_mode_free_accumulate=has_mode_free_accumulate,
             qk_slots=tuple(
                 jax.empty_ref(slot_type, memory_space=pltpu.ACC(QK_MXU))
@@ -641,7 +664,7 @@ class MxuPipeline:
     def _push(mxu: int, tile: jax.Array) -> None:
         """Push a K tile (transposed, QK_MXU) or a V tile (PV_MXU)."""
         pltpu.matmul_push_rhs(
-            tile,
+            pad_to_mxu_width(tile),
             staging_register=STAGING_REGISTER,
             mxu_index=mxu,
             transpose=mxu == QK_MXU,
@@ -660,7 +683,7 @@ class MxuPipeline:
         if issued is not None:
             pltpu.matmul_acc_lhs(
                 self.qk_slots[issued.slot],
-                issued.ops.q_fragment(issued.item),
+                pad_to_mxu_width(issued.ops.q_fragment(issued.item)),
                 _load_register(issued),
             )
         weighted = by_tick.get(tick - delays.pv_issue)
@@ -672,8 +695,9 @@ class MxuPipeline:
             )
         finished = by_tick.get(tick - delays.pv_pop)
         if finished is not None:
+            weighted_values = pltpu.matmul_pop(self.pv_slots[finished.slot])
             finished.ops.accumulate(
-                finished.item, pltpu.matmul_pop(self.pv_slots[finished.slot])
+                finished.item, weighted_values[:, : self.head_dim_v]
             )
         scored = by_tick.get(tick - delays.qk_pop)
         if scored is not None:

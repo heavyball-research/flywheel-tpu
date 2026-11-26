@@ -2140,6 +2140,7 @@ def make_mxu_loop(
         schedule=schedule,
         pipeline=MxuPipeline.allocate(
             shape,
+            head_dim_v=traits.head_dim_v,
             has_mode_free_accumulate=zeroes_row_start(
                 traits.group_bq // FRAGMENT_ROWS, shape
             ),
@@ -2289,7 +2290,12 @@ def first_row_carry(loop: VarlenMxuLoop) -> VarlenRowCarry:
     traits, blocks = loop.traits, loop.blocks
     zero = jnp.int32(0)
     first_desc, second_desc, _ = blocks.first_two_blocks(zero, zero)
-    loop.start_group_q(zero, zero, *loop.schedule.row_group(zero))
+
+    # A batch of empty sequences runs no group to wait for the first Q.
+    @pl.when(loop.schedule.num_groups > 0)
+    def _start_first_q():
+        loop.start_group_q(zero, zero, *loop.schedule.row_group(zero))
+
     blocks.start(first_desc, 0)
     wait_rotated_kv_block(traits, loop.kv_refs, 0)
     is_second_fresh = blocks.is_fresh(second_desc, first_desc).astype(jnp.int32)

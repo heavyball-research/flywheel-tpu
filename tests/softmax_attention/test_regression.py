@@ -1327,11 +1327,13 @@ def test_flash_attn_with_kvcache_pads_block_table_to_whole_blocks():
     np.testing.assert_array_equal(slot_kv[..., 1::2, :], v[:, 0])
 
 
-# Note (david): the head width whose dense and packed varlen builds run the
+# Note (david): the head widths whose dense and packed varlen builds run the
 # explicit MXU loops (kernels/fwd_dense_mxu.py, kernels/fwd_varlen_mxu.py) on
 # a chip with MXU accumulators; everywhere else these shapes take the
-# dot_general loops that test_prefill.py's grid covers.
+# dot_general loops that test_prefill.py's grid covers. The loops zero-pad
+# PADDED_MXU_HEAD_DIM to the MXU width.
 MXU_HEAD_DIM = 256
+PADDED_MXU_HEAD_DIM = 128
 
 
 @requires_mxu_accumulators
@@ -1386,14 +1388,15 @@ def test_dense_mxu_dispatch(nheads, seqlen, causal):
         (512, 512, 4224, True),
     ],
 )
-def test_dense_mxu_small_blocks(block_q, block_kv, seqlen, causal):
+@pytest.mark.parametrize("head_dim", [PADDED_MXU_HEAD_DIM, MXU_HEAD_DIM])
+def test_dense_mxu_small_blocks(block_q, block_kv, seqlen, causal, head_dim):
     # Note (david): blocks below the loop's bodies group into larger ones, or
     # into one kv block whose row runs as one segment; a kv axis of no whole
     # number of blocks pads to them, a full row ending at the last body with
     # a valid key and a causal row never meeting the padded keys.
-    q, k, v = random_qkv(0, 1, seqlen, 4, 2, MXU_HEAD_DIM)
+    q, k, v = random_qkv(0, 1, seqlen, 4, 2, head_dim)
     variant = make_variant(
-        MXU_HEAD_DIM**-0.5,
+        head_dim**-0.5,
         softcap=0.0,
         causal=causal,
         window_size=(-1, -1),
@@ -1408,7 +1411,7 @@ def test_dense_mxu_small_blocks(block_q, block_kv, seqlen, causal):
         block_sizes=BlockSizes(
             block_q=block_q, block_kv=block_kv, block_q_compute=block_q // 2
         ),
-        head_dim=MXU_HEAD_DIM,
+        head_dim=head_dim,
         num_kv_heads=2,
         interpret=INTERPRET,
     )
@@ -1541,7 +1544,10 @@ def test_dense_mxu_masked_blocks_of_one_slot_lap(
         ([40, 90, 1, 128, 60, 700, 30], 8, (128, 256, 16, 256)),
     ],
 )
-def test_varlen_mxu_small_blocks(seqlens, nheads_k, blocks, monkeypatch):
+@pytest.mark.parametrize("head_dim", [PADDED_MXU_HEAD_DIM, MXU_HEAD_DIM])
+def test_varlen_mxu_small_blocks(
+    seqlens, nheads_k, blocks, head_dim, monkeypatch
+):
     # Note (david): pinned blocks of few fragments a tile run the explicit
     # loop as they are: a row's tiles in whole slot laps, those past its live
     # ones hiding every key.
@@ -1554,7 +1560,7 @@ def test_varlen_mxu_small_blocks(seqlens, nheads_k, blocks, monkeypatch):
 
     monkeypatch.setattr(fwd_varlen, "varlen_mxu_fwd_body", counted_body)
     jax.clear_caches()
-    q, k, v, segments = packed_qkv(seqlens, 8, nheads_k, MXU_HEAD_DIM)
+    q, k, v, segments = packed_qkv(seqlens, 8, nheads_k, head_dim)
     cu = cu_seqlens_of(seqlens)
     out = varlen_attn(
         q,
@@ -1637,8 +1643,9 @@ def test_dense_mxu_dispatch_takes_a_runtime_offset():
         (False, 1152, 8192, 4, 3),
     ],
 )
+@pytest.mark.parametrize("head_dim", [PADDED_MXU_HEAD_DIM, MXU_HEAD_DIM])
 def test_dense_mxu_guard_replay(
-    causal, seqlen_q, seqlen, nheads_k, scaled_quarter
+    causal, seqlen_q, seqlen, nheads_k, scaled_quarter, head_dim
 ):
     # Note (david): keys scaled far up in a block a row visits after the one
     # its anchors come from push its row sums past the guard, so the row
@@ -1646,9 +1653,7 @@ def test_dense_mxu_guard_replay(
     # later, a full row anchors on block 0. The sinks and lse read the
     # replayed state; the one-block MQA rows run from one staged block, and
     # the 1152-row q block's longer loop bodies leave no check unit.
-    q, k, v = random_qkv(
-        0, 1, seqlen_q, 4, nheads_k, MXU_HEAD_DIM, seqlen_k=seqlen
-    )
+    q, k, v = random_qkv(0, 1, seqlen_q, 4, nheads_k, head_dim, seqlen_k=seqlen)
     quarter = seqlen // 4
     keys = slice(scaled_quarter * quarter, (scaled_quarter + 1) * quarter)
     k = k.at[:, keys].multiply(40.0)

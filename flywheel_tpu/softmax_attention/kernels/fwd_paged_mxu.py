@@ -14,7 +14,7 @@
 
 """Paged forward main loop on the explicit MXU pipeline.
 
-On a chip with MXU accumulators a head_dim 256 paged build runs
+On a chip with MXU accumulators a paged build of head_dim 128 or 256 runs
 paged_mxu_fwd_body in place of kernels/fwd_paged.py's paged_fwd_body.
 
 The loop runs the schedule's row groups: a row alone, or rows of one live
@@ -2667,9 +2667,10 @@ def paged_mxu_fwd_body(
         operands=operands,
         schedule=schedule,
         pipeline=MxuPipeline.allocate(
+            head_dim_v=traits.head_dim_v,
             has_mode_free_accumulate=zeroes_row_start(
                 traits.group_bq // FRAGMENT_ROWS
-            )
+            ),
         ),
         q_refs=paged_refs.q_refs,
         kv_refs=paged_refs.kv_refs,

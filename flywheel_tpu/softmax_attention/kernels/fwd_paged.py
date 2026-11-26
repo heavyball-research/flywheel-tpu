@@ -21,8 +21,8 @@ heads' K and V rows in kv_layout's merged order. Every head group is one kv
 head, which stages only the u32 word rows of each page that hold its K and
 V, and whose q heads are stacked over the rows of every score fragment.
 
-On a chip with MXU accumulators a head_dim 256 build runs its fragments on
-the explicit MXU pipeline instead (kernels/fwd_paged_mxu.py).
+On a chip with MXU accumulators a head_dim 128 or 256 build runs its
+fragments on the explicit MXU pipeline instead (kernels/fwd_paged_mxu.py).
 """
 
 from collections.abc import Sequence

@@ -1299,13 +1299,13 @@ def mxu_ragged_case(heads, kv_heads):
         (256, 2, 16, (127, 0)),
     ],
 )
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_paged_mxu_dispatch(
-    page_size, gqa_fold, max_seqlen_q_bucket, window_size
+    page_size, gqa_fold, max_seqlen_q_bucket, window_size, head_dim
 ):
     # Note (david): every page size, block and window runs the explicit
     # loop: a 768-token page gives kv blocks of three MXU tiles, a 384-token
     # page tile DMAs of half a tile, and short chunks small q blocks.
-    head_dim = 256
     variant = make_variant(
         head_dim**-0.5,
         softcap=0.0,
@@ -1352,15 +1352,19 @@ def test_paged_mxu_small_blocks(heads, kv_heads, blocks, explicit_builds):
     "heads,kv_heads,blocks",
     [(8, 4, (128, 256, 16, 256)), (4, 4, (128, 512, 16, 256))],
 )
-def test_paged_mxu_row_groups(heads, kv_heads, blocks, explicit_builds):
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_paged_mxu_row_groups(
+    heads, kv_heads, blocks, head_dim, explicit_builds
+):
     # Note (david): runs of requests of one live kv tile share start segments
-    # (row groups), up to a group's capacity, between lone longer rows.
+    # (row groups), up to a group's capacity, between lone longer rows; a
+    # head_dim 128 build zero-pads its operands to the MXU width.
     case = random_ragged_case(
         lengths=(64, 37, 1, 100, 64, 0, 64, 30, 600, 64, 50, 9, 64),
         prefixes=(0, 100, 200, 0, 30, 512, 0, 150, 1000, 0, 0, 240, 20),
         heads=heads,
         kv_heads=kv_heads,
-        head_dim=256,
+        head_dim=head_dim,
         capacity=4096,
         padding=9,
     )

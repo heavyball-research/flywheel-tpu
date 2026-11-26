@@ -2455,7 +2455,8 @@ def make_dense_mxu_loop(
     (q_refs, out_refs, state, row_end_sum, check_refs)."""
     q_refs, out_refs, state, row_end_sum, check_refs = loop_refs
     pipeline = MxuPipeline.allocate(
-        has_mode_free_accumulate=zeroes_row_start(traits.bq // FRAGMENT_ROWS)
+        head_dim_v=traits.head_dim_v,
+        has_mode_free_accumulate=zeroes_row_start(traits.bq // FRAGMENT_ROWS),
     )
     layout = dense_row_layout(
         traits,
