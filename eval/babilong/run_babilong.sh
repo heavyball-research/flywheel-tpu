@@ -176,9 +176,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# One TPU job at a time on this host.
-exec 9> "$HOME/tpu.lock"
-flock -n 9
+# One TPU job at a time on this host: CI and the benchmarks take the same
+# lock, and a run waits for whichever job holds it.
+# Note: the lock is opened read-only and created only when missing. With
+# fs.protected_regular, an O_CREAT open of a file in /tmp that another user
+# owns fails even when the file exists.
+tpu_lock=/tmp/tpu.lock
+[[ -e "$tpu_lock" ]] || (umask 022 && touch "$tpu_lock") 2>/dev/null || true
+exec 9< "$tpu_lock"
+if ! flock -n 9; then
+    echo "Waiting for $tpu_lock: another TPU job holds it."
+    flock 9
+fi
 
 eval_args=(
     --snapshot "$SNAPSHOT"
